@@ -1,0 +1,65 @@
+# Rust build artifacts
+/target/
+
+# Local runtime data
+/data/
+/history/
+*.db
+*.db-*
+*.sqlite
+*.sqlite-*
+*.sqlite3
+*.sqlite3-*
+*.log
+
+# Local environment and editor files
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+.DS_Store
+*.swp
+*.swo
+*~
+/.vscode/*
+!/.vscode/extensions.json
+
+# Local Codex task logs and raw evaluation evidence
+/.codex-tasks/
+/.delegation/
+/implementation-evidence/
+/preimplementation-evidence/
+
+# X11 review captures can contain account metadata
+/.visual-review/
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.webp
+!assets/**/*.png
+!assets/**/*.jpg
+!assets/**/*.jpeg
+!assets/**/*.gif
+!assets/**/*.webp
+
+# Local agent metadata
+/.agents/
+/.codex/
+
+# Unpublished acceptance and audit bundles
+/ACCEPTANCE.md
+/FINAL_ACCEPTANCE.md
+/G4_*.tsv
+/G4_MANIFEST_EVIDENCE.json
+/IMPLEMENTATION_DAG.md
+/PREIMPLEMENTATION_*.json
+/PROTOCOL_P2D_CLOSURE*
+/REQUIREMENTS.md
+/STORAGE_B_FOCUS11_CLOSURE.tsv
+/THREAD_C_*
+/VERIFICATION_PLAN.md
+/verify_*.sh

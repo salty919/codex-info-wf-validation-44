@@ -1,0 +1,69 @@
+{
+  "schema": "CODEX_INFO_THREAD_SCHEMA_MANIFEST_V1",
+  "codex_cli_version": "0.147.0",
+  "generated_utc_date": "2026-08-14",
+  "generation_command": [
+    "codex",
+    "app-server",
+    "generate-json-schema",
+    "--out",
+    "<empty-output-directory>"
+  ],
+  "experimental": false,
+  "bundle": {
+    "generated_path": "codex_app_server_protocol.v2.schemas.json",
+    "raw_sha256": "f3dec1e031d99a420b137b903f02196d4325eece57620c925bb7130b25f168d2"
+  },
+  "artifacts": [
+    {
+      "id": "ThreadListParams",
+      "path": "protocol/thread/ThreadListParams.canonical.json",
+      "generated_path": "v2/ThreadListParams.json",
+      "generated_raw_sha256": "b227bb78acf9b91060d03c56d3f2072cdd9f1bd08290c11e8869f1a663b16da2",
+      "canonical_jq_cS_sha256": "6a63582e96c9092edcdc19935484cadcd72a1ae128762f6d666fc2017596d310",
+      "vendored_sha256": "6a63582e96c9092edcdc19935484cadcd72a1ae128762f6d666fc2017596d310"
+    },
+    {
+      "id": "ThreadListResponse",
+      "path": "protocol/thread/ThreadListResponse.canonical.json",
+      "generated_path": "v2/ThreadListResponse.json",
+      "generated_raw_sha256": "08d5ffb0a799cf0d1c42c11b12c8bc4b04d6e515f96c6789bbec532eba1b2612",
+      "canonical_jq_cS_sha256": "f3d94a229732a0756eb8c6698e325c05a1105fb2b6fe668814b8e3277a21f130",
+      "vendored_sha256": "f3d94a229732a0756eb8c6698e325c05a1105fb2b6fe668814b8e3277a21f130"
+    }
+  ],
+  "source_kinds": [
+    "cli",
+    "vscode",
+    "exec",
+    "appServer",
+    "subAgent",
+    "subAgentReview",
+    "subAgentCompact",
+    "subAgentThreadSpawn",
+    "subAgentOther",
+    "unknown"
+  ],
+  "replacement_gate": {
+    "implicit_runtime_follow": false,
+    "fail_gate": "G2",
+    "changed_inputs": [
+      "codex_cli_version",
+      "generated_utc_date",
+      "generation_command",
+      "experimental",
+      "bundle.raw_sha256",
+      "artifact generated_raw_sha256",
+      "artifact canonical_jq_cS_sha256",
+      "artifact vendored_sha256",
+      "source_kinds",
+      "generated schema definitions"
+    ],
+    "required_before_replacement": [
+      "update protocol/thread artifacts and manifest",
+      "update REQUIREMENTS.md, DESIGN.md, SECURITY.md, VERIFICATION_PLAN.md",
+      "update positive, rejection, boundary, conflict, E2E and mutation fixtures",
+      "rerun G1, G2, G3, G4 and preimplementation integration gate"
+    ]
+  }
+}

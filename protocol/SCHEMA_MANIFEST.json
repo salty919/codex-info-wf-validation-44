@@ -1,0 +1,62 @@
+{
+  "schema": "CODEX_INFO_PROTOCOL_SCHEMA_MANIFEST_V1",
+  "codex_cli_version": "0.147.0",
+  "generated_utc_date": "2026-08-14",
+  "generation_command": [
+    "codex",
+    "app-server",
+    "generate-json-schema",
+    "--out",
+    "<empty-output-directory>"
+  ],
+  "experimental": false,
+  "bundle": {
+    "generated_path": "codex_app_server_protocol.v2.schemas.json",
+    "sha256": "f3dec1e031d99a420b137b903f02196d4325eece57620c925bb7130b25f168d2"
+  },
+  "artifacts": [
+    {
+      "id": "GetAccountResponse",
+      "path": "protocol/v2/GetAccountResponse.json",
+      "generated_path": "v2/GetAccountResponse.json",
+      "generated_raw_sha256": "dc770d8377dfe9b93b67e857e22ba7f99726265c8ca5cae63c5ad06e78b70b9d",
+      "canonical_jq_cS_sha256": "03949a001fd055f6ad8bb10ab7b7a2a4d3850b3b46de9f2131195c61ce9c2df5",
+      "vendored_sha256": "9274e7c57af620183f775f56dfa2f9061329f46420ee8f40df7c536676a47280"
+    },
+    {
+      "id": "GetAccountRateLimitsResponse",
+      "path": "protocol/v2/GetAccountRateLimitsResponse.json",
+      "generated_path": "v2/GetAccountRateLimitsResponse.json",
+      "generated_raw_sha256": "c67762e486f5a9b081ec42650fce657781669e6b1261c09c47bc8085d8cf2fc1",
+      "canonical_jq_cS_sha256": "e313f2918e069b0c3380890ea92986197f3c74a9e1a163e80b51235c1f0aa79d",
+      "vendored_sha256": "92e7bc01aee38d2f0c483a2d3812620aa99703c752cc0bafea0ae30096ea6390"
+    },
+    {
+      "id": "PlanType",
+      "path": "protocol/v2/PlanType.canonical.json",
+      "extraction": "jq -cS .definitions.PlanType codex_app_server_protocol.v2.schemas.json",
+      "generated_raw_sha256": "585f8053090425683e665307b22b7f2793e17f93340361bb1c00b95320d9643c",
+      "canonical_jq_cS_sha256": "585f8053090425683e665307b22b7f2793e17f93340361bb1c00b95320d9643c",
+      "vendored_sha256": "585f8053090425683e665307b22b7f2793e17f93340361bb1c00b95320d9643c"
+    }
+  ],
+  "replacement_gate": {
+    "implicit_runtime_follow": false,
+    "fail_gate": "G2",
+    "changed_inputs": [
+      "codex_cli_version",
+      "generated_utc_date",
+      "generation_command",
+      "experimental",
+      "bundle.sha256",
+      "any artifact generated_raw/canonical/vendored SHA-256",
+      "PlanType enum sequence"
+    ],
+    "required_before_replacement": [
+      "update protocol artifacts and manifest",
+      "update REQUIREMENTS.md, DESIGN.md, SECURITY.md, VERIFICATION_PLAN.md",
+      "update positive, rejection, boundary, conflict, E2E and mutation fixtures",
+      "rerun G1, G2, G3, G4 and preimplementation integration gate"
+    ]
+  }
+}

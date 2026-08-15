@@ -1,0 +1,4 @@
+[env]
+# WSLの最小イメージにはfontconfig.pcが含まれないことがある。共有ライブラリを
+# 実行時に読み込むSlintの公式フォールバックを使い、開発ヘッダーを要求しない。
+RUST_FONTCONFIG_DLOPEN = "1"

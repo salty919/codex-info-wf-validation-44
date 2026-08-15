@@ -1,0 +1,166 @@
+import { Header, RemainingQuota, WeekGauge, AccountActivity, ModelUsage, StatusBanner, AuthPanel, GraphWindow, ThreadsWindow } from "components.slint";
+import { DesignTokens } from "theme.slint";
+import "../assets/NotoSansJP.ttf";
+
+export { GraphWindow, ThreadsWindow }
+
+export component MainWindow inherits Window {
+    preferred-width: 900px;
+    preferred-height: 480px;
+    min-width: 900px;
+    max-width: 900px;
+    min-height: 480px;
+    max-height: 480px;
+    in-out property <string> window-title: "アカウント未接続 — プラン未設定";
+    title: root.window-title;
+    background: status-level == "warning" ? DesignTokens.canvas-warning :
+        status-level == "error" ? DesignTokens.canvas-error : DesignTokens.canvas;
+    default-font-family: "Noto Sans JP";
+
+    changed maximized => {
+        if (self.maximized) {
+            self.maximized = false;
+        }
+    }
+    changed full-screen => {
+        if (self.full-screen) {
+            self.full-screen = false;
+        }
+    }
+
+    in-out property <bool> authenticated: false;
+    in-out property <bool> has-usage: false;
+    in-out property <bool> has-auth-url: false;
+    in-out property <bool> checking: true;
+    in-out property <bool> has-error: false;
+    in-out property <string> quota-title: "残り利用枠";
+    in-out property <bool> has-quota-percent: true;
+    in-out property <bool> has-active-thread: false;
+    in-out property <int> active-thread-count: 0;
+    in-out property <int> active-thread-sol-count: 0;
+    in-out property <int> active-thread-terra-count: 0;
+    in-out property <int> active-thread-luna-count: 0;
+    in-out property <int> active-thread-other-count: 0;
+    in-out property <string> estimated-cost-label;
+    in-out property <string> remaining-label: "—";
+    in-out property <string> week-label;
+    in-out property <string> model-usage-names;
+    in-out property <string> model-usage-input-tokens;
+    in-out property <string> model-usage-input-costs;
+    in-out property <string> model-usage-cached-tokens;
+    in-out property <string> model-usage-cached-costs;
+    in-out property <string> model-usage-output-tokens;
+    in-out property <string> model-usage-output-costs;
+    in-out property <string> model-usage-period;
+    in-out property <bool> has-model-usage: false;
+    in-out property <string> status;
+    in-out property <string> status-level: "info";
+    in-out property <float> remaining-percent: 0;
+    in-out property <float> remaining-days: 0;
+    private property <length> content-width: root.width > 800px ? DesignTokens.content-max-width : root.width - 2 * DesignTokens.outer-margin-compact;
+    callback begin-auth();
+    callback check-auth();
+    callback retry();
+    callback open-graph();
+    callback open-threads();
+
+    Rectangle {
+        x: root.width > 800px ? (root.width - DesignTokens.content-max-width) / 2 : DesignTokens.outer-margin-compact;
+        y: DesignTokens.outer-margin-compact;
+        width: root.content-width;
+        height: root.height - self.y - DesignTokens.outer-margin-compact;
+
+        if root.authenticated : VerticalLayout {
+            x: 0px;
+            y: 0px;
+            width: root.content-width;
+            height: parent.height;
+            spacing: DesignTokens.space-2;
+            alignment: start;
+            Header {
+                width: root.content-width;
+                preferred-width: root.content-width;
+                horizontal-stretch: 1;
+                period-label: root.model-usage-period;
+                show-graph: true;
+                open-graph => { root.open-graph(); }
+            }
+            if root.has-usage : RemainingQuota {
+                width: root.content-width;
+                preferred-width: root.content-width;
+                horizontal-stretch: 1;
+                quota-title: root.has-quota-percent ? root.quota-title : "利用枠";
+                remaining-label: root.remaining-label;
+                remaining-percent: root.remaining-percent;
+                has-quota-percent: root.has-quota-percent;
+                estimated-cost-label: root.estimated-cost-label;
+            }
+            if root.has-usage && root.has-quota-percent : WeekGauge {
+                width: root.content-width;
+                preferred-width: root.content-width;
+                horizontal-stretch: 1;
+                remaining-days: root.remaining-days;
+                remaining-label: root.week-label;
+            }
+            AccountActivity {
+                width: root.content-width;
+                preferred-width: root.content-width;
+                horizontal-stretch: 1;
+                has-active-thread: root.has-active-thread;
+                active-thread-count: root.active-thread-count;
+                sol-count: root.active-thread-sol-count;
+                terra-count: root.active-thread-terra-count;
+                luna-count: root.active-thread-luna-count;
+                other-count: root.active-thread-other-count;
+                open-threads => { root.open-threads(); }
+            }
+            if root.has-model-usage : ModelUsage {
+                width: root.content-width;
+                preferred-width: root.content-width;
+                horizontal-stretch: 1;
+                model-names: root.model-usage-names;
+                input-token-rows: root.model-usage-input-tokens;
+                input-cost-rows: root.model-usage-input-costs;
+                cached-token-rows: root.model-usage-cached-tokens;
+                cached-cost-rows: root.model-usage-cached-costs;
+                output-token-rows: root.model-usage-output-tokens;
+                output-cost-rows: root.model-usage-output-costs;
+            }
+            StatusBanner {
+                width: root.content-width;
+                preferred-width: root.content-width;
+                horizontal-stretch: 1;
+                message: root.status;
+                level: root.status-level;
+                show-retry: root.has-error;
+                retry => { root.retry(); }
+            }
+        }
+        if !root.authenticated : VerticalLayout {
+            x: 0px;
+            y: 0px;
+            width: root.content-width;
+            height: parent.height;
+            spacing: DesignTokens.space-2;
+            alignment: start;
+            Header {
+                width: root.content-width;
+                preferred-width: root.content-width;
+                horizontal-stretch: 1;
+                period-label: "";
+                show-graph: false;
+            }
+            AuthPanel {
+                width: root.content-width;
+                preferred-width: root.content-width;
+                horizontal-stretch: 1;
+                has-auth-url: root.has-auth-url;
+                checking: root.checking;
+                status: root.status;
+                has-error: root.has-error;
+                begin-auth => { root.begin-auth(); }
+                check-auth => { root.check-auth(); }
+            }
+        }
+    }
+}

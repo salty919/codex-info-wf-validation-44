@@ -1,0 +1,30 @@
+[package]
+name = "codex_info"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+chrono = { version = "0.4", features = ["serde"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# X11を明示し、WSLgでWayland/EGL経路を選ばない。ソフトウェア描画はrun.shの
+# llvmpipe設定とも整合し、GPUドライバがなくても起動できる。
+slint = { version = "1.17.1", default-features = false, features = ["std", "compat-1-2", "backend-winit-x11", "renderer-software", "raw-window-handle-06", "unstable-winit-030"] }
+# Slintのビルド時依存と実行時依存でfontconfigの読み込み方式を揃える。
+fontique = { version = "0.10.0", default-features = false, features = ["fontconfig-dlopen"] }
+rusqlite = { version = "0.32", features = ["bundled", "limits"] }
+raw-window-handle = "0.6"
+x11rb = "0.13"
+url = "2"
+
+[build-dependencies]
+slint-build = "1.17.1"
+
+[[test]]
+name = "usage_store"
+path = "src/usage_store.rs"
+
+[[test]]
+name = "security"
+path = "src/security.rs"
