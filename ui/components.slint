@@ -1,3 +1,6 @@
+// Copyright (C) 2026 salty919
+// SPDX-License-Identifier: GPL-3.0-only
+
 import { DesignTokens } from "theme.slint";
 import { ListView } from "std-widgets.slint";
 
@@ -132,12 +135,13 @@ export component Header inherits Rectangle {
     in property <string> period-label;
     in property <bool> show-graph: false;
     callback open-graph();
+    callback open-legal-notice();
     height: 48px;
 
     Text {
         x: 0px;
         y: 0px;
-        width: parent.width - (root.show-graph ? 104px : 20px);
+        width: parent.width - (root.show-graph ? 196px : 104px);
         height: 24px;
         text: "利用状況";
         color: DesignTokens.text-primary;
@@ -149,7 +153,7 @@ export component Header inherits Rectangle {
     Text {
         x: 0px;
         y: 25px;
-        width: parent.width - (root.show-graph ? 104px : 20px);
+        width: parent.width - (root.show-graph ? 196px : 104px);
         height: 19px;
         text: root.period-label;
         color: DesignTokens.text-secondary;
@@ -181,6 +185,31 @@ export component Header inherits Rectangle {
         }
         TouchArea {
             clicked => { root.open-graph(); }
+        }
+    }
+    Rectangle {
+        x: parent.width - (root.show-graph ? 176px : 84px);
+        y: 6px;
+        width: 84px;
+        height: 36px;
+        border-radius: DesignTokens.radius-control;
+        border-width: 1px;
+        border-color: DesignTokens.border-subtle;
+        background: DesignTokens.raised;
+        Text {
+            x: 8px;
+            width: parent.width - 16px;
+            height: parent.height;
+            text: "法的通知";
+            color: DesignTokens.text-primary;
+            font-size: DesignTokens.text-body;
+            font-weight: 700;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+            overflow: elide;
+        }
+        TouchArea {
+            clicked => { root.open-legal-notice(); }
         }
     }
 }
@@ -483,6 +512,160 @@ export component AccountActivity inherits Rectangle {
         color: DesignTokens.text-muted;
         font-size: DesignTokens.text-caption;
         vertical-alignment: center;
+    }
+}
+
+export component LegalNoticeWindow inherits Window {
+    preferred-width: 720px;
+    preferred-height: 520px;
+    min-width: 620px;
+    min-height: 460px;
+    // Keep the native X11 title ASCII; the in-window heading carries the
+    // Japanese meaning without relying on the window-manager font.
+    in-out property <string> window-title: "Codex Info - Legal Notices";
+    title: root.window-title;
+    background: DesignTokens.canvas;
+    default-font-family: "Noto Sans JP";
+
+    changed maximized => {
+        if (self.maximized) {
+            self.maximized = false;
+        }
+    }
+    changed full-screen => {
+        if (self.full-screen) {
+            self.full-screen = false;
+        }
+    }
+
+    callback close-legal-notice();
+
+    Rectangle {
+        x: 28px;
+        y: 22px;
+        width: parent.width - 56px;
+        height: parent.height - 44px;
+        border-radius: DesignTokens.radius-surface;
+        border-width: 1px;
+        border-color: DesignTokens.border-subtle;
+        background: DesignTokens.raised;
+
+        Text {
+            x: 20px;
+            y: 16px;
+            width: parent.width - 136px;
+            height: 30px;
+            text: "法的通知";
+            color: DesignTokens.text-primary;
+            font-size: 22px;
+            font-weight: 700;
+            vertical-alignment: center;
+        }
+        Text {
+            x: 20px;
+            y: 58px;
+            width: parent.width - 40px;
+            height: 20px;
+            text: "Codex Info の独自コードと文書: GPL-3.0-only";
+            color: DesignTokens.accent-primary;
+            font-size: DesignTokens.text-body;
+            font-weight: 700;
+            vertical-alignment: center;
+        }
+        Text {
+            x: 20px;
+            y: 84px;
+            width: parent.width - 40px;
+            height: 20px;
+            text: "Copyright (C) 2026 salty919";
+            color: DesignTokens.text-secondary;
+            font-size: DesignTokens.text-caption;
+            vertical-alignment: center;
+        }
+        Text {
+            x: 20px;
+            y: 122px;
+            width: parent.width - 40px;
+            height: 20px;
+            text: "本ソフトウェアは無保証です。GPL-3.0-only の条件で再配布できます。";
+            color: DesignTokens.text-primary;
+            font-size: DesignTokens.text-caption;
+            vertical-alignment: center;
+        }
+        Text {
+            x: 20px;
+            y: 148px;
+            width: parent.width - 40px;
+            height: 20px;
+            text: "ライセンス本文: LICENSE";
+            color: DesignTokens.text-secondary;
+            font-size: DesignTokens.text-caption;
+            vertical-alignment: center;
+        }
+        Rectangle {
+            x: 20px;
+            y: 184px;
+            width: parent.width - 40px;
+            height: 1px;
+            background: DesignTokens.border-subtle;
+        }
+        Text {
+            x: 20px;
+            y: 202px;
+            width: parent.width - 40px;
+            height: 20px;
+            text: "Noto Sans JP: OFL-1.1 / Noto Project Authors / Adobe";
+            color: DesignTokens.text-primary;
+            font-size: DesignTokens.text-caption;
+            vertical-alignment: center;
+        }
+        Text {
+            x: 20px;
+            y: 228px;
+            width: parent.width - 40px;
+            height: 20px;
+            text: "Codex生成スキーマ: Apache-2.0 / Copyright 2025 OpenAI";
+            color: DesignTokens.text-primary;
+            font-size: DesignTokens.text-caption;
+            vertical-alignment: center;
+        }
+        Text {
+            x: 20px;
+            y: 254px;
+            width: parent.width - 40px;
+            height: 20px;
+            text: "Slint と Rust 依存クレートは各上流ライセンスを保持します。";
+            color: DesignTokens.text-primary;
+            font-size: DesignTokens.text-caption;
+            vertical-alignment: center;
+        }
+        Text {
+            x: 20px;
+            y: 280px;
+            width: parent.width - 40px;
+            height: 20px;
+            text: "詳細: THIRD_PARTY_NOTICES.md と LICENSES/";
+            color: DesignTokens.text-secondary;
+            font-size: DesignTokens.text-caption;
+            vertical-alignment: center;
+        }
+        Text {
+            x: 20px;
+            y: 306px;
+            width: parent.width - 40px;
+            height: 20px;
+            text: "バイナリ配布時は各依存の LICENSE/NOTICE を同梱してください。";
+            color: DesignTokens.text-muted;
+            font-size: 11px;
+            vertical-alignment: center;
+        }
+        ActionButton {
+            x: parent.width - 104px;
+            y: parent.height - 50px;
+            width: 84px;
+            text: "閉じる";
+            clicked => { root.close-legal-notice(); }
+        }
     }
 }
 

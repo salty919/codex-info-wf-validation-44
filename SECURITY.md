@@ -1,3 +1,6 @@
+<!-- Copyright (C) 2026 salty919 -->
+<!-- SPDX-License-Identifier: GPL-3.0-only -->
+
 # Security threat model and acceptance gate
 
 Contract identifier: `SECURITY_CONTRACT_V1_2026-08-14`.

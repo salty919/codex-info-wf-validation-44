@@ -1,3 +1,6 @@
+// Copyright (C) 2026 salty919
+// SPDX-License-Identifier: GPL-3.0-only
+
 #![deny(unsafe_code)]
 
 use chrono::{DateTime, Local, Months, Utc};
@@ -5266,6 +5269,7 @@ fn main() -> Result<(), slint::PlatformError> {
     // every series enabled, preserving the combined cumulative view.
     let graph_window = Rc::new(RefCell::new(None::<GraphWindow>));
     let threads_window = Rc::new(RefCell::new(None::<ThreadsWindow>));
+    let legal_notice_window = Rc::new(RefCell::new(None::<LegalNoticeWindow>));
     let x11_monitor = Rc::new(X11WindowStateMonitor::connect());
 
     {
@@ -5387,6 +5391,26 @@ fn main() -> Result<(), slint::PlatformError> {
             }
         });
     }
+    {
+        let legal_notice_window = Rc::clone(&legal_notice_window);
+        ui.on_open_legal_notice(move || {
+            let mut legal_notice_window = legal_notice_window.borrow_mut();
+            if legal_notice_window.is_none() {
+                if let Ok(window) = LegalNoticeWindow::new() {
+                    let weak_window = window.as_weak();
+                    window.on_close_legal_notice(move || {
+                        if let Some(window) = weak_window.upgrade() {
+                            let _ = window.hide();
+                        }
+                    });
+                    *legal_notice_window = Some(window);
+                }
+            }
+            if let Some(window) = legal_notice_window.as_ref() {
+                let _ = window.show();
+            }
+        });
+    }
 
     if matches!(
         preview_kind.as_deref(),
@@ -5401,17 +5425,24 @@ fn main() -> Result<(), slint::PlatformError> {
     if preview_kind.as_deref() == Some("multi-thread") {
         ui.invoke_open_threads();
     }
+    if preview_kind.as_deref() == Some("legal") {
+        ui.invoke_open_legal_notice();
+    }
 
     state.borrow().sync_ui(&ui);
     let weak_ui_for_bounds = ui.as_weak();
     let monitor = Rc::clone(&x11_monitor);
     let threads_window_for_bounds = Rc::clone(&threads_window);
+    let legal_notice_window_for_bounds = Rc::clone(&legal_notice_window);
     let main_monitor_timer = Timer::default();
     main_monitor_timer.start(TimerMode::Repeated, Duration::from_millis(100), move || {
         if let Some(ui) = weak_ui_for_bounds.upgrade() {
             if let Some(monitor) = monitor.as_ref() {
                 monitor.enforce(ui.window());
                 if let Some(window) = threads_window_for_bounds.borrow().as_ref() {
+                    monitor.enforce(window.window());
+                }
+                if let Some(window) = legal_notice_window_for_bounds.borrow().as_ref() {
                     monitor.enforce(window.window());
                 }
             }
@@ -7276,8 +7307,17 @@ mod tests {
             .split("export component GraphWindow inherits Window {")
             .nth(1)
             .expect("GraphWindow");
+        let legal_notice = components
+            .split("export component LegalNoticeWindow inherits Window {")
+            .nth(1)
+            .expect("LegalNoticeWindow");
         assert!(threads.contains("title: root.window-title;"));
         assert!(graph.contains("title: root.window-title;"));
+        assert!(legal_notice.contains("title: root.window-title;"));
+        assert!(legal_notice.contains("window-title: \"Codex Info - Legal Notices\";"));
+        assert!(legal_notice.contains("GPL-3.0-only"));
+        assert!(legal_notice.contains("Copyright (C) 2026 salty919"));
+        assert!(main.contains("callback open-legal-notice();"));
         for fixed_source in [main, threads] {
             assert!(fixed_source.contains("min-width: 900px;"));
             assert!(fixed_source.contains("max-width: 900px;"));
@@ -7303,6 +7343,8 @@ mod tests {
             1
         );
         assert!(!rust_source.contains("install_fixed_window_guard(graph.window())"));
+        assert_eq!(rust_source.matches("LegalNoticeWindow::new()").count(), 1);
+        assert!(rust_source.contains("ui.on_open_legal_notice"));
     }
 
     #[test]

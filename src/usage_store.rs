@@ -1,3 +1,6 @@
+// Copyright (C) 2026 salty919
+// SPDX-License-Identifier: GPL-3.0-only
+
 use chrono::{DateTime, Months, Utc};
 use rusqlite::types::Value;
 use rusqlite::{params, Connection, OptionalExtension};

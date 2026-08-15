@@ -1,3 +1,6 @@
+# Copyright (C) 2026 salty919
+# SPDX-License-Identifier: GPL-3.0-only
+
 [env]
 # WSLの最小イメージにはfontconfig.pcが含まれないことがある。共有ライブラリを
 # 実行時に読み込むSlintの公式フォールバックを使い、開発ヘッダーを要求しない。

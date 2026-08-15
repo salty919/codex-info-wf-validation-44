@@ -1,3 +1,6 @@
+// Copyright (C) 2026 salty919
+// SPDX-License-Identifier: GPL-3.0-only
+
 //! Pure contracts for the pinned `thread/list` response.
 //!
 //! This module deliberately keeps the wire schema and the validation errors

@@ -1,3 +1,6 @@
+// Copyright (C) 2026 salty919
+// SPDX-License-Identifier: GPL-3.0-only
+
 //! Schema-first account and quota decoding for the vendored app-server v2
 //! protocol.
 //!

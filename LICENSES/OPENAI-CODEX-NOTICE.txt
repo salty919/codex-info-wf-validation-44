@@ -1,0 +1,8 @@
+Copyright 2025 OpenAI
+
+The generated protocol schemas listed in THIRD_PARTY_NOTICES.md were
+generated from OpenAI Codex CLI rust-v0.147.0 and retain the upstream
+Apache-2.0 attribution. The Apache-2.0 license text is provided in
+LICENSES/Apache-2.0.txt.
+
+Source: https://github.com/openai/codex/tree/rust-v0.147.0

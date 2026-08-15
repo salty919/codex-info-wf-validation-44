@@ -1,3 +1,6 @@
+# Copyright (C) 2026 salty919
+# SPDX-License-Identifier: GPL-3.0-only
+
 [package]
 name = "codex_info"
 version = "0.1.0"

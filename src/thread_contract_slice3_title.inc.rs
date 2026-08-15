@@ -1,3 +1,6 @@
+// Copyright (C) 2026 salty919
+// SPDX-License-Identifier: GPL-3.0-only
+
 {
     fn title(item: &Value) -> String {
         validate_thread_item(item).unwrap().title().to_owned()

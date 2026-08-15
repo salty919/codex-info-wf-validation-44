@@ -1,3 +1,6 @@
+// Copyright (C) 2026 salty919
+// SPDX-License-Identifier: GPL-3.0-only
+
 //! Security boundaries shared by the Codex process, storage, and UI layers.
 //!
 //! The functions in this module deliberately return redacted, categorical

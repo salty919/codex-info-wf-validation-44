@@ -1,8 +1,11 @@
-import { Header, RemainingQuota, WeekGauge, AccountActivity, ModelUsage, StatusBanner, AuthPanel, GraphWindow, ThreadsWindow } from "components.slint";
+// Copyright (C) 2026 salty919
+// SPDX-License-Identifier: GPL-3.0-only
+
+import { Header, RemainingQuota, WeekGauge, AccountActivity, ModelUsage, StatusBanner, AuthPanel, GraphWindow, ThreadsWindow, LegalNoticeWindow } from "components.slint";
 import { DesignTokens } from "theme.slint";
 import "../assets/NotoSansJP.ttf";
 
-export { GraphWindow, ThreadsWindow }
+export { GraphWindow, ThreadsWindow, LegalNoticeWindow }
 
 export component MainWindow inherits Window {
     preferred-width: 900px;
@@ -63,6 +66,7 @@ export component MainWindow inherits Window {
     callback retry();
     callback open-graph();
     callback open-threads();
+    callback open-legal-notice();
 
     Rectangle {
         x: root.width > 800px ? (root.width - DesignTokens.content-max-width) / 2 : DesignTokens.outer-margin-compact;
@@ -84,6 +88,7 @@ export component MainWindow inherits Window {
                 period-label: root.model-usage-period;
                 show-graph: true;
                 open-graph => { root.open-graph(); }
+                open-legal-notice => { root.open-legal-notice(); }
             }
             if root.has-usage : RemainingQuota {
                 width: root.content-width;
@@ -149,6 +154,7 @@ export component MainWindow inherits Window {
                 horizontal-stretch: 1;
                 period-label: "";
                 show-graph: false;
+                open-legal-notice => { root.open-legal-notice(); }
             }
             AuthPanel {
                 width: root.content-width;

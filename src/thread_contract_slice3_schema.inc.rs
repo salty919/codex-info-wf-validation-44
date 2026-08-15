@@ -1,3 +1,6 @@
+// Copyright (C) 2026 salty919
+// SPDX-License-Identifier: GPL-3.0-only
+
 {
     macro_rules! row {
         ($label:literal, $instance:expr, $schema:expr, OK) => {

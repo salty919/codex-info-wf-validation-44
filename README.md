@@ -1,3 +1,6 @@
+<!-- Copyright (C) 2026 salty919 -->
+<!-- SPDX-License-Identifier: GPL-3.0-only -->
+
 # Codex Info（Rust / X Window / WSLg）
 
 Codex App ServerからChatGPT/Codexアカウントのレート制限と週次または月間のリセット時刻を取得し、WSLのX Windowに表示します。WebサーバーやTkinterは使いません。UIはRustの宣言的GUIツールキットSlintで構成しています。
@@ -66,10 +69,11 @@ codex app-server --help
 - プランはschema検証済みアカウント情報からnative Window titleへ表示します。Enterpriseの`individualLimit`は月間枠として扱い、`unlimited`は固定上限なしとして表示します。認証状態や固定月間上限を、レスポンスにない情報から推測しません。
 - リセット前後24時間は状態バナーで明示
 - 認証失敗・Codex未起動などは画面にエラー表示
+- 画面右上の「法的通知」から、GPLの無保証条項と第三者素材のライセンスを確認できます。ソース配布物の`LICENSE`、`THIRD_PARTY_NOTICES.md`、`LICENSES/`も併せて保持してください。
 
 ## Windowサイズとプレビュー
 
-Main/Threads画面はclient 900×480px固定（初期・最小・最大900×480）で、本文を左右30pxに揃えます。Slintのmin/max hints、winitの`Resized` mismatch event guard、X11 state monitorで固定し、mismatch時のevent-triggered `request_inner_size`は許可します。timer/Slint `set_size`修復、hide/recreate/retryは行いません。移動・最小化・復元・閉じるは通常動作します。Graph画面はclient 940×640px（初期）、最小700×480pxで、最大幅・最大高さを設けず拡大・最大化・全画面化を許可します。状態別の確認には`CODEX_INFO_PREVIEW=auth|normal|warning|reset-warning|error|zero|full|monthly|unlimited|idle`を使い、グラフ表示は`CODEX_INFO_PREVIEW=graph|graph-old`で確認できます。`CODEX_INFO_PREVIEW_SIZE`はMain/Threadsでは900×480px、Graphでは幅・高さそれぞれ700×480pxを下限として適用し、上限は設けません。メイン画面の指定例は`CODEX_INFO_PREVIEW=normal ./run.sh`です。
+Main/Threads画面はclient 900×480px固定（初期・最小・最大900×480）で、本文を左右30pxに揃えます。Slintのmin/max hints、winitの`Resized` mismatch event guard、X11 state monitorで固定し、mismatch時のevent-triggered `request_inner_size`は許可します。timer/Slint `set_size`修復、hide/recreate/retryは行いません。移動・最小化・復元・閉じるは通常動作します。Graph画面はclient 940×640px（初期）、最小700×480pxで、最大幅・最大高さを設けず拡大・最大化・全画面化を許可します。状態別の確認には`CODEX_INFO_PREVIEW=auth|normal|warning|reset-warning|error|zero|full|monthly|unlimited|idle|legal`を使い、グラフ表示は`CODEX_INFO_PREVIEW=graph|graph-old`で確認できます。`CODEX_INFO_PREVIEW_SIZE`はMain/Threadsでは900×480px、Graphでは幅・高さそれぞれ700×480pxを下限として適用し、上限は設けません。メイン画面の指定例は`CODEX_INFO_PREVIEW=normal ./run.sh`です。
 
 ## UIを調整する場所
 
@@ -77,6 +81,8 @@ Main/Threads画面はclient 900×480px固定（初期・最小・最大900×480�
 
 ## ライセンス
 
-別途明記された第三者素材を除き、このリポジトリの独自コードと文書は[GNU General Public License version 3](LICENSE)のみに基づいて提供されます（SPDX: `GPL-3.0-only`）。
+Copyright (C) 2026 salty919
+
+別途明記された第三者素材を除き、このリポジトリの独自コードと文書は[GNU General Public License version 3](LICENSE)のみに基づいて提供されます（SPDX: `GPL-3.0-only`）。著作権一覧は[COPYRIGHT](COPYRIGHT)を参照してください。
 
 同梱フォント、Codex CLIから生成したプロトコルスキーマ、Slint、およびRust依存クレートには、それぞれのライセンスが引き続き適用されます。詳細は[第三者ライセンス通知](THIRD_PARTY_NOTICES.md)を参照してください。
