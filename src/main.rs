@@ -309,6 +309,30 @@ fn install_fixed_window_guard(window: &slint::Window) {
     });
 }
 
+/// Shows an existing secondary window and asks the native window manager to
+/// activate and raise it.  `Window::show()` only maps a hidden Slint window; it
+/// does not change the stacking order when the window already exists.
+fn show_and_focus_window(
+    window: &slint::Window,
+    x11_monitor: Option<&X11WindowStateMonitor>,
+) -> Result<(), slint::PlatformError> {
+    let was_visible = window.is_visible();
+    let window_id = was_visible.then(|| x11_window_id(window)).flatten();
+    // Weston (the Xwayland window manager used by WSLg) ignores an explicit
+    // raise request for a client that is already mapped.  Remapping the same
+    // native window gives the WM its normal MapRequest path, which reliably
+    // moves the existing window above its siblings without recreating it.
+    if window_id.is_some() {
+        window.hide()?;
+    }
+    window.show()?;
+    let _ = window.with_winit_window(|winit_window| winit_window.focus_window());
+    if let Some(x11_monitor) = x11_monitor {
+        x11_monitor.raise_and_activate(window);
+    }
+    Ok(())
+}
+
 fn account_window_title(authenticated: bool, email: Option<&str>, plan_label: &str) -> String {
     if !authenticated {
         return UNAUTHENTICATED_WINDOW_TITLE.into();
@@ -5049,7 +5073,8 @@ fn format_unsigned_count(value: u128) -> String {
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use x11rb::connection::Connection;
 use x11rb::protocol::xproto::{
-    Atom, AtomEnum, ClientMessageEvent, ConnectionExt, EventMask, PropMode, Window as X11Window,
+    Atom, AtomEnum, ClientMessageEvent, ConfigureWindowAux, ConnectionExt, EventMask, PropMode,
+    StackMode, Window as X11Window,
 };
 use x11rb::rust_connection::RustConnection;
 use x11rb::wrapper::ConnectionExt as WrapperConnectionExt;
@@ -5060,6 +5085,7 @@ struct X11StateAtoms {
     fullscreen: Atom,
     maximized_vert: Atom,
     maximized_horz: Atom,
+    active_window: Option<Atom>,
 }
 
 struct X11WindowStateMonitor {
@@ -5126,6 +5152,7 @@ impl X11WindowStateMonitor {
             fullscreen: Self::intern_atom(&connection, b"_NET_WM_STATE_FULLSCREEN")?,
             maximized_vert: Self::intern_atom(&connection, b"_NET_WM_STATE_MAXIMIZED_VERT")?,
             maximized_horz: Self::intern_atom(&connection, b"_NET_WM_STATE_MAXIMIZED_HORZ")?,
+            active_window: Self::intern_atom(&connection, b"_NET_ACTIVE_WINDOW"),
         };
         let motif_wm_hints = Self::intern_atom(&connection, b"_MOTIF_WM_HINTS");
         Some(Self {
@@ -5231,6 +5258,28 @@ impl X11WindowStateMonitor {
             );
         }
     }
+
+    fn raise_and_activate(&self, window: &slint::Window) {
+        let Some(window_id) = x11_window_id(window) else {
+            return;
+        };
+        let stack_mode = ConfigureWindowAux::new().stack_mode(StackMode::ABOVE);
+        let _ = self.connection.configure_window(window_id, &stack_mode);
+
+        if let Some(active_window) = self.atoms.active_window {
+            let event_mask = EventMask::SUBSTRUCTURE_REDIRECT | EventMask::SUBSTRUCTURE_NOTIFY;
+            let event = ClientMessageEvent::new(
+                32,
+                window_id,
+                active_window,
+                [1, x11rb::CURRENT_TIME, 0, 0, 0],
+            );
+            let _ = self
+                .connection
+                .send_event(false, self.root, event_mask, event);
+        }
+        let _ = self.connection.flush();
+    }
 }
 
 /// Parses the visual-review size override without applying window-specific
@@ -5287,6 +5336,7 @@ fn main() -> Result<(), slint::PlatformError> {
     {
         let state = Rc::clone(&state);
         let graph_window = Rc::clone(&graph_window);
+        let x11_monitor = Rc::clone(&x11_monitor);
         let graph_old_preview = preview_kind.as_deref() == Some("graph-old");
         let graph_period_preview =
             matches!(preview_kind.as_deref(), Some("graph-period" | "graph-many"));
@@ -5364,13 +5414,14 @@ fn main() -> Result<(), slint::PlatformError> {
             }
             if let Some(graph) = graph_window.as_ref() {
                 sync_graph_window(&state.borrow(), graph);
-                let _ = graph.show();
+                let _ = show_and_focus_window(graph.window(), x11_monitor.as_ref().as_ref());
             }
         });
     }
     {
         let state = Rc::clone(&state);
         let threads_window = Rc::clone(&threads_window);
+        let x11_monitor = Rc::clone(&x11_monitor);
         ui.on_open_threads(move || {
             let mut threads_window = threads_window.borrow_mut();
             if threads_window.is_none() {
@@ -5387,12 +5438,13 @@ fn main() -> Result<(), slint::PlatformError> {
             }
             if let Some(window) = threads_window.as_ref() {
                 sync_threads_window(&state.borrow(), window);
-                let _ = window.show();
+                let _ = show_and_focus_window(window.window(), x11_monitor.as_ref().as_ref());
             }
         });
     }
     {
         let legal_notice_window = Rc::clone(&legal_notice_window);
+        let x11_monitor = Rc::clone(&x11_monitor);
         ui.on_open_legal_notice(move || {
             let mut legal_notice_window = legal_notice_window.borrow_mut();
             if legal_notice_window.is_none() {
@@ -5407,7 +5459,7 @@ fn main() -> Result<(), slint::PlatformError> {
                 }
             }
             if let Some(window) = legal_notice_window.as_ref() {
-                let _ = window.show();
+                let _ = show_and_focus_window(window.window(), x11_monitor.as_ref().as_ref());
             }
         });
     }
@@ -7394,6 +7446,7 @@ mod tests {
             fullscreen: 2,
             maximized_vert: 3,
             maximized_horz: 4,
+            active_window: None,
         };
         assert_eq!(forbidden_x11_states(&[], &atoms), (false, false));
         assert_eq!(
@@ -7528,8 +7581,44 @@ mod tests {
         assert!(!source.contains("monitor.enforce(graph.window());"));
         assert_eq!(source.matches("Duration::from_millis(100)").count(), 1);
         assert_eq!(source.matches("GraphWindow::new()").count(), 1);
-        assert_eq!(source.matches("graph.show()").count(), 1);
+        assert_eq!(
+            source
+                .matches("show_and_focus_window(graph.window(),")
+                .count(),
+            1
+        );
         assert_eq!(source.matches("graph.hide()").count(), 1);
+    }
+
+    #[test]
+    fn existing_secondary_windows_are_raised_without_recreation() {
+        let source = include_str!("main.rs")
+            .split_once("#[cfg(test)]\nmod tests")
+            .map(|(source, _)| source)
+            .expect("production source");
+        assert!(source.contains("fn show_and_focus_window("));
+        assert!(source.contains("let was_visible = window.is_visible()"));
+        assert!(
+            source.contains("window.with_winit_window(|winit_window| winit_window.focus_window())")
+        );
+        assert!(source.contains("x11_monitor.raise_and_activate(window)"));
+        assert!(source.contains("ConfigureWindowAux::new().stack_mode(StackMode::ABOVE)"));
+        assert_eq!(
+            source
+                .matches("show_and_focus_window(graph.window(),")
+                .count(),
+            1
+        );
+        assert_eq!(
+            source
+                .matches("show_and_focus_window(window.window(),")
+                .count(),
+            2
+        );
+        assert_eq!(source.matches("ThreadsWindow::new()").count(), 1);
+        assert_eq!(source.matches("LegalNoticeWindow::new()").count(), 1);
+        assert!(!source.contains("graph.show()"));
+        assert!(!source.contains("let _ = window.show();"));
     }
 
     #[test]
