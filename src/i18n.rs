@@ -359,7 +359,7 @@ impl I18n {
                 LegalDistribution => "バイナリ配布時は各依存の LICENSE/NOTICE を同梱してください。",
                 Close => "閉じる",
                 ActiveThreads => "実行中のスレッド",
-                Context => "コンテキスト",
+                Context => "コンテキスト使用率",
                 Instruction => "指示",
                 Tokens => "トークン",
                 Model => "モデル",
@@ -650,6 +650,28 @@ impl I18n {
             format!("{number}{}", self.text(TextKey::Tokens))
         } else {
             format!("{number} {}", self.text(TextKey::Tokens))
+        }
+    }
+
+    /// Format the current token total as a percentage of the model's context
+    /// window. The caller may pair this value with the localized token limit
+    /// so the percentage has an explicit scale.
+    pub fn format_context_usage(&self, used_tokens: u64, context_window: u64) -> String {
+        if context_window == 0 {
+            return "—".to_owned();
+        }
+        let tenths = (u128::from(used_tokens)
+            .saturating_mul(1_000)
+            .saturating_add(u128::from(context_window / 2)))
+            / u128::from(context_window);
+        let tenths = tenths.min(1_000);
+        let whole = tenths / 10;
+        let fraction = tenths % 10;
+        let whole = self.format_grouped_unsigned(whole);
+        if fraction == 0 {
+            format!("{whole}%")
+        } else {
+            format!("{whole}{}{fraction}%", self.decimal_separator())
         }
     }
 
@@ -963,7 +985,7 @@ fn basic_text(key: TextKey, language: &str) -> &'static str {
         }
         ("en", Close) => "Close",
         ("en", ActiveThreads) => "Running threads",
-        ("en", Context) => "Context",
+        ("en", Context) => "Context usage",
         ("en", Instruction) => "Instruction",
         ("en", Tokens) => "tokens",
         ("en", Model) => "Model",
@@ -1048,7 +1070,7 @@ fn basic_text(key: TextKey, language: &str) -> &'static str {
         ("zh", LegalDistribution) => "分发二进制文件时请附带各依赖的 LICENSE/NOTICE。",
         ("zh", Close) => "关闭",
         ("zh", ActiveThreads) => "运行中的线程",
-        ("zh", Context) => "上下文",
+        ("zh", Context) => "上下文使用率",
         ("zh", Instruction) => "指令",
         ("zh", Tokens) => "令牌",
         ("zh", Model) => "模型",
@@ -1150,7 +1172,7 @@ const KO_CATALOG: [&str; 79] = [
     "바이너리 배포 시 각 의존성의 LICENSE/NOTICE를 포함하세요.",
     "닫기",
     "실행 중인 스레드",
-    "컨텍스트",
+    "컨텍스트 사용률",
     "지시",
     "토큰",
     "모델",
@@ -1232,7 +1254,7 @@ const ES_CATALOG: [&str; 79] = [
     "Incluye las licencias LICENSE/NOTICE al distribuir binarios.",
     "Cerrar",
     "Hilos en ejecución",
-    "Contexto",
+    "Uso del contexto",
     "Instrucción",
     "tokens",
     "Modelo",
@@ -1314,7 +1336,7 @@ const FR_CATALOG: [&str; 79] = [
     "Joignez les fichiers LICENSE/NOTICE des dépendances lors de la distribution.",
     "Fermer",
     "Fils en cours",
-    "Contexte",
+    "Utilisation du contexte",
     "Instruction",
     "jetons",
     "Modèle",
@@ -1372,7 +1394,7 @@ const FR_CATALOG: [&str; 79] = [
 ];
 
 const DE_CATALOG: [&str; 79] = [
-    "Noto Sans JP", "Konto nicht verbunden — Tarif nicht festgelegt", "Tarif nicht festgelegt", "Kostenlos", "Unternehmen", "Bildung", "Nutzung", "Diagramm", "Rechtliche Hinweise", "Läuft", "Threads nach Modell", "Sonstige", "Details", "Keine laufenden Threads", "Codex-Info-Code und Dokumente: GPL-3.0-only", "Diese Software wird ohne Gewährleistung bereitgestellt. Weitergabe unter GPL-3.0-only ist erlaubt.", "Lizenztext: LICENSE", "Noto Sans JP / Noto Sans KR: OFL-1.1 / Noto Project Authors / Adobe", "Von Codex erzeugtes Schema: Apache-2.0 / Copyright 2025 OpenAI", "Slint und Rust-Abhängigkeiten behalten ihre ursprünglichen Lizenzen.", "Details: THIRD_PARTY_NOTICES.md und LICENSES/", "Beim Verteilen von Binärdateien die LICENSE/NOTICE-Dateien beilegen.", "Schließen", "Laufende Threads", "Kontext", "Anweisung", "Tokens", "Modell", "Eingabe", "Cache", "Ausgabe", "Erneut versuchen", "Nutzungsverlauf", "Verbleibend", "Stündliche Token-Nutzung (nach Modell) / verbleibend %", "Kumulierte stündliche Ausgaben (nach Modell) / verbleibend %", "Keine Aufzeichnungen", "Codex-Konto verbinden", "Schließe die Authentifizierung im Browser ab. Sie wird automatisch geprüft.", "Die Authentifizierung wird von Codex verwaltet; diese App speichert keine Zugangsdaten.", "Authentifizierungsseite öffnen", "Authentifizierung starten", "Wird geprüft…", "Authentifizierung prüfen", "Verwendet den Authentifizierungsstatus der Codex CLI.", "Kein Verlauf", "AN", "AUS", "Verbindung mit Codex app-server…", "Nutzung wird aktualisiert…", "Authentifizierung wird geprüft…", "Authentifiziert. Nutzung wird geladen…", "Nicht authentifiziert. Authentifizierung starten.", "Authentifizierungs-URL erstellt. «Authentifizierungsseite öffnen» wählen.", "Authentifizierungs-URL wird erstellt…", "Authentifizierungs-URL konnte nicht geöffnet werden.", "Nutzung konnte nicht abgerufen werden. Codex-app-server-Verbindung prüfen.", "Status kann nicht angezeigt werden.", "Fast keine Nutzung mehr verfügbar.", "Nutzung wird knapp.", "Weniger als 24 Stunden bis zum Zurücksetzen.", "Zuletzt aktualisiert", "Nutzung aktualisiert. Vorheriger Verlauf und Threads bleiben erhalten.", "Nutzung aktualisiert. Vorheriger Verlauf bleibt erhalten.", "Nutzung aktualisiert. Vorherige Thread-Anzeige bleibt erhalten.", "Haupt", "Unter", "Übergeordneter Thread läuft nicht", "Übergeordnet", " (aktuell)", "Frist", "Schätzung", "Wird bald zurückgesetzt", "Keine feste Grenze", "Verbleibende Nutzung", "Verbleibende Monatsnutzung", "Nutzungsgrenze", "Dollar", "Token",
+    "Noto Sans JP", "Konto nicht verbunden — Tarif nicht festgelegt", "Tarif nicht festgelegt", "Kostenlos", "Unternehmen", "Bildung", "Nutzung", "Diagramm", "Rechtliche Hinweise", "Läuft", "Threads nach Modell", "Sonstige", "Details", "Keine laufenden Threads", "Codex-Info-Code und Dokumente: GPL-3.0-only", "Diese Software wird ohne Gewährleistung bereitgestellt. Weitergabe unter GPL-3.0-only ist erlaubt.", "Lizenztext: LICENSE", "Noto Sans JP / Noto Sans KR: OFL-1.1 / Noto Project Authors / Adobe", "Von Codex erzeugtes Schema: Apache-2.0 / Copyright 2025 OpenAI", "Slint und Rust-Abhängigkeiten behalten ihre ursprünglichen Lizenzen.", "Details: THIRD_PARTY_NOTICES.md und LICENSES/", "Beim Verteilen von Binärdateien die LICENSE/NOTICE-Dateien beilegen.", "Schließen", "Laufende Threads", "Kontextnutzung", "Anweisung", "Tokens", "Modell", "Eingabe", "Cache", "Ausgabe", "Erneut versuchen", "Nutzungsverlauf", "Verbleibend", "Stündliche Token-Nutzung (nach Modell) / verbleibend %", "Kumulierte stündliche Ausgaben (nach Modell) / verbleibend %", "Keine Aufzeichnungen", "Codex-Konto verbinden", "Schließe die Authentifizierung im Browser ab. Sie wird automatisch geprüft.", "Die Authentifizierung wird von Codex verwaltet; diese App speichert keine Zugangsdaten.", "Authentifizierungsseite öffnen", "Authentifizierung starten", "Wird geprüft…", "Authentifizierung prüfen", "Verwendet den Authentifizierungsstatus der Codex CLI.", "Kein Verlauf", "AN", "AUS", "Verbindung mit Codex app-server…", "Nutzung wird aktualisiert…", "Authentifizierung wird geprüft…", "Authentifiziert. Nutzung wird geladen…", "Nicht authentifiziert. Authentifizierung starten.", "Authentifizierungs-URL erstellt. «Authentifizierungsseite öffnen» wählen.", "Authentifizierungs-URL wird erstellt…", "Authentifizierungs-URL konnte nicht geöffnet werden.", "Nutzung konnte nicht abgerufen werden. Codex-app-server-Verbindung prüfen.", "Status kann nicht angezeigt werden.", "Fast keine Nutzung mehr verfügbar.", "Nutzung wird knapp.", "Weniger als 24 Stunden bis zum Zurücksetzen.", "Zuletzt aktualisiert", "Nutzung aktualisiert. Vorheriger Verlauf und Threads bleiben erhalten.", "Nutzung aktualisiert. Vorheriger Verlauf bleibt erhalten.", "Nutzung aktualisiert. Vorherige Thread-Anzeige bleibt erhalten.", "Haupt", "Unter", "Übergeordneter Thread läuft nicht", "Übergeordnet", " (aktuell)", "Frist", "Schätzung", "Wird bald zurückgesetzt", "Keine feste Grenze", "Verbleibende Nutzung", "Verbleibende Monatsnutzung", "Nutzungsgrenze", "Dollar", "Token",
 ];
 
 const PT_CATALOG: [&str; 79] = [
@@ -1400,7 +1422,7 @@ const PT_CATALOG: [&str; 79] = [
     "Inclua LICENSE/NOTICE de cada dependência ao distribuir binários.",
     "Fechar",
     "Threads em execução",
-    "Contexto",
+    "Uso do contexto",
     "Instrução",
     "tokens",
     "Modelo",
@@ -1482,7 +1504,7 @@ const IT_CATALOG: [&str; 79] = [
     "Includi LICENSE/NOTICE di ogni dipendenza nella distribuzione dei binari.",
     "Chiudi",
     "Thread in esecuzione",
-    "Contesto",
+    "Utilizzo del contesto",
     "Istruzione",
     "token",
     "Modello",
@@ -1564,7 +1586,7 @@ const RU_CATALOG: [&str; 79] = [
     "При распространении бинарных файлов приложите LICENSE/NOTICE зависимостей.",
     "Закрыть",
     "Выполняющиеся потоки",
-    "Контекст",
+    "Использование контекста",
     "Инструкция",
     "токены",
     "Модель",
@@ -1686,6 +1708,19 @@ mod tests {
             I18n::from_parts(Language::Japanese, Tz::UTC).font_family(),
             "Noto Sans JP"
         );
+    }
+
+    #[test]
+    fn context_usage_is_derived_from_tokens_and_capped_at_full() {
+        let english = I18n::from_parts(Language::English, Tz::UTC);
+        assert_eq!(english.format_context_usage(0, 100), "0%");
+        assert_eq!(english.format_context_usage(50, 100), "50%");
+        assert_eq!(english.format_context_usage(1, 3), "33.3%");
+        assert_eq!(english.format_context_usage(u64::MAX, 100), "100%");
+        assert_eq!(english.format_context_usage(1, 0), "—");
+
+        let french = I18n::from_parts(Language::French, Tz::UTC);
+        assert_eq!(french.format_context_usage(1, 3), "33,3%");
     }
 
     #[test]

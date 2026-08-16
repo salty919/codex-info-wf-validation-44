@@ -3,11 +3,11 @@
 
 # 多言語化・日本語表示仕様
 
-この文書は、Codex Infoの固定UI文言、時刻表示、同梱フォントを変更する人向けの短い運用仕様です。実際のライセンス条件は[LICENSE](../LICENSE)を参照してください。
+Codex Infoの固定UI文言、時刻表示、フォント、配布ライセンスに関する仕様です。GPLv3の正式な条件は[LICENSE](../LICENSE)に定めます。
 
-## 対応言語
+## 対応言語とフォント
 
-起動時のlocaleから、次のprimary language subtagを選びます。
+起動時localeのprimary language subtagに対応するcatalogとフォントを選びます。
 
 | primary subtag | 表示言語 | フォント |
 | --- | --- | --- |
@@ -22,40 +22,27 @@
 | `it` | Italiano | `Noto Sans JP` |
 | `ru` | Русский | `Noto Sans JP` |
 
-`LC_ALL`、`LC_MESSAGES`、`LANG`の順に、最初の空でない値だけを使います。`C`、`POSIX`、不正な値、未対応言語は英語として扱い、下位の変数へ進みません。encoding suffix（`.UTF-8`）とmodifier（`@...`）を除外し、`-`と`_`を同じ区切りとして扱います。`zh_TW`や`zh-Hant`も、今回のcatalogでは簡体字へ安全にフォールバックします。`LANGUAGE`は参照しません。
+localeは`LC_ALL`、`LC_MESSAGES`、`LANG`の順に最初の非空値を採用します。encoding suffix（`.UTF-8`）とmodifier（`@...`）を除き、`-`と`_`を同じ区切りとしてprimary subtagを判定します。`C`、`POSIX`、不正値、未対応言語は英語catalogへ対応付け、`zh_TW`と`zh-Hant`は簡体字catalogへ対応付けます。
 
-表示確認の例:
-
-```bash
-LANG=ja_JP.UTF-8 LC_ALL= TZ=Asia/Tokyo CODEX_INFO_PREVIEW=normal ./run.sh
-LANG=en_US.UTF-8 LC_ALL= TZ=Europe/Berlin CODEX_INFO_PREVIEW=normal ./run.sh
-LANG=ko_KR.UTF-8 LC_ALL= CODEX_INFO_PREVIEW=legal ./run.sh
-```
-
-localeは`I18n`へ起動時に保存されます。実行中に環境変数を変更しても、既存Windowの言語やtimezoneを再選択しません。変更後は再起動してください。
+localeとtimezoneはプロセス起動時に確定します。`TZ`には`Asia/Tokyo`や`Europe/Berlin`などのIANA IDを指定でき、無効値はUTCへ対応付けます。
 
 ## 時刻基準
 
-- 内部のepoch秒、並び順、期間の境界はUTCのまま保持します。
-- 絶対時刻、履歴期間、グラフ横軸は起動時に解決したIANA timezoneへ変換し、数値UTC offset（例`+09:00`）を付けます。
-- 経過時間・残り時間は`now_utc - timestamp_utc`の差分で計算し、DSTによる時計の飛びを混ぜません。
-- `TZ`にIANA ID（例`Asia/Tokyo`、`Europe/Berlin`）を指定できます。POSIX rule文字列（`JST-9`）や裸のoffset（`+09:00`）は受け付けず、無効値はUTCへフォールバックします。
-- 無効なepochは、値欄では`—`、グラフ軸では空値、履歴選択肢では除外します。推測した時刻を表示しません。
+- epoch秒、並び順、期間の境界はUTCで保持します。
+- 絶対時刻、履歴期間、グラフ横軸は起動時timezoneへ変換し、数値UTC offset（例`+09:00`）を付けます。
+- 経過時間と残り時間はUTC秒の差分を各言語の単位へ変換します。
+- 無効epochは値欄を`—`、グラフ軸を空値、履歴選択肢を除外として表示します。
 
-## 日本語表示に必要なもの
+## 固定文言
 
-`ui/app.slint`が`assets/NotoSansJP.ttf`と`assets/NotoSansKR.otf`を直接importし、`UiStrings.font-family`をWindow全体の`default-font-family`へ設定します。そのため、OSのfontconfig設定やホスト側の日本語フォント有無に表示が依存しません。
+固定UI文言はcatalogで管理します。thread title、email、モデル名、製品名、ライセンス名、ログ生値は原文を表示し、数値とepoch秒だけを表示時のlocale・timezoneへ変換します。
 
-変更時は次を守ってください。
+日本語・韓国語フォントは`assets/NotoSansJP.ttf`と`assets/NotoSansKR.otf`をSlintへ埋め込み、起動時localeのフォントを各Windowへ適用します。フォントのOFL-1.1通知は[THIRD_PARTY_NOTICES.md](../THIRD_PARTY_NOTICES.md)と[assets/NOTICE.txt](../assets/NOTICE.txt)に記載します。
 
-1. 固定文言をSlint/Rustへ直接追加せず、`TextKey`と`UiStrings`へ登録する。
-2. `TextKey::ALL`の全キーについて10 catalogが空文字にならないことを単体テストで確認する。
-3. ユーザー入力のthread title、email、モデル名、製品名、ライセンス名、ログ生値は翻訳しない。数値とepoch秒は表示時だけlocale/timezoneへ変換する。
-4. 日本語の追加文言はglyph manifest（この表と`src/i18n.rs`の日本語catalog）へ反映し、`CODEX_INFO_PREVIEW=normal|auth|warning|error|legal`の新しい画像で欠字・文字化け・clipを目視する。
-5. 韓国語を変更した場合は`NotoSansKR.otf`のOFL-1.1通知も同時に確認する。
+ネイティブタイトルバーは使用しません。各Windowのボタン以外の画面領域を移動用に使い、画面内タイトル領域、操作記号、固定文言は埋め込みフォントでlocale表示します。Graphだけは四隅の広い対角領域と辺から枠をリサイズし、最大化／復元も提供します。
 
-UIの受入では、900×480のMain/Threads、700×480以上のGraph、Legal Windowを少なくとも日本語で確認します。状態別プレビューはリポジトリ直下のREADMEに記載した`CODEX_INFO_PREVIEW`値を使い、最後の編集後に新しいプロセスからキャプチャしてください。
+## 配布ライセンス
 
-## ライセンス文書の扱い
+英語の[LICENSE](../LICENSE)がGPLv3の正文です。[LICENSE.ja.md](../LICENSE.ja.md)は日本語案内です。独自コードと文書は`GPL-3.0-only`、生成スキーマはApache-2.0、同梱フォントはOFL-1.1、SlintとCargo依存クレートは各上流ライセンスで提供します。
 
-`LICENSE`はGNU GPLv3の英語正文であり、変更しません。`LICENSE.ja.md`は日本語の参照導線です。フォント、生成スキーマ、Slint、Cargo依存クレートは各上流ライセンスのまま再配布し、`THIRD_PARTY_NOTICES.md`、`assets/NOTICE.txt`、`LICENSES/`を配布物から省略しないでください。
+ソース・バイナリ配布物には`LICENSE`、[THIRD_PARTY_NOTICES.md](../THIRD_PARTY_NOTICES.md)、[assets/NOTICE.txt](../assets/NOTICE.txt)、[LICENSES/](../LICENSES/)を同梱します。

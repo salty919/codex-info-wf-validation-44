@@ -24,7 +24,7 @@ export struct UiStrings {
     legal-distribution: string,
     close: string,
     active-threads: string,
-    context: string,
+    context-usage: string,
     instruction: string,
     tokens: string,
     model: string,
@@ -46,8 +46,128 @@ export struct UiStrings {
     check-auth: string,
     auth-cli: string,
     no-history: string,
-    on: string,
-    off: string,
+}
+
+// Frameless windows keep their system-independent controls in the application
+// surface. The glyphs are deliberately ASCII/Unicode symbols rather than
+// translated words so the controls stay compact in every locale.
+export component WindowControlButton inherits Rectangle {
+    in property <string> glyph;
+    in property <bool> destructive: false;
+    callback activated();
+    width: 36px;
+    height: 28px;
+    border-radius: 4px;
+    border-width: 1px;
+    border-color: control-touch.has-hover
+        ? (root.destructive ? DesignTokens.danger : DesignTokens.graph-control-border)
+        : DesignTokens.border-subtle;
+    background: control-touch.has-hover
+        ? (root.destructive ? #3b2028 : DesignTokens.graph-control-hover)
+        : DesignTokens.graph-control-surface;
+
+    Text {
+        width: parent.width;
+        height: parent.height;
+        text: root.glyph;
+        color: root.destructive && control-touch.has-hover
+            ? DesignTokens.danger
+            : DesignTokens.text-primary;
+        font-size: root.glyph == "×" ? 18px : 16px;
+        font-weight: 700;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+    control-touch := TouchArea {
+        mouse-cursor: MouseCursor.pointer;
+        clicked => { root.activated(); }
+    }
+}
+
+export component WindowControls inherits Rectangle {
+    in property <bool> show-maximize: false;
+    in property <bool> maximized: false;
+    callback minimize();
+    callback toggle-maximize();
+    callback close();
+    width: root.show-maximize ? 108px : 72px;
+    height: 28px;
+
+    WindowControlButton {
+        x: 0px;
+        glyph: "-";
+        activated => { root.minimize(); }
+    }
+    if root.show-maximize : WindowControlButton {
+        x: 36px;
+        glyph: root.maximized ? "❐" : "□";
+        activated => { root.toggle-maximize(); }
+    }
+    WindowControlButton {
+        x: root.show-maximize ? 72px : 36px;
+        glyph: "×";
+        destructive: true;
+        activated => { root.close(); }
+    }
+}
+
+// The first left-button press is handed to winit so the window manager owns
+// the drag gesture. Controls are layered above this area at each call site.
+export component WindowDragArea inherits TouchArea {
+    callback begin-drag();
+    mouse-cursor: MouseCursor.move;
+    pointer-event(event) => {
+        if (event.kind == PointerEventKind.down && event.button == PointerEventButton.left) {
+            root.begin-drag();
+        }
+    }
+}
+
+// WSLg may report the compositor wrapper as decorated even after `no-frame`.
+// Graph therefore exposes explicit edge/corner handles in addition to
+// Slint's built-in frameless resize-border support.
+export component WindowResizeHandle inherits TouchArea {
+    in property <string> direction;
+    in property <MouseCursor> resize-cursor: MouseCursor.default;
+    in property <bool> corner: false;
+    callback begin-resize(string);
+    mouse-cursor: root.resize-cursor;
+
+    // Keep the hit target visually quiet until the pointer reaches it. The
+    // enlarged corner target remains discoverable through the diagonal cursor
+    // and a subtle hover tint instead of changing the graph's plot geometry.
+    Rectangle {
+        x: 0px;
+        y: 0px;
+        width: parent.width;
+        height: parent.height;
+        visible: root.has-hover;
+        background: DesignTokens.accent-primary;
+        opacity: root.corner ? 0.24 : 0.12;
+    }
+
+    // A small always-visible bracket makes the enlarged corner target
+    // discoverable even before the pointer reaches it. The hit area remains
+    // the full 28px square; this mark is only a visual affordance.
+    Rectangle {
+        visible: root.corner;
+        x: root.direction == "north-east" || root.direction == "south-east"
+            ? parent.width - 12px : 2px;
+        y: root.direction == "south-west" || root.direction == "south-east"
+            ? parent.height - 12px : 2px;
+        width: 10px;
+        height: 10px;
+        border-width: 1px;
+        border-radius: 2px;
+        border-color: DesignTokens.accent-primary;
+        opacity: 0.48;
+    }
+
+    pointer-event(event) => {
+        if (event.kind == PointerEventKind.down && event.button == PointerEventButton.left) {
+            root.begin-resize(root.direction);
+        }
+    }
 }
 
 export struct ActiveThreadRow {
@@ -57,7 +177,7 @@ export struct ActiveThreadRow {
     parent-title: string,
     model: string,
     tokens: string,
-    context-window: string,
+    context-usage: string,
     thread-age: string,
     instruction-age: string,
     tree-depth: int,
@@ -193,14 +313,31 @@ export component Header inherits Rectangle {
     in property <bool> show-graph: false;
     callback open-graph();
     callback open-legal-notice();
+    callback begin-window-drag();
+    callback minimize-window();
+    callback close-window();
     property <length> legal-button-width: 208px;
     property <length> graph-button-width: 100px;
+    property <length> window-control-width: 72px;
+    private property <length> action-reserve: root.window-control-width + 8px;
+    // Keep the move target before all legal/graph/window controls so a
+    // frameless button click is never interpreted as a window move.
+    private property <length> action-start: root.width - root.window-control-width - 8px
+        - (root.show-graph ? root.graph-button-width + 8px + root.legal-button-width : root.legal-button-width);
     height: 48px;
+
+    WindowDragArea {
+        x: 0px;
+        y: 0px;
+        width: root.action-start;
+        height: parent.height;
+        begin-drag => { root.begin-window-drag(); }
+    }
 
     Text {
         x: 0px;
         y: 0px;
-        width: parent.width - (root.show-graph ? 260px : 152px);
+        width: parent.width - (root.show-graph ? 260px : 152px) - root.action-reserve;
         height: 24px;
         text: root.strings.usage-status;
         color: DesignTokens.text-primary;
@@ -212,7 +349,7 @@ export component Header inherits Rectangle {
     Text {
         x: 0px;
         y: 25px;
-        width: parent.width - (root.show-graph ? 260px : 152px);
+        width: parent.width - (root.show-graph ? 260px : 152px) - root.action-reserve;
         height: 19px;
         text: root.period-label;
         color: DesignTokens.text-secondary;
@@ -221,7 +358,7 @@ export component Header inherits Rectangle {
         overflow: elide;
     }
     Rectangle {
-        x: parent.width - root.graph-button-width;
+        x: parent.width - root.window-control-width - 8px - root.graph-button-width;
         y: 6px;
         width: root.graph-button-width;
         height: 36px;
@@ -247,7 +384,8 @@ export component Header inherits Rectangle {
         }
     }
     Rectangle {
-        x: parent.width - (root.show-graph ? root.graph-button-width + 8px + root.legal-button-width : root.legal-button-width);
+        x: parent.width - root.window-control-width - 8px
+            - (root.show-graph ? root.graph-button-width + 8px + root.legal-button-width : root.legal-button-width);
         y: 6px;
         width: root.legal-button-width;
         height: 36px;
@@ -271,6 +409,14 @@ export component Header inherits Rectangle {
             clicked => { root.open-legal-notice(); }
         }
     }
+    WindowControls {
+        x: parent.width - root.window-control-width;
+        y: 10px;
+        show-maximize: false;
+        minimize => { root.minimize-window(); }
+        close => { root.close-window(); }
+    }
+
 }
 
 export component RemainingQuota inherits Rectangle {
@@ -505,10 +651,6 @@ component ThreadModelStat inherits Rectangle {
 export component AccountActivity inherits Rectangle {
     in property <UiStrings> strings;
     in property <string> active-thread-count-label;
-    // Legacy Japanese binding retained as a source-compatibility marker:
-    // text: root.active-thread-count + "件";
-    // text: "モデル別スレッド";
-    // label: "その他";
     in property <bool> has-active-thread: false;
     in property <int> active-thread-count: 0;
     in property <int> sol-count: 0;
@@ -584,11 +726,6 @@ export component AccountActivity inherits Rectangle {
         indicator-color: DesignTokens.text-muted;
     }
     if root.has-active-thread : ActionButton {
-        /* Legacy geometry marker retained for source-compatibility tests.
-y: 14px;
-        width: 64px;
-        height: 24px;
-        */
         x: parent.width - 112px;
         y: 14px;
         width: 100px;
@@ -610,18 +747,19 @@ y: 14px;
 }
 
 export component LegalNoticeWindow inherits Window {
-    // Previous native title: window-title: "Codex Info - Legal Notices";
-    // License marker retained for source audits: GPL-3.0-only
     preferred-width: 720px;
     preferred-height: 520px;
-    min-width: 620px;
-    min-height: 460px;
-    // The runtime native title is localized together with the in-window
-    // heading. The embedded font is used by this Window; the historical ASCII
-    // marker above is retained only for source-compatibility audits.
+    min-width: 720px;
+    max-width: 720px;
+    min-height: 520px;
+    max-height: 520px;
+    // WM metadata remains ASCII-safe for task switching, while the visible
+    // title and controls are rendered inside this frameless surface.
     in-out property <string> window-title;
     in property <UiStrings> strings;
     in-out property <bool> reset-close-buttons: false;
+    no-frame: true;
+    resize-border-width: 0px;
     title: root.window-title;
     background: DesignTokens.canvas;
     default-font-family: root.strings.font-family;
@@ -638,6 +776,26 @@ export component LegalNoticeWindow inherits Window {
     }
 
     callback close-legal-notice();
+    callback begin-window-drag();
+    callback minimize-window();
+    callback close-window();
+
+    Rectangle {
+        x: 0px;
+        y: 0px;
+        width: root.width;
+        height: root.height;
+        background: DesignTokens.canvas;
+        z: -10;
+    }
+    WindowDragArea {
+        x: 0px;
+        y: 0px;
+        width: root.width;
+        height: root.height;
+        z: -5;
+        begin-drag => { root.begin-window-drag(); }
+    }
 
     Rectangle {
         x: 28px;
@@ -648,6 +806,14 @@ export component LegalNoticeWindow inherits Window {
         border-width: 1px;
         border-color: DesignTokens.border-subtle;
         background: DesignTokens.raised;
+
+        WindowDragArea {
+            x: 1px;
+            y: 1px;
+            width: parent.width - 74px;
+            height: 48px;
+            begin-drag => { root.begin-window-drag(); }
+        }
 
         Text {
             x: 20px;
@@ -758,14 +924,12 @@ export component LegalNoticeWindow inherits Window {
             font-size: 11px;
             vertical-alignment: center;
         }
-        ActionButton {
-            x: parent.width - 104px;
-            y: parent.height - 50px;
-            width: 84px;
-            text: root.strings.close;
-            activate-on-press: true;
-            reset-press-state: root.reset-close-buttons;
-            clicked => { root.close-legal-notice(); }
+        WindowControls {
+            x: parent.width - 72px;
+            y: 10px;
+            show-maximize: false;
+            minimize => { root.minimize-window(); }
+            close => { root.close-window(); }
         }
     }
 }
@@ -780,13 +944,9 @@ export component ThreadsWindow inherits Window {
     in-out property <string> window-title;
     in property <UiStrings> strings;
     in property <string> thread-count-label;
-    // Metadata source shape retained for compatibility: text: "稼働 " + row.thread-age;
-    // Metadata source shape retained for compatibility: text: "指示 " + row.instruction-age;
-    // text: "指示";
-    // Metadata source shape retained for compatibility: text: "トークン";
-    // Metadata source shape retained for compatibility: text: "コンテキスト " + row.context-window;
-    // text: "コンテキスト";
     in-out property <bool> reset-close-buttons: false;
+    no-frame: true;
+    resize-border-width: 0px;
     title: root.window-title;
     background: DesignTokens.canvas;
     default-font-family: root.strings.font-family;
@@ -804,12 +964,32 @@ export component ThreadsWindow inherits Window {
 
     in property <[ActiveThreadRow]> thread-rows;
     callback close-threads();
+    callback begin-window-drag();
+    callback minimize-window();
+    callback close-window();
     // A lone thread gets the complete detail viewport so the information is
     // not stranded in a small strip at the top. With multiple threads, keep a
     // Three complete cards fit in the 384px viewport. 128px is the compact
     // multi-thread unit; the single-thread detail card remains 384px.
     property <bool> single-thread: root.thread-rows.length == 1;
     property <length> thread-row-height: root.single-thread ? 384px : 128px;
+
+    Rectangle {
+        x: 0px;
+        y: 0px;
+        width: root.width;
+        height: root.height;
+        background: DesignTokens.canvas;
+        z: -10;
+    }
+    WindowDragArea {
+        x: 0px;
+        y: 0px;
+        width: root.width;
+        height: root.height;
+        z: -5;
+        begin-drag => { root.begin-window-drag(); }
+    }
 
     header-panel := Rectangle {
         x: 30px;
@@ -818,6 +998,13 @@ export component ThreadsWindow inherits Window {
         height: 48px;
         background: DesignTokens.canvas;
         z: 2;
+        WindowDragArea {
+            x: 0px;
+            y: 0px;
+            width: parent.width - 74px;
+            height: parent.height;
+            begin-drag => { root.begin-window-drag(); }
+        }
         Text {
             x: 0px;
             y: 0px;
@@ -842,16 +1029,13 @@ export component ThreadsWindow inherits Window {
             vertical-alignment: center;
             z: 2;
         }
-        ActionButton {
-            x: parent.width - 88px;
-            y: 6px;
-            width: 88px;
-            height: 36px;
-            text: root.strings.close;
-            activate-on-press: true;
-            reset-press-state: root.reset-close-buttons;
-            z: 2;
-            clicked => { root.close-threads(); }
+        WindowControls {
+            x: parent.width - 72px;
+            y: 10px;
+            show-maximize: false;
+            z: 3;
+            minimize => { root.minimize-window(); }
+            close => { root.close-window(); }
         }
     }
 
@@ -878,10 +1062,6 @@ export component ThreadsWindow inherits Window {
                     property <int> display-depth: min(row.tree-depth, 3);
                     // The tree owns a dedicated left gutter. It must never
                     // share the relation, title, or metadata text lanes.
-                    // Legacy rail geometry markers retained for source audits:
-                    // tree-base-x: 92px;
-                    // tree-depth-step: 20px;
-                    // tree-junction-y: 28px;
                     property <length> tree-base-x: 24px;
                     property <length> tree-depth-step: 16px;
                     property <length> tree-junction-y: 36px;
@@ -902,7 +1082,6 @@ export component ThreadsWindow inherits Window {
                     Text {
                         x: root.single-thread ? 20px : 72px;
                         y: root.single-thread ? 24px : 8px;
-                        // Legacy width contract: width: root.single-thread ? 90px : 78px;
                         width: root.single-thread ? 90px : 78px;
                         height: root.single-thread ? 34px : 24px;
                         text: row.relation;
@@ -954,8 +1133,6 @@ export component ThreadsWindow inherits Window {
                     if !root.single-thread && row.connected-to-parent : Rectangle {
                         x: parent.tree-base-x + (parent.display-depth - 1) * parent.tree-depth-step;
                         y: parent.tree-junction-y - 1px;
-                        // Keep a 20px text-free landing zone before the title.
-                        // Legacy width marker: width: parent.title-x - self.x - 8px;
                         width: parent.title-x - self.x - 20px;
                         height: 2px;
                         background: DesignTokens.warning;
@@ -1018,17 +1195,29 @@ export component ThreadsWindow inherits Window {
                     }
                     Text {
                         x: parent.width - 284px;
-                        y: 48px;
+                        y: 45px;
                         width: 268px;
-                        height: 24px;
-                        text: root.strings.context + " " + row.context-window;
+                        height: 17px;
+                        text: root.strings.context-usage;
                         color: DesignTokens.text-secondary;
-                        font-size: 16px;
+                        font-size: 14px;
                         font-weight: 600;
                         horizontal-alignment: right;
                         vertical-alignment: center;
                         visible: !root.single-thread;
-                        overflow: elide;
+                    }
+                    Text {
+                        x: parent.width - 284px;
+                        y: 62px;
+                        width: 268px;
+                        height: 18px;
+                        text: row.context-usage;
+                        color: DesignTokens.text-secondary;
+                        font-size: 14px;
+                        font-weight: 600;
+                        horizontal-alignment: right;
+                        vertical-alignment: center;
+                        visible: !root.single-thread;
                     }
                     Rectangle {
                         x: root.single-thread ? 400px : parent.width - 560px;
@@ -1101,8 +1290,7 @@ export component ThreadsWindow inherits Window {
                         y: parent.has-parent-title ? 148px : 100px;
                         width: 280px;
                         height: 24px;
-            text: root.strings.running;
-            // text: "稼働";
+                        text: root.strings.running;
                         color: DesignTokens.text-muted;
                         font-size: 16px;
                         font-weight: 700;
@@ -1154,11 +1342,30 @@ export component ThreadsWindow inherits Window {
                         y: parent.has-parent-title ? 266px : 242px;
                         width: 320px;
                         height: 24px;
-                        text: root.strings.context;
+                        text: root.strings.context-usage;
                         color: DesignTokens.text-muted;
                         font-size: 16px;
                         font-weight: 700;
                         vertical-alignment: center;
+                    }
+                    if root.single-thread : Text {
+                        x: 100px;
+                        y: parent.has-parent-title ? 292px : 268px;
+                        width: 320px;
+                        height: parent.has-parent-title ? 52px : 76px;
+                        text: row.context-usage;
+                        color: DesignTokens.text-primary;
+                        font-size: 24px;
+                        font-weight: 700;
+                        horizontal-alignment: left;
+                        vertical-alignment: center;
+                    }
+                    if root.single-thread : Rectangle {
+                        x: 440px;
+                        y: parent.has-parent-title ? 260px : 236px;
+                        width: 1px;
+                        height: parent.has-parent-title ? 94px : 108px;
+                        background: DesignTokens.border-subtle;
                     }
                     if root.single-thread : Text {
                         x: 470px;
@@ -1170,24 +1377,6 @@ export component ThreadsWindow inherits Window {
                         font-size: 24px;
                         font-weight: 700;
                         horizontal-alignment: right;
-                        vertical-alignment: center;
-                    }
-                    if root.single-thread : Rectangle {
-                        x: 440px;
-                        y: parent.has-parent-title ? 260px : 236px;
-                        width: 1px;
-                        height: parent.has-parent-title ? 94px : 108px;
-                        background: DesignTokens.border-subtle;
-                    }
-                    if root.single-thread : Text {
-                        x: 100px;
-                        y: parent.has-parent-title ? 292px : 268px;
-                        width: 320px;
-                        height: parent.has-parent-title ? 52px : 76px;
-                        text: row.context-window;
-                        color: DesignTokens.text-primary;
-                        font-size: 24px;
-                        font-weight: 700;
                         vertical-alignment: center;
                     }
                     if root.single-thread : Text {
@@ -1312,7 +1501,6 @@ export component StatusBanner inherits Rectangle {
 }
 
 component GraphToggle inherits Rectangle {
-    in property <UiStrings> strings;
     in property <string> label;
     in property <color> series-color;
     in-out property <bool> checked: true;
@@ -1334,7 +1522,8 @@ component GraphToggle inherits Rectangle {
         x: 28px;
         width: parent.width - 32px;
         height: parent.height;
-        text: root.label + (root.checked ? " " + root.strings.on : " " + root.strings.off);
+        // Series state is represented by color and label contrast.
+        text: root.label;
         color: root.checked ? DesignTokens.text-primary : DesignTokens.text-muted;
         font-size: 10px;
         vertical-alignment: center;
@@ -1350,6 +1539,11 @@ export struct RemainingMarker {
     y: float,
 }
 
+export struct GraphUnusedInterval {
+    start: float,
+    width: float,
+}
+
 // Pathの座標は0〜100のviewboxで受け取る。Rust側はgraph-dataのJSONを正本にして
 // 各系列のSVG path commandsへ変換するため、Slint側でJSONを解釈する必要がない。
 export component GraphWindow inherits Window {
@@ -1361,11 +1555,17 @@ export component GraphWindow inherits Window {
     in property <UiStrings> strings;
     in property <bool> has-history-options: true;
     in-out property <bool> reset-close-buttons: false;
+    no-frame: true;
+    // Slint supplies edge resize hit-testing for frameless winit windows.
+    // Keep this enabled so Graph retains the resize behavior requested by
+    // the user while the other fixed-size windows remain non-resizable.
+    resize-border-width: 6px;
     title: root.window-title;
     background: DesignTokens.canvas;
     default-font-family: root.strings.font-family;
 
     in-out property <string> graph-data;
+    in-out property <[GraphUnusedInterval]> unused-intervals;
     in-out property <bool> show-remaining: true;
     in-out property <bool> show-luna: true;
     in-out property <bool> show-terra: true;
@@ -1398,11 +1598,20 @@ export component GraphWindow inherits Window {
     in-out property <string> current-sol-label;
     in-out property <string> current-terra-label;
     in-out property <string> current-luna-label;
+    in-out property <string> current-remaining-connector-path;
+    in-out property <string> current-sol-connector-path;
+    in-out property <string> current-terra-connector-path;
+    in-out property <string> current-luna-connector-path;
     in-out property <float> current-remaining-y;
     in-out property <float> current-sol-y;
     in-out property <float> current-terra-y;
     in-out property <float> current-luna-y;
     callback close-graph();
+    callback begin-window-drag();
+    callback begin-window-resize(string);
+    callback minimize-window();
+    callback toggle-maximize-window();
+    callback close-window();
     callback select-history(string);
     callback select-metric(string);
     callback toggle-remaining();
@@ -1413,14 +1622,33 @@ export component GraphWindow inherits Window {
     private property <length> content-x: min(30px, max(20px, 20px + (root.width - 700px) / 24));
     private property <length> content-width: root.width - 2 * root.content-x;
     private property <length> plot-left: 92px;
-    private property <length> current-label-gap: 8px;
-    private property <length> current-label-width: 112px;
-    private property <length> current-label-right-padding: 10px;
+    private property <length> current-label-gap: 10px;
+    private property <length> current-label-width: root.show-tokens ? 112px : 80px;
+    private property <length> current-label-right-padding: 4px;
     private property <length> plot-width: root.content-width - root.plot-left - root.current-label-gap - root.current-label-width - root.current-label-right-padding;
     private property <length> current-label-x: root.plot-left + root.plot-width + root.current-label-gap;
     // The history popup is an overlay. Keep the toggles and plot geometry
     // fixed so opening the list never reflows or shrinks the graph.
     private property <length> history-toggle-y: 144px;
+
+    // A frameless surface must paint every pixel explicitly; otherwise an
+    // underlying window can show through the margins around the graph.
+    Rectangle {
+        x: 0px;
+        y: 0px;
+        width: root.width;
+        height: root.height;
+        background: DesignTokens.canvas;
+        z: -10;
+    }
+    WindowDragArea {
+        x: 0px;
+        y: 0px;
+        width: root.width;
+        height: root.height;
+        z: -5;
+        begin-drag => { root.begin-window-drag(); }
+    }
 
     Rectangle {
         x: root.content-x;
@@ -1428,10 +1656,28 @@ export component GraphWindow inherits Window {
         width: root.content-width;
         height: root.height - 48px;
 
+        // Paint the frameless title strip explicitly. This also prevents a
+        // compositor from exposing an uninitialized transparent surface while
+        // the custom drag region is idle.
+        Rectangle {
+            x: 0px;
+            y: 0px;
+            width: parent.width;
+            height: 36px;
+            background: DesignTokens.canvas;
+            z: -2;
+        }
+        WindowDragArea {
+            x: 0px;
+            y: 0px;
+            width: parent.width - 244px;
+            height: 36px;
+            begin-drag => { root.begin-window-drag(); }
+        }
         Text {
             x: 0px;
             y: 0px;
-            width: parent.width - 232px;
+            width: parent.width - 252px;
             height: 36px;
             text: root.strings.usage-trend;
             color: DesignTokens.text-primary;
@@ -1439,17 +1685,17 @@ export component GraphWindow inherits Window {
             font-weight: 700;
             vertical-alignment: center;
         }
-        ActionButton {
-            x: parent.width - 88px;
-            y: 0px;
-            width: 88px;
-            text: root.strings.close;
-            activate-on-press: true;
-            reset-press-state: root.reset-close-buttons;
-            clicked => { root.close-graph(); }
+        WindowControls {
+            x: parent.width - 108px;
+            y: 4px;
+            show-maximize: true;
+            maximized: root.maximized;
+            minimize => { root.minimize-window(); }
+            toggle-maximize => { root.toggle-maximize-window(); }
+            close => { root.close-window(); }
         }
         GraphSelect {
-            x: parent.width - 224px;
+            x: parent.width - 244px;
             y: 0px;
             width: 128px;
             height: 36px;
@@ -1486,10 +1732,10 @@ export component GraphWindow inherits Window {
             selected(value) => { root.select-history(value); }
         }
 
-        GraphToggle { x: 0px; y: root.history-toggle-y; width: 96px; label: root.strings.remaining; strings: root.strings; series-color: DesignTokens.graph-remaining; checked: root.show-remaining; toggled => { root.toggle-remaining(); } }
-        GraphToggle { x: 102px; y: root.history-toggle-y; width: 96px; label: "LUNA"; strings: root.strings; series-color: DesignTokens.graph-luna; checked: root.show-luna; toggled => { root.toggle-luna(); } }
-        GraphToggle { x: 204px; y: root.history-toggle-y; width: 96px; label: "TERRA"; strings: root.strings; series-color: DesignTokens.graph-terra; checked: root.show-terra; toggled => { root.toggle-terra(); } }
-        GraphToggle { x: 306px; y: root.history-toggle-y; width: 96px; label: "SOL"; strings: root.strings; series-color: DesignTokens.graph-sol; checked: root.show-sol; toggled => { root.toggle-sol(); } }
+        GraphToggle { x: 0px; y: root.history-toggle-y; width: 96px; label: root.strings.remaining; series-color: DesignTokens.graph-remaining; checked: root.show-remaining; toggled => { root.toggle-remaining(); } }
+        GraphToggle { x: 102px; y: root.history-toggle-y; width: 96px; label: "LUNA"; series-color: DesignTokens.graph-luna; checked: root.show-luna; toggled => { root.toggle-luna(); } }
+        GraphToggle { x: 204px; y: root.history-toggle-y; width: 96px; label: "TERRA"; series-color: DesignTokens.graph-terra; checked: root.show-terra; toggled => { root.toggle-terra(); } }
+        GraphToggle { x: 306px; y: root.history-toggle-y; width: 96px; label: "SOL"; series-color: DesignTokens.graph-sol; checked: root.show-sol; toggled => { root.toggle-sol(); } }
 
         Rectangle {
             x: 0px;
@@ -1509,8 +1755,20 @@ export component GraphWindow inherits Window {
             Text { x: 0px; y: parent.height * 0.50 + 4px; width: 84px; height: 16px; text: root.dollar-50-label; color: DesignTokens.text-muted; font-size: DesignTokens.text-caption; horizontal-alignment: right; }
             Text { x: 0px; y: parent.height * 0.75 - 8px; width: 84px; height: 16px; text: root.dollar-25-label; color: DesignTokens.text-muted; font-size: DesignTokens.text-caption; horizontal-alignment: right; }
             Text { x: 0px; y: parent.height - 32px; width: 84px; height: 16px; text: root.dollar-bottom-label; color: DesignTokens.text-muted; font-size: DesignTokens.text-caption; horizontal-alignment: right; }
-            // Previous Japanese description: 累積消費ドル（モデル別）
             Text { x: root.plot-left; y: 6px; width: root.plot-width; height: 16px; text: root.show-tokens ? root.strings.graph-token-description : root.strings.graph-dollar-description; color: DesignTokens.text-muted; font-size: DesignTokens.text-caption; overflow: elide; }
+
+            // Neutral bands expose intervals where no model changed its
+            // cumulative usage. They sit below the grid and series paths so
+            // the idle state remains visible without hiding data lines.
+            for interval in root.unused-intervals: Rectangle {
+                x: root.plot-left + root.plot-width * interval.start / 100;
+                y: 28px;
+                width: root.plot-width * interval.width / 100;
+                height: parent.height - 52px;
+                background: DesignTokens.text-muted;
+                opacity: 0.10;
+                visible: root.has-graph-data && interval.width > 0.0;
+            }
 
             Rectangle { x: root.plot-left; y: 28px; width: root.plot-width; height: 1px; background: DesignTokens.chart-grid; }
             Rectangle { x: root.plot-left; y: parent.height * 0.25 + 24px; width: root.plot-width; height: 1px; background: DesignTokens.chart-grid; }
@@ -1522,6 +1780,75 @@ export component GraphWindow inherits Window {
             Rectangle { x: root.plot-left + root.plot-width * 0.50; y: 28px; width: 1px; height: parent.height - 52px; background: DesignTokens.chart-grid; }
             Rectangle { x: root.plot-left + root.plot-width * 0.75; y: 28px; width: 1px; height: parent.height - 52px; background: DesignTokens.chart-grid; }
             Rectangle { x: root.plot-left + root.plot-width; y: 28px; width: 1px; height: parent.height - 52px; background: DesignTokens.chart-grid; }
+
+            // Rust emits leader coordinates in the same 0..100 viewbox as the
+            // series. Fit each short path to the label gap and plot height;
+            // without this, the normalized values become raw pixels and stray
+            // lines appear near the middle/top instead of reaching the label.
+            Path {
+                x: root.plot-left + root.plot-width;
+                y: 28px;
+                width: root.current-label-gap;
+                height: parent.height - 52px;
+                viewbox-width: 100;
+                viewbox-height: 100;
+                fit: fill;
+                commands: root.current-remaining-connector-path;
+                visible: root.current-remaining-connector-path != "" && root.show-remaining;
+                stroke: DesignTokens.graph-remaining;
+                stroke-width: 1px;
+                fill: transparent;
+                opacity: 0.8;
+                stroke-line-cap: round;
+            }
+            Path {
+                x: root.plot-left + root.plot-width;
+                y: 28px;
+                width: root.current-label-gap;
+                height: parent.height - 52px;
+                viewbox-width: 100;
+                viewbox-height: 100;
+                fit: fill;
+                commands: root.current-sol-connector-path;
+                visible: root.current-sol-connector-path != "" && root.show-sol;
+                stroke: DesignTokens.graph-sol;
+                stroke-width: 1px;
+                fill: transparent;
+                opacity: 0.8;
+                stroke-line-cap: round;
+            }
+            Path {
+                x: root.plot-left + root.plot-width;
+                y: 28px;
+                width: root.current-label-gap;
+                height: parent.height - 52px;
+                viewbox-width: 100;
+                viewbox-height: 100;
+                fit: fill;
+                commands: root.current-terra-connector-path;
+                visible: root.current-terra-connector-path != "" && root.show-terra;
+                stroke: DesignTokens.graph-terra;
+                stroke-width: 1px;
+                fill: transparent;
+                opacity: 0.8;
+                stroke-line-cap: round;
+            }
+            Path {
+                x: root.plot-left + root.plot-width;
+                y: 28px;
+                width: root.current-label-gap;
+                height: parent.height - 52px;
+                viewbox-width: 100;
+                viewbox-height: 100;
+                fit: fill;
+                commands: root.current-luna-connector-path;
+                visible: root.current-luna-connector-path != "" && root.show-luna;
+                stroke: DesignTokens.graph-luna;
+                stroke-width: 1px;
+                fill: transparent;
+                opacity: 0.8;
+                stroke-line-cap: round;
+            }
 
             Text { x: root.current-label-x; y: 28px + root.current-remaining-y * (parent.height - 52px) - 8px; width: root.current-label-width; height: 16px; text: root.current-remaining-label; visible: root.current-remaining-label != "" && root.show-remaining; color: DesignTokens.graph-remaining; font-size: 10px; font-weight: 700; horizontal-alignment: left; }
             Text { x: root.current-label-x; y: 28px + root.current-luna-y * (parent.height - 52px) - 8px; width: root.current-label-width; height: 16px; text: root.current-luna-label; visible: root.current-luna-label != "" && root.show-luna; color: DesignTokens.graph-luna; font-size: 10px; font-weight: 700; horizontal-alignment: left; }
@@ -1688,6 +2015,94 @@ export component GraphWindow inherits Window {
                 }
             }
         }
+    }
+
+    // Keep resize hit areas above the graph content. Slint's built-in
+    // frameless hit testing remains enabled, while these explicit handles
+    // cover compositors that report a hidden frame as decorated.
+    WindowResizeHandle {
+        z: 20;
+        x: 14px;
+        y: 0px;
+        width: root.width - 28px;
+        height: 14px;
+        direction: "north";
+        resize-cursor: MouseCursor.ns-resize;
+        begin-resize(direction) => { root.begin-window-resize(direction); }
+    }
+    WindowResizeHandle {
+        z: 20;
+        x: 14px;
+        y: root.height - 14px;
+        width: root.width - 28px;
+        height: 14px;
+        direction: "south";
+        resize-cursor: MouseCursor.ns-resize;
+        begin-resize(direction) => { root.begin-window-resize(direction); }
+    }
+    WindowResizeHandle {
+        z: 20;
+        x: 0px;
+        y: 14px;
+        width: 14px;
+        height: root.height - 28px;
+        direction: "west";
+        resize-cursor: MouseCursor.ew-resize;
+        begin-resize(direction) => { root.begin-window-resize(direction); }
+    }
+    WindowResizeHandle {
+        z: 20;
+        x: root.width - 14px;
+        y: 14px;
+        width: 14px;
+        height: root.height - 28px;
+        direction: "east";
+        resize-cursor: MouseCursor.ew-resize;
+        begin-resize(direction) => { root.begin-window-resize(direction); }
+    }
+    WindowResizeHandle {
+        z: 30;
+        x: 0px;
+        y: 0px;
+        width: 28px;
+        height: 28px;
+        direction: "north-west";
+        resize-cursor: MouseCursor.nwse-resize;
+        corner: true;
+        begin-resize(direction) => { root.begin-window-resize(direction); }
+    }
+    WindowResizeHandle {
+        z: 30;
+        x: root.width - 28px;
+        y: 0px;
+        width: 28px;
+        height: 28px;
+        direction: "north-east";
+        resize-cursor: MouseCursor.nesw-resize;
+        corner: true;
+        begin-resize(direction) => { root.begin-window-resize(direction); }
+    }
+    WindowResizeHandle {
+        z: 30;
+        x: 0px;
+        y: root.height - 28px;
+        width: 28px;
+        height: 28px;
+        direction: "south-west";
+        resize-cursor: MouseCursor.nesw-resize;
+        corner: true;
+        begin-resize(direction) => { root.begin-window-resize(direction); }
+    }
+    WindowResizeHandle {
+        z: 30;
+        x: root.width - 28px;
+        y: root.height - 28px;
+        width: 28px;
+        height: 28px;
+        direction: "south-east";
+        resize-cursor: MouseCursor.nwse-resize;
+        corner: true;
+        begin-resize(direction) => { root.begin-window-resize(direction); }
     }
 }
 

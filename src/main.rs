@@ -269,7 +269,10 @@ const LEGACY_MOVING_RESET_PAIR_HORIZON_TOLERANCE_SECONDS: i64 = 60;
 const GRAPH_METRIC_OPTIONS: [&str; 2] = ["ドル", "トークン"];
 const FIXED_WINDOW_WIDTH: u32 = 900;
 const FIXED_WINDOW_HEIGHT: u32 = 480;
-#[cfg(test)]
+const GRAPH_WINDOW_WIDTH: u32 = 940;
+const GRAPH_WINDOW_HEIGHT: u32 = 640;
+const LEGAL_WINDOW_WIDTH: u32 = 720;
+const LEGAL_WINDOW_HEIGHT: u32 = 520;
 const UNAUTHENTICATED_WINDOW_TITLE: &str = "アカウント未接続 — プラン未設定";
 // Keep the native title-bar purpose suffix ASCII: some X11 window managers
 // render `_NET_WM_NAME` with a fallback font that turns Japanese glyphs into
@@ -286,14 +289,34 @@ enum WindowPurpose {
     Legal,
 }
 
+impl WindowPurpose {
+    fn native_label(self) -> &'static str {
+        match self {
+            Self::Threads => "Threads",
+            Self::Graph => "Graph",
+            Self::Legal => "Legal",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum FixedResizeDecision {
     Propagate,
     RejectAndRestore,
 }
 
+#[cfg(test)]
 fn fixed_resize_decision(width: u32, height: u32) -> FixedResizeDecision {
-    if width == 0 || height == 0 || (width == FIXED_WINDOW_WIDTH && height == FIXED_WINDOW_HEIGHT) {
+    fixed_resize_decision_for_size(width, height, FIXED_WINDOW_WIDTH, FIXED_WINDOW_HEIGHT)
+}
+
+fn fixed_resize_decision_for_size(
+    width: u32,
+    height: u32,
+    expected_width: u32,
+    expected_height: u32,
+) -> FixedResizeDecision {
+    if width == 0 || height == 0 || (width == expected_width && height == expected_height) {
         FixedResizeDecision::Propagate
     } else {
         FixedResizeDecision::RejectAndRestore
@@ -301,18 +324,263 @@ fn fixed_resize_decision(width: u32, height: u32) -> FixedResizeDecision {
 }
 
 fn install_fixed_window_guard(window: &slint::Window) {
-    window.on_winit_window_event(|slint_window, event| {
+    install_window_size_guard(window, FIXED_WINDOW_WIDTH, FIXED_WINDOW_HEIGHT);
+}
+
+fn install_resizable_window(window: &slint::Window) {
+    let _ = window.with_winit_window(|winit_window| winit_window.set_resizable(true));
+}
+
+#[derive(Clone, Copy)]
+enum ManualX11WindowAction {
+    Move,
+    Resize(winit::window::ResizeDirection),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ManualX11Geometry {
+    x: i32,
+    y: i32,
+    width: i32,
+    height: i32,
+}
+
+/// WSLg's Weston wrapper does not consistently honor `_NET_WM_MOVERESIZE` for
+/// frameless clients. Keep the same left-button gesture usable there by
+/// tracking the pointer on a private X11 connection and issuing configure
+/// requests directly. On other backends the native winit operation remains
+/// the fallback.
+fn start_manual_x11_window_action(window: &slint::Window, action: ManualX11WindowAction) -> bool {
+    let Some(window_id) = x11_window_id(window) else {
+        return false;
+    };
+    let Ok((connection, screen_num)) = x11rb::connect(None) else {
+        return false;
+    };
+    let Some(screen) = connection.setup().roots.get(screen_num) else {
+        return false;
+    };
+    let root = screen.root;
+    let target = x11_top_level_parent(&connection, window_id, root).unwrap_or(window_id);
+    let Ok(pointer_cookie) = connection.query_pointer(root) else {
+        return false;
+    };
+    let Ok(pointer) = pointer_cookie.reply() else {
+        return false;
+    };
+    let Ok(target_geometry_cookie) = connection.get_geometry(target) else {
+        return false;
+    };
+    let Ok(target_geometry) = target_geometry_cookie.reply() else {
+        return false;
+    };
+    let Ok(client_geometry_cookie) = connection.get_geometry(window_id) else {
+        return false;
+    };
+    let Ok(client_geometry) = client_geometry_cookie.reply() else {
+        return false;
+    };
+    let initial = ManualX11Geometry {
+        x: i32::from(target_geometry.x),
+        y: i32::from(target_geometry.y),
+        // Configure requests target the managed wrapper on WSLg, while its
+        // width/height request is interpreted as the child client size.
+        width: i32::from(client_geometry.width),
+        height: i32::from(client_geometry.height),
+    };
+    let pointer_x = i32::from(pointer.root_x);
+    let pointer_y = i32::from(pointer.root_y);
+
+    thread::spawn(move || {
+        let mut observed_button = false;
+        let deadline = Instant::now() + Duration::from_millis(500);
+        loop {
+            let Ok(pointer_cookie) = connection.query_pointer(root) else {
+                break;
+            };
+            let Ok(pointer) = pointer_cookie.reply() else {
+                break;
+            };
+            let pressed = pointer.mask.contains(KeyButMask::BUTTON1);
+            if !pressed {
+                if observed_button || Instant::now() >= deadline {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(4));
+                continue;
+            }
+            observed_button = true;
+            let delta_x = i32::from(pointer.root_x) - pointer_x;
+            let delta_y = i32::from(pointer.root_y) - pointer_y;
+            let geometry = match action {
+                ManualX11WindowAction::Move => ManualX11Geometry {
+                    x: initial.x.saturating_add(delta_x),
+                    y: initial.y.saturating_add(delta_y),
+                    ..initial
+                },
+                ManualX11WindowAction::Resize(direction) => {
+                    manual_resize_geometry(initial, direction, delta_x, delta_y)
+                }
+            };
+            let width = u32::try_from(geometry.width.max(1)).unwrap_or(u32::MAX);
+            let height = u32::try_from(geometry.height.max(1)).unwrap_or(u32::MAX);
+            let values = ConfigureWindowAux::new()
+                .x(geometry.x)
+                .y(geometry.y)
+                .width(width)
+                .height(height);
+            if connection.configure_window(target, &values).is_err() || connection.flush().is_err()
+            {
+                break;
+            }
+            thread::sleep(Duration::from_millis(8));
+        }
+    });
+    true
+}
+
+fn x11_top_level_parent(
+    connection: &RustConnection,
+    window: X11Window,
+    root: X11Window,
+) -> Option<X11Window> {
+    let mut current = window;
+    for _ in 0..8 {
+        let reply = connection.query_tree(current).ok()?.reply().ok()?;
+        if reply.parent == root || reply.parent == 0 {
+            return Some(current);
+        }
+        current = reply.parent;
+    }
+    Some(current)
+}
+
+fn manual_resize_geometry(
+    initial: ManualX11Geometry,
+    direction: winit::window::ResizeDirection,
+    delta_x: i32,
+    delta_y: i32,
+) -> ManualX11Geometry {
+    const MIN_WIDTH: i32 = 700;
+    const MIN_HEIGHT: i32 = 480;
+    let east = matches!(
+        direction,
+        winit::window::ResizeDirection::East
+            | winit::window::ResizeDirection::NorthEast
+            | winit::window::ResizeDirection::SouthEast
+    );
+    let west = matches!(
+        direction,
+        winit::window::ResizeDirection::West
+            | winit::window::ResizeDirection::NorthWest
+            | winit::window::ResizeDirection::SouthWest
+    );
+    let north = matches!(
+        direction,
+        winit::window::ResizeDirection::North
+            | winit::window::ResizeDirection::NorthEast
+            | winit::window::ResizeDirection::NorthWest
+    );
+    let south = matches!(
+        direction,
+        winit::window::ResizeDirection::South
+            | winit::window::ResizeDirection::SouthEast
+            | winit::window::ResizeDirection::SouthWest
+    );
+    let width = if east {
+        (initial.width.saturating_add(delta_x)).max(MIN_WIDTH)
+    } else if west {
+        (initial.width.saturating_sub(delta_x)).max(MIN_WIDTH)
+    } else {
+        initial.width
+    };
+    let height = if south {
+        (initial.height.saturating_add(delta_y)).max(MIN_HEIGHT)
+    } else if north {
+        (initial.height.saturating_sub(delta_y)).max(MIN_HEIGHT)
+    } else {
+        initial.height
+    };
+    ManualX11Geometry {
+        x: if west {
+            initial
+                .x
+                .saturating_add(initial.width.saturating_sub(width))
+        } else {
+            initial.x
+        },
+        y: if north {
+            initial
+                .y
+                .saturating_add(initial.height.saturating_sub(height))
+        } else {
+            initial.y
+        },
+        width,
+        height,
+    }
+}
+
+fn begin_window_drag(window: &slint::Window) {
+    if start_manual_x11_window_action(window, ManualX11WindowAction::Move) {
+        return;
+    }
+    let _ = window.with_winit_window(|winit_window| winit_window.drag_window());
+}
+
+fn minimize_window(window: &slint::Window) {
+    let _ = window.with_winit_window(|winit_window| winit_window.set_minimized(true));
+}
+
+fn toggle_maximize_window(window: &slint::Window) {
+    let _ = window.with_winit_window(|winit_window| {
+        winit_window.set_maximized(!winit_window.is_maximized());
+    });
+}
+
+fn parse_resize_direction(direction: &str) -> Option<winit::window::ResizeDirection> {
+    Some(match direction {
+        "east" => winit::window::ResizeDirection::East,
+        "north" => winit::window::ResizeDirection::North,
+        "north-east" => winit::window::ResizeDirection::NorthEast,
+        "north-west" => winit::window::ResizeDirection::NorthWest,
+        "south" => winit::window::ResizeDirection::South,
+        "south-east" => winit::window::ResizeDirection::SouthEast,
+        "south-west" => winit::window::ResizeDirection::SouthWest,
+        "west" => winit::window::ResizeDirection::West,
+        _ => return None,
+    })
+}
+
+fn begin_window_resize(window: &slint::Window, direction: &str) {
+    let Some(direction) = parse_resize_direction(direction) else {
+        return;
+    };
+    if start_manual_x11_window_action(window, ManualX11WindowAction::Resize(direction)) {
+        return;
+    }
+    let _ = window.with_winit_window(|winit_window| winit_window.drag_resize_window(direction));
+}
+
+fn install_window_size_guard(window: &slint::Window, expected_width: u32, expected_height: u32) {
+    let _ = window.with_winit_window(|winit_window| winit_window.set_resizable(false));
+    window.on_winit_window_event(move |slint_window, event| {
         let winit::event::WindowEvent::Resized(size) = event else {
             return EventResult::Propagate;
         };
-        match fixed_resize_decision(size.width, size.height) {
+        match fixed_resize_decision_for_size(
+            size.width,
+            size.height,
+            expected_width,
+            expected_height,
+        ) {
             FixedResizeDecision::Propagate => EventResult::Propagate,
             FixedResizeDecision::RejectAndRestore => {
                 let _ = slint_window.with_winit_window(|winit_window| {
                     winit_window.set_resizable(false);
                     let _ = winit_window.request_inner_size(winit::dpi::PhysicalSize::new(
-                        FIXED_WINDOW_WIDTH,
-                        FIXED_WINDOW_HEIGHT,
+                        expected_width,
+                        expected_height,
                     ));
                 });
                 EventResult::PreventDefault
@@ -407,21 +675,47 @@ fn localized_account_window_title(
     format!("{email} — {plan}")
 }
 
-fn localized_detail_window_title(
-    i18n: &I18n,
+fn native_detail_window_title(
+    _i18n: &I18n,
     authenticated: bool,
     account_title: &str,
     purpose: WindowPurpose,
 ) -> String {
     if !authenticated {
-        i18n.text(TextKey::WindowUnauthenticated).into()
+        return "Codex Info".into();
+    }
+    format!(
+        "{} - {}",
+        native_account_window_title(account_title),
+        purpose.native_label()
+    )
+}
+
+/// Native title bars may be rendered by a window-manager fallback font that
+/// does not contain the localized CJK glyphs. Keep the title-bar identity
+/// ASCII-only while the in-window headings continue to use the locale catalog.
+fn native_account_window_title(account_title: &str) -> String {
+    if account_title == UNAUTHENTICATED_WINDOW_TITLE {
+        return "Codex Info".into();
+    }
+    let Some((identity, plan)) = account_title.split_once(" — ") else {
+        return "Codex Info".into();
+    };
+    let identity = ascii_title_part(identity, "Codex");
+    let plan = ascii_title_part(plan, "Plan");
+    format!("{identity} - {plan}")
+}
+
+fn ascii_title_part(value: &str, fallback: &str) -> String {
+    let value = value.trim();
+    if !value.is_empty()
+        && value
+            .chars()
+            .all(|character| character.is_ascii_graphic() || character == ' ')
+    {
+        value.to_owned()
     } else {
-        let localized_purpose = match purpose {
-            WindowPurpose::Graph => i18n.text(TextKey::Graph),
-            WindowPurpose::Threads => i18n.text(TextKey::ActiveThreads),
-            WindowPurpose::Legal => i18n.text(TextKey::LegalNotices),
-        };
-        format!("{account_title} — {localized_purpose}")
+        fallback.to_owned()
     }
 }
 
@@ -1634,6 +1928,7 @@ fn three_months_before_utc(now: DateTime<Utc>) -> i64 {
 struct GraphPaths {
     remaining: String,
     remaining_markers: Vec<RemainingMarkerPosition>,
+    unused_intervals: Vec<UnusedIntervalPosition>,
     sol: String,
     terra: String,
     luna: String,
@@ -1648,6 +1943,10 @@ struct GraphPaths {
     current_sol_label: String,
     current_terra_label: String,
     current_luna_label: String,
+    current_remaining_point_y: f32,
+    current_sol_point_y: f32,
+    current_terra_point_y: f32,
+    current_luna_point_y: f32,
     current_remaining_y: f32,
     current_sol_y: f32,
     current_terra_y: f32,
@@ -1661,15 +1960,23 @@ struct RemainingMarkerPosition {
     boundary: i32,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct UnusedIntervalPosition {
+    start: f64,
+    width: f64,
+    preserve_boundary: bool,
+}
+
 fn graph_paths(samples: &[&UsageHistorySample], period_start: i64, period_end: i64) -> GraphPaths {
     let remaining_points = graph_points(samples, period_start, period_end, 100.0, |sample| {
         sample.remaining_percent
     });
-    let minute = smooth_model_spend(&graph_time_endpoints(
+    let raw_minute = graph_time_endpoints(
         minute_model_spend_for_metric(samples, false),
         period_start,
         period_end,
-    ));
+    );
+    let minute = smooth_model_spend(&raw_minute);
     // Dollar series are independent cumulative values.  The old stacked
     // implementation used the sum here, which made a model's line depend on
     // whether another model was enabled and could make a flat SOL history
@@ -1692,6 +1999,8 @@ fn graph_paths(samples: &[&UsageHistorySample], period_start: i64, period_end: i
             0.99
         }
     };
+    // Detect idle bands from raw cumulative snapshots, not smoothed lines.
+    let unused_intervals = unused_interval_positions(&raw_minute, period_start, period_end);
     GraphPaths {
         remaining: graph_path_from_points(&remaining_points, period_start, period_end, 100.0),
         remaining_markers: remaining_marker_positions_on_points(
@@ -1699,6 +2008,7 @@ fn graph_paths(samples: &[&UsageHistorySample], period_start: i64, period_end: i
             period_start,
             period_end,
         ),
+        unused_intervals,
         luna: metric_line_path(&minute, period_start, period_end, dollar_max, |point| {
             point.luna
         }),
@@ -1729,6 +2039,10 @@ fn graph_paths(samples: &[&UsageHistorySample], period_start: i64, period_end: i
         current_sol_y: graph_y(latest.sol, dollar_max),
         current_terra_y: graph_y(latest.terra, dollar_max),
         current_luna_y: graph_y(latest.luna, dollar_max),
+        current_remaining_point_y: graph_y(remaining.unwrap_or(0.0), 100.0),
+        current_sol_point_y: graph_y(latest.sol, dollar_max),
+        current_terra_point_y: graph_y(latest.terra, dollar_max),
+        current_luna_point_y: graph_y(latest.luna, dollar_max),
         ..GraphPaths::default()
     }
 }
@@ -1750,6 +2064,7 @@ fn graph_paths_for_selection(
         period_start,
         period_end,
     );
+    paths.unused_intervals = unused_interval_positions(&minute, period_start, period_end);
     let maximum = minute
         .iter()
         .map(|point| {
@@ -1786,6 +2101,9 @@ fn graph_paths_for_selection(
     paths.current_sol_label.clear();
     paths.current_terra_label.clear();
     paths.current_luna_label.clear();
+    paths.current_sol_point_y = 0.99;
+    paths.current_terra_point_y = 0.99;
+    paths.current_luna_point_y = 0.99;
     paths.current_sol_y = 0.99;
     paths.current_terra_y = 0.99;
     paths.current_luna_y = 0.99;
@@ -1805,6 +2123,7 @@ fn graph_paths_for_selection(
             String::new()
         };
         paths.current_luna_y = graph_y(latest.luna);
+        paths.current_luna_point_y = paths.current_luna_y;
     }
     if show_terra {
         (paths.terra_flat, paths.terra_rising) =
@@ -1820,6 +2139,7 @@ fn graph_paths_for_selection(
             String::new()
         };
         paths.current_terra_y = graph_y(latest.terra);
+        paths.current_terra_point_y = paths.current_terra_y;
     }
     if show_sol {
         (paths.sol_flat, paths.sol_rising) =
@@ -1835,6 +2155,7 @@ fn graph_paths_for_selection(
             String::new()
         };
         paths.current_sol_y = graph_y(latest.sol);
+        paths.current_sol_point_y = paths.current_sol_y;
     }
     paths
 }
@@ -2198,9 +2519,75 @@ fn split_metric_line_paths(
     (flat, rising)
 }
 
+/// Return horizontal bands where none of the three cumulative model series
+/// changes. These bands make idle time visible even when all flat paths sit on
+/// top of one another at the chart baseline.
+fn unused_interval_positions(
+    points: &[HourlyModelSpend],
+    period_start: i64,
+    period_end: i64,
+) -> Vec<UnusedIntervalPosition> {
+    let span = (period_end - period_start).max(1) as f64;
+    let to_x =
+        |timestamp: i64| ((timestamp - period_start) as f64 / span * 100.0).clamp(0.0, 100.0);
+    let mut intervals: Vec<UnusedIntervalPosition> = Vec::new();
+    for pair in points.windows(2) {
+        let [previous, current] = pair else {
+            continue;
+        };
+        if current.timestamp <= previous.timestamp {
+            continue;
+        }
+        let interval_start = previous.timestamp.max(period_start);
+        let interval_end = current.timestamp.min(period_end);
+        if interval_end <= interval_start {
+            continue;
+        }
+        let unchanged = [
+            (previous.sol, current.sol),
+            (previous.terra, current.terra),
+            (previous.luna, current.luna),
+        ]
+        .into_iter()
+        .all(|(before, after)| before.is_finite() && after.is_finite() && before == after);
+        let synthetic_zero_gap = previous.timestamp == period_start
+            && current.timestamp.saturating_sub(previous.timestamp) > 60
+            && previous.sol == 0.0
+            && previous.terra == 0.0
+            && previous.luna == 0.0
+            && [current.sol, current.terra, current.luna]
+                .into_iter()
+                .any(|value| value.is_finite() && value > 0.0);
+        if !unchanged && !synthetic_zero_gap {
+            continue;
+        }
+        let start = to_x(interval_start);
+        let end = to_x(interval_end);
+        if end <= start {
+            continue;
+        }
+        if let Some(last) = intervals.last_mut() {
+            let last_end = last.start + last.width;
+            if !last.preserve_boundary
+                && !synthetic_zero_gap
+                && (last_end - start).abs() <= f64::EPSILON
+            {
+                last.width = end - last.start;
+                continue;
+            }
+        }
+        intervals.push(UnusedIntervalPosition {
+            start,
+            width: end - start,
+            preserve_boundary: synthetic_zero_gap,
+        });
+    }
+    intervals
+}
+
 /// Keeps all visible right-edge labels inside the plot and at least 16px
-/// apart at the minimum 260px plot height. Resizing only increases the
-/// resulting physical separation.
+/// apart at the minimum 204px path height. GraphWindow's 700x480 minimum
+/// produces that path height; resizing only increases the physical spacing.
 fn separate_current_label_positions(
     paths: &mut GraphPaths,
     show_remaining: bool,
@@ -2208,8 +2595,9 @@ fn separate_current_label_positions(
     show_terra: bool,
     show_sol: bool,
 ) {
-    const HALF_LABEL: f32 = 8.0 / 260.0;
-    const MIN_SEPARATION: f32 = 16.0 / 260.0;
+    const MIN_PATH_HEIGHT: f32 = 204.0;
+    const HALF_LABEL: f32 = 8.0 / MIN_PATH_HEIGHT;
+    const MIN_SEPARATION: f32 = 16.0 / MIN_PATH_HEIGHT;
     const LOWER: f32 = HALF_LABEL;
     const UPPER: f32 = 1.0 - HALF_LABEL;
 
@@ -2259,6 +2647,19 @@ fn separate_current_label_positions(
             _ => unreachable!("label kind is internal and bounded"),
         }
     }
+}
+
+/// Draw a short, color-matched leader from the series endpoint to its
+/// right-edge label. Labels may be vertically separated to avoid overlap, so
+/// the connector preserves the correspondence without stacking text on top of
+/// another value.
+fn current_label_connector_path(point_y: f32, label_y: f32, has_label: bool) -> String {
+    if !has_label || !point_y.is_finite() || !label_y.is_finite() {
+        return String::new();
+    }
+    let point_y = point_y.clamp(0.0, 1.0) * 100.0;
+    let label_y = label_y.clamp(0.0, 1.0) * 100.0;
+    format!("M0.00 {point_y:.2} L100.00 {label_y:.2}")
 }
 
 fn dollar_axis_labels(maximum: f64) -> [String; 5] {
@@ -4557,7 +4958,7 @@ impl CodexInfoState {
 fn sync_graph_window(state: &CodexInfoState, graph: &GraphWindow) {
     graph.set_strings(ui_strings(&state.i18n));
     graph.set_window_title(
-        localized_detail_window_title(
+        native_detail_window_title(
             &state.i18n,
             state.authenticated,
             &state.window_title(),
@@ -4583,6 +4984,16 @@ fn sync_graph_window(state: &CodexInfoState, graph: &GraphWindow) {
     );
     let time_labels = state.graph_time_labels();
     graph.set_graph_data(state.graph_data().into());
+    graph.set_unused_intervals(slint::ModelRc::new(slint::VecModel::from(
+        paths
+            .unused_intervals
+            .iter()
+            .map(|interval| GraphUnusedInterval {
+                start: interval.start as f32,
+                width: interval.width as f32,
+            })
+            .collect::<Vec<_>>(),
+    )));
     let history_period_options = state.history_period_options();
     graph.set_has_history_options(
         !history_period_options.is_empty()
@@ -4632,10 +5043,46 @@ fn sync_graph_window(state: &CodexInfoState, graph: &GraphWindow) {
     graph.set_dollar_50_label(paths.dollar_labels[2].clone().into());
     graph.set_dollar_25_label(paths.dollar_labels[3].clone().into());
     graph.set_dollar_bottom_label(paths.dollar_labels[4].clone().into());
+    let has_current_remaining_label = !paths.current_remaining_label.is_empty();
+    let has_current_sol_label = !paths.current_sol_label.is_empty();
+    let has_current_terra_label = !paths.current_terra_label.is_empty();
+    let has_current_luna_label = !paths.current_luna_label.is_empty();
     graph.set_current_remaining_label(paths.current_remaining_label.into());
     graph.set_current_sol_label(paths.current_sol_label.into());
     graph.set_current_terra_label(paths.current_terra_label.into());
     graph.set_current_luna_label(paths.current_luna_label.into());
+    graph.set_current_remaining_connector_path(
+        current_label_connector_path(
+            paths.current_remaining_point_y,
+            paths.current_remaining_y,
+            has_current_remaining_label,
+        )
+        .into(),
+    );
+    graph.set_current_sol_connector_path(
+        current_label_connector_path(
+            paths.current_sol_point_y,
+            paths.current_sol_y,
+            has_current_sol_label,
+        )
+        .into(),
+    );
+    graph.set_current_terra_connector_path(
+        current_label_connector_path(
+            paths.current_terra_point_y,
+            paths.current_terra_y,
+            has_current_terra_label,
+        )
+        .into(),
+    );
+    graph.set_current_luna_connector_path(
+        current_label_connector_path(
+            paths.current_luna_point_y,
+            paths.current_luna_y,
+            has_current_luna_label,
+        )
+        .into(),
+    );
     graph.set_current_remaining_y(paths.current_remaining_y);
     graph.set_current_sol_y(paths.current_sol_y);
     graph.set_current_terra_y(paths.current_terra_y);
@@ -4911,11 +5358,18 @@ fn active_thread_rows_at_with_i18n(
                     .map(|total| i18n.format_token_value(total))
                     .unwrap_or_else(|| "—".to_owned())
                     .into(),
-                context_window: thread
-                    .context_window_tokens
-                    .map(|window| i18n.format_token_value(window))
-                    .unwrap_or_else(|| "—".to_owned())
-                    .into(),
+                context_usage: match (thread.total_tokens, thread.context_window_tokens) {
+                    (Some(used), Some(window)) if window > 0 => format!(
+                        "{} / {}",
+                        i18n.format_context_usage(used, window),
+                        i18n.format_token_value(window)
+                    ),
+                    (None, Some(window)) if window > 0 => {
+                        format!("— / {}", i18n.format_token_value(window))
+                    }
+                    _ => "—".to_owned(),
+                }
+                .into(),
                 thread_age: i18n.format_elapsed(now, thread.created_at).into(),
                 instruction_age: i18n.format_elapsed(now, thread.last_user_message_at).into(),
                 tree_depth: i32::try_from(presentation.forest_depth).unwrap_or(i32::MAX),
@@ -4954,7 +5408,7 @@ fn sync_threads_window(state: &CodexInfoState, threads_window: &ThreadsWindow) {
             .into(),
     );
     threads_window.set_window_title(
-        localized_detail_window_title(
+        native_detail_window_title(
             &state.i18n,
             state.authenticated,
             &state.window_title(),
@@ -4988,7 +5442,7 @@ fn ui_strings(i18n: &I18n) -> UiStrings {
         legal_distribution: i18n.text(TextKey::LegalDistribution).into(),
         close: i18n.text(TextKey::Close).into(),
         active_threads: i18n.text(TextKey::ActiveThreads).into(),
-        context: i18n.text(TextKey::Context).into(),
+        context_usage: i18n.text(TextKey::Context).into(),
         instruction: i18n.text(TextKey::Instruction).into(),
         tokens: i18n.text(TextKey::Tokens).into(),
         model: i18n.text(TextKey::Model).into(),
@@ -5010,8 +5464,6 @@ fn ui_strings(i18n: &I18n) -> UiStrings {
         check_auth: i18n.text(TextKey::CheckAuth).into(),
         auth_cli: i18n.text(TextKey::AuthCli).into(),
         no_history: i18n.text(TextKey::NoHistory).into(),
-        on: i18n.text(TextKey::On).into(),
-        off: i18n.text(TextKey::Off).into(),
     }
 }
 
@@ -5198,7 +5650,7 @@ impl CodexInfoState {
         ui.set_has_auth_url(self.auth_url.is_some());
         ui.set_checking(self.checking);
         ui.set_has_error(self.error.is_some());
-        ui.set_window_title(self.window_title().into());
+        ui.set_window_title(native_account_window_title(&self.window_title()).into());
         let quota_title = if self.monthly {
             self.i18n.text(TextKey::MonthlyQuotaRemaining)
         } else if self.quota_title == "利用枠" {
@@ -5497,8 +5949,8 @@ fn format_unsigned_count(value: u128) -> String {
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use x11rb::connection::Connection;
 use x11rb::protocol::xproto::{
-    Atom, AtomEnum, ClientMessageEvent, ConfigureWindowAux, ConnectionExt, EventMask, PropMode,
-    StackMode, Window as X11Window,
+    Atom, AtomEnum, ClientMessageEvent, ConfigureWindowAux, ConnectionExt, EventMask, KeyButMask,
+    PropMode, StackMode, Window as X11Window,
 };
 use x11rb::rust_connection::RustConnection;
 use x11rb::wrapper::ConnectionExt as WrapperConnectionExt;
@@ -5538,8 +5990,11 @@ fn x11_window_id(window: &slint::Window) -> Option<X11Window> {
 }
 
 const MOTIF_HINTS_FUNCTIONS: u32 = 1;
+const MOTIF_FUNCTION_ALL: u32 = 1;
+const MOTIF_FUNCTION_RESIZE: u32 = 1 << 1;
 const MOTIF_FUNCTION_MOVE: u32 = 1 << 2;
 const MOTIF_FUNCTION_MINIMIZE: u32 = 1 << 3;
+const MOTIF_FUNCTION_MAXIMIZE: u32 = 1 << 4;
 const MOTIF_FUNCTION_CLOSE: u32 = 1 << 5;
 
 fn motif_wm_functions(existing_flags: u32) -> (u32, u32) {
@@ -5547,6 +6002,20 @@ fn motif_wm_functions(existing_flags: u32) -> (u32, u32) {
         existing_flags | MOTIF_HINTS_FUNCTIONS,
         MOTIF_FUNCTION_MOVE | MOTIF_FUNCTION_MINIMIZE | MOTIF_FUNCTION_CLOSE,
     )
+}
+
+fn motif_wm_resizable_functions(existing_flags: u32, existing_functions: u32) -> (u32, u32) {
+    let functions = if existing_functions & MOTIF_FUNCTION_ALL == 0 {
+        existing_functions
+            | MOTIF_FUNCTION_RESIZE
+            | MOTIF_FUNCTION_MOVE
+            | MOTIF_FUNCTION_MINIMIZE
+            | MOTIF_FUNCTION_MAXIMIZE
+            | MOTIF_FUNCTION_CLOSE
+    } else {
+        existing_functions
+    };
+    (existing_flags | MOTIF_HINTS_FUNCTIONS, functions)
 }
 
 fn forbidden_x11_states(states: &[Atom], atoms: &X11StateAtoms) -> (bool, bool) {
@@ -5646,6 +6115,45 @@ impl X11WindowStateMonitor {
         }
     }
 
+    fn allow_resize(&self, window: &slint::Window) {
+        let Some(window_id) = x11_window_id(window) else {
+            return;
+        };
+        let Some(motif_wm_hints) = self.motif_wm_hints else {
+            return;
+        };
+        let Ok(cookie) =
+            self.connection
+                .get_property(false, window_id, motif_wm_hints, AtomEnum::ANY, 0, 5)
+        else {
+            return;
+        };
+        let Ok(reply) = cookie.reply() else {
+            return;
+        };
+        let Some(values) = reply.value32() else {
+            return;
+        };
+        let mut hints = [0_u32; 5];
+        for (hint, value) in hints.iter_mut().zip(values) {
+            *hint = value;
+        }
+        (hints[0], hints[1]) = motif_wm_resizable_functions(hints[0], hints[1]);
+        if self
+            .connection
+            .change_property32(
+                PropMode::REPLACE,
+                window_id,
+                motif_wm_hints,
+                motif_wm_hints,
+                &hints,
+            )
+            .is_ok()
+        {
+            let _ = self.connection.flush();
+        }
+    }
+
     fn enforce(&self, window: &slint::Window) {
         let Some(window_id) = x11_window_id(window) else {
             return;
@@ -5687,8 +6195,22 @@ impl X11WindowStateMonitor {
         let Some(window_id) = x11_window_id(window) else {
             return;
         };
+        // Xwayland/WSLg can place the client inside a compositor-owned
+        // wrapper. Raising only the Slint client leaves the main window above
+        // a frameless secondary surface, so raise the wrapper as well.
+        let raise_target = self
+            .connection
+            .query_tree(window_id)
+            .ok()
+            .and_then(|cookie| cookie.reply().ok())
+            .map(|reply| reply.parent)
+            .filter(|parent| *parent != self.root)
+            .unwrap_or(window_id);
         let stack_mode = ConfigureWindowAux::new().stack_mode(StackMode::ABOVE);
-        let _ = self.connection.configure_window(window_id, &stack_mode);
+        let _ = self.connection.configure_window(raise_target, &stack_mode);
+        if raise_target != window_id {
+            let _ = self.connection.configure_window(window_id, &stack_mode);
+        }
 
         if let Some(active_window) = self.atoms.active_window {
             let event_mask = EventMask::SUBSTRUCTURE_REDIRECT | EventMask::SUBSTRUCTURE_NOTIFY;
@@ -5746,6 +6268,32 @@ fn main() -> Result<(), slint::PlatformError> {
     let x11_monitor = Rc::new(X11WindowStateMonitor::connect());
 
     {
+        let weak_ui = ui.as_weak();
+        ui.on_begin_window_drag(move || {
+            if let Some(ui) = weak_ui.upgrade() {
+                begin_window_drag(ui.window());
+            }
+        });
+    }
+    {
+        let weak_ui = ui.as_weak();
+        ui.on_minimize_window(move || {
+            if let Some(ui) = weak_ui.upgrade() {
+                minimize_window(ui.window());
+            }
+        });
+    }
+    {
+        let weak_ui = ui.as_weak();
+        ui.on_close_window(move || {
+            if let Some(ui) = weak_ui.upgrade() {
+                let _ = ui.hide();
+            }
+            let _ = slint::quit_event_loop();
+        });
+    }
+
+    {
         let state = Rc::clone(&state);
         ui.on_begin_auth(move || state.borrow_mut().open_auth());
     }
@@ -5772,13 +6320,49 @@ fn main() -> Result<(), slint::PlatformError> {
             if graph_window.is_none() {
                 if let Ok(graph) = GraphWindow::new() {
                     graph.set_open_history_on_start(graph_period_preview);
-                    if let Some((width, height)) = graph_preview_size {
-                        graph
-                            .window()
-                            .set_size(slint::LogicalSize::new(width as f32, height as f32));
+                    let (graph_width, graph_height) =
+                        graph_preview_size.unwrap_or((GRAPH_WINDOW_WIDTH, GRAPH_WINDOW_HEIGHT));
+                    if graph_preview_size.is_some() {
+                        graph.window().set_size(slint::LogicalSize::new(
+                            graph_width as f32,
+                            graph_height as f32,
+                        ));
                     }
+                    install_resizable_window(graph.window());
+                    let weak_graph = graph.as_weak();
+                    graph.on_begin_window_drag(move || {
+                        if let Some(graph) = weak_graph.upgrade() {
+                            begin_window_drag(graph.window());
+                        }
+                    });
+                    let weak_graph = graph.as_weak();
+                    graph.on_begin_window_resize(move |direction| {
+                        if let Some(graph) = weak_graph.upgrade() {
+                            begin_window_resize(graph.window(), direction.as_str());
+                        }
+                    });
+                    let weak_graph = graph.as_weak();
+                    graph.on_minimize_window(move || {
+                        if let Some(graph) = weak_graph.upgrade() {
+                            minimize_window(graph.window());
+                        }
+                    });
+                    let weak_graph = graph.as_weak();
+                    graph.on_toggle_maximize_window(move || {
+                        if let Some(graph) = weak_graph.upgrade() {
+                            toggle_maximize_window(graph.window());
+                        }
+                    });
                     let weak_graph = graph.as_weak();
                     graph.on_close_graph(move || {
+                        if let Some(graph) = weak_graph.upgrade() {
+                            graph.set_reset_close_buttons(true);
+                            graph.set_reset_close_buttons(false);
+                            let _ = graph.hide();
+                        }
+                    });
+                    let weak_graph = graph.as_weak();
+                    graph.on_close_window(move || {
                         if let Some(graph) = weak_graph.upgrade() {
                             graph.set_reset_close_buttons(true);
                             graph.set_reset_close_buttons(false);
@@ -5854,6 +6438,9 @@ fn main() -> Result<(), slint::PlatformError> {
                 graph.set_reset_close_buttons(false);
                 sync_graph_window(&state.borrow(), graph);
                 let _ = show_and_focus_window(graph.window(), x11_monitor.as_ref().as_ref());
+                if let Some(monitor) = x11_monitor.as_ref() {
+                    monitor.allow_resize(graph.window());
+                }
             }
         });
     }
@@ -5867,7 +6454,27 @@ fn main() -> Result<(), slint::PlatformError> {
                 if let Ok(window) = ThreadsWindow::new() {
                     install_fixed_window_guard(window.window());
                     let weak_window = window.as_weak();
+                    window.on_begin_window_drag(move || {
+                        if let Some(window) = weak_window.upgrade() {
+                            begin_window_drag(window.window());
+                        }
+                    });
+                    let weak_window = window.as_weak();
+                    window.on_minimize_window(move || {
+                        if let Some(window) = weak_window.upgrade() {
+                            minimize_window(window.window());
+                        }
+                    });
+                    let weak_window = window.as_weak();
                     window.on_close_threads(move || {
+                        if let Some(window) = weak_window.upgrade() {
+                            window.set_reset_close_buttons(true);
+                            window.set_reset_close_buttons(false);
+                            let _ = window.hide();
+                        }
+                    });
+                    let weak_window = window.as_weak();
+                    window.on_close_window(move || {
                         if let Some(window) = weak_window.upgrade() {
                             window.set_reset_close_buttons(true);
                             window.set_reset_close_buttons(false);
@@ -5904,8 +6511,33 @@ fn main() -> Result<(), slint::PlatformError> {
             let mut legal_notice_window = legal_notice_window.borrow_mut();
             if legal_notice_window.is_none() {
                 if let Ok(window) = LegalNoticeWindow::new() {
+                    install_window_size_guard(
+                        window.window(),
+                        LEGAL_WINDOW_WIDTH,
+                        LEGAL_WINDOW_HEIGHT,
+                    );
+                    let weak_window = window.as_weak();
+                    window.on_begin_window_drag(move || {
+                        if let Some(window) = weak_window.upgrade() {
+                            begin_window_drag(window.window());
+                        }
+                    });
+                    let weak_window = window.as_weak();
+                    window.on_minimize_window(move || {
+                        if let Some(window) = weak_window.upgrade() {
+                            minimize_window(window.window());
+                        }
+                    });
                     let weak_window = window.as_weak();
                     window.on_close_legal_notice(move || {
+                        if let Some(window) = weak_window.upgrade() {
+                            window.set_reset_close_buttons(true);
+                            window.set_reset_close_buttons(false);
+                            let _ = window.hide();
+                        }
+                    });
+                    let weak_window = window.as_weak();
+                    window.on_close_window(move || {
                         if let Some(window) = weak_window.upgrade() {
                             window.set_reset_close_buttons(true);
                             window.set_reset_close_buttons(false);
@@ -5930,7 +6562,7 @@ fn main() -> Result<(), slint::PlatformError> {
                 let state_ref = state.borrow();
                 window.set_strings(ui_strings(&state_ref.i18n));
                 window.set_window_title(
-                    localized_detail_window_title(
+                    native_detail_window_title(
                         &state_ref.i18n,
                         state_ref.authenticated,
                         &state_ref.window_title(),
@@ -5968,6 +6600,7 @@ fn main() -> Result<(), slint::PlatformError> {
     state.borrow().sync_ui(&ui);
     let weak_ui_for_bounds = ui.as_weak();
     let monitor = Rc::clone(&x11_monitor);
+    let graph_window_for_resize = Rc::clone(&graph_window);
     let threads_window_for_bounds = Rc::clone(&threads_window);
     let legal_notice_window_for_bounds = Rc::clone(&legal_notice_window);
     let main_monitor_timer = Timer::default();
@@ -5975,6 +6608,11 @@ fn main() -> Result<(), slint::PlatformError> {
         if let Some(ui) = weak_ui_for_bounds.upgrade() {
             if let Some(monitor) = monitor.as_ref() {
                 monitor.enforce(ui.window());
+                if let Some(graph) = graph_window_for_resize.borrow().as_ref() {
+                    if graph.window().is_visible() {
+                        monitor.allow_resize(graph.window());
+                    }
+                }
                 if let Some(window) = threads_window_for_bounds.borrow().as_ref() {
                     if window.window().is_visible() {
                         monitor.enforce(window.window());
@@ -6033,31 +6671,37 @@ fn main() -> Result<(), slint::PlatformError> {
 
 #[cfg(test)]
 mod tests {
+    use super::winit;
     use super::{
         account_window_title, active_thread_model_counts, active_thread_rows_at,
         add_recovery_usage, automatic_refresh_interval, clamp_graph_preview_size,
-        collect_session_file, complete_rollout_prefix_len, detail_window_title,
-        fetch_active_thread_update_for_paths, fetch_active_thread_update_for_paths_and_state,
-        fixed_resize_decision, format_elapsed, format_estimated_cost, format_model_usage_columns,
-        format_percent, format_period_label, graph_paths, graph_paths_for_selection,
-        graph_period_end, graph_points, graph_time_endpoints, minute_model_spend,
-        minute_model_spend_for_metric, model_usage_timeline_from_events, monthly_window_seconds,
+        collect_session_file, complete_rollout_prefix_len, current_label_connector_path,
+        detail_window_title, fetch_active_thread_update_for_paths,
+        fetch_active_thread_update_for_paths_and_state, fixed_resize_decision, format_elapsed,
+        format_estimated_cost, format_model_usage_columns, format_percent, format_period_label,
+        graph_paths, graph_paths_for_selection, graph_period_end, graph_points,
+        graph_time_endpoints, minute_model_spend, minute_model_spend_for_metric,
+        model_usage_timeline_from_events, monthly_window_seconds, native_account_window_title,
         normal_status_text, open_codex_session_paths, parse_preview_size, parse_rate_limits,
-        period_remaining_text, plan_type_label, preview_model_row, read_recovery_entries,
-        recovery_timed_usage, remaining_graph_y, remaining_marker_positions,
+        parse_resize_direction, period_remaining_text, plan_type_label, preview_model_row,
+        read_recovery_entries, recovery_timed_usage, remaining_graph_y, remaining_marker_positions,
         remaining_marker_positions_on_points, request_with_timeout, same_rollout_identity,
         separate_current_label_positions, session_event_model, session_event_type,
         session_jsonl_files, session_token_snapshot, smooth_model_spend, smooth_remaining_points,
         split_metric_line_paths, stacked_area_path, thread_presentation_rows,
-        three_months_before_utc, week_remaining_text, ActiveThread, ActiveThreadUpdate,
-        CodexInfoState, Event, FixedResizeDecision, GraphPaths, GraphWindow, HourlyModelSpend,
-        LocalUsageResult, ModelDollarTotals, ModelTokenTotals, ModelUsageRow, ModelUsageTotals,
-        RpcReadEvent, SessionTraversalBudget, TokenSnapshot, UsageEvent, UsageHistory,
-        UsageHistorySample, UsageStore, FIXED_WINDOW_HEIGHT, FIXED_WINDOW_WIDTH,
-        GRAPH_METRIC_OPTIONS, GRAPH_WINDOW_PURPOSE, LOCAL_ESTIMATE_PRICE_VERSION,
-        THREADS_WINDOW_PURPOSE, UNAUTHENTICATED_WINDOW_TITLE, WEEK_SECONDS,
+        three_months_before_utc, unused_interval_positions, week_remaining_text, ActiveThread,
+        ActiveThreadUpdate, CodexInfoState, Event, FixedResizeDecision, GraphPaths, GraphWindow,
+        HourlyModelSpend, LocalUsageResult, ManualX11Geometry, ModelDollarTotals, ModelTokenTotals,
+        ModelUsageRow, ModelUsageTotals, RpcReadEvent, SessionTraversalBudget, TokenSnapshot,
+        UnusedIntervalPosition, UsageEvent, UsageHistory, UsageHistorySample, UsageStore,
+        FIXED_WINDOW_HEIGHT, FIXED_WINDOW_WIDTH, GRAPH_METRIC_OPTIONS, GRAPH_WINDOW_PURPOSE,
+        LOCAL_ESTIMATE_PRICE_VERSION, THREADS_WINDOW_PURPOSE, UNAUTHENTICATED_WINDOW_TITLE,
+        WEEK_SECONDS,
     };
-    use super::{forbidden_x11_states, motif_wm_functions, X11StateAtoms};
+    use super::{
+        forbidden_x11_states, manual_resize_geometry, motif_wm_functions,
+        motif_wm_resizable_functions, X11StateAtoms,
+    };
     use chrono::{TimeZone, Utc};
     use codex_info::thread_contract;
     use rusqlite::Connection;
@@ -6869,6 +7513,34 @@ mod tests {
     }
 
     #[test]
+    fn native_title_bars_are_ascii_safe_and_keep_move_context() {
+        assert_eq!(
+            native_account_window_title("salty919@gmail.com — Pro Lite"),
+            "salty919@gmail.com - Pro Lite"
+        );
+        assert_eq!(
+            native_account_window_title("salty919@gmail.com — エンタープライズ"),
+            "salty919@gmail.com - Plan"
+        );
+        assert_eq!(
+            super::native_detail_window_title(
+                &super::I18n::detect(),
+                true,
+                "salty919@gmail.com — Pro Lite",
+                super::WindowPurpose::Threads,
+            ),
+            "salty919@gmail.com - Pro Lite - Threads"
+        );
+        assert!(super::native_detail_window_title(
+            &super::I18n::detect(),
+            true,
+            "salty919@gmail.com — エンタープライズ",
+            super::WindowPurpose::Graph,
+        )
+        .is_ascii());
+    }
+
+    #[test]
     fn window_title_email_is_one_line_bounded_and_control_free() {
         assert_eq!(
             account_window_title(true, Some("a\n\tb"), "Pro"),
@@ -6978,7 +7650,7 @@ mod tests {
             rows[0].tokens.as_str(),
             "18,446,744,073,709,551,615トークン"
         );
-        assert_eq!(rows[0].context_window.as_str(), "258,400トークン");
+        assert_eq!(rows[0].context_usage.as_str(), "100% / 258,400トークン");
         assert_eq!(rows[1].relation.as_str(), "サブ D1");
         assert_eq!(rows[1].tree_depth, 1);
         assert!(rows[1].connected_to_parent);
@@ -7914,11 +8586,122 @@ mod tests {
     }
 
     #[test]
-    fn native_window_contracts_bind_dynamic_titles_and_fixed_guard_only_to_fixed_windows() {
+    fn graph_resize_handles_cover_all_edges_and_corners() {
+        let directions = [
+            ("north", winit::window::ResizeDirection::North),
+            ("south", winit::window::ResizeDirection::South),
+            ("east", winit::window::ResizeDirection::East),
+            ("west", winit::window::ResizeDirection::West),
+            ("north-east", winit::window::ResizeDirection::NorthEast),
+            ("north-west", winit::window::ResizeDirection::NorthWest),
+            ("south-east", winit::window::ResizeDirection::SouthEast),
+            ("south-west", winit::window::ResizeDirection::SouthWest),
+        ];
+        for (name, expected) in directions {
+            assert_eq!(parse_resize_direction(name), Some(expected));
+        }
+        assert_eq!(parse_resize_direction("invalid"), None);
+
+        let source = include_str!("../ui/components.slint");
+        let graph = source
+            .split("export component GraphWindow inherits Window {")
+            .nth(1)
+            .expect("GraphWindow");
+        assert!(graph.contains("callback begin-window-resize(string);"));
+        for direction in [
+            "direction: \"north\";",
+            "direction: \"south\";",
+            "direction: \"east\";",
+            "direction: \"west\";",
+            "direction: \"north-east\";",
+            "direction: \"north-west\";",
+            "direction: \"south-east\";",
+            "direction: \"south-west\";",
+        ] {
+            assert!(
+                graph.contains(direction),
+                "missing graph resize handle: {direction}"
+            );
+        }
+        for marker in [
+            "width: root.width - 28px;",
+            "height: 14px;",
+            "height: 28px;",
+            "resize-cursor: MouseCursor.nwse-resize;",
+            "resize-cursor: MouseCursor.nesw-resize;",
+            "corner: true;",
+        ] {
+            assert!(
+                graph.contains(marker),
+                "missing resize affordance: {marker}"
+            );
+        }
+        let main = include_str!("../src/main.rs");
+        assert!(main.contains("graph.on_begin_window_resize"));
+        assert!(main.contains("drag_resize_window(direction)"));
+    }
+
+    #[test]
+    fn manual_resize_geometry_keeps_corner_direction_and_minimum() {
+        let initial = ManualX11Geometry {
+            x: 100,
+            y: 80,
+            width: 940,
+            height: 640,
+        };
+        assert_eq!(
+            manual_resize_geometry(initial, winit::window::ResizeDirection::SouthEast, 120, 80,),
+            ManualX11Geometry {
+                x: 100,
+                y: 80,
+                width: 1060,
+                height: 720,
+            }
+        );
+        assert_eq!(
+            manual_resize_geometry(initial, winit::window::ResizeDirection::NorthWest, 120, 80,),
+            ManualX11Geometry {
+                x: 220,
+                y: 160,
+                width: 820,
+                height: 560,
+            }
+        );
+        assert_eq!(
+            manual_resize_geometry(
+                initial,
+                winit::window::ResizeDirection::NorthWest,
+                1_000,
+                1_000,
+            ),
+            ManualX11Geometry {
+                x: 340,
+                y: 240,
+                width: 700,
+                height: 480,
+            }
+        );
+    }
+
+    #[test]
+    fn native_window_contracts_keep_non_graph_windows_move_only() {
         let main = include_str!("../ui/app.slint");
         assert!(main.contains("title: root.window-title;"));
+        assert!(main.contains("no-frame: true;"));
+        assert!(main.contains("resize-border-width: 0px;"));
+        assert!(main.contains("z: -5;"));
+        assert!(main.contains("width: root.width;\n        height: root.height;"));
         assert!(!main.contains("title: \"Codex Info\";"));
         let components = include_str!("../ui/components.slint");
+        assert!(components.contains("export component WindowControls"));
+        assert!(components.contains("export component WindowDragArea"));
+        let header = components
+            .split("export component Header inherits Rectangle {")
+            .nth(1)
+            .and_then(|source| source.split("export component RemainingQuota").next())
+            .expect("Header component");
+        assert!(header.contains("private property <length> action-start:"));
+        assert!(header.contains("width: root.action-start;"));
         let threads = components
             .split("export component ThreadsWindow inherits Window {")
             .nth(1)
@@ -7932,11 +8715,40 @@ mod tests {
             .nth(1)
             .expect("LegalNoticeWindow");
         assert!(threads.contains("title: root.window-title;"));
+        assert!(threads.contains("no-frame: true;"));
+        assert!(threads.contains("resize-border-width: 0px;"));
+        assert!(threads.contains("WindowControls"));
+        assert!(threads.contains("WindowDragArea"));
+        assert!(threads.contains("z: -5;"));
+        assert!(threads.contains("width: root.width;\n        height: root.height;"));
         assert!(graph.contains("title: root.window-title;"));
+        assert!(graph.contains("no-frame: true;"));
+        assert!(graph.contains("resize-border-width: 6px;"));
+        assert!(graph.contains("show-maximize: true;"));
+        assert!(graph.contains("WindowControls"));
+        assert!(graph.contains("WindowDragArea"));
+        assert!(graph.contains("z: -5;"));
+        assert!(graph.contains("width: root.width;\n        height: root.height;"));
         assert!(legal_notice.contains("title: root.window-title;"));
-        assert!(legal_notice.contains("window-title: \"Codex Info - Legal Notices\";"));
-        assert!(legal_notice.contains("GPL-3.0-only"));
-        assert!(legal_notice.contains("Copyright (C) 2026 salty919"));
+        assert!(legal_notice.contains("no-frame: true;"));
+        assert!(legal_notice.contains("resize-border-width: 0px;"));
+        assert!(legal_notice.contains("WindowControls"));
+        assert!(legal_notice.contains("WindowDragArea"));
+        assert!(legal_notice.contains("z: -5;"));
+        assert!(legal_notice.contains("width: root.width;\n        height: root.height;"));
+        for marker in [
+            "preferred-width: 720px;",
+            "preferred-height: 520px;",
+            "min-width: 720px;",
+            "max-width: 720px;",
+            "min-height: 520px;",
+            "max-height: 520px;",
+        ] {
+            assert!(
+                legal_notice.contains(marker),
+                "missing LegalNoticeWindow marker: {marker}"
+            );
+        }
         assert!(main.contains("callback open-legal-notice();"));
         for fixed_source in [main, threads] {
             assert!(fixed_source.contains("min-width: 900px;"));
@@ -7962,7 +8774,14 @@ mod tests {
                 .count(),
             1
         );
-        assert!(!rust_source.contains("install_fixed_window_guard(graph.window())"));
+        assert!(rust_source.contains("install_resizable_window(graph.window());"));
+        assert!(!rust_source
+            .contains("install_window_size_guard(graph.window(), graph_width, graph_height);"));
+        assert!(rust_source.contains(
+            "install_window_size_guard(\n                        window.window(),\n                        LEGAL_WINDOW_WIDTH,\n                        LEGAL_WINDOW_HEIGHT,\n                    );"
+        ));
+        assert!(rust_source.contains("winit_window.set_resizable(false)"));
+        assert!(rust_source.contains("winit_window.set_resizable(true)"));
         assert_eq!(rust_source.matches("LegalNoticeWindow::new()").count(), 1);
         assert!(rust_source.contains("ui.on_open_legal_notice"));
     }
@@ -7973,13 +8792,13 @@ mod tests {
         for marker in [
             "width: 2px;",
             "height: root.thread-row-height;",
-            "tree-base-x: 92px;",
-            "tree-depth-step: 20px;",
-            "tree-junction-y: 28px;",
+            "property <length> tree-base-x: 24px;",
+            "property <length> tree-depth-step: 16px;",
+            "property <length> tree-junction-y: 36px;",
             "x: parent.tree-base-x + parent.tree-depth-step;",
             "x: parent.tree-base-x + 2 * parent.tree-depth-step;",
             "y: parent.tree-junction-y - 1px;",
-            "width: parent.title-x - self.x - 8px;",
+            "width: parent.title-x - self.x - 20px;",
             "background: DesignTokens.warning;",
             "height: root.thread-row-height - parent.tree-junction-y;",
             "border-radius: 2px;",
@@ -8060,6 +8879,12 @@ mod tests {
     fn motif_functions_allow_move_minimize_close_without_resize_or_maximize() {
         assert_eq!(motif_wm_functions(0), (1, 0x2c));
         assert_eq!(motif_wm_functions(0x40), (0x41, 0x2c));
+    }
+
+    #[test]
+    fn motif_functions_allow_graph_resize_and_maximize() {
+        assert_eq!(motif_wm_resizable_functions(0x2, 0), (0x3, 0x3e));
+        assert_eq!(motif_wm_resizable_functions(0x3, 1), (0x3, 1));
     }
 
     #[test]
@@ -8148,13 +8973,15 @@ mod tests {
         let geometry = |width: f64, height: f64| {
             let margin = (20.0 + (width - 700.0) / 24.0).clamp(20.0, 30.0);
             let content = width - 2.0 * margin;
-            let plot_width = content - 222.0;
+            // 92px plot gutter + 10px leader gap + 80px dollar labels + 4px
+            // right padding. Token mode reserves a wider label column.
+            let plot_width = content - 186.0;
             let plot_height = height - 276.0;
             (margin, plot_width, plot_height)
         };
-        assert_eq!(geometry(700.0, 480.0), (20.0, 438.0, 204.0));
-        assert_eq!(geometry(940.0, 640.0), (30.0, 658.0, 364.0));
-        assert_eq!(geometry(1_200.0, 800.0), (30.0, 918.0, 524.0));
+        assert_eq!(geometry(700.0, 480.0), (20.0, 474.0, 204.0));
+        assert_eq!(geometry(940.0, 640.0), (30.0, 694.0, 364.0));
+        assert_eq!(geometry(1_200.0, 800.0), (30.0, 954.0, 524.0));
         assert_eq!(geometry(1_201.0, 801.0).1 - geometry(1_200.0, 800.0).1, 1.0);
         assert_eq!(geometry(1_201.0, 801.0).2 - geometry(1_200.0, 800.0).2, 1.0);
     }
@@ -8180,7 +9007,7 @@ mod tests {
                 .count(),
             1
         );
-        assert_eq!(source.matches("graph.hide()").count(), 2);
+        assert_eq!(source.matches("graph.hide()").count(), 3);
     }
 
     #[test]
@@ -8243,14 +9070,14 @@ mod tests {
         assert!(action_button.contains("activate-on-press: false"));
         assert!(action_button.contains("reset-press-state: false"));
         assert!(action_button.contains("changed pressed =>"));
-        assert_eq!(components.matches("activate-on-press: true;").count(), 3);
+        assert_eq!(components.matches("activate-on-press: true;").count(), 0);
         assert_eq!(
             components
                 .matches("reset-press-state: root.reset-close-buttons;")
                 .count(),
-            3
+            0
         );
-        assert_eq!(source.matches("set_reset_close_buttons(true)").count(), 9);
+        assert_eq!(source.matches("set_reset_close_buttons(true)").count(), 12);
     }
 
     #[test]
@@ -8410,26 +9237,50 @@ mod tests {
                     .next()
             })
             .expect("AccountActivity");
-        assert!(account.contains("text: root.active-thread-count + \"件\";"));
-        assert!(account.contains("text: \"モデル別スレッド\";"));
+        assert!(account.contains("text: root.active-thread-count-label;"));
+        assert!(account.contains("text: root.strings.model-threads;"));
         assert!(account.contains("label: \"SOL\";"));
         assert!(account.contains("label: \"TERRA\";"));
         assert!(account.contains("label: \"LUNA\";"));
-        assert!(account.contains("label: \"その他\";"));
-        assert!(account.contains("y: 14px;\n        width: 64px;\n        height: 24px;"));
+        assert!(account.contains("label: root.strings.other;"));
+        assert!(account.contains("x: parent.width - 112px;"));
+        assert!(account.contains("width: 100px;\n        height: 24px;"));
     }
 
     #[test]
     fn dollar_graph_is_presented_as_independent_lines() {
         let slint = include_str!("../ui/components.slint");
-        assert!(slint.contains("累積消費ドル（モデル別）"));
+        assert!(slint.contains("root.strings.graph-dollar-description"));
         assert!(!slint.contains("累積消費ドル（積み上げ）"));
         assert!(slint.contains("model: root.metric-options;"));
         assert!(slint.contains("current-index: root.selected-metric-index;"));
         assert!(!slint.contains("current-value:"));
+        for marker in [
+            "current-remaining-connector-path",
+            "current-sol-connector-path",
+            "current-terra-connector-path",
+            "current-luna-connector-path",
+            "current-label-gap: 10px;",
+            "current-label-width: root.show-tokens ? 112px : 80px;",
+            "current-label-right-padding: 4px;",
+        ] {
+            assert!(
+                slint.contains(marker),
+                "missing graph label mapping: {marker}"
+            );
+        }
+        // Connector coordinates are normalized to the 0..100 viewbox. They
+        // must fill the narrow label gap; otherwise Slint treats the values as
+        // raw pixels and paints stray lines near the plot center/top.
+        assert_eq!(
+            slint
+                .matches("fit: fill;\n                commands: root.current-")
+                .count(),
+            4
+        );
         // An open SVG path must never be implicitly closed and painted to the
         // baseline; that was the visual source of the old stacked-area graph.
-        assert_eq!(slint.matches("fill: transparent;").count(), 7);
+        assert_eq!(slint.matches("fill: transparent;").count(), 11);
     }
 
     #[test]
@@ -9649,6 +10500,16 @@ mod tests {
     }
 
     #[test]
+    fn current_label_connector_path_links_series_endpoint_to_displaced_label() {
+        assert_eq!(
+            current_label_connector_path(0.80, 0.68, true),
+            "M0.00 80.00 L100.00 68.00"
+        );
+        assert_eq!(current_label_connector_path(0.80, 0.68, false), "");
+        assert_eq!(current_label_connector_path(f32::NAN, 0.68, true), "");
+    }
+
+    #[test]
     fn focused_model_graph_rebases_the_selected_area_to_zero() {
         let samples = [
             UsageHistorySample::new(
@@ -9866,7 +10727,7 @@ mod tests {
         assert_eq!(zero_paths.dollar_labels[0], "1");
 
         let source = include_str!("../ui/components.slint");
-        assert!(source.contains("x: parent.width - 224px;"));
+        assert!(source.contains("x: parent.width - 244px;"));
         assert!(source.contains("model: root.metric-options;"));
         assert!(source.contains("selected(value) => { root.select-metric(value); }"));
     }
@@ -10088,6 +10949,216 @@ mod tests {
     }
 
     #[test]
+    fn unused_intervals_mark_idle_segments_and_preserve_first_use_boundary() {
+        let points = [
+            HourlyModelSpend {
+                timestamp: 0,
+                ..HourlyModelSpend::default()
+            },
+            HourlyModelSpend {
+                timestamp: 60,
+                ..HourlyModelSpend::default()
+            },
+            HourlyModelSpend {
+                timestamp: 120,
+                sol: 1.0,
+                ..HourlyModelSpend::default()
+            },
+            HourlyModelSpend {
+                timestamp: 180,
+                sol: 1.0,
+                ..HourlyModelSpend::default()
+            },
+            HourlyModelSpend {
+                timestamp: 240,
+                sol: 2.0,
+                ..HourlyModelSpend::default()
+            },
+        ];
+        assert_eq!(
+            unused_interval_positions(&points, 0, 240),
+            vec![
+                UnusedIntervalPosition {
+                    start: 0.0,
+                    width: 25.0,
+                    preserve_boundary: false,
+                },
+                UnusedIntervalPosition {
+                    start: 50.0,
+                    width: 25.0,
+                    preserve_boundary: false,
+                },
+            ]
+        );
+
+        let first_use = [
+            HourlyModelSpend {
+                timestamp: 0,
+                ..HourlyModelSpend::default()
+            },
+            HourlyModelSpend {
+                timestamp: 180,
+                sol: 4.0,
+                ..HourlyModelSpend::default()
+            },
+            HourlyModelSpend {
+                timestamp: 240,
+                sol: 4.0,
+                ..HourlyModelSpend::default()
+            },
+        ];
+        assert_eq!(
+            unused_interval_positions(&first_use, 0, 240),
+            vec![
+                UnusedIntervalPosition {
+                    start: 0.0,
+                    width: 75.0,
+                    preserve_boundary: true,
+                },
+                UnusedIntervalPosition {
+                    start: 75.0,
+                    width: 25.0,
+                    preserve_boundary: false,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn unused_intervals_merge_adjacent_flat_segments() {
+        let points = [
+            HourlyModelSpend {
+                timestamp: 0,
+                sol: 2.0,
+                terra: 1.0,
+                luna: 3.0,
+            },
+            HourlyModelSpend {
+                timestamp: 60,
+                sol: 2.0,
+                terra: 1.0,
+                luna: 3.0,
+            },
+            HourlyModelSpend {
+                timestamp: 120,
+                sol: 2.0,
+                terra: 1.0,
+                luna: 3.0,
+            },
+            HourlyModelSpend {
+                timestamp: 180,
+                sol: 2.0,
+                terra: 1.0,
+                luna: 3.0,
+            },
+        ];
+        assert_eq!(
+            unused_interval_positions(&points, 0, 180),
+            vec![UnusedIntervalPosition {
+                start: 0.0,
+                width: 100.0,
+                preserve_boundary: false,
+            }]
+        );
+    }
+
+    #[test]
+    fn unused_intervals_use_the_selected_dollar_or_token_metric() {
+        let samples = [
+            UsageHistorySample::new_with_usage(
+                0,
+                1_000,
+                100.0,
+                ModelDollarTotals::default(),
+                ModelTokenTotals::default(),
+            ),
+            UsageHistorySample::new_with_usage(
+                60,
+                1_000,
+                99.0,
+                ModelDollarTotals {
+                    sol: 1.0,
+                    ..ModelDollarTotals::default()
+                },
+                ModelTokenTotals {
+                    sol: 100,
+                    ..ModelTokenTotals::default()
+                },
+            ),
+            UsageHistorySample::new_with_usage(
+                120,
+                1_000,
+                98.0,
+                ModelDollarTotals {
+                    sol: 1.0,
+                    ..ModelDollarTotals::default()
+                },
+                ModelTokenTotals {
+                    sol: 200,
+                    ..ModelTokenTotals::default()
+                },
+            ),
+            UsageHistorySample::new_with_usage(
+                180,
+                1_000,
+                97.0,
+                ModelDollarTotals {
+                    sol: 1.0,
+                    ..ModelDollarTotals::default()
+                },
+                ModelTokenTotals {
+                    sol: 200,
+                    ..ModelTokenTotals::default()
+                },
+            ),
+        ];
+        let references = samples.iter().collect::<Vec<_>>();
+        let dollars = graph_paths_for_selection(&references, 0, 180, true, true, true, false);
+        let tokens = graph_paths_for_selection(&references, 0, 180, true, true, true, true);
+
+        assert_eq!(dollars.unused_intervals.len(), 1);
+        assert!((dollars.unused_intervals[0].start - 33.3333333333).abs() < 0.000_001);
+        assert!((dollars.unused_intervals[0].width - 66.6666666667).abs() < 0.000_001);
+        assert_eq!(tokens.unused_intervals.len(), 1);
+        assert!((tokens.unused_intervals[0].start - 66.6666666667).abs() < 0.000_001);
+        assert!((tokens.unused_intervals[0].width - 33.3333333333).abs() < 0.000_001);
+    }
+
+    #[test]
+    fn dollar_idle_bands_use_raw_cumulative_values_before_line_smoothing() {
+        let samples = [
+            UsageHistorySample::new(0, 1_000, 100.0, ModelDollarTotals::default()),
+            UsageHistorySample::new(60, 1_000, 99.0, ModelDollarTotals::default()),
+            UsageHistorySample::new(
+                120,
+                1_000,
+                98.0,
+                ModelDollarTotals {
+                    sol: 1.0,
+                    ..ModelDollarTotals::default()
+                },
+            ),
+            UsageHistorySample::new(
+                180,
+                1_000,
+                97.0,
+                ModelDollarTotals {
+                    sol: 1.0,
+                    ..ModelDollarTotals::default()
+                },
+            ),
+        ];
+        let references = samples.iter().collect::<Vec<_>>();
+        let paths = graph_paths(&references, 0, 180);
+
+        assert_eq!(paths.unused_intervals.len(), 2);
+        assert!((paths.unused_intervals[0].start - 0.0).abs() < 0.000_001);
+        assert!((paths.unused_intervals[0].width - 33.3333333333).abs() < 0.000_001);
+        assert!((paths.unused_intervals[1].start - 66.6666666667).abs() < 0.000_001);
+        assert!((paths.unused_intervals[1].width - 33.3333333333).abs() < 0.000_001);
+    }
+
+    #[test]
     fn current_graph_labels_are_clamped_and_separated_at_minimum_size() {
         let mut paths = GraphPaths {
             current_remaining_label: "50%".into(),
@@ -10108,12 +11179,12 @@ mod tests {
             paths.current_sol_y,
         ];
         positions.sort_by(f32::total_cmp);
-        let minimum = 8.0 / 260.0;
+        let minimum = 8.0 / 204.0;
         let maximum = 1.0 - minimum;
         assert!(positions[0] >= minimum);
         assert!(positions[3] <= maximum);
         for pair in positions.windows(2) {
-            assert!((pair[1] - pair[0]) * 260.0 >= 15.999);
+            assert!((pair[1] - pair[0]) * 204.0 >= 15.999);
         }
     }
 
@@ -10261,6 +11332,9 @@ mod tests {
         ));
         assert!(graph.contains("background: DesignTokens.graph-control-surface;"));
         assert!(graph.contains("opacity: 0.72;"));
+        assert!(graph.contains("in-out property <[GraphUnusedInterval]> unused-intervals;"));
+        assert!(graph.contains("for interval in root.unused-intervals: Rectangle"));
+        assert!(graph.contains("background: DesignTokens.text-muted;"));
         let toggle = source
             .split("component GraphToggle inherits Rectangle {")
             .nth(1)
@@ -10268,6 +11342,9 @@ mod tests {
             .expect("GraphToggle");
         assert!(toggle.contains("background: transparent;"));
         assert!(!toggle.contains("border-width: 1px;"));
+        assert!(toggle.contains("text: root.label;"));
+        assert!(!toggle.contains("strings.on"));
+        assert!(!toggle.contains("strings.off"));
     }
 
     #[test]
@@ -10365,15 +11442,16 @@ mod tests {
         assert!(threads.contains("width: root.single-thread ? 90px : 78px;"));
         assert!(threads.contains("width: 268px;"));
         assert!(threads.contains("text: row.model;"));
-        assert!(threads.contains("text: \"稼働 \" + row.thread-age;"));
-        assert!(threads.contains("text: \"指示 \" + row.instruction-age;"));
-        assert!(threads.contains("text: \"稼働\";"));
-        assert!(threads.contains("text: \"指示\";"));
-        assert!(threads.contains("text: \"トークン\";"));
+        assert!(threads.contains("text: root.strings.running + \" \" + row.thread-age;"));
+        assert!(threads.contains("text: root.strings.instruction + \" \" + row.instruction-age;"));
+        assert!(threads.contains("text: root.strings.running;"));
+        assert!(threads.contains("text: root.strings.instruction;"));
+        assert!(threads.contains("text: root.strings.tokens;"));
         assert!(threads.contains("text: row.tokens;"));
-        assert!(threads.contains("text: row.context-window;"));
-        assert!(threads.contains("text: \"コンテキスト \" + row.context-window;"));
-        assert!(threads.contains("text: \"コンテキスト\";"));
+        assert!(threads.contains("text: row.context-usage;"));
+        assert!(threads.contains("text: root.strings.context-usage;"));
+        assert!(threads.contains("text: row.context-usage;"));
+        assert!(threads.contains("text: root.strings.context-usage;"));
         assert!(threads.contains("width: parent.width - 486px;"));
         assert!(threads.contains("property <bool> has-parent-title: row.parent-title != \"\";"));
         assert!(threads.contains("visible: !root.single-thread || parent.has-parent-title;"));

@@ -1,7 +1,7 @@
 // Copyright (C) 2026 salty919
 // SPDX-License-Identifier: GPL-3.0-only
 
-import { UiStrings, Header, RemainingQuota, WeekGauge, AccountActivity, ModelUsage, StatusBanner, AuthPanel, GraphWindow, ThreadsWindow, LegalNoticeWindow } from "components.slint";
+import { UiStrings, Header, WindowDragArea, RemainingQuota, WeekGauge, AccountActivity, ModelUsage, StatusBanner, AuthPanel, GraphWindow, ThreadsWindow, LegalNoticeWindow } from "components.slint";
 import { DesignTokens } from "theme.slint";
 import "../assets/NotoSansJP.ttf";
 import "../assets/NotoSansKR.otf";
@@ -17,6 +17,10 @@ export component MainWindow inherits Window {
     max-height: 480px;
     in-out property <string> window-title;
     in-out property <UiStrings> strings;
+    // The application owns the title controls so the native frame never
+    // reintroduces a platform-specific maximize/resize affordance.
+    no-frame: true;
+    resize-border-width: 0px;
     title: root.window-title;
     background: status-level == "warning" ? DesignTokens.canvas-warning :
         status-level == "error" ? DesignTokens.canvas-error : DesignTokens.canvas;
@@ -70,6 +74,29 @@ export component MainWindow inherits Window {
     callback open-graph();
     callback open-threads();
     callback open-legal-notice();
+    callback begin-window-drag();
+    callback minimize-window();
+    callback close-window();
+
+    // Frameless windows do not receive a compositor-painted frame. Paint the
+    // entire client surface so margins never reveal another window beneath it.
+    Rectangle {
+        x: 0px;
+        y: 0px;
+        width: root.width;
+        height: root.height;
+        background: status-level == "warning" ? DesignTokens.canvas-warning :
+            status-level == "error" ? DesignTokens.canvas-error : DesignTokens.canvas;
+        z: -10;
+    }
+    WindowDragArea {
+        x: 0px;
+        y: 0px;
+        width: root.width;
+        height: root.height;
+        z: -5;
+        begin-drag => { root.begin-window-drag(); }
+    }
 
     Rectangle {
         x: root.width > 800px ? (root.width - DesignTokens.content-max-width) / 2 : DesignTokens.outer-margin-compact;
@@ -93,6 +120,9 @@ export component MainWindow inherits Window {
                 show-graph: true;
                 open-graph => { root.open-graph(); }
                 open-legal-notice => { root.open-legal-notice(); }
+                begin-window-drag => { root.begin-window-drag(); }
+                minimize-window => { root.minimize-window(); }
+                close-window => { root.close-window(); }
             }
             if root.has-usage : RemainingQuota {
                 width: root.content-width;
@@ -164,6 +194,9 @@ export component MainWindow inherits Window {
                 period-label: "";
                 show-graph: false;
                 open-legal-notice => { root.open-legal-notice(); }
+                begin-window-drag => { root.begin-window-drag(); }
+                minimize-window => { root.minimize-window(); }
+                close-window => { root.close-window(); }
             }
             AuthPanel {
                 strings: root.strings;
