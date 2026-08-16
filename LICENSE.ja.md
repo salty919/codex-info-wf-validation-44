@@ -3,7 +3,7 @@
 
 # GNU GPLv3 日本語案内
 
-英語の[LICENSE](LICENSE)がGNU General Public License version 3（GPLv3）の正文です。このファイルは、条件・定義・配布・免責・特許・追加許可を日本語で案内します。正式な解釈と契約条件は英語正文に定めます。
+英語の[LICENSE](LICENSE)がGNU General Public License version 3（GPLv3）の正文です。このファイルは、このリポジトリでの適用範囲と配布時の確認事項を日本語で案内します。定義・配布・免責・特許・追加許可を含む正式な解釈と契約条件は英語正文に定めます。
 
 ## 正式な本文
 
