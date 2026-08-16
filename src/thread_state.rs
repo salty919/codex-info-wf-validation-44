@@ -40,6 +40,7 @@ pub enum ThreadStateError {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NativeThreadCandidate {
     pub id: String,
+    pub created_at: Option<i64>,
     pub updated_at: i64,
     pub title: String,
     pub rollout_path: PathBuf,
@@ -50,6 +51,7 @@ pub struct NativeThreadCandidate {
 #[derive(Clone, Debug)]
 struct NativeThreadRow {
     id: String,
+    created_at: Option<i64>,
     updated_at: i64,
     title: String,
     rollout_path: PathBuf,
@@ -208,6 +210,79 @@ fn require_column(
     Ok(())
 }
 
+fn optional_text_column(
+    columns: &BTreeMap<String, ColumnContract>,
+    name: &str,
+) -> Result<bool, ThreadStateError> {
+    let Some(column) = columns.get(name) else {
+        return Ok(false);
+    };
+    if column.declared_type != "TEXT" || column.not_null || column.primary_key {
+        return Err(ThreadStateError::InvalidSchema);
+    }
+    Ok(true)
+}
+
+fn optional_integer_column(
+    columns: &BTreeMap<String, ColumnContract>,
+    name: &str,
+) -> Result<bool, ThreadStateError> {
+    let Some(column) = columns.get(name) else {
+        return Ok(false);
+    };
+    if column.declared_type != "INTEGER" || column.primary_key {
+        return Err(ThreadStateError::InvalidSchema);
+    }
+    Ok(true)
+}
+
+fn task_title_from_agent_path(path: &str) -> Option<String> {
+    let component = Path::new(path).file_name()?.to_str()?.trim();
+    if component.is_empty() {
+        return None;
+    }
+    let readable = component.replace('_', " ");
+    let mut characters = readable.chars();
+    let first = characters.next()?.to_uppercase().collect::<String>();
+    let title = format!("{first}{}", characters.collect::<String>());
+    security::bounded_thread_title(&title)
+        .ok()
+        .filter(|title| !title.is_empty())
+}
+
+fn native_thread_title(
+    name: Option<&str>,
+    preview: &str,
+    agent_path: Option<&str>,
+    agent_nickname: Option<&str>,
+) -> Result<String, ThreadStateError> {
+    let normalized_name = name
+        .map(security::bounded_thread_title)
+        .transpose()
+        .map_err(|_| ThreadStateError::InvalidRow)?
+        .unwrap_or_default();
+    let normalized_preview =
+        security::bounded_thread_title(preview).map_err(|_| ThreadStateError::InvalidRow)?;
+    if !normalized_name.is_empty() {
+        return Ok(normalized_name);
+    }
+    if !normalized_preview.is_empty() {
+        return Ok(normalized_preview);
+    }
+    if let Some(title) = agent_path.and_then(task_title_from_agent_path) {
+        return Ok(title);
+    }
+    if let Some(nickname) = agent_nickname
+        .map(security::bounded_thread_title)
+        .transpose()
+        .map_err(|_| ThreadStateError::InvalidRow)?
+        .filter(|nickname| !nickname.is_empty())
+    {
+        return Ok(nickname);
+    }
+    Ok("アクティブなスレッド".to_owned())
+}
+
 fn validate_state_schema(connection: &Connection) -> Result<(), ThreadStateError> {
     let edges = table_columns(connection, "thread_spawn_edges")?;
     require_column(&edges, "parent_thread_id", "TEXT", true, false)?;
@@ -285,6 +360,25 @@ fn read_descendants(
     let mut expanded = HashSet::new();
     let mut discovered_rows = BTreeMap::<String, NativeThreadRow>::new();
     let mut parents = HashMap::<String, String>::new();
+    let thread_columns = table_columns(connection, "threads")?;
+    let has_agent_path = optional_text_column(&thread_columns, "agent_path")?;
+    let has_agent_nickname = optional_text_column(&thread_columns, "agent_nickname")?;
+    let has_created_at = optional_integer_column(&thread_columns, "created_at")?;
+    let agent_path_column = if has_agent_path {
+        "t.agent_path"
+    } else {
+        "NULL"
+    };
+    let agent_nickname_column = if has_agent_nickname {
+        "t.agent_nickname"
+    } else {
+        "NULL"
+    };
+    let created_at_column = if has_created_at {
+        "t.created_at"
+    } else {
+        "NULL"
+    };
 
     while !frontier.is_empty() {
         let current = frontier
@@ -307,7 +401,8 @@ fn read_descendants(
                 .ok_or(ThreadStateError::LimitExceeded)?;
             let sql = format!(
                 "SELECT e.parent_thread_id, e.child_thread_id, t.rollout_path, \
-                 t.updated_at, t.archived, t.name, t.preview, t.thread_source \
+                 {created_at_column}, t.updated_at, t.archived, t.name, t.preview, t.thread_source, \
+                 {agent_path_column}, {agent_nickname_column} \
                  FROM thread_spawn_edges e \
                  LEFT JOIN threads t ON t.id = e.child_thread_id \
                  WHERE e.parent_thread_id IN ({placeholders}) \
@@ -326,22 +421,39 @@ fn read_descendants(
                             row.get::<_, Option<String>>(2)?,
                             row.get::<_, Option<i64>>(3)?,
                             row.get::<_, Option<i64>>(4)?,
-                            row.get::<_, Option<String>>(5)?,
+                            row.get::<_, Option<i64>>(5)?,
                             row.get::<_, Option<String>>(6)?,
                             row.get::<_, Option<String>>(7)?,
+                            row.get::<_, Option<String>>(8)?,
+                            row.get::<_, Option<String>>(9)?,
+                            row.get::<_, Option<String>>(10)?,
                         ))
                     },
                 )
                 .map_err(|_| ThreadStateError::Database)?;
             for row in rows {
-                let (parent, id, rollout_path, updated_at, archived, name, preview, source) =
-                    row.map_err(|_| ThreadStateError::InvalidRow)?;
+                let (
+                    parent,
+                    id,
+                    rollout_path,
+                    created_at,
+                    updated_at,
+                    archived,
+                    name,
+                    preview,
+                    source,
+                    agent_path,
+                    agent_nickname,
+                ) = row.map_err(|_| ThreadStateError::InvalidRow)?;
                 if !valid_thread_id(&parent)
                     || !valid_thread_id(&id)
                     || updated_at.is_none_or(|value| value <= 0)
                     || archived != Some(0)
                     || source.as_deref() != Some("subagent")
                 {
+                    return Err(ThreadStateError::InvalidRow);
+                }
+                if created_at.is_some_and(|value| value <= 0) {
                     return Err(ThreadStateError::InvalidRow);
                 }
                 if creates_cycle(&parent, &id, &parents) {
@@ -366,25 +478,15 @@ fn read_descendants(
                 {
                     return Err(ThreadStateError::UnsafePath);
                 }
-                let normalized_name = name
-                    .as_deref()
-                    .map(security::bounded_thread_title)
-                    .transpose()
-                    .map_err(|_| ThreadStateError::InvalidRow)?
-                    .unwrap_or_default();
-                let normalized_preview = security::bounded_thread_title(
+                let title = native_thread_title(
+                    name.as_deref(),
                     preview.as_deref().ok_or(ThreadStateError::InvalidRow)?,
-                )
-                .map_err(|_| ThreadStateError::InvalidRow)?;
-                let title = if !normalized_name.is_empty() {
-                    normalized_name
-                } else if !normalized_preview.is_empty() {
-                    normalized_preview
-                } else {
-                    "アクティブなスレッド".to_owned()
-                };
+                    agent_path.as_deref(),
+                    agent_nickname.as_deref(),
+                )?;
                 let candidate = NativeThreadRow {
                     id: id.clone(),
+                    created_at,
                     updated_at: updated_at.ok_or(ThreadStateError::InvalidRow)?,
                     title,
                     rollout_path: canonical_rollout,
@@ -392,6 +494,7 @@ fn read_descendants(
                 };
                 if let Some(existing) = discovered_rows.get(&id) {
                     if existing.id != candidate.id
+                        || existing.created_at != candidate.created_at
                         || existing.updated_at != candidate.updated_at
                         || existing.title != candidate.title
                         || existing.rollout_path != candidate.rollout_path
@@ -418,6 +521,7 @@ fn read_descendants(
             let depth = i32::try_from(depth).map_err(|_| ThreadStateError::LimitExceeded)?;
             Ok(NativeThreadCandidate {
                 id: row.id,
+                created_at: row.created_at,
                 updated_at: row.updated_at,
                 title: row.title,
                 rollout_path: row.rollout_path,
@@ -497,11 +601,14 @@ mod tests {
                     "CREATE TABLE threads (
                         id TEXT PRIMARY KEY,
                         rollout_path TEXT NOT NULL,
+                        created_at INTEGER NOT NULL,
                         updated_at INTEGER NOT NULL,
                         archived INTEGER NOT NULL,
                         name TEXT,
                         preview TEXT NOT NULL,
-                        thread_source TEXT
+                        thread_source TEXT,
+                        agent_path TEXT,
+                        agent_nickname TEXT
                     );
                     CREATE TABLE thread_spawn_edges (
                         parent_thread_id TEXT NOT NULL,
@@ -522,8 +629,8 @@ mod tests {
             self.database()
                 .execute(
                     "INSERT INTO threads
-                     (id, rollout_path, updated_at, archived, name, preview, thread_source)
-                     VALUES (?1, ?2, ?3, 0, ?4, ?5, 'subagent')",
+                     (id, rollout_path, created_at, updated_at, archived, name, preview, thread_source)
+                     VALUES (?1, ?2, ?3, ?3, 0, ?4, ?5, 'subagent')",
                     params![
                         id,
                         rollout_path.to_string_lossy().as_ref(),
@@ -543,6 +650,15 @@ mod tests {
                     params![parent, child],
                 )
                 .expect("state fixture edge");
+        }
+
+        fn set_agent_metadata(&self, id: &str, path: Option<&str>, nickname: Option<&str>) {
+            self.database()
+                .execute(
+                    "UPDATE threads SET agent_path = ?2, agent_nickname = ?3 WHERE id = ?1",
+                    params![id, path, nickname],
+                )
+                .expect("state fixture agent metadata");
         }
 
         fn rollout(&self, id: &str) -> PathBuf {
@@ -590,6 +706,37 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![("child", "root", 1), ("grandchild", "child", 2)]
         );
+    }
+
+    #[test]
+    fn native_descendant_title_uses_agent_task_name_when_database_title_is_empty() {
+        let fixture = StateFixture::new();
+        let child_path = fixture.rollout("child");
+        fixture.add_thread("child", &child_path);
+        fixture
+            .database()
+            .execute(
+                "UPDATE threads SET name = '', preview = '' WHERE id = 'child'",
+                [],
+            )
+            .expect("clear state fixture title");
+        fixture.set_agent_metadata(
+            "child",
+            Some("/root/graph_period_final_audit_v2"),
+            Some("Einstein"),
+        );
+        fixture.add_edge("root", "child");
+
+        let descendants =
+            load_native_descendants(&fixture.root, &fixture.sessions, &fixture.roots(&["root"]))
+                .expect("descendant graph");
+        assert_eq!(descendants[0].title, "Graph period final audit v2");
+
+        fixture.set_agent_metadata("child", None, Some("Einstein"));
+        let descendants =
+            load_native_descendants(&fixture.root, &fixture.sessions, &fixture.roots(&["root"]))
+                .expect("descendant graph");
+        assert_eq!(descendants[0].title, "Einstein");
     }
 
     #[test]

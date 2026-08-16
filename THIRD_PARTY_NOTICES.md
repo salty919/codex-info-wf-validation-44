@@ -7,14 +7,14 @@ Copyright (C) 2026 salty919
 
 このリポジトリの独自コードと文書は、別途記載した第三者物を除き GPL-3.0-only で提供します。第三者物は、以下に記載する各上流ライセンスのままです。
 
-## Noto Sans JP
+## Noto Sans JP / Noto Sans CJK KR
 
-- 対象: `assets/NotoSansJP.ttf`
-- 著作権: Copyright 2022 The Noto Project Authors
-- フォント内の著作権・予約フォント名: `(c) 2014-2021 Adobe (http://www.adobe.com/), with Reserved Font Name 'Source'.`
+- 対象: `assets/NotoSansJP.ttf`、`assets/NotoSansKR.otf`
+- フォント内の著作権表示: `NotoSansJP.ttf`は`(c) 2014-2021 Adobe (http://www.adobe.com/), with Reserved Font Name 'Source'.`、`NotoSansKR.otf`は`© 2014-2021 Adobe (http://www.adobe.com/).`
 - ライセンス: SIL Open Font License, Version 1.1 (OFL-1.1)
-- このフォントは GPL-3.0-only の対象に取り込まず、OFL-1.1 のまま再配布します。全文は [LICENSES/OFL-1.1.txt](LICENSES/OFL-1.1.txt) を参照してください。
-- 出所: [Noto CJK](https://github.com/notofonts/noto-cjk)
+- フォントファイル自体は GPL-3.0-only へ再ライセンスせず、OFL-1.1 のまま同梱・再配布します。全文は [LICENSES/OFL-1.1.txt](LICENSES/OFL-1.1.txt) を参照してください。
+- `NotoSansKR.otf`は韓国語catalogの欠字を避けるために追加したNoto Sans CJK KRのRegularフォントです。日本語・韓国語以外のcatalogも、同梱フォントのLatin/CJKグリフを使用します。
+- 出所: [Noto Sans JP（Google Fonts）](https://github.com/google/fonts/tree/main/ofl/notosansjp)、[Noto Sans CJK KR 2.004](https://github.com/notofonts/noto-cjk/tree/Sans2.004)
 
 ## Codex CLI 生成プロトコルスキーマ
 

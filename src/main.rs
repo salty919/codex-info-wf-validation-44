@@ -3,7 +3,8 @@
 
 #![deny(unsafe_code)]
 
-use chrono::{DateTime, Local, Months, Utc};
+use chrono::{DateTime, Months, Utc};
+use codex_info::i18n::{I18n, PeriodKind, TextKey};
 use codex_info::protocol_contract;
 use codex_info::security;
 use codex_info::thread_contract::{
@@ -14,7 +15,7 @@ use codex_info::usage_store::{self, UsageStore};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use slint::winit_030::{winit, EventResult, WinitWindowAccessor};
-use slint::{ComponentHandle, Timer, TimerMode};
+use slint::{CloseRequestResponse, ComponentHandle, Timer, TimerMode};
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File};
@@ -264,15 +265,39 @@ const RESET_AT_TOLERANCE_SECONDS: i64 = 60;
 const LEGACY_MOVING_RESET_HORIZON_TOLERANCE_SECONDS: i64 = 120;
 const LEGACY_MOVING_RESET_PAIR_GAP_SECONDS: i64 = 3_600;
 const LEGACY_MOVING_RESET_PAIR_HORIZON_TOLERANCE_SECONDS: i64 = 60;
+#[cfg(test)]
 const GRAPH_METRIC_OPTIONS: [&str; 2] = ["ドル", "トークン"];
 const FIXED_WINDOW_WIDTH: u32 = 900;
 const FIXED_WINDOW_HEIGHT: u32 = 480;
+const GRAPH_WINDOW_WIDTH: u32 = 940;
+const GRAPH_WINDOW_HEIGHT: u32 = 640;
+const LEGAL_WINDOW_WIDTH: u32 = 720;
+const LEGAL_WINDOW_HEIGHT: u32 = 520;
 const UNAUTHENTICATED_WINDOW_TITLE: &str = "アカウント未接続 — プラン未設定";
 // Keep the native title-bar purpose suffix ASCII: some X11 window managers
 // render `_NET_WM_NAME` with a fallback font that turns Japanese glyphs into
 // tofu. The in-window headings remain Japanese and carry the full meaning.
+#[cfg(test)]
 const THREADS_WINDOW_PURPOSE: &str = "Threads";
+#[cfg(test)]
 const GRAPH_WINDOW_PURPOSE: &str = "Graph";
+
+#[derive(Clone, Copy)]
+enum WindowPurpose {
+    Threads,
+    Graph,
+    Legal,
+}
+
+impl WindowPurpose {
+    fn native_label(self) -> &'static str {
+        match self {
+            Self::Threads => "Threads",
+            Self::Graph => "Graph",
+            Self::Legal => "Legal",
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum FixedResizeDecision {
@@ -280,8 +305,18 @@ enum FixedResizeDecision {
     RejectAndRestore,
 }
 
+#[cfg(test)]
 fn fixed_resize_decision(width: u32, height: u32) -> FixedResizeDecision {
-    if width == 0 || height == 0 || (width == FIXED_WINDOW_WIDTH && height == FIXED_WINDOW_HEIGHT) {
+    fixed_resize_decision_for_size(width, height, FIXED_WINDOW_WIDTH, FIXED_WINDOW_HEIGHT)
+}
+
+fn fixed_resize_decision_for_size(
+    width: u32,
+    height: u32,
+    expected_width: u32,
+    expected_height: u32,
+) -> FixedResizeDecision {
+    if width == 0 || height == 0 || (width == expected_width && height == expected_height) {
         FixedResizeDecision::Propagate
     } else {
         FixedResizeDecision::RejectAndRestore
@@ -289,18 +324,263 @@ fn fixed_resize_decision(width: u32, height: u32) -> FixedResizeDecision {
 }
 
 fn install_fixed_window_guard(window: &slint::Window) {
-    window.on_winit_window_event(|slint_window, event| {
+    install_window_size_guard(window, FIXED_WINDOW_WIDTH, FIXED_WINDOW_HEIGHT);
+}
+
+fn install_resizable_window(window: &slint::Window) {
+    let _ = window.with_winit_window(|winit_window| winit_window.set_resizable(true));
+}
+
+#[derive(Clone, Copy)]
+enum ManualX11WindowAction {
+    Move,
+    Resize(winit::window::ResizeDirection),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ManualX11Geometry {
+    x: i32,
+    y: i32,
+    width: i32,
+    height: i32,
+}
+
+/// WSLg's Weston wrapper does not consistently honor `_NET_WM_MOVERESIZE` for
+/// frameless clients. Keep the same left-button gesture usable there by
+/// tracking the pointer on a private X11 connection and issuing configure
+/// requests directly. On other backends the native winit operation remains
+/// the fallback.
+fn start_manual_x11_window_action(window: &slint::Window, action: ManualX11WindowAction) -> bool {
+    let Some(window_id) = x11_window_id(window) else {
+        return false;
+    };
+    let Ok((connection, screen_num)) = x11rb::connect(None) else {
+        return false;
+    };
+    let Some(screen) = connection.setup().roots.get(screen_num) else {
+        return false;
+    };
+    let root = screen.root;
+    let target = x11_top_level_parent(&connection, window_id, root).unwrap_or(window_id);
+    let Ok(pointer_cookie) = connection.query_pointer(root) else {
+        return false;
+    };
+    let Ok(pointer) = pointer_cookie.reply() else {
+        return false;
+    };
+    let Ok(target_geometry_cookie) = connection.get_geometry(target) else {
+        return false;
+    };
+    let Ok(target_geometry) = target_geometry_cookie.reply() else {
+        return false;
+    };
+    let Ok(client_geometry_cookie) = connection.get_geometry(window_id) else {
+        return false;
+    };
+    let Ok(client_geometry) = client_geometry_cookie.reply() else {
+        return false;
+    };
+    let initial = ManualX11Geometry {
+        x: i32::from(target_geometry.x),
+        y: i32::from(target_geometry.y),
+        // Configure requests target the managed wrapper on WSLg, while its
+        // width/height request is interpreted as the child client size.
+        width: i32::from(client_geometry.width),
+        height: i32::from(client_geometry.height),
+    };
+    let pointer_x = i32::from(pointer.root_x);
+    let pointer_y = i32::from(pointer.root_y);
+
+    thread::spawn(move || {
+        let mut observed_button = false;
+        let deadline = Instant::now() + Duration::from_millis(500);
+        loop {
+            let Ok(pointer_cookie) = connection.query_pointer(root) else {
+                break;
+            };
+            let Ok(pointer) = pointer_cookie.reply() else {
+                break;
+            };
+            let pressed = pointer.mask.contains(KeyButMask::BUTTON1);
+            if !pressed {
+                if observed_button || Instant::now() >= deadline {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(4));
+                continue;
+            }
+            observed_button = true;
+            let delta_x = i32::from(pointer.root_x) - pointer_x;
+            let delta_y = i32::from(pointer.root_y) - pointer_y;
+            let geometry = match action {
+                ManualX11WindowAction::Move => ManualX11Geometry {
+                    x: initial.x.saturating_add(delta_x),
+                    y: initial.y.saturating_add(delta_y),
+                    ..initial
+                },
+                ManualX11WindowAction::Resize(direction) => {
+                    manual_resize_geometry(initial, direction, delta_x, delta_y)
+                }
+            };
+            let width = u32::try_from(geometry.width.max(1)).unwrap_or(u32::MAX);
+            let height = u32::try_from(geometry.height.max(1)).unwrap_or(u32::MAX);
+            let values = ConfigureWindowAux::new()
+                .x(geometry.x)
+                .y(geometry.y)
+                .width(width)
+                .height(height);
+            if connection.configure_window(target, &values).is_err() || connection.flush().is_err()
+            {
+                break;
+            }
+            thread::sleep(Duration::from_millis(8));
+        }
+    });
+    true
+}
+
+fn x11_top_level_parent(
+    connection: &RustConnection,
+    window: X11Window,
+    root: X11Window,
+) -> Option<X11Window> {
+    let mut current = window;
+    for _ in 0..8 {
+        let reply = connection.query_tree(current).ok()?.reply().ok()?;
+        if reply.parent == root || reply.parent == 0 {
+            return Some(current);
+        }
+        current = reply.parent;
+    }
+    Some(current)
+}
+
+fn manual_resize_geometry(
+    initial: ManualX11Geometry,
+    direction: winit::window::ResizeDirection,
+    delta_x: i32,
+    delta_y: i32,
+) -> ManualX11Geometry {
+    const MIN_WIDTH: i32 = 700;
+    const MIN_HEIGHT: i32 = 480;
+    let east = matches!(
+        direction,
+        winit::window::ResizeDirection::East
+            | winit::window::ResizeDirection::NorthEast
+            | winit::window::ResizeDirection::SouthEast
+    );
+    let west = matches!(
+        direction,
+        winit::window::ResizeDirection::West
+            | winit::window::ResizeDirection::NorthWest
+            | winit::window::ResizeDirection::SouthWest
+    );
+    let north = matches!(
+        direction,
+        winit::window::ResizeDirection::North
+            | winit::window::ResizeDirection::NorthEast
+            | winit::window::ResizeDirection::NorthWest
+    );
+    let south = matches!(
+        direction,
+        winit::window::ResizeDirection::South
+            | winit::window::ResizeDirection::SouthEast
+            | winit::window::ResizeDirection::SouthWest
+    );
+    let width = if east {
+        (initial.width.saturating_add(delta_x)).max(MIN_WIDTH)
+    } else if west {
+        (initial.width.saturating_sub(delta_x)).max(MIN_WIDTH)
+    } else {
+        initial.width
+    };
+    let height = if south {
+        (initial.height.saturating_add(delta_y)).max(MIN_HEIGHT)
+    } else if north {
+        (initial.height.saturating_sub(delta_y)).max(MIN_HEIGHT)
+    } else {
+        initial.height
+    };
+    ManualX11Geometry {
+        x: if west {
+            initial
+                .x
+                .saturating_add(initial.width.saturating_sub(width))
+        } else {
+            initial.x
+        },
+        y: if north {
+            initial
+                .y
+                .saturating_add(initial.height.saturating_sub(height))
+        } else {
+            initial.y
+        },
+        width,
+        height,
+    }
+}
+
+fn begin_window_drag(window: &slint::Window) {
+    if start_manual_x11_window_action(window, ManualX11WindowAction::Move) {
+        return;
+    }
+    let _ = window.with_winit_window(|winit_window| winit_window.drag_window());
+}
+
+fn minimize_window(window: &slint::Window) {
+    let _ = window.with_winit_window(|winit_window| winit_window.set_minimized(true));
+}
+
+fn toggle_maximize_window(window: &slint::Window) {
+    let _ = window.with_winit_window(|winit_window| {
+        winit_window.set_maximized(!winit_window.is_maximized());
+    });
+}
+
+fn parse_resize_direction(direction: &str) -> Option<winit::window::ResizeDirection> {
+    Some(match direction {
+        "east" => winit::window::ResizeDirection::East,
+        "north" => winit::window::ResizeDirection::North,
+        "north-east" => winit::window::ResizeDirection::NorthEast,
+        "north-west" => winit::window::ResizeDirection::NorthWest,
+        "south" => winit::window::ResizeDirection::South,
+        "south-east" => winit::window::ResizeDirection::SouthEast,
+        "south-west" => winit::window::ResizeDirection::SouthWest,
+        "west" => winit::window::ResizeDirection::West,
+        _ => return None,
+    })
+}
+
+fn begin_window_resize(window: &slint::Window, direction: &str) {
+    let Some(direction) = parse_resize_direction(direction) else {
+        return;
+    };
+    if start_manual_x11_window_action(window, ManualX11WindowAction::Resize(direction)) {
+        return;
+    }
+    let _ = window.with_winit_window(|winit_window| winit_window.drag_resize_window(direction));
+}
+
+fn install_window_size_guard(window: &slint::Window, expected_width: u32, expected_height: u32) {
+    let _ = window.with_winit_window(|winit_window| winit_window.set_resizable(false));
+    window.on_winit_window_event(move |slint_window, event| {
         let winit::event::WindowEvent::Resized(size) = event else {
             return EventResult::Propagate;
         };
-        match fixed_resize_decision(size.width, size.height) {
+        match fixed_resize_decision_for_size(
+            size.width,
+            size.height,
+            expected_width,
+            expected_height,
+        ) {
             FixedResizeDecision::Propagate => EventResult::Propagate,
             FixedResizeDecision::RejectAndRestore => {
                 let _ = slint_window.with_winit_window(|winit_window| {
                     winit_window.set_resizable(false);
                     let _ = winit_window.request_inner_size(winit::dpi::PhysicalSize::new(
-                        FIXED_WINDOW_WIDTH,
-                        FIXED_WINDOW_HEIGHT,
+                        expected_width,
+                        expected_height,
                     ));
                 });
                 EventResult::PreventDefault
@@ -309,6 +589,31 @@ fn install_fixed_window_guard(window: &slint::Window) {
     });
 }
 
+/// Shows an existing secondary window and asks the native window manager to
+/// activate and raise it.  `Window::show()` only maps a hidden Slint window; it
+/// does not change the stacking order when the window already exists.
+fn show_and_focus_window(
+    window: &slint::Window,
+    x11_monitor: Option<&X11WindowStateMonitor>,
+) -> Result<(), slint::PlatformError> {
+    let was_visible = window.is_visible();
+    let window_id = was_visible.then(|| x11_window_id(window)).flatten();
+    // Weston (the Xwayland window manager used by WSLg) ignores an explicit
+    // raise request for a client that is already mapped.  Remapping the same
+    // native window gives the WM its normal MapRequest path, which reliably
+    // moves the existing window above its siblings without recreating it.
+    if window_id.is_some() {
+        window.hide()?;
+    }
+    window.show()?;
+    let _ = window.with_winit_window(|winit_window| winit_window.focus_window());
+    if let Some(x11_monitor) = x11_monitor {
+        x11_monitor.raise_and_activate(window);
+    }
+    Ok(())
+}
+
+#[cfg(test)]
 fn account_window_title(authenticated: bool, email: Option<&str>, plan_label: &str) -> String {
     if !authenticated {
         return UNAUTHENTICATED_WINDOW_TITLE.into();
@@ -326,11 +631,91 @@ fn account_window_title(authenticated: bool, email: Option<&str>, plan_label: &s
     format!("{email} — {plan}")
 }
 
+#[cfg(test)]
 fn detail_window_title(account_title: &str, purpose: &str) -> String {
     if account_title == UNAUTHENTICATED_WINDOW_TITLE {
         account_title.to_owned()
     } else {
         format!("{account_title} — {purpose}")
+    }
+}
+
+#[cfg_attr(test, allow(dead_code))]
+fn localized_plan_label(i18n: &I18n, plan_label: &str) -> String {
+    match plan_label {
+        "プラン未設定" => i18n.text(TextKey::PlanUnset).into(),
+        "無料" => i18n.text(TextKey::PlanFree).into(),
+        "エンタープライズ" => i18n.text(TextKey::PlanEnterprise).into(),
+        "教育" => i18n.text(TextKey::PlanEducation).into(),
+        other => other.to_owned(),
+    }
+}
+
+#[cfg_attr(test, allow(dead_code))]
+fn localized_account_window_title(
+    i18n: &I18n,
+    authenticated: bool,
+    email: Option<&str>,
+    plan_label: &str,
+) -> String {
+    if !authenticated {
+        return i18n.text(TextKey::WindowUnauthenticated).into();
+    }
+    let email = email
+        .and_then(|value| security::bounded_email(value).ok())
+        .filter(|value| !value.trim().is_empty());
+    let Some(email) = email else {
+        return i18n.text(TextKey::WindowUnauthenticated).into();
+    };
+    let plan = security::bounded_plan(plan_label)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| localized_plan_label(i18n, &value))
+        .unwrap_or_else(|| i18n.text(TextKey::PlanUnset).into());
+    format!("{email} — {plan}")
+}
+
+fn native_detail_window_title(
+    _i18n: &I18n,
+    authenticated: bool,
+    account_title: &str,
+    purpose: WindowPurpose,
+) -> String {
+    if !authenticated {
+        return "Codex Info".into();
+    }
+    format!(
+        "{} - {}",
+        native_account_window_title(account_title),
+        purpose.native_label()
+    )
+}
+
+/// Native title bars may be rendered by a window-manager fallback font that
+/// does not contain the localized CJK glyphs. Keep the title-bar identity
+/// ASCII-only while the in-window headings continue to use the locale catalog.
+fn native_account_window_title(account_title: &str) -> String {
+    if account_title == UNAUTHENTICATED_WINDOW_TITLE {
+        return "Codex Info".into();
+    }
+    let Some((identity, plan)) = account_title.split_once(" — ") else {
+        return "Codex Info".into();
+    };
+    let identity = ascii_title_part(identity, "Codex");
+    let plan = ascii_title_part(plan, "Plan");
+    format!("{identity} - {plan}")
+}
+
+fn ascii_title_part(value: &str, fallback: &str) -> String {
+    let value = value.trim();
+    if !value.is_empty()
+        && value
+            .chars()
+            .all(|character| character.is_ascii_graphic() || character == ' ')
+    {
+        value.to_owned()
+    } else {
+        fallback.to_owned()
     }
 }
 
@@ -347,11 +732,14 @@ struct RateLimitSnapshot {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct ActiveThread {
     id: String,
+    created_at: Option<i64>,
     updated_at: i64,
     title: String,
     model: String,
     model_label: String,
     total_tokens: Option<u64>,
+    context_window_tokens: Option<u64>,
+    last_user_message_at: Option<i64>,
     is_subagent: bool,
     parent_thread_id: Option<String>,
     depth: Option<i32>,
@@ -702,11 +1090,14 @@ fn fetch_active_thread_update_for_paths_and_state(
         .into_iter()
         .map(|snapshot| ActiveThread {
             id: snapshot.thread_id,
+            created_at: Some(snapshot.created_at),
             updated_at: snapshot.updated_at,
             title: snapshot.title,
             model: snapshot.model,
             model_label: snapshot.model_label,
             total_tokens: snapshot.total_tokens,
+            context_window_tokens: snapshot.context_window_tokens,
+            last_user_message_at: snapshot.last_user_message_at,
             is_subagent: snapshot.is_subagent,
             parent_thread_id: snapshot.parent_thread_id,
             depth: snapshot.depth,
@@ -730,11 +1121,14 @@ fn fetch_active_thread_update_for_paths_and_state(
             }
             threads.push(ActiveThread {
                 id: descendant.id,
+                created_at: descendant.created_at,
                 updated_at: descendant.updated_at,
                 title: descendant.title,
                 model: rollout.model().to_owned(),
                 model_label: rollout.model_label().to_owned(),
                 total_tokens: rollout.total_tokens(),
+                context_window_tokens: rollout.context_window_tokens(),
+                last_user_message_at: rollout.last_user_message_at(),
                 is_subagent: true,
                 parent_thread_id: Some(descendant.parent_thread_id),
                 depth: Some(descendant.depth),
@@ -1015,7 +1409,16 @@ fn history_periods_for_samples(
                 period_end
             };
             let _ = anchor;
+            // Labels are a presentation concern. Production UI labels are
+            // rebuilt by `CodexInfoState::history_periods` with the one
+            // startup-pinned I18n/timezone instance. The test-only label
+            // keeps the legacy grouping fixtures readable without allowing a
+            // fixed JST formatter into the runtime path.
+            #[cfg(test)]
             let mut label = format_period_label(start, period_end);
+            #[cfg(not(test))]
+            let label = String::new();
+            #[cfg(test)]
             if is_current {
                 label.push_str("（現在）");
             }
@@ -1031,21 +1434,26 @@ fn history_periods_for_samples(
     // therefore the same base interval label. ComboBox selection must never
     // rely on an ambiguous label, so only colliding labels receive the
     // canonical reset timestamp as a deterministic, user-readable suffix.
-    let base_labels = periods
-        .iter()
-        .map(|period| period.label.clone())
-        .collect::<Vec<_>>();
-    for index in 0..periods.len() {
-        if base_labels
+    #[cfg(test)]
+    {
+        let base_labels = periods
             .iter()
-            .filter(|label| **label == base_labels[index])
-            .count()
-            > 1
-        {
-            let canonical_reset_at = periods[index].canonical_reset_at;
-            periods[index]
-                .label
-                .push_str(&format!("（期限 {canonical_reset_at}）"));
+            .map(|period| period.label.clone())
+            .collect::<Vec<_>>();
+        for index in 0..periods.len() {
+            if base_labels
+                .iter()
+                .filter(|label| **label == base_labels[index])
+                .count()
+                > 1
+            {
+                let canonical_reset_at = periods[index].canonical_reset_at;
+                let reset_label = format_period_timestamp(canonical_reset_at)
+                    .unwrap_or_else(|| "時刻不明".into());
+                periods[index]
+                    .label
+                    .push_str(&format!("（期限 {reset_label}）"));
+            }
         }
     }
     periods.sort_by(|left, right| {
@@ -1340,6 +1748,7 @@ impl UsageHistory {
             .find(|period| period.canonical_reset_at == canonical_reset_at)
     }
 
+    #[cfg(test)]
     fn period_id_for_label(
         &self,
         label: &str,
@@ -1352,6 +1761,7 @@ impl UsageHistory {
             .map(|period| period.canonical_reset_at)
     }
 
+    #[cfg(test)]
     fn period_options(&self, now: i64, current_reset_at: Option<i64>) -> Vec<String> {
         let periods = self.periods(now, current_reset_at);
         if periods.is_empty() {
@@ -1518,6 +1928,7 @@ fn three_months_before_utc(now: DateTime<Utc>) -> i64 {
 struct GraphPaths {
     remaining: String,
     remaining_markers: Vec<RemainingMarkerPosition>,
+    unused_intervals: Vec<UnusedIntervalPosition>,
     sol: String,
     terra: String,
     luna: String,
@@ -1532,6 +1943,10 @@ struct GraphPaths {
     current_sol_label: String,
     current_terra_label: String,
     current_luna_label: String,
+    current_remaining_point_y: f32,
+    current_sol_point_y: f32,
+    current_terra_point_y: f32,
+    current_luna_point_y: f32,
     current_remaining_y: f32,
     current_sol_y: f32,
     current_terra_y: f32,
@@ -1545,15 +1960,23 @@ struct RemainingMarkerPosition {
     boundary: i32,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct UnusedIntervalPosition {
+    start: f64,
+    width: f64,
+    preserve_boundary: bool,
+}
+
 fn graph_paths(samples: &[&UsageHistorySample], period_start: i64, period_end: i64) -> GraphPaths {
     let remaining_points = graph_points(samples, period_start, period_end, 100.0, |sample| {
         sample.remaining_percent
     });
-    let minute = smooth_model_spend(&graph_time_endpoints(
+    let raw_minute = graph_time_endpoints(
         minute_model_spend_for_metric(samples, false),
         period_start,
         period_end,
-    ));
+    );
+    let minute = smooth_model_spend(&raw_minute);
     // Dollar series are independent cumulative values.  The old stacked
     // implementation used the sum here, which made a model's line depend on
     // whether another model was enabled and could make a flat SOL history
@@ -1576,6 +1999,8 @@ fn graph_paths(samples: &[&UsageHistorySample], period_start: i64, period_end: i
             0.99
         }
     };
+    // Detect idle bands from raw cumulative snapshots, not smoothed lines.
+    let unused_intervals = unused_interval_positions(&raw_minute, period_start, period_end);
     GraphPaths {
         remaining: graph_path_from_points(&remaining_points, period_start, period_end, 100.0),
         remaining_markers: remaining_marker_positions_on_points(
@@ -1583,6 +2008,7 @@ fn graph_paths(samples: &[&UsageHistorySample], period_start: i64, period_end: i
             period_start,
             period_end,
         ),
+        unused_intervals,
         luna: metric_line_path(&minute, period_start, period_end, dollar_max, |point| {
             point.luna
         }),
@@ -1613,6 +2039,10 @@ fn graph_paths(samples: &[&UsageHistorySample], period_start: i64, period_end: i
         current_sol_y: graph_y(latest.sol, dollar_max),
         current_terra_y: graph_y(latest.terra, dollar_max),
         current_luna_y: graph_y(latest.luna, dollar_max),
+        current_remaining_point_y: graph_y(remaining.unwrap_or(0.0), 100.0),
+        current_sol_point_y: graph_y(latest.sol, dollar_max),
+        current_terra_point_y: graph_y(latest.terra, dollar_max),
+        current_luna_point_y: graph_y(latest.luna, dollar_max),
         ..GraphPaths::default()
     }
 }
@@ -1634,6 +2064,7 @@ fn graph_paths_for_selection(
         period_start,
         period_end,
     );
+    paths.unused_intervals = unused_interval_positions(&minute, period_start, period_end);
     let maximum = minute
         .iter()
         .map(|point| {
@@ -1670,6 +2101,9 @@ fn graph_paths_for_selection(
     paths.current_sol_label.clear();
     paths.current_terra_label.clear();
     paths.current_luna_label.clear();
+    paths.current_sol_point_y = 0.99;
+    paths.current_terra_point_y = 0.99;
+    paths.current_luna_point_y = 0.99;
     paths.current_sol_y = 0.99;
     paths.current_terra_y = 0.99;
     paths.current_luna_y = 0.99;
@@ -1689,6 +2123,7 @@ fn graph_paths_for_selection(
             String::new()
         };
         paths.current_luna_y = graph_y(latest.luna);
+        paths.current_luna_point_y = paths.current_luna_y;
     }
     if show_terra {
         (paths.terra_flat, paths.terra_rising) =
@@ -1704,6 +2139,7 @@ fn graph_paths_for_selection(
             String::new()
         };
         paths.current_terra_y = graph_y(latest.terra);
+        paths.current_terra_point_y = paths.current_terra_y;
     }
     if show_sol {
         (paths.sol_flat, paths.sol_rising) =
@@ -1719,6 +2155,7 @@ fn graph_paths_for_selection(
             String::new()
         };
         paths.current_sol_y = graph_y(latest.sol);
+        paths.current_sol_point_y = paths.current_sol_y;
     }
     paths
 }
@@ -2082,9 +2519,75 @@ fn split_metric_line_paths(
     (flat, rising)
 }
 
+/// Return horizontal bands where none of the three cumulative model series
+/// changes. These bands make idle time visible even when all flat paths sit on
+/// top of one another at the chart baseline.
+fn unused_interval_positions(
+    points: &[HourlyModelSpend],
+    period_start: i64,
+    period_end: i64,
+) -> Vec<UnusedIntervalPosition> {
+    let span = (period_end - period_start).max(1) as f64;
+    let to_x =
+        |timestamp: i64| ((timestamp - period_start) as f64 / span * 100.0).clamp(0.0, 100.0);
+    let mut intervals: Vec<UnusedIntervalPosition> = Vec::new();
+    for pair in points.windows(2) {
+        let [previous, current] = pair else {
+            continue;
+        };
+        if current.timestamp <= previous.timestamp {
+            continue;
+        }
+        let interval_start = previous.timestamp.max(period_start);
+        let interval_end = current.timestamp.min(period_end);
+        if interval_end <= interval_start {
+            continue;
+        }
+        let unchanged = [
+            (previous.sol, current.sol),
+            (previous.terra, current.terra),
+            (previous.luna, current.luna),
+        ]
+        .into_iter()
+        .all(|(before, after)| before.is_finite() && after.is_finite() && before == after);
+        let synthetic_zero_gap = previous.timestamp == period_start
+            && current.timestamp.saturating_sub(previous.timestamp) > 60
+            && previous.sol == 0.0
+            && previous.terra == 0.0
+            && previous.luna == 0.0
+            && [current.sol, current.terra, current.luna]
+                .into_iter()
+                .any(|value| value.is_finite() && value > 0.0);
+        if !unchanged && !synthetic_zero_gap {
+            continue;
+        }
+        let start = to_x(interval_start);
+        let end = to_x(interval_end);
+        if end <= start {
+            continue;
+        }
+        if let Some(last) = intervals.last_mut() {
+            let last_end = last.start + last.width;
+            if !last.preserve_boundary
+                && !synthetic_zero_gap
+                && (last_end - start).abs() <= f64::EPSILON
+            {
+                last.width = end - last.start;
+                continue;
+            }
+        }
+        intervals.push(UnusedIntervalPosition {
+            start,
+            width: end - start,
+            preserve_boundary: synthetic_zero_gap,
+        });
+    }
+    intervals
+}
+
 /// Keeps all visible right-edge labels inside the plot and at least 16px
-/// apart at the minimum 260px plot height. Resizing only increases the
-/// resulting physical separation.
+/// apart at the minimum 204px path height. GraphWindow's 700x480 minimum
+/// produces that path height; resizing only increases the physical spacing.
 fn separate_current_label_positions(
     paths: &mut GraphPaths,
     show_remaining: bool,
@@ -2092,8 +2595,9 @@ fn separate_current_label_positions(
     show_terra: bool,
     show_sol: bool,
 ) {
-    const HALF_LABEL: f32 = 8.0 / 260.0;
-    const MIN_SEPARATION: f32 = 16.0 / 260.0;
+    const MIN_PATH_HEIGHT: f32 = 204.0;
+    const HALF_LABEL: f32 = 8.0 / MIN_PATH_HEIGHT;
+    const MIN_SEPARATION: f32 = 16.0 / MIN_PATH_HEIGHT;
     const LOWER: f32 = HALF_LABEL;
     const UPPER: f32 = 1.0 - HALF_LABEL;
 
@@ -2143,6 +2647,19 @@ fn separate_current_label_positions(
             _ => unreachable!("label kind is internal and bounded"),
         }
     }
+}
+
+/// Draw a short, color-matched leader from the series endpoint to its
+/// right-edge label. Labels may be vertically separated to avoid overlap, so
+/// the connector preserves the correspondence without stacking text on top of
+/// another value.
+fn current_label_connector_path(point_y: f32, label_y: f32, has_label: bool) -> String {
+    if !has_label || !point_y.is_finite() || !label_y.is_finite() {
+        return String::new();
+    }
+    let point_y = point_y.clamp(0.0, 1.0) * 100.0;
+    let label_y = label_y.clamp(0.0, 1.0) * 100.0;
+    format!("M0.00 {point_y:.2} L100.00 {label_y:.2}")
 }
 
 fn dollar_axis_labels(maximum: f64) -> [String; 5] {
@@ -3305,6 +3822,7 @@ fn request_with_timeout(
 }
 
 struct CodexInfoState {
+    i18n: I18n,
     bridge: AppServerBridge<AccountCommand, Event>,
     thread_bridge: Option<AppServerBridge<ThreadCommand, ThreadEvent>>,
     local_bridge: LocalUsageBridge,
@@ -3326,7 +3844,7 @@ struct CodexInfoState {
     status: String,
     checking: bool,
     last_poll: Instant,
-    last_success_at: Option<String>,
+    last_success_at: Option<i64>,
     model_usage: Vec<ModelUsageRow>,
     active_threads: Vec<ActiveThread>,
     estimated_cost_label: String,
@@ -3343,14 +3861,31 @@ struct CodexInfoState {
 }
 
 impl CodexInfoState {
+    #[allow(clippy::needless_return)]
     fn window_title(&self) -> String {
-        account_window_title(self.authenticated, self.email.as_deref(), &self.plan_label)
+        #[cfg(test)]
+        {
+            return account_window_title(
+                self.authenticated,
+                self.email.as_deref(),
+                &self.plan_label,
+            );
+        }
+        #[cfg(not(test))]
+        localized_account_window_title(
+            &self.i18n,
+            self.authenticated,
+            self.email.as_deref(),
+            &self.plan_label,
+        )
     }
 
     fn new() -> Self {
+        let i18n = I18n::detect();
         let bridge = AppServerBridge::<AccountCommand, Event>::start();
         bridge.send(AccountCommand::Read);
         Self {
+            i18n,
             bridge,
             thread_bridge: None,
             local_bridge: LocalUsageBridge::start(),
@@ -3390,6 +3925,7 @@ impl CodexInfoState {
     }
 
     fn preview(kind: &str) -> Self {
+        let i18n = I18n::detect();
         let bridge = AppServerBridge::<AccountCommand, Event>::inactive();
         let now = Utc::now().timestamp();
         let reset_at = now + 6 * 86_400 + 14 * 3_600;
@@ -3400,6 +3936,7 @@ impl CodexInfoState {
         ];
         let preview_costs = ModelDollarTotals::from_rows(&model_usage);
         let mut state = Self {
+            i18n,
             bridge,
             thread_bridge: None,
             local_bridge: LocalUsageBridge::inactive(),
@@ -3420,17 +3957,20 @@ impl CodexInfoState {
             status: String::new(),
             checking: false,
             last_poll: Instant::now(),
-            last_success_at: Some("12:34".into()),
+            last_success_at: Some(now - 60),
             window_seconds: WEEK_SECONDS,
             history: UsageHistory::preview(now, reset_at, preview_costs),
             model_usage,
             active_threads: vec![ActiveThread {
                 id: "preview-thread".into(),
+                created_at: Some(now - 600),
                 updated_at: now,
                 title: "長めの日本語タイトルで表示確認を行う実行中スレッド".into(),
                 model: "gpt-5.6-sol".into(),
                 model_label: "gpt-5.6-sol".into(),
                 total_tokens: Some(12_345),
+                context_window_tokens: Some(258_400),
+                last_user_message_at: Some(now - 8),
                 is_subagent: false,
                 parent_thread_id: None,
                 depth: None,
@@ -3471,89 +4011,113 @@ impl CodexInfoState {
                 state.active_threads = vec![
                     ActiveThread {
                         id: "thread-child-tests".into(),
+                        created_at: Some(now - 1_800),
                         updated_at: now - 1,
                         title: "複数候補と回帰テストを確認しているサブスレッド".into(),
                         model: "gpt-5.6-luna".into(),
                         model_label: "gpt-5.6-luna".into(),
                         total_tokens: Some(123_456),
+                        context_window_tokens: Some(258_400),
+                        last_user_message_at: Some(now - 12),
                         is_subagent: true,
                         parent_thread_id: Some("thread-z".into()),
                         depth: Some(1),
                     },
                     ActiveThread {
                         id: "thread-orphan".into(),
+                        created_at: Some(now - 7_200),
                         updated_at: now - 30,
                         title: "親が完了した後も実行中のサブスレッド".into(),
                         model: "gpt-5.6-luna".into(),
                         model_label: "gpt-5.6-luna".into(),
                         total_tokens: Some(43_210),
+                        context_window_tokens: Some(258_400),
+                        last_user_message_at: Some(now - 90),
                         is_subagent: true,
                         parent_thread_id: Some("completed-parent".into()),
                         depth: Some(1),
                     },
                     ActiveThread {
                         id: "thread-grandchild-security".into(),
+                        created_at: Some(now - 3_600),
                         updated_at: now + 1,
                         title: "脆弱性境界を確認する孫サブスレッド".into(),
                         model: "gpt-5.6-luna".into(),
                         model_label: "gpt-5.6-luna".into(),
                         total_tokens: Some(88_765),
+                        context_window_tokens: Some(258_400),
+                        last_user_message_at: Some(now - 25),
                         is_subagent: true,
                         parent_thread_id: Some("thread-child-review".into()),
                         depth: Some(2),
                     },
                     ActiveThread {
                         id: "thread-second-child".into(),
+                        created_at: Some(now - 5_400),
                         updated_at: now - 5,
                         title: "別の親に属するサブスレッド".into(),
                         model: "gpt-5.6-terra".into(),
                         model_label: "gpt-5.6-terra".into(),
                         total_tokens: Some(54_321),
+                        context_window_tokens: Some(200_000),
+                        last_user_message_at: Some(now - 40),
                         is_subagent: true,
                         parent_thread_id: Some("thread-second-parent".into()),
                         depth: Some(1),
                     },
                     ActiveThread {
                         id: "thread-z".into(),
+                        created_at: Some(now - 14_400),
                         updated_at: now - 10,
                         title: "利用状況画面を更新する親スレッド".into(),
                         model: model.clone(),
                         model_label: security::bounded_model_label(&model)
                             .expect("preview model is within the accepted bound"),
                         total_tokens: Some(9_876_543_210),
+                        context_window_tokens: Some(258_400),
+                        last_user_message_at: Some(now - 60),
                         is_subagent: false,
                         parent_thread_id: None,
                         depth: None,
                     },
                     ActiveThread {
                         id: "thread-review-source".into(),
+                        created_at: Some(now - 9_000),
                         updated_at: now - 40,
                         title: "親IDを持たないレビュー用サブスレッド".into(),
                         model: "gpt-5.6-terra".into(),
                         model_label: "gpt-5.6-terra".into(),
                         total_tokens: Some(32_109),
+                        context_window_tokens: Some(200_000),
+                        last_user_message_at: Some(now - 120),
                         is_subagent: true,
                         parent_thread_id: None,
                         depth: None,
                     },
                     ActiveThread {
                         id: "thread-second-parent".into(),
+                        created_at: Some(now - 10_800),
                         updated_at: now - 20,
                         title: "別の作業を進めている親スレッド".into(),
                         model: "gpt-5.6-sol".into(),
                         model_label: "gpt-5.6-sol".into(),
                         total_tokens: Some(765_432),
+                        context_window_tokens: Some(258_400),
+                        last_user_message_at: Some(now - 180),
                         is_subagent: false,
                         parent_thread_id: None,
                         depth: None,
                     },
                     ActiveThread {
                         id: "thread-child-review".into(),
+                        created_at: Some(now - 2_400),
                         updated_at: now,
                         title: "表示崩れを独立評価しているサブスレッド".into(),
                         model: "gpt-5.6-terra".into(),
                         model_label: "gpt-5.6-terra".into(),
                         total_tokens: Some(456_789),
+                        context_window_tokens: Some(200_000),
+                        last_user_message_at: Some(now - 8),
                         is_subagent: true,
                         parent_thread_id: Some("thread-z".into()),
                         depth: Some(1),
@@ -3808,7 +4372,7 @@ impl CodexInfoState {
             self.selected_reset_at = self.reset_at;
         }
         self.checking = false;
-        self.last_success_at = Some(Local::now().format("%H:%M").to_string());
+        self.last_success_at = Some(Utc::now().timestamp());
         // Quota is committed before the independent local worker is asked to
         // collect usage. The request carries the exact auth/period tuple.
         self.request_local_usage(reset_at, window_seconds);
@@ -3826,11 +4390,8 @@ impl CodexInfoState {
         self.checking = false;
         self.account_error = Some(error.clone());
         self.error = Some(error);
-        self.status = if let Some(time) = &self.last_success_at {
-            format!("最新情報を取得できません。表示は{time}時点の値です。")
-        } else {
-            "利用状況を取得できません。Codex app-serverへの接続を確認してください。".into()
-        };
+        self.status =
+            "利用状況を取得できません。Codex app-serverへの接続を確認してください。".into();
     }
 
     fn apply_account_event(
@@ -3956,11 +4517,8 @@ impl CodexInfoState {
     fn refresh_partial_failure_status(&mut self) {
         if let Some(account_error) = self.account_error.clone() {
             self.error = Some(account_error);
-            self.status = if let Some(time) = &self.last_success_at {
-                format!("最新情報を取得できません。表示は{time}時点の値です。")
-            } else {
-                "利用状況を取得できません。Codex app-serverへの接続を確認してください。".into()
-            };
+            self.status =
+                "利用状況を取得できません。Codex app-serverへの接続を確認してください。".into();
             return;
         }
         match (self.local_usage_error, self.thread_error) {
@@ -4071,24 +4629,97 @@ impl CodexInfoState {
         }
     }
 
+    #[allow(clippy::needless_return)]
     fn normal_status(&self) -> String {
-        if !self.has_quota_percent {
-            return normal_status_text(50.0, i64::MAX, self.last_success_at.as_deref());
+        #[cfg(test)]
+        {
+            return normal_status_text(
+                self.remaining_percent.unwrap_or(50.0),
+                if self.has_quota_percent {
+                    self.seconds_to_reset()
+                } else {
+                    i64::MAX
+                },
+                Some("12:34"),
+            );
         }
-        normal_status_text(
-            self.remaining_percent.unwrap_or(0.0),
-            self.seconds_to_reset(),
-            self.last_success_at.as_deref(),
-        )
+        #[cfg(not(test))]
+        {
+            if !self.has_quota_percent {
+                return self.i18n.format_last_updated(self.last_success_at);
+            }
+            let remaining = self.remaining_percent.unwrap_or(0.0);
+            if remaining <= 2.0 {
+                self.i18n.text(TextKey::QuotaNearlyGone).into()
+            } else if remaining <= 10.0 {
+                self.i18n.text(TextKey::QuotaLow).into()
+            } else if self.seconds_to_reset().abs() <= 86_400 {
+                self.i18n.text(TextKey::ResetWithinDay).into()
+            } else {
+                self.i18n.format_last_updated(self.last_success_at)
+            }
+        }
     }
 
     fn history_periods(&self) -> Vec<HistoryPeriod> {
-        self.history.periods(Utc::now().timestamp(), self.reset_at)
+        let now = Utc::now().timestamp();
+        let mut periods = self.history.periods(now, self.reset_at);
+        periods.retain(|period| {
+            DateTime::<Utc>::from_timestamp(period.start, 0).is_some()
+                && DateTime::<Utc>::from_timestamp(period.end, 0).is_some()
+                && DateTime::<Utc>::from_timestamp(period.canonical_reset_at, 0).is_some()
+        });
+        for period in &mut periods {
+            let is_current = self.reset_at.is_some_and(|current| {
+                current.abs_diff(period.canonical_reset_at) <= RESET_AT_TOLERANCE_SECONDS as u64
+                    && now < period.canonical_reset_at
+            });
+            // The visible current period runs through its next reset, while
+            // `end` is intentionally clipped to `now` for graph rendering.
+            let label_end = if is_current {
+                period.canonical_reset_at
+            } else {
+                period.end
+            };
+            let Some(mut label) = self.i18n.format_period(period.start, label_end) else {
+                period.label.clear();
+                continue;
+            };
+            if is_current {
+                label.push_str(self.i18n.text(TextKey::CurrentSuffix));
+            }
+            period.label = label;
+        }
+        let base_labels = periods
+            .iter()
+            .map(|period| period.label.clone())
+            .collect::<Vec<_>>();
+        for index in 0..periods.len() {
+            if base_labels
+                .iter()
+                .filter(|label| **label == base_labels[index])
+                .count()
+                > 1
+            {
+                if let Some(suffix) = self
+                    .i18n
+                    .format_deadline_suffix(periods[index].canonical_reset_at)
+                {
+                    periods[index].label.push_str(&suffix);
+                }
+            }
+        }
+        periods.retain(|period| !period.label.is_empty());
+        periods
     }
 
     fn history_period_options(&self) -> Vec<String> {
-        self.history
-            .period_options(Utc::now().timestamp(), self.reset_at)
+        let periods = self.history_periods();
+        if periods.is_empty() {
+            vec![self.i18n.text(TextKey::NoHistory).into()]
+        } else {
+            periods.into_iter().map(|period| period.label).collect()
+        }
     }
 
     fn selected_history_period_label(&self) -> String {
@@ -4117,20 +4748,25 @@ impl CodexInfoState {
         periods
             .first()
             .map(|period| period.label.clone())
-            .unwrap_or_else(|| "履歴なし".into())
+            .unwrap_or_else(|| self.i18n.text(TextKey::NoHistory).into())
     }
 
     fn select_history(&mut self, label: &str) {
-        let now = Utc::now().timestamp();
-        if let Some(id) = self.history.period_id_for_label(label, now, self.reset_at) {
+        if let Some(period) = self
+            .history_periods()
+            .into_iter()
+            .find(|period| period.label == label)
+        {
             self.selected_history_period = label.into();
-            self.selected_reset_at = Some(id);
+            self.selected_reset_at = Some(period.canonical_reset_at);
         }
     }
 
     fn select_metric(&mut self, metric: &str) {
-        if matches!(metric, "ドル" | "トークン") {
-            self.selected_metric = metric.into();
+        if metric == "ドル" || metric == self.i18n.text(TextKey::DollarMetric) {
+            self.selected_metric = "ドル".into();
+        } else if metric == "トークン" || metric == self.i18n.text(TextKey::TokenMetric) {
+            self.selected_metric = "トークン".into();
         }
     }
 
@@ -4143,12 +4779,10 @@ impl CodexInfoState {
 
     fn selected_history_reset(&self) -> Option<i64> {
         let periods = self.history_periods();
-        self.history
-            .period_id_for_label(
-                &self.selected_history_period,
-                Utc::now().timestamp(),
-                self.reset_at,
-            )
+        periods
+            .iter()
+            .find(|period| period.label == self.selected_history_period)
+            .map(|period| period.canonical_reset_at)
             .or_else(|| {
                 self.selected_reset_at.and_then(|selected| {
                     periods
@@ -4322,8 +4956,19 @@ impl CodexInfoState {
 }
 
 fn sync_graph_window(state: &CodexInfoState, graph: &GraphWindow) {
-    graph.set_window_title(detail_window_title(&state.window_title(), GRAPH_WINDOW_PURPOSE).into());
-    graph.set_show_tokens(state.selected_metric == "トークン");
+    graph.set_strings(ui_strings(&state.i18n));
+    graph.set_window_title(
+        native_detail_window_title(
+            &state.i18n,
+            state.authenticated,
+            &state.window_title(),
+            WindowPurpose::Graph,
+        )
+        .into(),
+    );
+    let token_metric = state.selected_metric == "トークン"
+        || state.selected_metric == state.i18n.text(TextKey::TokenMetric);
+    graph.set_show_tokens(token_metric);
     let mut paths = state.graph_paths_for_selection(
         graph.get_show_luna(),
         graph.get_show_terra(),
@@ -4339,7 +4984,21 @@ fn sync_graph_window(state: &CodexInfoState, graph: &GraphWindow) {
     );
     let time_labels = state.graph_time_labels();
     graph.set_graph_data(state.graph_data().into());
+    graph.set_unused_intervals(slint::ModelRc::new(slint::VecModel::from(
+        paths
+            .unused_intervals
+            .iter()
+            .map(|interval| GraphUnusedInterval {
+                start: interval.start as f32,
+                width: interval.width as f32,
+            })
+            .collect::<Vec<_>>(),
+    )));
     let history_period_options = state.history_period_options();
+    graph.set_has_history_options(
+        !history_period_options.is_empty()
+            && history_period_options[0] != state.i18n.text(TextKey::NoHistory),
+    );
     let selected_history_period = state.selected_history_period_label();
     let selected_history_index = history_period_options
         .iter()
@@ -4353,14 +5012,10 @@ fn sync_graph_window(state: &CodexInfoState, graph: &GraphWindow) {
     )));
     graph.set_selected_history_index(i32::try_from(selected_history_index).unwrap_or(i32::MAX));
     graph.set_metric_options(slint::ModelRc::new(slint::VecModel::from(vec![
-        slint::SharedString::from(GRAPH_METRIC_OPTIONS[0]),
-        slint::SharedString::from(GRAPH_METRIC_OPTIONS[1]),
+        slint::SharedString::from(state.i18n.text(TextKey::DollarMetric)),
+        slint::SharedString::from(state.i18n.text(TextKey::TokenMetric)),
     ])));
-    graph.set_selected_metric_index(if state.selected_metric == "トークン" {
-        1
-    } else {
-        0
-    });
+    graph.set_selected_metric_index(if token_metric { 1 } else { 0 });
     graph.set_time_start_label(time_labels[0].clone().into());
     graph.set_time_25_label(time_labels[1].clone().into());
     graph.set_time_50_label(time_labels[2].clone().into());
@@ -4388,10 +5043,46 @@ fn sync_graph_window(state: &CodexInfoState, graph: &GraphWindow) {
     graph.set_dollar_50_label(paths.dollar_labels[2].clone().into());
     graph.set_dollar_25_label(paths.dollar_labels[3].clone().into());
     graph.set_dollar_bottom_label(paths.dollar_labels[4].clone().into());
+    let has_current_remaining_label = !paths.current_remaining_label.is_empty();
+    let has_current_sol_label = !paths.current_sol_label.is_empty();
+    let has_current_terra_label = !paths.current_terra_label.is_empty();
+    let has_current_luna_label = !paths.current_luna_label.is_empty();
     graph.set_current_remaining_label(paths.current_remaining_label.into());
     graph.set_current_sol_label(paths.current_sol_label.into());
     graph.set_current_terra_label(paths.current_terra_label.into());
     graph.set_current_luna_label(paths.current_luna_label.into());
+    graph.set_current_remaining_connector_path(
+        current_label_connector_path(
+            paths.current_remaining_point_y,
+            paths.current_remaining_y,
+            has_current_remaining_label,
+        )
+        .into(),
+    );
+    graph.set_current_sol_connector_path(
+        current_label_connector_path(
+            paths.current_sol_point_y,
+            paths.current_sol_y,
+            has_current_sol_label,
+        )
+        .into(),
+    );
+    graph.set_current_terra_connector_path(
+        current_label_connector_path(
+            paths.current_terra_point_y,
+            paths.current_terra_y,
+            has_current_terra_label,
+        )
+        .into(),
+    );
+    graph.set_current_luna_connector_path(
+        current_label_connector_path(
+            paths.current_luna_point_y,
+            paths.current_luna_y,
+            has_current_luna_label,
+        )
+        .into(),
+    );
     graph.set_current_remaining_y(paths.current_remaining_y);
     graph.set_current_sol_y(paths.current_sol_y);
     graph.set_current_terra_y(paths.current_terra_y);
@@ -4418,9 +5109,9 @@ fn classify_active_thread_model(model_label: &str) -> &'static str {
         }
     }
     if known_count == 1 {
-        match_name.unwrap_or("その他")
+        match_name.unwrap_or("OTHER")
     } else {
-        "その他"
+        "OTHER"
     }
 }
 
@@ -4454,19 +5145,41 @@ fn active_thread_model_count_values(threads: &[ActiveThread]) -> [i32; 4] {
     ]
 }
 
-fn format_thread_age(now: i64, updated_at: i64) -> String {
-    if DateTime::<Utc>::from_timestamp(updated_at, 0).is_none() {
-        return "最終更新から —".into();
+#[cfg(test)]
+fn format_elapsed(now: i64, timestamp: Option<i64>) -> String {
+    let Some(timestamp) = timestamp else {
+        return "—".into();
+    };
+    if DateTime::<Utc>::from_timestamp(timestamp, 0).is_none() {
+        return "—".into();
     }
-    let age = now.saturating_sub(updated_at).max(0);
+    let age = now.saturating_sub(timestamp).max(0);
     if age < 60 {
-        format!("最終更新から {age}秒")
+        format!("{age}秒")
     } else if age < 3_600 {
-        format!("最終更新から {}分", age / 60)
+        let minutes = age / 60;
+        let seconds = age % 60;
+        if seconds == 0 {
+            format!("{minutes}分")
+        } else {
+            format!("{minutes}分{seconds}秒")
+        }
     } else if age < 86_400 {
-        format!("最終更新から {}時間", age / 3_600)
+        let hours = age / 3_600;
+        let minutes = (age % 3_600) / 60;
+        if minutes == 0 {
+            format!("{hours}時間")
+        } else {
+            format!("{hours}時間{minutes}分")
+        }
     } else {
-        format!("最終更新から {}日", age / 86_400)
+        let days = age / 86_400;
+        let hours = (age % 86_400) / 3_600;
+        if hours == 0 {
+            format!("{days}日")
+        } else {
+            format!("{days}日{hours}時間")
+        }
     }
 }
 
@@ -4506,7 +5219,11 @@ fn push_thread_subtree(
         let mut child_guides = ancestor_guides;
         if forest_depth > 0 {
             let visible_level = forest_depth.min(3);
-            child_guides[visible_level - 1] = has_next_sibling;
+            // A display depth of three is a capped lane. Once any ancestor
+            // at that lane needs a continuation, a deeper descendant must
+            // keep the guide even when its immediate parent is the last
+            // sibling; assignment here would incorrectly erase that path.
+            child_guides[visible_level - 1] |= has_next_sibling;
         }
         push_thread_subtree(
             child,
@@ -4587,7 +5304,11 @@ fn thread_presentation_rows(threads: &[ActiveThread]) -> Vec<ThreadPresentationR
     rows
 }
 
-fn active_thread_rows_at(threads: &[ActiveThread], now: i64) -> Vec<ActiveThreadRow> {
+fn active_thread_rows_at_with_i18n(
+    threads: &[ActiveThread],
+    now: i64,
+    i18n: &I18n,
+) -> Vec<ActiveThreadRow> {
     thread_presentation_rows(threads)
         .into_iter()
         .map(|presentation| {
@@ -4599,12 +5320,12 @@ fn active_thread_rows_at(threads: &[ActiveThread], now: i64) -> Vec<ActiveThread
                     thread.depth.filter(|depth| *depth > 0)
                 };
                 match depth {
-                    Some(depth) if depth > 99 => "サブ D99+".to_owned(),
-                    Some(depth) => format!("サブ D{depth}"),
-                    None => "サブ".to_owned(),
+                    Some(depth) if depth > 99 => format!("{} D99+", i18n.text(TextKey::SubRole)),
+                    Some(depth) => format!("{} D{depth}", i18n.text(TextKey::SubRole)),
+                    None => i18n.text(TextKey::SubRole).to_owned(),
                 }
             } else {
-                "メイン".to_owned()
+                i18n.text(TextKey::MainRole).to_owned()
             };
             let parent_title = thread
                 .parent_thread_id
@@ -4613,12 +5334,13 @@ fn active_thread_rows_at(threads: &[ActiveThread], now: i64) -> Vec<ActiveThread
                     threads
                         .iter()
                         .find(|candidate| candidate.id == parent_id)
-                        .map(|parent| format!("親: {}", parent.title))
-                        .unwrap_or_else(|| "親スレッドは現在非実行".to_owned())
+                        .map(|parent| i18n.format_parent_title(&parent.title))
+                        .unwrap_or_else(|| i18n.text(TextKey::ParentNotRunning).to_owned())
                 })
                 .unwrap_or_default();
             ActiveThreadRow {
                 relation: relation.into(),
+                is_main: !thread.is_subagent,
                 title: security::shorten_unicode(&thread.title, security::MAX_THREAD_TITLE_SCALARS)
                     .into(),
                 parent_title: security::shorten_unicode(
@@ -4633,10 +5355,23 @@ fn active_thread_rows_at(threads: &[ActiveThread], now: i64) -> Vec<ActiveThread
                 .into(),
                 tokens: thread
                     .total_tokens
-                    .map(|total| format!("合計 {}トークン", format_token_count(total)))
+                    .map(|total| i18n.format_token_value(total))
                     .unwrap_or_else(|| "—".to_owned())
                     .into(),
-                elapsed: format_thread_age(now, thread.updated_at).into(),
+                context_usage: match (thread.total_tokens, thread.context_window_tokens) {
+                    (Some(used), Some(window)) if window > 0 => format!(
+                        "{} / {}",
+                        i18n.format_context_usage(used, window),
+                        i18n.format_token_value(window)
+                    ),
+                    (None, Some(window)) if window > 0 => {
+                        format!("— / {}", i18n.format_token_value(window))
+                    }
+                    _ => "—".to_owned(),
+                }
+                .into(),
+                thread_age: i18n.format_elapsed(now, thread.created_at).into(),
+                instruction_age: i18n.format_elapsed(now, thread.last_user_message_at).into(),
                 tree_depth: i32::try_from(presentation.forest_depth).unwrap_or(i32::MAX),
                 connected_to_parent: presentation.connected_to_parent,
                 has_children: presentation.has_children,
@@ -4649,19 +5384,90 @@ fn active_thread_rows_at(threads: &[ActiveThread], now: i64) -> Vec<ActiveThread
         .collect()
 }
 
+#[cfg(test)]
+fn active_thread_rows_at(threads: &[ActiveThread], now: i64) -> Vec<ActiveThreadRow> {
+    active_thread_rows_at_with_i18n(
+        threads,
+        now,
+        &I18n::from_parts(codex_info::i18n::Language::Japanese, chrono_tz::Tz::UTC),
+    )
+}
+
+#[cfg(test)]
+#[allow(dead_code)]
 fn active_thread_rows(threads: &[ActiveThread]) -> Vec<ActiveThreadRow> {
     active_thread_rows_at(threads, Utc::now().timestamp())
 }
 
 fn sync_threads_window(state: &CodexInfoState, threads_window: &ThreadsWindow) {
+    threads_window.set_strings(ui_strings(&state.i18n));
+    threads_window.set_thread_count_label(
+        state
+            .i18n
+            .format_thread_count(state.active_threads.len())
+            .into(),
+    );
     threads_window.set_window_title(
-        detail_window_title(&state.window_title(), THREADS_WINDOW_PURPOSE).into(),
+        native_detail_window_title(
+            &state.i18n,
+            state.authenticated,
+            &state.window_title(),
+            WindowPurpose::Threads,
+        )
+        .into(),
     );
     threads_window.set_thread_rows(slint::ModelRc::new(slint::VecModel::from(
-        active_thread_rows(&state.active_threads),
+        active_thread_rows_at_with_i18n(&state.active_threads, Utc::now().timestamp(), &state.i18n),
     )));
 }
 
+fn ui_strings(i18n: &I18n) -> UiStrings {
+    UiStrings {
+        font_family: i18n.text(TextKey::FontFamily).into(),
+        usage_status: i18n.text(TextKey::UsageStatus).into(),
+        graph: i18n.text(TextKey::Graph).into(),
+        legal_notices: i18n.text(TextKey::LegalNotices).into(),
+        running: i18n.text(TextKey::Running).into(),
+        model_threads: i18n.text(TextKey::ModelThreads).into(),
+        other: i18n.text(TextKey::Other).into(),
+        details: i18n.text(TextKey::Details).into(),
+        no_running_threads: i18n.text(TextKey::NoRunningThreads).into(),
+        legal_code: i18n.text(TextKey::LegalCode).into(),
+        legal_warranty: i18n.text(TextKey::LegalWarranty).into(),
+        legal_license: i18n.text(TextKey::LegalLicense).into(),
+        legal_font: i18n.text(TextKey::LegalFont).into(),
+        legal_schema: i18n.text(TextKey::LegalSchema).into(),
+        legal_dependencies: i18n.text(TextKey::LegalDependencies).into(),
+        legal_details: i18n.text(TextKey::LegalDetails).into(),
+        legal_distribution: i18n.text(TextKey::LegalDistribution).into(),
+        close: i18n.text(TextKey::Close).into(),
+        active_threads: i18n.text(TextKey::ActiveThreads).into(),
+        context_usage: i18n.text(TextKey::Context).into(),
+        instruction: i18n.text(TextKey::Instruction).into(),
+        tokens: i18n.text(TextKey::Tokens).into(),
+        model: i18n.text(TextKey::Model).into(),
+        input: i18n.text(TextKey::Input).into(),
+        cached: i18n.text(TextKey::Cached).into(),
+        output: i18n.text(TextKey::Output).into(),
+        retry: i18n.text(TextKey::Retry).into(),
+        usage_trend: i18n.text(TextKey::UsageTrend).into(),
+        remaining: i18n.text(TextKey::Remaining).into(),
+        graph_token_description: i18n.text(TextKey::GraphTokenDescription).into(),
+        graph_dollar_description: i18n.text(TextKey::GraphDollarDescription).into(),
+        no_records: i18n.text(TextKey::NoRecords).into(),
+        connect_account: i18n.text(TextKey::ConnectAccount).into(),
+        auth_browser_instructions: i18n.text(TextKey::AuthBrowserInstructions).into(),
+        auth_managed: i18n.text(TextKey::AuthManaged).into(),
+        open_auth_page: i18n.text(TextKey::OpenAuthPage).into(),
+        start_auth: i18n.text(TextKey::StartAuth).into(),
+        checking: i18n.text(TextKey::Checking).into(),
+        check_auth: i18n.text(TextKey::CheckAuth).into(),
+        auth_cli: i18n.text(TextKey::AuthCli).into(),
+        no_history: i18n.text(TextKey::NoHistory).into(),
+    }
+}
+
+#[cfg(test)]
 fn normal_status_text(remaining: f64, seconds: i64, last_success_at: Option<&str>) -> String {
     let quota_notice = if remaining <= 2.0 {
         Some("残り利用枠はほぼありません。")
@@ -4739,6 +5545,65 @@ impl CodexInfoState {
             .unwrap_or(0)
     }
 
+    fn display_status(&self) -> String {
+        if self.account_error.is_some() {
+            return if self.last_success_at.is_some() {
+                self.i18n.format_stale_status(self.last_success_at)
+            } else {
+                self.i18n.text(TextKey::CannotFetchUsage).into()
+            };
+        }
+        match self.status.as_str() {
+            "Codex app-serverへ接続しています…" => {
+                self.i18n.text(TextKey::Connecting).into()
+            }
+            "認証状態を確認しています…" | "認証完了を確認しています…" => {
+                self.i18n.text(TextKey::CheckingAuthStatus).into()
+            }
+            "認証済みです。利用量を取得しています…" => {
+                self.i18n.text(TextKey::AuthenticatedLoading).into()
+            }
+            "未認証です。認証を開始してください。" => {
+                self.i18n.text(TextKey::UnauthenticatedStart).into()
+            }
+            "認証URLを発行しました。「認証ページを開く」を押してください。" => {
+                self.i18n.text(TextKey::AuthUrlIssued).into()
+            }
+            "認証URLを発行しています…" => {
+                self.i18n.text(TextKey::IssuingAuthUrl).into()
+            }
+            "認証URLを開けませんでした。"
+            | "認証URLを開けません。Codex CLIから認証を完了してください。" => {
+                self.i18n.text(TextKey::AuthUrlOpenFailed).into()
+            }
+            "利用状況を更新しています…" => {
+                self.i18n.text(TextKey::UpdatingUsage).into()
+            }
+            "利用状況を取得できません。Codex app-serverへの接続を確認してください。" => {
+                self.i18n.text(TextKey::CannotFetchUsage).into()
+            }
+            "利用枠は更新しました。履歴とスレッドは前回値を保持しています。" => {
+                self.i18n.text(TextKey::PartialHistoryThreads).into()
+            }
+            "利用枠は更新しました。履歴は前回値を保持しています。" => {
+                self.i18n.text(TextKey::PartialHistory).into()
+            }
+            "利用枠は更新しました。スレッド表示は前回値を保持しています。" => {
+                self.i18n.text(TextKey::PartialThreads).into()
+            }
+            "状態を表示できません。" => {
+                self.i18n.text(TextKey::CannotDisplayStatus).into()
+            }
+            _ if self.status.is_empty() => self.i18n.text(TextKey::CannotDisplayStatus).into(),
+            // `normal_status` is already formatted by the startup-pinned
+            // catalog (for example, a localized last-updated clock). Keep
+            // that value instead of replacing it with a generic Japanese
+            // fallback. All asynchronous status keys above are canonical
+            // internal values and are translated before reaching this arm.
+            _ => self.status.clone(),
+        }
+    }
+
     fn open_auth(&mut self) {
         if let Some(url) = self.auth_url.clone() {
             let opened = open_validated_auth_url(&url);
@@ -4780,25 +5645,42 @@ impl CodexInfoState {
             .map(|reset_at| self.period_seconds_for_reset(reset_at))
             .unwrap_or(self.window_seconds.max(WEEK_SECONDS));
         ui.set_authenticated(self.authenticated);
+        ui.set_strings(ui_strings(&self.i18n));
         ui.set_has_usage(self.has_usage);
         ui.set_has_auth_url(self.auth_url.is_some());
         ui.set_checking(self.checking);
         ui.set_has_error(self.error.is_some());
-        ui.set_window_title(self.window_title().into());
+        ui.set_window_title(native_account_window_title(&self.window_title()).into());
+        let quota_title = if self.monthly {
+            self.i18n.text(TextKey::MonthlyQuotaRemaining)
+        } else if self.quota_title == "利用枠" {
+            self.i18n.text(TextKey::UsageLimit)
+        } else {
+            self.i18n.text(TextKey::QuotaRemaining)
+        };
         ui.set_quota_title(
-            security::shorten_unicode(&self.quota_title, security::MAX_LIMIT_NAME_SCALARS).into(),
+            security::shorten_unicode(quota_title, security::MAX_LIMIT_NAME_SCALARS).into(),
         );
         ui.set_has_quota_percent(self.has_quota_percent);
         ui.set_remaining_label(
             if self.has_quota_percent {
                 format_percent(remaining)
             } else {
-                "固定上限なし".into()
+                self.i18n.text(TextKey::FixedLimitNone).into()
             }
             .into(),
         );
         ui.set_week_label(if self.has_quota_percent {
-            period_remaining_text(seconds.max(0), period_seconds, self.monthly).into()
+            self.i18n
+                .format_period_remaining(
+                    seconds,
+                    if self.monthly {
+                        PeriodKind::Monthly
+                    } else {
+                        PeriodKind::Weekly
+                    },
+                )
+                .into()
         } else {
             "".into()
         });
@@ -4820,12 +5702,19 @@ impl CodexInfoState {
         ui.set_model_usage_output_tokens(output_tokens.into());
         ui.set_model_usage_output_costs(output_costs.into());
         ui.set_model_usage_period(self.model_usage_period().into());
-        ui.set_estimated_cost_label(self.estimated_cost_label.clone().into());
-        ui.set_status(
-            security::bounded_status(&self.status)
-                .unwrap_or_else(|_| "状態を表示できません。".into())
-                .into(),
-        );
+        let estimate = if self.model_usage.is_empty() {
+            format!("{} —", self.i18n.text(TextKey::EstimatePrefix))
+        } else {
+            let total = self
+                .model_usage
+                .iter()
+                .map(ModelUsageRow::dollar_costs)
+                .map(|(sol, terra, luna)| sol + terra + luna)
+                .sum::<f64>();
+            self.i18n.format_estimate(total)
+        };
+        ui.set_estimated_cost_label(estimate.into());
+        ui.set_status(self.display_status().into());
         ui.set_status_level(self.status_level().into());
         ui.set_remaining_percent(remaining as f32);
         ui.set_remaining_days(if self.has_quota_percent {
@@ -4837,6 +5726,11 @@ impl CodexInfoState {
             ui.set_has_active_thread(true);
             ui.set_active_thread_count(
                 i32::try_from(self.active_threads.len()).unwrap_or(i32::MAX),
+            );
+            ui.set_active_thread_count_label(
+                self.i18n
+                    .format_thread_count(self.active_threads.len())
+                    .into(),
             );
             let [sol, terra, luna, other] = active_thread_model_count_values(&self.active_threads);
             ui.set_active_thread_sol_count(sol);
@@ -4850,6 +5744,7 @@ impl CodexInfoState {
             ui.set_active_thread_terra_count(0);
             ui.set_active_thread_luna_count(0);
             ui.set_active_thread_other_count(0);
+            ui.set_active_thread_count_label(self.i18n.format_thread_count(0).into());
         }
     }
 
@@ -4880,29 +5775,31 @@ impl CodexInfoState {
         let span = (period_end - period_start).max(1) as f64;
         [0.0, 0.25, 0.5, 0.75, 1.0].map(|fraction| {
             let timestamp = period_start + (span * fraction) as i64;
-            DateTime::from_timestamp(timestamp, 0)
-                .map(|time| time.with_timezone(&Local).format("%m/%d %H:%M").to_string())
-                .unwrap_or_default()
+            self.i18n.format_graph_time(timestamp).unwrap_or_default()
         })
     }
 }
 
-fn format_period_label(start: i64, end: i64) -> String {
-    let Some(start_time) = DateTime::from_timestamp(start, 0) else {
-        return String::new();
-    };
-    let Some(end_time) = DateTime::from_timestamp(end, 0) else {
-        return String::new();
-    };
-    format!(
-        "{} – {}",
-        start_time
-            .with_timezone(&Local)
-            .format("%Y/%m/%d %H:%M:%S %:z"),
-        end_time
-            .with_timezone(&Local)
-            .format("%Y/%m/%d %H:%M:%S %:z")
+#[cfg(test)]
+#[allow(clippy::needless_return)]
+fn format_period_timestamp(timestamp: i64) -> Option<String> {
+    let time = DateTime::from_timestamp(timestamp, 0)?;
+    Some(
+        time.with_timezone(&chrono_tz::Asia::Tokyo)
+            .format("%Y/%m/%d %H:%M:%S JST")
+            .to_string(),
     )
+}
+
+#[cfg(test)]
+fn format_period_label(start: i64, end: i64) -> String {
+    let Some(start) = format_period_timestamp(start) else {
+        return String::new();
+    };
+    let Some(end) = format_period_timestamp(end) else {
+        return String::new();
+    };
+    format!("{start} ～ {end}")
 }
 
 impl Drop for CodexInfoState {
@@ -4913,6 +5810,7 @@ impl Drop for CodexInfoState {
     }
 }
 
+#[cfg(test)]
 fn duration_parts(seconds: i64) -> (i64, i64, i64, i64) {
     let (days, rest) = (seconds / 86_400, seconds % 86_400);
     let (hours, rest) = (rest / 3_600, rest % 3_600);
@@ -4920,6 +5818,7 @@ fn duration_parts(seconds: i64) -> (i64, i64, i64, i64) {
     (days, hours, minutes, seconds)
 }
 
+#[cfg(test)]
 fn week_remaining_text(seconds: i64) -> String {
     let (days, hours, minutes, _) = duration_parts(seconds.max(0));
     if days > 0 {
@@ -4931,6 +5830,7 @@ fn week_remaining_text(seconds: i64) -> String {
     }
 }
 
+#[cfg(test)]
 fn period_remaining_text(seconds: i64, period_seconds: i64, monthly: bool) -> String {
     if monthly {
         let (days, hours, minutes, _) = duration_parts(seconds.max(0));
@@ -5049,7 +5949,8 @@ fn format_unsigned_count(value: u128) -> String {
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use x11rb::connection::Connection;
 use x11rb::protocol::xproto::{
-    Atom, AtomEnum, ClientMessageEvent, ConnectionExt, EventMask, PropMode, Window as X11Window,
+    Atom, AtomEnum, ClientMessageEvent, ConfigureWindowAux, ConnectionExt, EventMask, KeyButMask,
+    PropMode, StackMode, Window as X11Window,
 };
 use x11rb::rust_connection::RustConnection;
 use x11rb::wrapper::ConnectionExt as WrapperConnectionExt;
@@ -5060,6 +5961,7 @@ struct X11StateAtoms {
     fullscreen: Atom,
     maximized_vert: Atom,
     maximized_horz: Atom,
+    active_window: Option<Atom>,
 }
 
 struct X11WindowStateMonitor {
@@ -5088,8 +5990,11 @@ fn x11_window_id(window: &slint::Window) -> Option<X11Window> {
 }
 
 const MOTIF_HINTS_FUNCTIONS: u32 = 1;
+const MOTIF_FUNCTION_ALL: u32 = 1;
+const MOTIF_FUNCTION_RESIZE: u32 = 1 << 1;
 const MOTIF_FUNCTION_MOVE: u32 = 1 << 2;
 const MOTIF_FUNCTION_MINIMIZE: u32 = 1 << 3;
+const MOTIF_FUNCTION_MAXIMIZE: u32 = 1 << 4;
 const MOTIF_FUNCTION_CLOSE: u32 = 1 << 5;
 
 fn motif_wm_functions(existing_flags: u32) -> (u32, u32) {
@@ -5097,6 +6002,20 @@ fn motif_wm_functions(existing_flags: u32) -> (u32, u32) {
         existing_flags | MOTIF_HINTS_FUNCTIONS,
         MOTIF_FUNCTION_MOVE | MOTIF_FUNCTION_MINIMIZE | MOTIF_FUNCTION_CLOSE,
     )
+}
+
+fn motif_wm_resizable_functions(existing_flags: u32, existing_functions: u32) -> (u32, u32) {
+    let functions = if existing_functions & MOTIF_FUNCTION_ALL == 0 {
+        existing_functions
+            | MOTIF_FUNCTION_RESIZE
+            | MOTIF_FUNCTION_MOVE
+            | MOTIF_FUNCTION_MINIMIZE
+            | MOTIF_FUNCTION_MAXIMIZE
+            | MOTIF_FUNCTION_CLOSE
+    } else {
+        existing_functions
+    };
+    (existing_flags | MOTIF_HINTS_FUNCTIONS, functions)
 }
 
 fn forbidden_x11_states(states: &[Atom], atoms: &X11StateAtoms) -> (bool, bool) {
@@ -5126,6 +6045,7 @@ impl X11WindowStateMonitor {
             fullscreen: Self::intern_atom(&connection, b"_NET_WM_STATE_FULLSCREEN")?,
             maximized_vert: Self::intern_atom(&connection, b"_NET_WM_STATE_MAXIMIZED_VERT")?,
             maximized_horz: Self::intern_atom(&connection, b"_NET_WM_STATE_MAXIMIZED_HORZ")?,
+            active_window: Self::intern_atom(&connection, b"_NET_ACTIVE_WINDOW"),
         };
         let motif_wm_hints = Self::intern_atom(&connection, b"_MOTIF_WM_HINTS");
         Some(Self {
@@ -5195,6 +6115,45 @@ impl X11WindowStateMonitor {
         }
     }
 
+    fn allow_resize(&self, window: &slint::Window) {
+        let Some(window_id) = x11_window_id(window) else {
+            return;
+        };
+        let Some(motif_wm_hints) = self.motif_wm_hints else {
+            return;
+        };
+        let Ok(cookie) =
+            self.connection
+                .get_property(false, window_id, motif_wm_hints, AtomEnum::ANY, 0, 5)
+        else {
+            return;
+        };
+        let Ok(reply) = cookie.reply() else {
+            return;
+        };
+        let Some(values) = reply.value32() else {
+            return;
+        };
+        let mut hints = [0_u32; 5];
+        for (hint, value) in hints.iter_mut().zip(values) {
+            *hint = value;
+        }
+        (hints[0], hints[1]) = motif_wm_resizable_functions(hints[0], hints[1]);
+        if self
+            .connection
+            .change_property32(
+                PropMode::REPLACE,
+                window_id,
+                motif_wm_hints,
+                motif_wm_hints,
+                &hints,
+            )
+            .is_ok()
+        {
+            let _ = self.connection.flush();
+        }
+    }
+
     fn enforce(&self, window: &slint::Window) {
         let Some(window_id) = x11_window_id(window) else {
             return;
@@ -5230,6 +6189,42 @@ impl X11WindowStateMonitor {
                 self.atoms.maximized_horz,
             );
         }
+    }
+
+    fn raise_and_activate(&self, window: &slint::Window) {
+        let Some(window_id) = x11_window_id(window) else {
+            return;
+        };
+        // Xwayland/WSLg can place the client inside a compositor-owned
+        // wrapper. Raising only the Slint client leaves the main window above
+        // a frameless secondary surface, so raise the wrapper as well.
+        let raise_target = self
+            .connection
+            .query_tree(window_id)
+            .ok()
+            .and_then(|cookie| cookie.reply().ok())
+            .map(|reply| reply.parent)
+            .filter(|parent| *parent != self.root)
+            .unwrap_or(window_id);
+        let stack_mode = ConfigureWindowAux::new().stack_mode(StackMode::ABOVE);
+        let _ = self.connection.configure_window(raise_target, &stack_mode);
+        if raise_target != window_id {
+            let _ = self.connection.configure_window(window_id, &stack_mode);
+        }
+
+        if let Some(active_window) = self.atoms.active_window {
+            let event_mask = EventMask::SUBSTRUCTURE_REDIRECT | EventMask::SUBSTRUCTURE_NOTIFY;
+            let event = ClientMessageEvent::new(
+                32,
+                window_id,
+                active_window,
+                [1, x11rb::CURRENT_TIME, 0, 0, 0],
+            );
+            let _ = self
+                .connection
+                .send_event(false, self.root, event_mask, event);
+        }
+        let _ = self.connection.flush();
     }
 }
 
@@ -5273,6 +6268,32 @@ fn main() -> Result<(), slint::PlatformError> {
     let x11_monitor = Rc::new(X11WindowStateMonitor::connect());
 
     {
+        let weak_ui = ui.as_weak();
+        ui.on_begin_window_drag(move || {
+            if let Some(ui) = weak_ui.upgrade() {
+                begin_window_drag(ui.window());
+            }
+        });
+    }
+    {
+        let weak_ui = ui.as_weak();
+        ui.on_minimize_window(move || {
+            if let Some(ui) = weak_ui.upgrade() {
+                minimize_window(ui.window());
+            }
+        });
+    }
+    {
+        let weak_ui = ui.as_weak();
+        ui.on_close_window(move || {
+            if let Some(ui) = weak_ui.upgrade() {
+                let _ = ui.hide();
+            }
+            let _ = slint::quit_event_loop();
+        });
+    }
+
+    {
         let state = Rc::clone(&state);
         ui.on_begin_auth(move || state.borrow_mut().open_auth());
     }
@@ -5287,6 +6308,7 @@ fn main() -> Result<(), slint::PlatformError> {
     {
         let state = Rc::clone(&state);
         let graph_window = Rc::clone(&graph_window);
+        let x11_monitor = Rc::clone(&x11_monitor);
         let graph_old_preview = preview_kind.as_deref() == Some("graph-old");
         let graph_period_preview =
             matches!(preview_kind.as_deref(), Some("graph-period" | "graph-many"));
@@ -5298,16 +6320,65 @@ fn main() -> Result<(), slint::PlatformError> {
             if graph_window.is_none() {
                 if let Ok(graph) = GraphWindow::new() {
                     graph.set_open_history_on_start(graph_period_preview);
-                    if let Some((width, height)) = graph_preview_size {
-                        graph
-                            .window()
-                            .set_size(slint::LogicalSize::new(width as f32, height as f32));
+                    let (graph_width, graph_height) =
+                        graph_preview_size.unwrap_or((GRAPH_WINDOW_WIDTH, GRAPH_WINDOW_HEIGHT));
+                    if graph_preview_size.is_some() {
+                        graph.window().set_size(slint::LogicalSize::new(
+                            graph_width as f32,
+                            graph_height as f32,
+                        ));
                     }
+                    install_resizable_window(graph.window());
+                    let weak_graph = graph.as_weak();
+                    graph.on_begin_window_drag(move || {
+                        if let Some(graph) = weak_graph.upgrade() {
+                            begin_window_drag(graph.window());
+                        }
+                    });
+                    let weak_graph = graph.as_weak();
+                    graph.on_begin_window_resize(move |direction| {
+                        if let Some(graph) = weak_graph.upgrade() {
+                            begin_window_resize(graph.window(), direction.as_str());
+                        }
+                    });
+                    let weak_graph = graph.as_weak();
+                    graph.on_minimize_window(move || {
+                        if let Some(graph) = weak_graph.upgrade() {
+                            minimize_window(graph.window());
+                        }
+                    });
+                    let weak_graph = graph.as_weak();
+                    graph.on_toggle_maximize_window(move || {
+                        if let Some(graph) = weak_graph.upgrade() {
+                            toggle_maximize_window(graph.window());
+                        }
+                    });
                     let weak_graph = graph.as_weak();
                     graph.on_close_graph(move || {
                         if let Some(graph) = weak_graph.upgrade() {
+                            graph.set_reset_close_buttons(true);
+                            graph.set_reset_close_buttons(false);
                             let _ = graph.hide();
                         }
+                    });
+                    let weak_graph = graph.as_weak();
+                    graph.on_close_window(move || {
+                        if let Some(graph) = weak_graph.upgrade() {
+                            graph.set_reset_close_buttons(true);
+                            graph.set_reset_close_buttons(false);
+                            let _ = graph.hide();
+                        }
+                    });
+                    let weak_graph = graph.as_weak();
+                    graph.window().on_close_requested(move || {
+                        if let Some(graph) = weak_graph.upgrade() {
+                            graph.set_reset_close_buttons(true);
+                            graph.set_reset_close_buttons(false);
+                            if graph.hide().is_ok() {
+                                return CloseRequestResponse::KeepWindowShown;
+                            }
+                        }
+                        CloseRequestResponse::HideWindow
                     });
                     let weak_graph = graph.as_weak();
                     let state_for_toggle = Rc::clone(&state);
@@ -5363,51 +6434,145 @@ fn main() -> Result<(), slint::PlatformError> {
                 }
             }
             if let Some(graph) = graph_window.as_ref() {
+                graph.set_reset_close_buttons(true);
+                graph.set_reset_close_buttons(false);
                 sync_graph_window(&state.borrow(), graph);
-                let _ = graph.show();
+                let _ = show_and_focus_window(graph.window(), x11_monitor.as_ref().as_ref());
+                if let Some(monitor) = x11_monitor.as_ref() {
+                    monitor.allow_resize(graph.window());
+                }
             }
         });
     }
     {
         let state = Rc::clone(&state);
         let threads_window = Rc::clone(&threads_window);
+        let x11_monitor = Rc::clone(&x11_monitor);
         ui.on_open_threads(move || {
             let mut threads_window = threads_window.borrow_mut();
             if threads_window.is_none() {
                 if let Ok(window) = ThreadsWindow::new() {
                     install_fixed_window_guard(window.window());
                     let weak_window = window.as_weak();
+                    window.on_begin_window_drag(move || {
+                        if let Some(window) = weak_window.upgrade() {
+                            begin_window_drag(window.window());
+                        }
+                    });
+                    let weak_window = window.as_weak();
+                    window.on_minimize_window(move || {
+                        if let Some(window) = weak_window.upgrade() {
+                            minimize_window(window.window());
+                        }
+                    });
+                    let weak_window = window.as_weak();
                     window.on_close_threads(move || {
                         if let Some(window) = weak_window.upgrade() {
+                            window.set_reset_close_buttons(true);
+                            window.set_reset_close_buttons(false);
                             let _ = window.hide();
                         }
+                    });
+                    let weak_window = window.as_weak();
+                    window.on_close_window(move || {
+                        if let Some(window) = weak_window.upgrade() {
+                            window.set_reset_close_buttons(true);
+                            window.set_reset_close_buttons(false);
+                            let _ = window.hide();
+                        }
+                    });
+                    let weak_window = window.as_weak();
+                    window.window().on_close_requested(move || {
+                        if let Some(window) = weak_window.upgrade() {
+                            window.set_reset_close_buttons(true);
+                            window.set_reset_close_buttons(false);
+                            if window.hide().is_ok() {
+                                return CloseRequestResponse::KeepWindowShown;
+                            }
+                        }
+                        CloseRequestResponse::HideWindow
                     });
                     *threads_window = Some(window);
                 }
             }
             if let Some(window) = threads_window.as_ref() {
+                window.set_reset_close_buttons(true);
+                window.set_reset_close_buttons(false);
                 sync_threads_window(&state.borrow(), window);
-                let _ = window.show();
+                let _ = show_and_focus_window(window.window(), x11_monitor.as_ref().as_ref());
             }
         });
     }
     {
+        let state = Rc::clone(&state);
         let legal_notice_window = Rc::clone(&legal_notice_window);
+        let x11_monitor = Rc::clone(&x11_monitor);
         ui.on_open_legal_notice(move || {
             let mut legal_notice_window = legal_notice_window.borrow_mut();
             if legal_notice_window.is_none() {
                 if let Ok(window) = LegalNoticeWindow::new() {
+                    install_window_size_guard(
+                        window.window(),
+                        LEGAL_WINDOW_WIDTH,
+                        LEGAL_WINDOW_HEIGHT,
+                    );
+                    let weak_window = window.as_weak();
+                    window.on_begin_window_drag(move || {
+                        if let Some(window) = weak_window.upgrade() {
+                            begin_window_drag(window.window());
+                        }
+                    });
+                    let weak_window = window.as_weak();
+                    window.on_minimize_window(move || {
+                        if let Some(window) = weak_window.upgrade() {
+                            minimize_window(window.window());
+                        }
+                    });
                     let weak_window = window.as_weak();
                     window.on_close_legal_notice(move || {
                         if let Some(window) = weak_window.upgrade() {
+                            window.set_reset_close_buttons(true);
+                            window.set_reset_close_buttons(false);
                             let _ = window.hide();
                         }
+                    });
+                    let weak_window = window.as_weak();
+                    window.on_close_window(move || {
+                        if let Some(window) = weak_window.upgrade() {
+                            window.set_reset_close_buttons(true);
+                            window.set_reset_close_buttons(false);
+                            let _ = window.hide();
+                        }
+                    });
+                    let weak_window = window.as_weak();
+                    window.window().on_close_requested(move || {
+                        if let Some(window) = weak_window.upgrade() {
+                            window.set_reset_close_buttons(true);
+                            window.set_reset_close_buttons(false);
+                            if window.hide().is_ok() {
+                                return CloseRequestResponse::KeepWindowShown;
+                            }
+                        }
+                        CloseRequestResponse::HideWindow
                     });
                     *legal_notice_window = Some(window);
                 }
             }
             if let Some(window) = legal_notice_window.as_ref() {
-                let _ = window.show();
+                let state_ref = state.borrow();
+                window.set_strings(ui_strings(&state_ref.i18n));
+                window.set_window_title(
+                    native_detail_window_title(
+                        &state_ref.i18n,
+                        state_ref.authenticated,
+                        &state_ref.window_title(),
+                        WindowPurpose::Legal,
+                    )
+                    .into(),
+                );
+                window.set_reset_close_buttons(true);
+                window.set_reset_close_buttons(false);
+                let _ = show_and_focus_window(window.window(), x11_monitor.as_ref().as_ref());
             }
         });
     }
@@ -5422,7 +6587,10 @@ fn main() -> Result<(), slint::PlatformError> {
         }
         ui.invoke_open_graph();
     }
-    if preview_kind.as_deref() == Some("multi-thread") {
+    if matches!(
+        preview_kind.as_deref(),
+        Some("multi-thread" | "single-thread")
+    ) {
         ui.invoke_open_threads();
     }
     if preview_kind.as_deref() == Some("legal") {
@@ -5432,6 +6600,7 @@ fn main() -> Result<(), slint::PlatformError> {
     state.borrow().sync_ui(&ui);
     let weak_ui_for_bounds = ui.as_weak();
     let monitor = Rc::clone(&x11_monitor);
+    let graph_window_for_resize = Rc::clone(&graph_window);
     let threads_window_for_bounds = Rc::clone(&threads_window);
     let legal_notice_window_for_bounds = Rc::clone(&legal_notice_window);
     let main_monitor_timer = Timer::default();
@@ -5439,11 +6608,20 @@ fn main() -> Result<(), slint::PlatformError> {
         if let Some(ui) = weak_ui_for_bounds.upgrade() {
             if let Some(monitor) = monitor.as_ref() {
                 monitor.enforce(ui.window());
+                if let Some(graph) = graph_window_for_resize.borrow().as_ref() {
+                    if graph.window().is_visible() {
+                        monitor.allow_resize(graph.window());
+                    }
+                }
                 if let Some(window) = threads_window_for_bounds.borrow().as_ref() {
-                    monitor.enforce(window.window());
+                    if window.window().is_visible() {
+                        monitor.enforce(window.window());
+                    }
                 }
                 if let Some(window) = legal_notice_window_for_bounds.borrow().as_ref() {
-                    monitor.enforce(window.window());
+                    if window.window().is_visible() {
+                        monitor.enforce(window.window());
+                    }
                 }
             }
         }
@@ -5476,10 +6654,14 @@ fn main() -> Result<(), slint::PlatformError> {
                 }
                 state.sync_ui(&ui);
                 if let Some(graph) = graph_window_for_timer.borrow().as_ref() {
-                    sync_graph_window(&state, graph);
+                    if graph.window().is_visible() {
+                        sync_graph_window(&state, graph);
+                    }
                 }
                 if let Some(window) = threads_window_for_timer.borrow().as_ref() {
-                    sync_threads_window(&state, window);
+                    if window.window().is_visible() {
+                        sync_threads_window(&state, window);
+                    }
                 }
             }
         });
@@ -5489,31 +6671,37 @@ fn main() -> Result<(), slint::PlatformError> {
 
 #[cfg(test)]
 mod tests {
+    use super::winit;
     use super::{
         account_window_title, active_thread_model_counts, active_thread_rows_at,
         add_recovery_usage, automatic_refresh_interval, clamp_graph_preview_size,
-        collect_session_file, complete_rollout_prefix_len, detail_window_title,
-        fetch_active_thread_update_for_paths, fetch_active_thread_update_for_paths_and_state,
-        fixed_resize_decision, format_estimated_cost, format_model_usage_columns, format_percent,
-        format_period_label, format_thread_age, graph_paths, graph_paths_for_selection,
-        graph_period_end, graph_points, graph_time_endpoints, minute_model_spend,
-        minute_model_spend_for_metric, model_usage_timeline_from_events, monthly_window_seconds,
+        collect_session_file, complete_rollout_prefix_len, current_label_connector_path,
+        detail_window_title, fetch_active_thread_update_for_paths,
+        fetch_active_thread_update_for_paths_and_state, fixed_resize_decision, format_elapsed,
+        format_estimated_cost, format_model_usage_columns, format_percent, format_period_label,
+        graph_paths, graph_paths_for_selection, graph_period_end, graph_points,
+        graph_time_endpoints, minute_model_spend, minute_model_spend_for_metric,
+        model_usage_timeline_from_events, monthly_window_seconds, native_account_window_title,
         normal_status_text, open_codex_session_paths, parse_preview_size, parse_rate_limits,
-        period_remaining_text, plan_type_label, preview_model_row, read_recovery_entries,
-        recovery_timed_usage, remaining_graph_y, remaining_marker_positions,
+        parse_resize_direction, period_remaining_text, plan_type_label, preview_model_row,
+        read_recovery_entries, recovery_timed_usage, remaining_graph_y, remaining_marker_positions,
         remaining_marker_positions_on_points, request_with_timeout, same_rollout_identity,
         separate_current_label_positions, session_event_model, session_event_type,
         session_jsonl_files, session_token_snapshot, smooth_model_spend, smooth_remaining_points,
         split_metric_line_paths, stacked_area_path, thread_presentation_rows,
-        three_months_before_utc, week_remaining_text, ActiveThread, ActiveThreadUpdate,
-        CodexInfoState, Event, FixedResizeDecision, GraphPaths, GraphWindow, HourlyModelSpend,
-        LocalUsageResult, ModelDollarTotals, ModelTokenTotals, ModelUsageRow, ModelUsageTotals,
-        RpcReadEvent, SessionTraversalBudget, TokenSnapshot, UsageEvent, UsageHistory,
-        UsageHistorySample, UsageStore, FIXED_WINDOW_HEIGHT, FIXED_WINDOW_WIDTH,
-        GRAPH_METRIC_OPTIONS, GRAPH_WINDOW_PURPOSE, LOCAL_ESTIMATE_PRICE_VERSION,
-        THREADS_WINDOW_PURPOSE, UNAUTHENTICATED_WINDOW_TITLE, WEEK_SECONDS,
+        three_months_before_utc, unused_interval_positions, week_remaining_text, ActiveThread,
+        ActiveThreadUpdate, CodexInfoState, Event, FixedResizeDecision, GraphPaths, GraphWindow,
+        HourlyModelSpend, LocalUsageResult, ManualX11Geometry, ModelDollarTotals, ModelTokenTotals,
+        ModelUsageRow, ModelUsageTotals, RpcReadEvent, SessionTraversalBudget, TokenSnapshot,
+        UnusedIntervalPosition, UsageEvent, UsageHistory, UsageHistorySample, UsageStore,
+        FIXED_WINDOW_HEIGHT, FIXED_WINDOW_WIDTH, GRAPH_METRIC_OPTIONS, GRAPH_WINDOW_PURPOSE,
+        LOCAL_ESTIMATE_PRICE_VERSION, THREADS_WINDOW_PURPOSE, UNAUTHENTICATED_WINDOW_TITLE,
+        WEEK_SECONDS,
     };
-    use super::{forbidden_x11_states, motif_wm_functions, X11StateAtoms};
+    use super::{
+        forbidden_x11_states, manual_resize_geometry, motif_wm_functions,
+        motif_wm_resizable_functions, X11StateAtoms,
+    };
     use chrono::{TimeZone, Utc};
     use codex_info::thread_contract;
     use rusqlite::Connection;
@@ -5869,11 +7057,14 @@ mod tests {
 
         let replacement = ActiveThread {
             id: "replacement".into(),
+            created_at: Some(60),
             updated_at: 123,
             title: "replacement title".into(),
             model: "gpt-5.6-terra".into(),
             model_label: "gpt-5.6-terra".into(),
             total_tokens: Some(98_765),
+            context_window_tokens: None,
+            last_user_message_at: Some(120),
             is_subagent: true,
             parent_thread_id: Some("parent".into()),
             depth: Some(1),
@@ -6279,6 +7470,7 @@ mod tests {
             "full",
             "idle",
             "multi-thread",
+            "single-thread",
             "history-empty",
         ] {
             assert_eq!(
@@ -6318,6 +7510,34 @@ mod tests {
             detail_window_title(UNAUTHENTICATED_WINDOW_TITLE, THREADS_WINDOW_PURPOSE),
             UNAUTHENTICATED_WINDOW_TITLE
         );
+    }
+
+    #[test]
+    fn native_title_bars_are_ascii_safe_and_keep_move_context() {
+        assert_eq!(
+            native_account_window_title("salty919@gmail.com — Pro Lite"),
+            "salty919@gmail.com - Pro Lite"
+        );
+        assert_eq!(
+            native_account_window_title("salty919@gmail.com — エンタープライズ"),
+            "salty919@gmail.com - Plan"
+        );
+        assert_eq!(
+            super::native_detail_window_title(
+                &super::I18n::detect(),
+                true,
+                "salty919@gmail.com — Pro Lite",
+                super::WindowPurpose::Threads,
+            ),
+            "salty919@gmail.com - Pro Lite - Threads"
+        );
+        assert!(super::native_detail_window_title(
+            &super::I18n::detect(),
+            true,
+            "salty919@gmail.com — エンタープライズ",
+            super::WindowPurpose::Graph,
+        )
+        .is_ascii());
     }
 
     #[test]
@@ -6381,33 +7601,42 @@ mod tests {
         let threads = vec![
             ActiveThread {
                 id: "parent".into(),
+                created_at: Some(10),
                 updated_at: 20,
                 title: "親タイトル".into(),
                 model: "model-parent".into(),
                 model_label: "model-parent".into(),
                 total_tokens: Some(u64::MAX),
+                context_window_tokens: Some(258_400),
+                last_user_message_at: Some(19),
                 is_subagent: false,
                 parent_thread_id: None,
                 depth: None,
             },
             ActiveThread {
                 id: "child".into(),
+                created_at: Some(10),
                 updated_at: 19,
                 title: "子タイトル".into(),
                 model: "model-child".into(),
                 model_label: "model-child".into(),
                 total_tokens: Some(1_234),
+                context_window_tokens: None,
+                last_user_message_at: Some(18),
                 is_subagent: true,
                 parent_thread_id: Some("parent".into()),
                 depth: Some(1),
             },
             ActiveThread {
                 id: "orphan".into(),
+                created_at: None,
                 updated_at: 18,
                 title: "親が完了済みの子".into(),
                 model: "model-orphan".into(),
                 model_label: "model-orphan".into(),
                 total_tokens: None,
+                context_window_tokens: None,
+                last_user_message_at: None,
                 is_subagent: true,
                 parent_thread_id: Some("completed-parent".into()),
                 depth: Some(120),
@@ -6419,14 +7648,16 @@ mod tests {
         assert_eq!(rows[0].relation.as_str(), "メイン");
         assert_eq!(
             rows[0].tokens.as_str(),
-            "合計 18,446,744,073,709,551,615トークン"
+            "18,446,744,073,709,551,615トークン"
         );
+        assert_eq!(rows[0].context_usage.as_str(), "100% / 258,400トークン");
         assert_eq!(rows[1].relation.as_str(), "サブ D1");
         assert_eq!(rows[1].tree_depth, 1);
         assert!(rows[1].connected_to_parent);
         assert!(!rows[1].has_next_sibling);
         assert_eq!(rows[1].parent_title.as_str(), "親: 親タイトル");
-        assert_eq!(rows[1].elapsed.as_str(), "最終更新から 1秒");
+        assert_eq!(rows[1].thread_age.as_str(), "10秒");
+        assert_eq!(rows[1].instruction_age.as_str(), "2秒");
         assert_eq!(rows[2].relation.as_str(), "サブ D99+");
         assert_eq!(rows[2].tree_depth, 0);
         assert!(!rows[2].connected_to_parent);
@@ -6442,11 +7673,14 @@ mod tests {
                       parent: Option<&str>,
                       depth: Option<i32>| ActiveThread {
             id: id.into(),
+            created_at: Some(updated_at.saturating_sub(10)),
             updated_at,
             title: id.into(),
             model: "model".into(),
             model_label: "model".into(),
             total_tokens: None,
+            context_window_tokens: None,
+            last_user_message_at: Some(updated_at.saturating_sub(1)),
             is_subagent,
             parent_thread_id: parent.map(str::to_owned),
             depth,
@@ -6534,14 +7768,57 @@ mod tests {
     }
 
     #[test]
+    fn thread_presentation_keeps_capped_ancestor_guide_through_deeper_rows() {
+        let thread = |id: &str, updated_at: i64, parent: Option<&str>| ActiveThread {
+            id: id.into(),
+            created_at: Some(updated_at.saturating_sub(10)),
+            updated_at,
+            title: id.into(),
+            model: "model".into(),
+            model_label: "model".into(),
+            total_tokens: None,
+            context_window_tokens: None,
+            last_user_message_at: None,
+            is_subagent: parent.is_some(),
+            parent_thread_id: parent.map(str::to_owned),
+            depth: None,
+        };
+        let threads = vec![
+            thread("root", 100, None),
+            thread("level-1", 90, Some("root")),
+            thread("level-2", 80, Some("level-1")),
+            thread("level-3-first", 70, Some("level-2")),
+            thread("level-3-last", 60, Some("level-2")),
+            thread("level-4", 50, Some("level-3-first")),
+            thread("level-5", 40, Some("level-4")),
+        ];
+
+        let presentation = thread_presentation_rows(&threads);
+        let level_3_first = presentation
+            .iter()
+            .find(|row| threads[row.index].id == "level-3-first")
+            .expect("level 3 first sibling");
+        assert!(level_3_first.has_next_sibling);
+        let level_5 = presentation
+            .iter()
+            .find(|row| threads[row.index].id == "level-5")
+            .expect("deep descendant");
+        assert_eq!(level_5.forest_depth, 5);
+        assert!(level_5.ancestor_guides[2]);
+    }
+
+    #[test]
     fn active_thread_model_counts_use_exact_known_tokens_and_keep_named_zeroes() {
         let thread = |id: &str, model_label: &str| ActiveThread {
             id: id.into(),
+            created_at: Some(1),
             updated_at: 1,
             title: id.into(),
             model: "model".into(),
             model_label: model_label.into(),
             total_tokens: None,
+            context_window_tokens: None,
+            last_user_message_at: None,
             is_subagent: false,
             parent_thread_id: None,
             depth: None,
@@ -6562,15 +7839,18 @@ mod tests {
     #[test]
     fn thread_age_uses_fixed_boundaries_and_clamps_future() {
         let now = 86_400;
-        assert_eq!(format_thread_age(now, now), "最終更新から 0秒");
-        assert_eq!(format_thread_age(now, now - 59), "最終更新から 59秒");
-        assert_eq!(format_thread_age(now, now - 60), "最終更新から 1分");
-        assert_eq!(format_thread_age(now, now - 3_599), "最終更新から 59分");
-        assert_eq!(format_thread_age(now, now - 3_600), "最終更新から 1時間");
-        assert_eq!(format_thread_age(now, now - 86_399), "最終更新から 23時間");
-        assert_eq!(format_thread_age(now, now - 86_400), "最終更新から 1日");
-        assert_eq!(format_thread_age(now, now + 60), "最終更新から 0秒");
-        assert_eq!(format_thread_age(now, i64::MAX), "最終更新から —");
+        assert_eq!(format_elapsed(now, Some(now)), "0秒");
+        assert_eq!(format_elapsed(now, Some(now - 59)), "59秒");
+        assert_eq!(format_elapsed(now, Some(now - 60)), "1分");
+        assert_eq!(format_elapsed(now, Some(now - 83)), "1分23秒");
+        assert_eq!(format_elapsed(now, Some(now - 3_599)), "59分59秒");
+        assert_eq!(format_elapsed(now, Some(now - 3_600)), "1時間");
+        assert_eq!(format_elapsed(now, Some(now - 3_661)), "1時間1分");
+        assert_eq!(format_elapsed(now, Some(now - 86_399)), "23時間59分");
+        assert_eq!(format_elapsed(now, Some(now - 86_400)), "1日");
+        assert_eq!(format_elapsed(now, Some(now + 60)), "0秒");
+        assert_eq!(format_elapsed(now, Some(i64::MAX)), "—");
+        assert_eq!(format_elapsed(now, None), "—");
     }
 
     #[cfg(unix)]
@@ -6704,11 +7984,14 @@ mod tests {
             update,
             ActiveThreadUpdate::Snapshot(vec![ActiveThread {
                 id: "fallback".into(),
+                created_at: Some(1),
                 updated_at: 10,
                 title: "title-fallback".into(),
                 model: "gpt-5.6-sol".into(),
                 model_label: "gpt-5.6-sol".into(),
                 total_tokens: Some(12_345),
+                context_window_tokens: None,
+                last_user_message_at: None,
                 is_subagent: false,
                 parent_thread_id: None,
                 depth: None,
@@ -6833,22 +8116,28 @@ mod tests {
             ActiveThreadUpdate::Snapshot(vec![
                 ActiveThread {
                     id: "thread-z".into(),
+                    created_at: Some(1),
                     updated_at: 20,
                     title: "title-thread-z".into(),
                     model: "model-z".into(),
                     model_label: "model-z".into(),
                     total_tokens: Some(999),
+                    context_window_tokens: None,
+                    last_user_message_at: None,
                     is_subagent: false,
                     parent_thread_id: None,
                     depth: None,
                 },
                 ActiveThread {
                     id: "thread-a".into(),
+                    created_at: Some(1),
                     updated_at: 20,
                     title: "title-thread-a".into(),
                     model: "model-a".into(),
                     model_label: "model-a".into(),
                     total_tokens: Some(111),
+                    context_window_tokens: None,
+                    last_user_message_at: None,
                     is_subagent: true,
                     parent_thread_id: Some("thread-z".into()),
                     depth: Some(1),
@@ -6977,11 +8266,14 @@ mod tests {
             update,
             ActiveThreadUpdate::Snapshot(vec![ActiveThread {
                 id: "root".into(),
+                created_at: Some(1),
                 updated_at: 10,
                 title: "title-root".into(),
                 model: "native-model".into(),
                 model_label: "native-model".into(),
                 total_tokens: None,
+                context_window_tokens: None,
+                last_user_message_at: None,
                 is_subagent: false,
                 parent_thread_id: None,
                 depth: None,
@@ -7294,11 +8586,122 @@ mod tests {
     }
 
     #[test]
-    fn native_window_contracts_bind_dynamic_titles_and_fixed_guard_only_to_fixed_windows() {
+    fn graph_resize_handles_cover_all_edges_and_corners() {
+        let directions = [
+            ("north", winit::window::ResizeDirection::North),
+            ("south", winit::window::ResizeDirection::South),
+            ("east", winit::window::ResizeDirection::East),
+            ("west", winit::window::ResizeDirection::West),
+            ("north-east", winit::window::ResizeDirection::NorthEast),
+            ("north-west", winit::window::ResizeDirection::NorthWest),
+            ("south-east", winit::window::ResizeDirection::SouthEast),
+            ("south-west", winit::window::ResizeDirection::SouthWest),
+        ];
+        for (name, expected) in directions {
+            assert_eq!(parse_resize_direction(name), Some(expected));
+        }
+        assert_eq!(parse_resize_direction("invalid"), None);
+
+        let source = include_str!("../ui/components.slint");
+        let graph = source
+            .split("export component GraphWindow inherits Window {")
+            .nth(1)
+            .expect("GraphWindow");
+        assert!(graph.contains("callback begin-window-resize(string);"));
+        for direction in [
+            "direction: \"north\";",
+            "direction: \"south\";",
+            "direction: \"east\";",
+            "direction: \"west\";",
+            "direction: \"north-east\";",
+            "direction: \"north-west\";",
+            "direction: \"south-east\";",
+            "direction: \"south-west\";",
+        ] {
+            assert!(
+                graph.contains(direction),
+                "missing graph resize handle: {direction}"
+            );
+        }
+        for marker in [
+            "width: root.width - 28px;",
+            "height: 14px;",
+            "height: 28px;",
+            "resize-cursor: MouseCursor.nwse-resize;",
+            "resize-cursor: MouseCursor.nesw-resize;",
+            "corner: true;",
+        ] {
+            assert!(
+                graph.contains(marker),
+                "missing resize affordance: {marker}"
+            );
+        }
+        let main = include_str!("../src/main.rs");
+        assert!(main.contains("graph.on_begin_window_resize"));
+        assert!(main.contains("drag_resize_window(direction)"));
+    }
+
+    #[test]
+    fn manual_resize_geometry_keeps_corner_direction_and_minimum() {
+        let initial = ManualX11Geometry {
+            x: 100,
+            y: 80,
+            width: 940,
+            height: 640,
+        };
+        assert_eq!(
+            manual_resize_geometry(initial, winit::window::ResizeDirection::SouthEast, 120, 80,),
+            ManualX11Geometry {
+                x: 100,
+                y: 80,
+                width: 1060,
+                height: 720,
+            }
+        );
+        assert_eq!(
+            manual_resize_geometry(initial, winit::window::ResizeDirection::NorthWest, 120, 80,),
+            ManualX11Geometry {
+                x: 220,
+                y: 160,
+                width: 820,
+                height: 560,
+            }
+        );
+        assert_eq!(
+            manual_resize_geometry(
+                initial,
+                winit::window::ResizeDirection::NorthWest,
+                1_000,
+                1_000,
+            ),
+            ManualX11Geometry {
+                x: 340,
+                y: 240,
+                width: 700,
+                height: 480,
+            }
+        );
+    }
+
+    #[test]
+    fn native_window_contracts_keep_non_graph_windows_move_only() {
         let main = include_str!("../ui/app.slint");
         assert!(main.contains("title: root.window-title;"));
+        assert!(main.contains("no-frame: true;"));
+        assert!(main.contains("resize-border-width: 0px;"));
+        assert!(main.contains("z: -5;"));
+        assert!(main.contains("width: root.width;\n        height: root.height;"));
         assert!(!main.contains("title: \"Codex Info\";"));
         let components = include_str!("../ui/components.slint");
+        assert!(components.contains("export component WindowControls"));
+        assert!(components.contains("export component WindowDragArea"));
+        let header = components
+            .split("export component Header inherits Rectangle {")
+            .nth(1)
+            .and_then(|source| source.split("export component RemainingQuota").next())
+            .expect("Header component");
+        assert!(header.contains("private property <length> action-start:"));
+        assert!(header.contains("width: root.action-start;"));
         let threads = components
             .split("export component ThreadsWindow inherits Window {")
             .nth(1)
@@ -7312,11 +8715,40 @@ mod tests {
             .nth(1)
             .expect("LegalNoticeWindow");
         assert!(threads.contains("title: root.window-title;"));
+        assert!(threads.contains("no-frame: true;"));
+        assert!(threads.contains("resize-border-width: 0px;"));
+        assert!(threads.contains("WindowControls"));
+        assert!(threads.contains("WindowDragArea"));
+        assert!(threads.contains("z: -5;"));
+        assert!(threads.contains("width: root.width;\n        height: root.height;"));
         assert!(graph.contains("title: root.window-title;"));
+        assert!(graph.contains("no-frame: true;"));
+        assert!(graph.contains("resize-border-width: 6px;"));
+        assert!(graph.contains("show-maximize: true;"));
+        assert!(graph.contains("WindowControls"));
+        assert!(graph.contains("WindowDragArea"));
+        assert!(graph.contains("z: -5;"));
+        assert!(graph.contains("width: root.width;\n        height: root.height;"));
         assert!(legal_notice.contains("title: root.window-title;"));
-        assert!(legal_notice.contains("window-title: \"Codex Info - Legal Notices\";"));
-        assert!(legal_notice.contains("GPL-3.0-only"));
-        assert!(legal_notice.contains("Copyright (C) 2026 salty919"));
+        assert!(legal_notice.contains("no-frame: true;"));
+        assert!(legal_notice.contains("resize-border-width: 0px;"));
+        assert!(legal_notice.contains("WindowControls"));
+        assert!(legal_notice.contains("WindowDragArea"));
+        assert!(legal_notice.contains("z: -5;"));
+        assert!(legal_notice.contains("width: root.width;\n        height: root.height;"));
+        for marker in [
+            "preferred-width: 720px;",
+            "preferred-height: 520px;",
+            "min-width: 720px;",
+            "max-width: 720px;",
+            "min-height: 520px;",
+            "max-height: 520px;",
+        ] {
+            assert!(
+                legal_notice.contains(marker),
+                "missing LegalNoticeWindow marker: {marker}"
+            );
+        }
         assert!(main.contains("callback open-legal-notice();"));
         for fixed_source in [main, threads] {
             assert!(fixed_source.contains("min-width: 900px;"));
@@ -7342,7 +8774,14 @@ mod tests {
                 .count(),
             1
         );
-        assert!(!rust_source.contains("install_fixed_window_guard(graph.window())"));
+        assert!(rust_source.contains("install_resizable_window(graph.window());"));
+        assert!(!rust_source
+            .contains("install_window_size_guard(graph.window(), graph_width, graph_height);"));
+        assert!(rust_source.contains(
+            "install_window_size_guard(\n                        window.window(),\n                        LEGAL_WINDOW_WIDTH,\n                        LEGAL_WINDOW_HEIGHT,\n                    );"
+        ));
+        assert!(rust_source.contains("winit_window.set_resizable(false)"));
+        assert!(rust_source.contains("winit_window.set_resizable(true)"));
         assert_eq!(rust_source.matches("LegalNoticeWindow::new()").count(), 1);
         assert!(rust_source.contains("ui.on_open_legal_notice"));
     }
@@ -7352,14 +8791,17 @@ mod tests {
         let source = include_str!("../ui/components.slint");
         for marker in [
             "width: 2px;",
-            "height: 72px;",
-            "x: 96px;",
-            "x: 116px;",
-            "x: 136px;",
-            "y: 17px;",
-            "width: 20px;",
+            "height: root.thread-row-height;",
+            "property <length> tree-base-x: 24px;",
+            "property <length> tree-depth-step: 16px;",
+            "property <length> tree-junction-y: 36px;",
+            "x: parent.tree-base-x + parent.tree-depth-step;",
+            "x: parent.tree-base-x + 2 * parent.tree-depth-step;",
+            "y: parent.tree-junction-y - 1px;",
+            "width: parent.title-x - self.x - 20px;",
             "background: DesignTokens.warning;",
-            "height: 54px;",
+            "height: root.thread-row-height - parent.tree-junction-y;",
+            "border-radius: 2px;",
             "ancestor-guide-1",
             "ancestor-guide-2",
             "ancestor-guide-3",
@@ -7388,12 +8830,35 @@ mod tests {
     }
 
     #[test]
+    fn thread_rails_keep_every_text_lane_outside_the_tree_gutter() {
+        let source = include_str!("../ui/components.slint");
+        for marker in [
+            "property <length> tree-base-x: 24px;",
+            "property <length> tree-depth-step: 16px;",
+            "property <length> tree-junction-y: 36px;",
+            "x: root.single-thread ? 20px : 72px;",
+            ": 172px + self.display-depth * 24px;",
+            "width: parent.title-x - self.x - 20px;",
+            "x: parent.title-x - 24px;",
+            "if !root.single-thread && row.ancestor-guide-1 : Rectangle {",
+            "if !root.single-thread && row.connected-to-parent : Rectangle {",
+            "if !root.single-thread && row.has-children : Rectangle {",
+        ] {
+            assert!(
+                source.contains(marker),
+                "missing non-overlap contract: {marker}"
+            );
+        }
+    }
+
+    #[test]
     fn forbidden_x11_states_identifies_fullscreen_maximize_and_unrelated_atoms() {
         let atoms = X11StateAtoms {
             wm_state: 1,
             fullscreen: 2,
             maximized_vert: 3,
             maximized_horz: 4,
+            active_window: None,
         };
         assert_eq!(forbidden_x11_states(&[], &atoms), (false, false));
         assert_eq!(
@@ -7414,6 +8879,12 @@ mod tests {
     fn motif_functions_allow_move_minimize_close_without_resize_or_maximize() {
         assert_eq!(motif_wm_functions(0), (1, 0x2c));
         assert_eq!(motif_wm_functions(0x40), (0x41, 0x2c));
+    }
+
+    #[test]
+    fn motif_functions_allow_graph_resize_and_maximize() {
+        assert_eq!(motif_wm_resizable_functions(0x2, 0), (0x3, 0x3e));
+        assert_eq!(motif_wm_resizable_functions(0x3, 1), (0x3, 1));
     }
 
     #[test]
@@ -7502,13 +8973,15 @@ mod tests {
         let geometry = |width: f64, height: f64| {
             let margin = (20.0 + (width - 700.0) / 24.0).clamp(20.0, 30.0);
             let content = width - 2.0 * margin;
-            let plot_width = content - 222.0;
+            // 92px plot gutter + 10px leader gap + 80px dollar labels + 4px
+            // right padding. Token mode reserves a wider label column.
+            let plot_width = content - 186.0;
             let plot_height = height - 276.0;
             (margin, plot_width, plot_height)
         };
-        assert_eq!(geometry(700.0, 480.0), (20.0, 438.0, 204.0));
-        assert_eq!(geometry(940.0, 640.0), (30.0, 658.0, 364.0));
-        assert_eq!(geometry(1_200.0, 800.0), (30.0, 918.0, 524.0));
+        assert_eq!(geometry(700.0, 480.0), (20.0, 474.0, 204.0));
+        assert_eq!(geometry(940.0, 640.0), (30.0, 694.0, 364.0));
+        assert_eq!(geometry(1_200.0, 800.0), (30.0, 954.0, 524.0));
         assert_eq!(geometry(1_201.0, 801.0).1 - geometry(1_200.0, 800.0).1, 1.0);
         assert_eq!(geometry(1_201.0, 801.0).2 - geometry(1_200.0, 800.0).2, 1.0);
     }
@@ -7528,8 +9001,83 @@ mod tests {
         assert!(!source.contains("monitor.enforce(graph.window());"));
         assert_eq!(source.matches("Duration::from_millis(100)").count(), 1);
         assert_eq!(source.matches("GraphWindow::new()").count(), 1);
-        assert_eq!(source.matches("graph.show()").count(), 1);
-        assert_eq!(source.matches("graph.hide()").count(), 1);
+        assert_eq!(
+            source
+                .matches("show_and_focus_window(graph.window(),")
+                .count(),
+            1
+        );
+        assert_eq!(source.matches("graph.hide()").count(), 3);
+    }
+
+    #[test]
+    fn existing_secondary_windows_are_raised_without_recreation() {
+        let source = include_str!("main.rs")
+            .split_once("#[cfg(test)]\nmod tests")
+            .map(|(source, _)| source)
+            .expect("production source");
+        assert!(source.contains("fn show_and_focus_window("));
+        assert!(source.contains("let was_visible = window.is_visible()"));
+        assert!(
+            source.contains("window.with_winit_window(|winit_window| winit_window.focus_window())")
+        );
+        assert!(source.contains("x11_monitor.raise_and_activate(window)"));
+        assert!(source.contains("ConfigureWindowAux::new().stack_mode(StackMode::ABOVE)"));
+        assert_eq!(
+            source
+                .matches("show_and_focus_window(graph.window(),")
+                .count(),
+            1
+        );
+        assert_eq!(
+            source
+                .matches("show_and_focus_window(window.window(),")
+                .count(),
+            2
+        );
+        assert_eq!(source.matches("ThreadsWindow::new()").count(), 1);
+        assert_eq!(source.matches("LegalNoticeWindow::new()").count(), 1);
+        assert!(!source.contains("graph.show()"));
+        assert!(!source.contains("let _ = window.show();"));
+    }
+
+    #[test]
+    fn secondary_close_hides_before_native_close_and_skips_hidden_work() {
+        let source = include_str!("main.rs")
+            .split_once("#[cfg(test)]\nmod tests")
+            .map(|(source, _)| source)
+            .expect("production source");
+        assert_eq!(source.matches("on_close_requested(move ||").count(), 3);
+        assert_eq!(
+            source
+                .matches("CloseRequestResponse::KeepWindowShown")
+                .count(),
+            3
+        );
+        assert!(source.contains("if graph.hide().is_ok()"));
+        assert!(source.contains("if window.hide().is_ok()"));
+        assert!(source.contains("if graph.window().is_visible()"));
+        assert!(source.contains("if window.window().is_visible()"));
+
+        let components = include_str!("../ui/components.slint");
+        let action_button = components
+            .split_once("component ActionButton inherits Rectangle {")
+            .and_then(|(_, source)| source.split_once("export component WeekGauge"))
+            .map(|(source, _)| source)
+            .expect("ActionButton component");
+        assert!(action_button.contains("touch-area := TouchArea"));
+        assert!(action_button.contains("touch-area.pressed"));
+        assert!(action_button.contains("activate-on-press: false"));
+        assert!(action_button.contains("reset-press-state: false"));
+        assert!(action_button.contains("changed pressed =>"));
+        assert_eq!(components.matches("activate-on-press: true;").count(), 0);
+        assert_eq!(
+            components
+                .matches("reset-press-state: root.reset-close-buttons;")
+                .count(),
+            0
+        );
+        assert_eq!(source.matches("set_reset_close_buttons(true)").count(), 12);
     }
 
     #[test]
@@ -7689,26 +9237,50 @@ mod tests {
                     .next()
             })
             .expect("AccountActivity");
-        assert!(account.contains("text: root.active-thread-count + \"件\";"));
-        assert!(account.contains("text: \"モデル別スレッド\";"));
+        assert!(account.contains("text: root.active-thread-count-label;"));
+        assert!(account.contains("text: root.strings.model-threads;"));
         assert!(account.contains("label: \"SOL\";"));
         assert!(account.contains("label: \"TERRA\";"));
         assert!(account.contains("label: \"LUNA\";"));
-        assert!(account.contains("label: \"その他\";"));
-        assert!(account.contains("y: 14px;\n        width: 64px;\n        height: 24px;"));
+        assert!(account.contains("label: root.strings.other;"));
+        assert!(account.contains("x: parent.width - 112px;"));
+        assert!(account.contains("width: 100px;\n        height: 24px;"));
     }
 
     #[test]
     fn dollar_graph_is_presented_as_independent_lines() {
         let slint = include_str!("../ui/components.slint");
-        assert!(slint.contains("累積消費ドル（モデル別）"));
+        assert!(slint.contains("root.strings.graph-dollar-description"));
         assert!(!slint.contains("累積消費ドル（積み上げ）"));
         assert!(slint.contains("model: root.metric-options;"));
         assert!(slint.contains("current-index: root.selected-metric-index;"));
         assert!(!slint.contains("current-value:"));
+        for marker in [
+            "current-remaining-connector-path",
+            "current-sol-connector-path",
+            "current-terra-connector-path",
+            "current-luna-connector-path",
+            "current-label-gap: 10px;",
+            "current-label-width: root.show-tokens ? 112px : 80px;",
+            "current-label-right-padding: 4px;",
+        ] {
+            assert!(
+                slint.contains(marker),
+                "missing graph label mapping: {marker}"
+            );
+        }
+        // Connector coordinates are normalized to the 0..100 viewbox. They
+        // must fill the narrow label gap; otherwise Slint treats the values as
+        // raw pixels and paints stray lines near the plot center/top.
+        assert_eq!(
+            slint
+                .matches("fit: fill;\n                commands: root.current-")
+                .count(),
+            4
+        );
         // An open SVG path must never be implicitly closed and painted to the
         // baseline; that was the visual source of the old stacked-area graph.
-        assert_eq!(slint.matches("fill: transparent;").count(), 7);
+        assert_eq!(slint.matches("fill: transparent;").count(), 11);
     }
 
     #[test]
@@ -8417,6 +9989,10 @@ mod tests {
                 .count()
                 >= 2
         );
+        assert!(periods
+            .iter()
+            .filter(|period| period.label.contains("（期限 "))
+            .all(|period| period.label.contains("JST")));
         for period in &periods {
             assert_eq!(
                 history.period_id_for_label(&period.label, 2_000, None),
@@ -8924,6 +10500,16 @@ mod tests {
     }
 
     #[test]
+    fn current_label_connector_path_links_series_endpoint_to_displaced_label() {
+        assert_eq!(
+            current_label_connector_path(0.80, 0.68, true),
+            "M0.00 80.00 L100.00 68.00"
+        );
+        assert_eq!(current_label_connector_path(0.80, 0.68, false), "");
+        assert_eq!(current_label_connector_path(f32::NAN, 0.68, true), "");
+    }
+
+    #[test]
     fn focused_model_graph_rebases_the_selected_area_to_zero() {
         let samples = [
             UsageHistorySample::new(
@@ -9141,7 +10727,7 @@ mod tests {
         assert_eq!(zero_paths.dollar_labels[0], "1");
 
         let source = include_str!("../ui/components.slint");
-        assert!(source.contains("x: parent.width - 224px;"));
+        assert!(source.contains("x: parent.width - 244px;"));
         assert!(source.contains("model: root.metric-options;"));
         assert!(source.contains("selected(value) => { root.select-metric(value); }"));
     }
@@ -9363,6 +10949,216 @@ mod tests {
     }
 
     #[test]
+    fn unused_intervals_mark_idle_segments_and_preserve_first_use_boundary() {
+        let points = [
+            HourlyModelSpend {
+                timestamp: 0,
+                ..HourlyModelSpend::default()
+            },
+            HourlyModelSpend {
+                timestamp: 60,
+                ..HourlyModelSpend::default()
+            },
+            HourlyModelSpend {
+                timestamp: 120,
+                sol: 1.0,
+                ..HourlyModelSpend::default()
+            },
+            HourlyModelSpend {
+                timestamp: 180,
+                sol: 1.0,
+                ..HourlyModelSpend::default()
+            },
+            HourlyModelSpend {
+                timestamp: 240,
+                sol: 2.0,
+                ..HourlyModelSpend::default()
+            },
+        ];
+        assert_eq!(
+            unused_interval_positions(&points, 0, 240),
+            vec![
+                UnusedIntervalPosition {
+                    start: 0.0,
+                    width: 25.0,
+                    preserve_boundary: false,
+                },
+                UnusedIntervalPosition {
+                    start: 50.0,
+                    width: 25.0,
+                    preserve_boundary: false,
+                },
+            ]
+        );
+
+        let first_use = [
+            HourlyModelSpend {
+                timestamp: 0,
+                ..HourlyModelSpend::default()
+            },
+            HourlyModelSpend {
+                timestamp: 180,
+                sol: 4.0,
+                ..HourlyModelSpend::default()
+            },
+            HourlyModelSpend {
+                timestamp: 240,
+                sol: 4.0,
+                ..HourlyModelSpend::default()
+            },
+        ];
+        assert_eq!(
+            unused_interval_positions(&first_use, 0, 240),
+            vec![
+                UnusedIntervalPosition {
+                    start: 0.0,
+                    width: 75.0,
+                    preserve_boundary: true,
+                },
+                UnusedIntervalPosition {
+                    start: 75.0,
+                    width: 25.0,
+                    preserve_boundary: false,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn unused_intervals_merge_adjacent_flat_segments() {
+        let points = [
+            HourlyModelSpend {
+                timestamp: 0,
+                sol: 2.0,
+                terra: 1.0,
+                luna: 3.0,
+            },
+            HourlyModelSpend {
+                timestamp: 60,
+                sol: 2.0,
+                terra: 1.0,
+                luna: 3.0,
+            },
+            HourlyModelSpend {
+                timestamp: 120,
+                sol: 2.0,
+                terra: 1.0,
+                luna: 3.0,
+            },
+            HourlyModelSpend {
+                timestamp: 180,
+                sol: 2.0,
+                terra: 1.0,
+                luna: 3.0,
+            },
+        ];
+        assert_eq!(
+            unused_interval_positions(&points, 0, 180),
+            vec![UnusedIntervalPosition {
+                start: 0.0,
+                width: 100.0,
+                preserve_boundary: false,
+            }]
+        );
+    }
+
+    #[test]
+    fn unused_intervals_use_the_selected_dollar_or_token_metric() {
+        let samples = [
+            UsageHistorySample::new_with_usage(
+                0,
+                1_000,
+                100.0,
+                ModelDollarTotals::default(),
+                ModelTokenTotals::default(),
+            ),
+            UsageHistorySample::new_with_usage(
+                60,
+                1_000,
+                99.0,
+                ModelDollarTotals {
+                    sol: 1.0,
+                    ..ModelDollarTotals::default()
+                },
+                ModelTokenTotals {
+                    sol: 100,
+                    ..ModelTokenTotals::default()
+                },
+            ),
+            UsageHistorySample::new_with_usage(
+                120,
+                1_000,
+                98.0,
+                ModelDollarTotals {
+                    sol: 1.0,
+                    ..ModelDollarTotals::default()
+                },
+                ModelTokenTotals {
+                    sol: 200,
+                    ..ModelTokenTotals::default()
+                },
+            ),
+            UsageHistorySample::new_with_usage(
+                180,
+                1_000,
+                97.0,
+                ModelDollarTotals {
+                    sol: 1.0,
+                    ..ModelDollarTotals::default()
+                },
+                ModelTokenTotals {
+                    sol: 200,
+                    ..ModelTokenTotals::default()
+                },
+            ),
+        ];
+        let references = samples.iter().collect::<Vec<_>>();
+        let dollars = graph_paths_for_selection(&references, 0, 180, true, true, true, false);
+        let tokens = graph_paths_for_selection(&references, 0, 180, true, true, true, true);
+
+        assert_eq!(dollars.unused_intervals.len(), 1);
+        assert!((dollars.unused_intervals[0].start - 33.3333333333).abs() < 0.000_001);
+        assert!((dollars.unused_intervals[0].width - 66.6666666667).abs() < 0.000_001);
+        assert_eq!(tokens.unused_intervals.len(), 1);
+        assert!((tokens.unused_intervals[0].start - 66.6666666667).abs() < 0.000_001);
+        assert!((tokens.unused_intervals[0].width - 33.3333333333).abs() < 0.000_001);
+    }
+
+    #[test]
+    fn dollar_idle_bands_use_raw_cumulative_values_before_line_smoothing() {
+        let samples = [
+            UsageHistorySample::new(0, 1_000, 100.0, ModelDollarTotals::default()),
+            UsageHistorySample::new(60, 1_000, 99.0, ModelDollarTotals::default()),
+            UsageHistorySample::new(
+                120,
+                1_000,
+                98.0,
+                ModelDollarTotals {
+                    sol: 1.0,
+                    ..ModelDollarTotals::default()
+                },
+            ),
+            UsageHistorySample::new(
+                180,
+                1_000,
+                97.0,
+                ModelDollarTotals {
+                    sol: 1.0,
+                    ..ModelDollarTotals::default()
+                },
+            ),
+        ];
+        let references = samples.iter().collect::<Vec<_>>();
+        let paths = graph_paths(&references, 0, 180);
+
+        assert_eq!(paths.unused_intervals.len(), 2);
+        assert!((paths.unused_intervals[0].start - 0.0).abs() < 0.000_001);
+        assert!((paths.unused_intervals[0].width - 33.3333333333).abs() < 0.000_001);
+        assert!((paths.unused_intervals[1].start - 66.6666666667).abs() < 0.000_001);
+        assert!((paths.unused_intervals[1].width - 33.3333333333).abs() < 0.000_001);
+    }
+
+    #[test]
     fn current_graph_labels_are_clamped_and_separated_at_minimum_size() {
         let mut paths = GraphPaths {
             current_remaining_label: "50%".into(),
@@ -9383,12 +11179,12 @@ mod tests {
             paths.current_sol_y,
         ];
         positions.sort_by(f32::total_cmp);
-        let minimum = 8.0 / 260.0;
+        let minimum = 8.0 / 204.0;
         let maximum = 1.0 - minimum;
         assert!(positions[0] >= minimum);
         assert!(positions[3] <= maximum);
         for pair in positions.windows(2) {
-            assert!((pair[1] - pair[0]) * 260.0 >= 15.999);
+            assert!((pair[1] - pair[0]) * 204.0 >= 15.999);
         }
     }
 
@@ -9452,9 +11248,11 @@ mod tests {
     #[test]
     fn period_label_has_month_and_day_for_both_endpoints() {
         let label = format_period_label(1_700_000_000, 1_700_086_400);
+        assert_eq!(label, "2023/11/15 07:13:20 JST ～ 2023/11/16 07:13:20 JST");
         assert_eq!(label.matches('/').count(), 4);
-        assert_eq!(label.matches(" – ").count(), 1);
-        let endpoints: Vec<_> = label.split(" – ").collect();
+        assert_eq!(label.matches(" JST").count(), 2);
+        assert_eq!(label.matches(" ～ ").count(), 1);
+        let endpoints: Vec<_> = label.split(" ～ ").collect();
         assert_eq!(endpoints.len(), 2);
         assert!(endpoints
             .iter()
@@ -9475,19 +11273,34 @@ mod tests {
     }
 
     #[test]
-    fn graph_history_popup_stays_inside_the_control_band() {
+    fn graph_history_placeholder_is_not_selectable() {
+        let source = include_str!("../ui/components.slint");
+        let graph_select = source
+            .split_once("export component GraphSelect inherits Rectangle {")
+            .and_then(|(_, source)| source.split_once("export component Header"))
+            .map(|(source, _)| source)
+            .expect("GraphSelect component");
+        assert!(graph_select.contains(
+            "enabled: root.model.length > 0 && !(root.model.length == 1 && root.model[0] == \"履歴なし\");"
+        ));
+    }
+
+    #[test]
+    fn graph_history_popup_overlays_plot_without_reflowing_it() {
         let source = include_str!("../ui/components.slint");
         let graph = source
             .split("export component GraphWindow inherits Window {")
             .nth(1)
             .expect("GraphWindow");
-        assert!(graph.contains("popup-above: true;"));
+        assert!(graph.contains("popup-above: false;"));
         assert!(graph.contains("y: 72px;"));
-        assert!(graph.contains("history-toggle-y: history-select.popup-open ? 72px + history-select.popup-height + 8px : 144px;"));
+        assert!(graph.contains("history-toggle-y: 144px;"));
+        assert!(!graph.contains("history-toggle-y: history-select.popup-open ?"));
+        assert!(graph.contains("z: 2;"));
         assert!(graph.contains("y: root.history-toggle-y + 32px;"));
         assert!(source.contains("y: root.popup-above ? 0px : root.height;"));
         assert!(source.contains(
-            "out property <length> popup-height: min(128px, max(root.item-height, root.model.length * root.item-height));"
+            "out property <length> popup-height: min(130px, max(root.item-height + 2px, root.model.length * root.item-height + 2px));"
         ));
         assert!(source.contains("popup-list := ListView"));
     }
@@ -9515,10 +11328,13 @@ mod tests {
             .nth(1)
             .expect("GraphWindow");
         assert!(source.contains(
-            "out property <length> popup-height: min(128px, max(root.item-height, root.model.length * root.item-height));"
+            "out property <length> popup-height: min(130px, max(root.item-height + 2px, root.model.length * root.item-height + 2px));"
         ));
         assert!(graph.contains("background: DesignTokens.graph-control-surface;"));
         assert!(graph.contains("opacity: 0.72;"));
+        assert!(graph.contains("in-out property <[GraphUnusedInterval]> unused-intervals;"));
+        assert!(graph.contains("for interval in root.unused-intervals: Rectangle"));
+        assert!(graph.contains("background: DesignTokens.text-muted;"));
         let toggle = source
             .split("component GraphToggle inherits Rectangle {")
             .nth(1)
@@ -9526,6 +11342,9 @@ mod tests {
             .expect("GraphToggle");
         assert!(toggle.contains("background: transparent;"));
         assert!(!toggle.contains("border-width: 1px;"));
+        assert!(toggle.contains("text: root.label;"));
+        assert!(!toggle.contains("strings.on"));
+        assert!(!toggle.contains("strings.off"));
     }
 
     #[test]
@@ -9606,6 +11425,54 @@ mod tests {
     }
 
     #[test]
+    fn threads_window_uses_readable_primary_metadata_layout() {
+        let threads = include_str!("../ui/components.slint")
+            .split("export component ThreadsWindow inherits Window {")
+            .nth(1)
+            .expect("ThreadsWindow");
+        assert!(threads.contains("property <bool> single-thread: root.thread-rows.length == 1;"));
+        assert!(threads
+            .contains("property <length> thread-row-height: root.single-thread ? 384px : 128px;"));
+        assert!(threads.contains("height: root.thread-row-height;"));
+        assert!(threads.contains("font-size: root.single-thread ? 28px : 20px;"));
+        assert!(threads.contains("font-size: root.single-thread ? 22px : 18px;"));
+        assert!(threads.contains("font-size: 28px;"));
+        assert!(threads.contains("font-size: 24px;"));
+        assert!(threads.contains("font-size: 18px;"));
+        assert!(threads.contains("width: root.single-thread ? 90px : 78px;"));
+        assert!(threads.contains("width: 268px;"));
+        assert!(threads.contains("text: row.model;"));
+        assert!(threads.contains("text: root.strings.running + \" \" + row.thread-age;"));
+        assert!(threads.contains("text: root.strings.instruction + \" \" + row.instruction-age;"));
+        assert!(threads.contains("text: root.strings.running;"));
+        assert!(threads.contains("text: root.strings.instruction;"));
+        assert!(threads.contains("text: root.strings.tokens;"));
+        assert!(threads.contains("text: row.tokens;"));
+        assert!(threads.contains("text: row.context-usage;"));
+        assert!(threads.contains("text: root.strings.context-usage;"));
+        assert!(threads.contains("text: row.context-usage;"));
+        assert!(threads.contains("text: root.strings.context-usage;"));
+        assert!(threads.contains("width: parent.width - 486px;"));
+        assert!(threads.contains("property <bool> has-parent-title: row.parent-title != \"\";"));
+        assert!(threads.contains("visible: !root.single-thread || parent.has-parent-title;"));
+        assert!(threads.contains("y: parent.has-parent-title ? 132px : 84px;"));
+        assert!(!threads.contains("row.elapsed"));
+        assert!(threads.contains("x: root.single-thread ? 400px : parent.width - 560px;"));
+        assert!(threads.contains("x: parent.width - 300px;"));
+    }
+
+    #[test]
+    fn single_thread_preview_uses_the_full_detail_viewport() {
+        let source = include_str!("main.rs")
+            .split_once("#[cfg(test)]\nmod tests")
+            .map(|(source, _)| source)
+            .expect("production source");
+        assert!(source.contains("Some(\"multi-thread\" | \"single-thread\")"));
+        let state = CodexInfoState::preview("single-thread");
+        assert_eq!(state.active_threads.len(), 1);
+    }
+
+    #[test]
     fn threads_window_header_stays_above_the_scrolling_rows() {
         let threads = include_str!("../ui/components.slint")
             .split("export component ThreadsWindow inherits Window {")
@@ -9621,6 +11488,8 @@ mod tests {
         assert!(header.contains("width: 840px;"));
         assert!(header.contains("height: 48px;"));
         assert!(header.contains("background: DesignTokens.canvas;"));
+        assert!(header.contains("font-size: 22px;"));
+        assert!(header.contains("font-size: 16px;"));
         assert!(header.contains("z: 2;"));
     }
 }

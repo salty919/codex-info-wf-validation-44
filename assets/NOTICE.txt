@@ -1,7 +1,14 @@
-Noto Sans Japanese font (Noto Sans JP)
+Noto Sans CJK fonts (Noto Sans JP and Noto Sans CJK KR)
 
-Copyright 2022 The Noto Project Authors
+NotoSansJP.ttf:
 Copyright (c) 2014-2021 Adobe (http://www.adobe.com/), with Reserved Font Name 'Source'.
+
+NotoSansKR.otf:
+Copyright © 2014-2021 Adobe (http://www.adobe.com/).
 Licensed under the SIL Open Font License, Version 1.1.
 License text: ../LICENSES/OFL-1.1.txt
-Source: https://github.com/notofonts/noto-cjk
+Source: Noto Sans JP: https://github.com/google/fonts/tree/main/ofl/notosansjp
+Source: Noto Sans CJK KR 2.004: https://github.com/notofonts/noto-cjk/tree/Sans2.004
+
+The repository embeds both `NotoSansJP.ttf` and `NotoSansKR.otf`. The font
+files remain under OFL-1.1; they are not relicensed under GPL-3.0-only.

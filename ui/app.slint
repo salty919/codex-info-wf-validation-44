@@ -1,11 +1,12 @@
 // Copyright (C) 2026 salty919
 // SPDX-License-Identifier: GPL-3.0-only
 
-import { Header, RemainingQuota, WeekGauge, AccountActivity, ModelUsage, StatusBanner, AuthPanel, GraphWindow, ThreadsWindow, LegalNoticeWindow } from "components.slint";
+import { UiStrings, Header, WindowDragArea, RemainingQuota, WeekGauge, AccountActivity, ModelUsage, StatusBanner, AuthPanel, GraphWindow, ThreadsWindow, LegalNoticeWindow } from "components.slint";
 import { DesignTokens } from "theme.slint";
 import "../assets/NotoSansJP.ttf";
+import "../assets/NotoSansKR.otf";
 
-export { GraphWindow, ThreadsWindow, LegalNoticeWindow }
+export { GraphWindow, ThreadsWindow, LegalNoticeWindow, UiStrings }
 
 export component MainWindow inherits Window {
     preferred-width: 900px;
@@ -14,11 +15,16 @@ export component MainWindow inherits Window {
     max-width: 900px;
     min-height: 480px;
     max-height: 480px;
-    in-out property <string> window-title: "アカウント未接続 — プラン未設定";
+    in-out property <string> window-title;
+    in-out property <UiStrings> strings;
+    // The application owns the title controls so the native frame never
+    // reintroduces a platform-specific maximize/resize affordance.
+    no-frame: true;
+    resize-border-width: 0px;
     title: root.window-title;
     background: status-level == "warning" ? DesignTokens.canvas-warning :
         status-level == "error" ? DesignTokens.canvas-error : DesignTokens.canvas;
-    default-font-family: "Noto Sans JP";
+    default-font-family: root.strings.font-family;
 
     changed maximized => {
         if (self.maximized) {
@@ -36,10 +42,11 @@ export component MainWindow inherits Window {
     in-out property <bool> has-auth-url: false;
     in-out property <bool> checking: true;
     in-out property <bool> has-error: false;
-    in-out property <string> quota-title: "残り利用枠";
+    in-out property <string> quota-title;
     in-out property <bool> has-quota-percent: true;
     in-out property <bool> has-active-thread: false;
     in-out property <int> active-thread-count: 0;
+    in-out property <string> active-thread-count-label;
     in-out property <int> active-thread-sol-count: 0;
     in-out property <int> active-thread-terra-count: 0;
     in-out property <int> active-thread-luna-count: 0;
@@ -67,6 +74,29 @@ export component MainWindow inherits Window {
     callback open-graph();
     callback open-threads();
     callback open-legal-notice();
+    callback begin-window-drag();
+    callback minimize-window();
+    callback close-window();
+
+    // Frameless windows do not receive a compositor-painted frame. Paint the
+    // entire client surface so margins never reveal another window beneath it.
+    Rectangle {
+        x: 0px;
+        y: 0px;
+        width: root.width;
+        height: root.height;
+        background: status-level == "warning" ? DesignTokens.canvas-warning :
+            status-level == "error" ? DesignTokens.canvas-error : DesignTokens.canvas;
+        z: -10;
+    }
+    WindowDragArea {
+        x: 0px;
+        y: 0px;
+        width: root.width;
+        height: root.height;
+        z: -5;
+        begin-drag => { root.begin-window-drag(); }
+    }
 
     Rectangle {
         x: root.width > 800px ? (root.width - DesignTokens.content-max-width) / 2 : DesignTokens.outer-margin-compact;
@@ -82,6 +112,7 @@ export component MainWindow inherits Window {
             spacing: DesignTokens.space-2;
             alignment: start;
             Header {
+                strings: root.strings;
                 width: root.content-width;
                 preferred-width: root.content-width;
                 horizontal-stretch: 1;
@@ -89,12 +120,15 @@ export component MainWindow inherits Window {
                 show-graph: true;
                 open-graph => { root.open-graph(); }
                 open-legal-notice => { root.open-legal-notice(); }
+                begin-window-drag => { root.begin-window-drag(); }
+                minimize-window => { root.minimize-window(); }
+                close-window => { root.close-window(); }
             }
             if root.has-usage : RemainingQuota {
                 width: root.content-width;
                 preferred-width: root.content-width;
                 horizontal-stretch: 1;
-                quota-title: root.has-quota-percent ? root.quota-title : "利用枠";
+                quota-title: root.quota-title;
                 remaining-label: root.remaining-label;
                 remaining-percent: root.remaining-percent;
                 has-quota-percent: root.has-quota-percent;
@@ -108,6 +142,8 @@ export component MainWindow inherits Window {
                 remaining-label: root.week-label;
             }
             AccountActivity {
+                strings: root.strings;
+                active-thread-count-label: root.active-thread-count-label;
                 width: root.content-width;
                 preferred-width: root.content-width;
                 horizontal-stretch: 1;
@@ -120,6 +156,7 @@ export component MainWindow inherits Window {
                 open-threads => { root.open-threads(); }
             }
             if root.has-model-usage : ModelUsage {
+                strings: root.strings;
                 width: root.content-width;
                 preferred-width: root.content-width;
                 horizontal-stretch: 1;
@@ -132,6 +169,7 @@ export component MainWindow inherits Window {
                 output-cost-rows: root.model-usage-output-costs;
             }
             StatusBanner {
+                strings: root.strings;
                 width: root.content-width;
                 preferred-width: root.content-width;
                 horizontal-stretch: 1;
@@ -149,14 +187,19 @@ export component MainWindow inherits Window {
             spacing: DesignTokens.space-2;
             alignment: start;
             Header {
+                strings: root.strings;
                 width: root.content-width;
                 preferred-width: root.content-width;
                 horizontal-stretch: 1;
                 period-label: "";
                 show-graph: false;
                 open-legal-notice => { root.open-legal-notice(); }
+                begin-window-drag => { root.begin-window-drag(); }
+                minimize-window => { root.minimize-window(); }
+                close-window => { root.close-window(); }
             }
             AuthPanel {
+                strings: root.strings;
                 width: root.content-width;
                 preferred-width: root.content-width;
                 horizontal-stretch: 1;

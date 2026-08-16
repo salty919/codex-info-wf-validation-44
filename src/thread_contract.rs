@@ -13,6 +13,7 @@ use std::io::{BufRead, Cursor};
 use std::path::Path;
 use std::sync::OnceLock;
 
+use chrono::DateTime;
 use serde_json::{json, Map, Value};
 
 use crate::security;
@@ -609,11 +610,12 @@ fn number_at_least(instance: &Value, minimum: &Value) -> Result<bool, Validation
 
 /// Immutable, schema-first representation of a Thread item.  The complete
 /// validated JSON is retained privately for exact deduplication in C2; only
-/// the four derived values are exposed here.
+/// bounded identity, timing, relation, and title fields are exposed here.
 #[derive(Clone, Debug)]
 pub struct ValidatedThreadCandidate {
     raw: Value,
     id: String,
+    created_at: i64,
     updated_at: i64,
     path: Option<String>,
     title: String,
@@ -629,6 +631,10 @@ impl ValidatedThreadCandidate {
 
     pub fn updated_at(&self) -> i64 {
         self.updated_at
+    }
+
+    pub fn created_at(&self) -> i64 {
+        self.created_at
     }
 
     pub fn path(&self) -> Option<&str> {
@@ -661,6 +667,7 @@ impl ValidatedThreadCandidate {
 
     pub fn derived_eq(&self, other: &Self) -> bool {
         self.id == other.id
+            && self.created_at == other.created_at
             && self.updated_at == other.updated_at
             && self.path == other.path
             && self.title == other.title
@@ -678,6 +685,7 @@ impl PartialEq for ValidatedThreadCandidate {
     fn eq(&self, other: &Self) -> bool {
         self.raw == other.raw
             && self.id == other.id
+            && self.created_at == other.created_at
             && self.updated_at == other.updated_at
             && self.path == other.path
             && self.title == other.title
@@ -925,6 +933,11 @@ pub fn validate_thread_item(item: &Value) -> Result<ValidatedThreadCandidate, Th
         .and_then(Value::as_i64)
         .filter(|value| *value > 0)
         .ok_or(ThreadContractError::InvalidItem)?;
+    let created_at = object
+        .get("createdAt")
+        .and_then(Value::as_i64)
+        .filter(|value| *value > 0)
+        .ok_or(ThreadContractError::InvalidItem)?;
     let id = object
         .get("id")
         .and_then(Value::as_str)
@@ -971,6 +984,7 @@ pub fn validate_thread_item(item: &Value) -> Result<ValidatedThreadCandidate, Th
     Ok(ValidatedThreadCandidate {
         raw: item.clone(),
         id,
+        created_at,
         updated_at,
         path,
         title,
@@ -1136,6 +1150,8 @@ pub struct ValidatedRollout {
     model: String,
     model_label: String,
     total_tokens: Option<u64>,
+    context_window_tokens: Option<u64>,
+    last_user_message_at: Option<i64>,
 }
 
 impl ValidatedRollout {
@@ -1154,6 +1170,14 @@ impl ValidatedRollout {
     pub fn total_tokens(&self) -> Option<u64> {
         self.total_tokens
     }
+
+    pub fn context_window_tokens(&self) -> Option<u64> {
+        self.context_window_tokens
+    }
+
+    pub fn last_user_message_at(&self) -> Option<i64> {
+        self.last_user_message_at
+    }
 }
 
 #[derive(Default)]
@@ -1161,6 +1185,8 @@ struct RolloutState {
     last_task_running: Option<bool>,
     last_model: Option<String>,
     last_total_tokens: Option<u64>,
+    last_context_window_tokens: Option<u64>,
+    last_user_message_at: Option<i64>,
 }
 
 fn finish_rollout(state: RolloutState) -> Result<ValidatedRollout, RolloutError> {
@@ -1175,7 +1201,18 @@ fn finish_rollout(state: RolloutState) -> Result<ValidatedRollout, RolloutError>
         model,
         model_label,
         total_tokens: state.last_total_tokens,
+        context_window_tokens: state.last_context_window_tokens,
+        last_user_message_at: state.last_user_message_at,
     })
+}
+
+fn event_timestamp(value: &Value) -> Option<i64> {
+    value
+        .get("timestamp")
+        .and_then(Value::as_str)
+        .and_then(|timestamp| DateTime::parse_from_rfc3339(timestamp).ok())
+        .map(|timestamp| timestamp.timestamp())
+        .filter(|timestamp| *timestamp > 0)
 }
 
 /// Validate a bounded JSONL stream before returning any task, model, or token
@@ -1234,7 +1271,27 @@ fn apply_rollout_event(value: &Value, state: &mut RolloutState) -> Result<(), Ro
             .get("type")
             .and_then(Value::as_str)
             .ok_or(RolloutError::InvalidKnownEvent)?;
+        if event_type == "user_message" {
+            if let Some(timestamp) = event_timestamp(value) {
+                state.last_user_message_at = Some(timestamp);
+            }
+        }
         return apply_known_rollout_event(event_type, payload, true, state);
+    }
+
+    if root_type == "response_item"
+        && value
+            .get("payload")
+            .and_then(Value::as_object)
+            .is_some_and(|payload| {
+                payload.get("type").and_then(Value::as_str) == Some("message")
+                    && payload.get("role").and_then(Value::as_str) == Some("user")
+            })
+    {
+        if let Some(timestamp) = event_timestamp(value) {
+            state.last_user_message_at = Some(timestamp);
+        }
+        return Ok(());
     }
 
     let event = match root.get("payload") {
@@ -1294,6 +1351,15 @@ fn apply_known_rollout_event(
                 .and_then(Value::as_u64)
                 .ok_or(RolloutError::InvalidKnownEvent)?;
             state.last_total_tokens = Some(total_tokens);
+            if let Some(context_window) = info.get("model_context_window") {
+                state.last_context_window_tokens = Some(
+                    context_window
+                        .as_u64()
+                        .ok_or(RolloutError::InvalidKnownEvent)?,
+                );
+            } else {
+                state.last_context_window_tokens = None;
+            }
         }
         _ => {}
     }
@@ -1324,11 +1390,14 @@ fn extract_known_model(
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ActiveThreadSnapshot {
     pub thread_id: String,
+    pub created_at: i64,
     pub updated_at: i64,
     pub title: String,
     pub model: String,
     pub model_label: String,
     pub total_tokens: Option<u64>,
+    pub context_window_tokens: Option<u64>,
+    pub last_user_message_at: Option<i64>,
     pub is_subagent: bool,
     pub parent_thread_id: Option<String>,
     pub depth: Option<i32>,
@@ -1412,11 +1481,14 @@ where
         }
         snapshots.push(ActiveThreadSnapshot {
             thread_id: candidate.id().to_owned(),
+            created_at: candidate.created_at(),
             updated_at: candidate.updated_at(),
             title: candidate.title().to_owned(),
             model: rollout.model().to_owned(),
             model_label: rollout.model_label().to_owned(),
             total_tokens: rollout.total_tokens(),
+            context_window_tokens: rollout.context_window_tokens(),
+            last_user_message_at: rollout.last_user_message_at(),
             is_subagent: candidate.is_subagent(),
             parent_thread_id: candidate.parent_thread_id().map(ToOwned::to_owned),
             depth: candidate.depth(),
@@ -3031,6 +3103,37 @@ mod tests {
     }
 
     #[test]
+    fn thread_c_context_window_is_taken_from_the_latest_token_count() {
+        let events = [
+            json!({"type":"task_started"}),
+            json!({"type":"event_msg","payload":{"type":"token_count","info":{
+                "total_token_usage":{"total_tokens":10},
+                "model_context_window":128000
+            }}}),
+            json!({"type":"event_msg","payload":{"type":"token_count","info":{
+                "total_token_usage":{"total_tokens":20},
+                "model_context_window":258400
+            }}}),
+        ];
+        let parsed = parse_rollout(&rollout_bytes(&events)).unwrap();
+        assert_eq!(parsed.total_tokens(), Some(20));
+        assert_eq!(parsed.context_window_tokens(), Some(258_400));
+
+        let without_field = parse_rollout(&rollout_bytes(&[
+            json!({"type":"event_msg","payload":{"type":"token_count","info":{
+                "total_token_usage":{"total_tokens":25},
+                "model_context_window":128000
+            }}}),
+            json!({"type":"event_msg","payload":{"type":"token_count","info":{
+                "total_token_usage":{"total_tokens":30}
+            }}}),
+        ]))
+        .unwrap();
+        assert_eq!(without_field.total_tokens(), Some(30));
+        assert_eq!(without_field.context_window_tokens(), None);
+    }
+
+    #[test]
     fn thread_c_known_token_invalid_event_rejects_entire_rollout() {
         let started = r#"{"type":"task_started"}"#;
         let valid = r#"{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"total_tokens":55}}}}"#;
@@ -3046,6 +3149,9 @@ mod tests {
             r#"{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"total_tokens":[]}}}}"#,
             r#"{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"total_tokens":{}}}}}"#,
             r#"{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"total_tokens":18446744073709551616}}}}"#,
+            r#"{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"total_tokens":1},"model_context_window":null}}}"#,
+            r#"{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"total_tokens":1},"model_context_window":-1}}}"#,
+            r#"{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"total_tokens":1},"model_context_window":"258400"}}}"#,
         ];
         for line in invalid {
             assert_eq!(
@@ -3110,6 +3216,8 @@ mod tests {
                 model: "不明".to_owned(),
                 model_label: "不明".to_owned(),
                 total_tokens: None,
+                context_window_tokens: None,
+                last_user_message_at: None,
             })
         );
         assert!(parse_rollout(b"{}\n").is_ok());
@@ -3201,6 +3309,39 @@ mod tests {
     }
 
     #[test]
+    fn thread_c_tracks_latest_user_instruction_timestamp_for_duration_display() {
+        let rollout = rollout_bytes(&[
+            json!({
+                "timestamp":"2026-08-15T00:00:01Z",
+                "type":"event_msg",
+                "payload":{"type":"user_message","message":{"text":"first"}}
+            }),
+            json!({
+                "timestamp":"2026-08-15T00:00:02Z",
+                "type":"response_item",
+                "payload":{"type":"message","role":"user","content":[]}
+            }),
+            json!({
+                "timestamp":"2026-08-15T00:00:03Z",
+                "type":"task_started"
+            }),
+            json!({
+                "type":"event_msg",
+                "payload":{"type":"user_message","message":{"text":"no timestamp"}}
+            }),
+        ]);
+        let parsed = parse_rollout(&rollout).expect("user events are valid rollout records");
+        assert_eq!(
+            parsed.last_user_message_at(),
+            Some(
+                DateTime::parse_from_rfc3339("2026-08-15T00:00:02Z")
+                    .expect("fixture timestamp")
+                    .timestamp()
+            )
+        );
+    }
+
+    #[test]
     fn thread_c_candidate_failure_falls_through_in_total_order() {
         let cycle = terminal_cycle(vec![
             thread_fixture("inactive", 400, "inactive"),
@@ -3228,11 +3369,14 @@ mod tests {
             outcome,
             ThreadCycleOutcome::Snapshots(vec![ActiveThreadSnapshot {
                 thread_id: "winner".to_owned(),
+                created_at: 1,
                 updated_at: 100,
                 title: "winner-title".to_owned(),
                 model: "winner-model".to_owned(),
                 model_label: "winner-model".to_owned(),
                 total_tokens: Some(42),
+                context_window_tokens: None,
+                last_user_message_at: None,
                 is_subagent: false,
                 parent_thread_id: None,
                 depth: None,
@@ -3263,11 +3407,14 @@ mod tests {
             outcome,
             ThreadCycleOutcome::Snapshots(vec![ActiveThreadSnapshot {
                 thread_id: "candidate-a".to_owned(),
+                created_at: 1,
                 updated_at: 20,
                 title: "title-a".to_owned(),
                 model: "model-a".to_owned(),
                 model_label: "model-a".to_owned(),
                 total_tokens: Some(111),
+                context_window_tokens: None,
+                last_user_message_at: None,
                 is_subagent: false,
                 parent_thread_id: None,
                 depth: None,
@@ -3295,11 +3442,14 @@ mod tests {
             outcome,
             ThreadCycleOutcome::Snapshots(vec![ActiveThreadSnapshot {
                 thread_id: "without-token".to_owned(),
+                created_at: 1,
                 updated_at: 20,
                 title: "without-token".to_owned(),
                 model: "model-only".to_owned(),
                 model_label: "model-only".to_owned(),
                 total_tokens: None,
+                context_window_tokens: None,
+                last_user_message_at: None,
                 is_subagent: false,
                 parent_thread_id: None,
                 depth: None,
