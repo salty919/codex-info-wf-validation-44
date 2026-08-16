@@ -24,6 +24,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::rc::Rc;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
+use std::sync::{Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -345,6 +346,75 @@ struct ManualX11Geometry {
     height: i32,
 }
 
+const MANUAL_X11_POLL_INTERVAL: Duration = Duration::from_millis(4);
+
+static ACTIVE_MANUAL_X11_ACTIONS: OnceLock<Mutex<BTreeSet<X11Window>>> = OnceLock::new();
+
+struct ManualX11ActionLease {
+    keys: [X11Window; 2],
+}
+
+fn active_manual_x11_actions() -> &'static Mutex<BTreeSet<X11Window>> {
+    ACTIVE_MANUAL_X11_ACTIONS.get_or_init(|| Mutex::new(BTreeSet::new()))
+}
+
+fn claim_manual_x11_action(target: X11Window, client: X11Window) -> Option<ManualX11ActionLease> {
+    let mut active = active_manual_x11_actions()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if active.contains(&target) || (client != target && active.contains(&client)) {
+        return None;
+    }
+    active.insert(target);
+    active.insert(client);
+    drop(active);
+    Some(ManualX11ActionLease {
+        keys: [target, client],
+    })
+}
+
+impl Drop for ManualX11ActionLease {
+    fn drop(&mut self) {
+        let mut active = active_manual_x11_actions()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        active.remove(&self.keys[0]);
+        active.remove(&self.keys[1]);
+    }
+}
+
+fn finish_manual_x11_action(connection: &RustConnection, target: X11Window) {
+    // A final round trip makes all requests flushed by this worker visible to
+    // the X server before the per-target lease is released. This prevents a
+    // new drag from racing an older configure request on the same window.
+    let _ = connection.flush();
+    if let Ok(cookie) = connection.get_geometry(target) {
+        let _ = cookie.reply();
+    }
+}
+
+fn configure_manual_x11_geometry(
+    connection: &RustConnection,
+    target: X11Window,
+    action: ManualX11WindowAction,
+    geometry: ManualX11Geometry,
+) -> bool {
+    let width = u32::try_from(geometry.width.max(1)).unwrap_or(u32::MAX);
+    let height = u32::try_from(geometry.height.max(1)).unwrap_or(u32::MAX);
+    let values = match action {
+        ManualX11WindowAction::Move => ConfigureWindowAux::new().x(geometry.x).y(geometry.y),
+        ManualX11WindowAction::Resize(_) => ConfigureWindowAux::new()
+            .x(geometry.x)
+            .y(geometry.y)
+            .width(width)
+            .height(height),
+    };
+    if connection.configure_window(target, &values).is_err() || connection.flush().is_err() {
+        return false;
+    }
+    true
+}
+
 /// WSLg's Weston wrapper does not consistently honor `_NET_WM_MOVERESIZE` for
 /// frameless clients. Keep the same left-button gesture usable there by
 /// tracking the pointer on a private X11 connection and issuing configure
@@ -362,6 +432,17 @@ fn start_manual_x11_window_action(window: &slint::Window, action: ManualX11Windo
     };
     let root = screen.root;
     let target = x11_top_level_parent(&connection, window_id, root).unwrap_or(window_id);
+    // A down event can reach more than one drag surface while the Slint item
+    // tree is settling a grab. Only the first callback may own this target;
+    // otherwise two polling workers can apply different pointer baselines and
+    // visibly pull the window back and forth.
+    // Keep the client XID in the lease as well as the managed wrapper.  The
+    // wrapper lookup can transiently fall back to the client while a
+    // compositor reparents the surface; the stable client key still prevents
+    // two baselines from configuring one visible window.
+    let Some(action_lease) = claim_manual_x11_action(target, window_id) else {
+        return true;
+    };
     let Ok(pointer_cookie) = connection.query_pointer(root) else {
         return false;
     };
@@ -374,6 +455,12 @@ fn start_manual_x11_window_action(window: &slint::Window, action: ManualX11Windo
     let Ok(target_geometry) = target_geometry_cookie.reply() else {
         return false;
     };
+    let Ok(client_position_cookie) = connection.translate_coordinates(window_id, root, 0, 0) else {
+        return false;
+    };
+    let Ok(client_position) = client_position_cookie.reply() else {
+        return false;
+    };
     let Ok(client_geometry_cookie) = connection.get_geometry(window_id) else {
         return false;
     };
@@ -381,8 +468,17 @@ fn start_manual_x11_window_action(window: &slint::Window, action: ManualX11Windo
         return false;
     };
     let initial = ManualX11Geometry {
-        x: i32::from(target_geometry.x),
-        y: i32::from(target_geometry.y),
+        // Pointer coordinates are relative to the X11 root.  The client
+        // position must use that same coordinate space; the managed wrapper's
+        // get_geometry() position is offset by the compositor frame.
+        x: match action {
+            ManualX11WindowAction::Move => i32::from(client_position.dst_x),
+            ManualX11WindowAction::Resize(_) => i32::from(target_geometry.x),
+        },
+        y: match action {
+            ManualX11WindowAction::Move => i32::from(client_position.dst_y),
+            ManualX11WindowAction::Resize(_) => i32::from(target_geometry.y),
+        },
         // Configure requests target the managed wrapper on WSLg, while its
         // width/height request is interpreted as the child client size.
         width: i32::from(client_geometry.width),
@@ -392,7 +488,9 @@ fn start_manual_x11_window_action(window: &slint::Window, action: ManualX11Windo
     let pointer_y = i32::from(pointer.root_y);
 
     thread::spawn(move || {
+        let _action_lease = action_lease;
         let mut observed_button = false;
+        let mut last_geometry = initial;
         let deadline = Instant::now() + Duration::from_millis(500);
         loop {
             let Ok(pointer_cookie) = connection.query_pointer(root) else {
@@ -403,7 +501,21 @@ fn start_manual_x11_window_action(window: &slint::Window, action: ManualX11Windo
             };
             let pressed = pointer.mask.contains(KeyButMask::BUTTON1);
             if !pressed {
-                if observed_button || Instant::now() >= deadline {
+                if observed_button {
+                    // The release sample is the final pointer position.  Apply
+                    // it once before ending the worker so a fast circular
+                    // gesture cannot stop on an older queued coordinate.
+                    let delta_x = i32::from(pointer.root_x) - pointer_x;
+                    let delta_y = i32::from(pointer.root_y) - pointer_y;
+                    let geometry = manual_window_geometry(initial, action, delta_x, delta_y);
+                    if geometry != last_geometry
+                        && !configure_manual_x11_geometry(&connection, target, action, geometry)
+                    {
+                        break;
+                    }
+                    break;
+                }
+                if Instant::now() >= deadline {
                     break;
                 }
                 thread::sleep(Duration::from_millis(4));
@@ -412,29 +524,18 @@ fn start_manual_x11_window_action(window: &slint::Window, action: ManualX11Windo
             observed_button = true;
             let delta_x = i32::from(pointer.root_x) - pointer_x;
             let delta_y = i32::from(pointer.root_y) - pointer_y;
-            let geometry = match action {
-                ManualX11WindowAction::Move => ManualX11Geometry {
-                    x: initial.x.saturating_add(delta_x),
-                    y: initial.y.saturating_add(delta_y),
-                    ..initial
-                },
-                ManualX11WindowAction::Resize(direction) => {
-                    manual_resize_geometry(initial, direction, delta_x, delta_y)
-                }
-            };
-            let width = u32::try_from(geometry.width.max(1)).unwrap_or(u32::MAX);
-            let height = u32::try_from(geometry.height.max(1)).unwrap_or(u32::MAX);
-            let values = ConfigureWindowAux::new()
-                .x(geometry.x)
-                .y(geometry.y)
-                .width(width)
-                .height(height);
-            if connection.configure_window(target, &values).is_err() || connection.flush().is_err()
-            {
+            let geometry = manual_window_geometry(initial, action, delta_x, delta_y);
+            if geometry == last_geometry {
+                thread::sleep(MANUAL_X11_POLL_INTERVAL);
+                continue;
+            }
+            if !configure_manual_x11_geometry(&connection, target, action, geometry) {
                 break;
             }
-            thread::sleep(Duration::from_millis(8));
+            last_geometry = geometry;
+            thread::sleep(MANUAL_X11_POLL_INTERVAL);
         }
+        finish_manual_x11_action(&connection, target);
     });
     true
 }
@@ -453,6 +554,24 @@ fn x11_top_level_parent(
         current = reply.parent;
     }
     Some(current)
+}
+
+fn manual_window_geometry(
+    initial: ManualX11Geometry,
+    action: ManualX11WindowAction,
+    delta_x: i32,
+    delta_y: i32,
+) -> ManualX11Geometry {
+    match action {
+        ManualX11WindowAction::Move => ManualX11Geometry {
+            x: initial.x.saturating_add(delta_x),
+            y: initial.y.saturating_add(delta_y),
+            ..initial
+        },
+        ManualX11WindowAction::Resize(direction) => {
+            manual_resize_geometry(initial, direction, delta_x, delta_y)
+        }
+    }
 }
 
 fn manual_resize_geometry(
@@ -6691,16 +6810,16 @@ mod tests {
         split_metric_line_paths, stacked_area_path, thread_presentation_rows,
         three_months_before_utc, unused_interval_positions, week_remaining_text, ActiveThread,
         ActiveThreadUpdate, CodexInfoState, Event, FixedResizeDecision, GraphPaths, GraphWindow,
-        HourlyModelSpend, LocalUsageResult, ManualX11Geometry, ModelDollarTotals, ModelTokenTotals,
-        ModelUsageRow, ModelUsageTotals, RpcReadEvent, SessionTraversalBudget, TokenSnapshot,
-        UnusedIntervalPosition, UsageEvent, UsageHistory, UsageHistorySample, UsageStore,
-        FIXED_WINDOW_HEIGHT, FIXED_WINDOW_WIDTH, GRAPH_METRIC_OPTIONS, GRAPH_WINDOW_PURPOSE,
-        LOCAL_ESTIMATE_PRICE_VERSION, THREADS_WINDOW_PURPOSE, UNAUTHENTICATED_WINDOW_TITLE,
-        WEEK_SECONDS,
+        HourlyModelSpend, LocalUsageResult, ManualX11Geometry, ManualX11WindowAction,
+        ModelDollarTotals, ModelTokenTotals, ModelUsageRow, ModelUsageTotals, RpcReadEvent,
+        SessionTraversalBudget, TokenSnapshot, UnusedIntervalPosition, UsageEvent, UsageHistory,
+        UsageHistorySample, UsageStore, FIXED_WINDOW_HEIGHT, FIXED_WINDOW_WIDTH,
+        GRAPH_METRIC_OPTIONS, GRAPH_WINDOW_PURPOSE, LOCAL_ESTIMATE_PRICE_VERSION,
+        THREADS_WINDOW_PURPOSE, UNAUTHENTICATED_WINDOW_TITLE, WEEK_SECONDS,
     };
     use super::{
-        forbidden_x11_states, manual_resize_geometry, motif_wm_functions,
-        motif_wm_resizable_functions, X11StateAtoms,
+        claim_manual_x11_action, forbidden_x11_states, manual_resize_geometry,
+        manual_window_geometry, motif_wm_functions, motif_wm_resizable_functions, X11StateAtoms,
     };
     use chrono::{TimeZone, Utc};
     use codex_info::thread_contract;
@@ -8681,6 +8800,67 @@ mod tests {
                 height: 480,
             }
         );
+    }
+
+    #[test]
+    fn manual_move_geometry_preserves_client_origin_and_applies_pointer_delta() {
+        let initial = ManualX11Geometry {
+            x: 2_506,
+            y: 1_296,
+            width: 900,
+            height: 480,
+        };
+        assert_eq!(
+            manual_window_geometry(initial, ManualX11WindowAction::Move, 0, 0),
+            initial
+        );
+        assert_eq!(
+            manual_window_geometry(initial, ManualX11WindowAction::Move, 60, 40),
+            ManualX11Geometry {
+                x: 2_566,
+                y: 1_336,
+                ..initial
+            }
+        );
+        assert_eq!(
+            manual_window_geometry(initial, ManualX11WindowAction::Move, -40, -30),
+            ManualX11Geometry {
+                x: 2_466,
+                y: 1_266,
+                ..initial
+            }
+        );
+    }
+
+    #[test]
+    fn manual_x11_action_claim_is_exclusive_per_target_and_released_after_finish() {
+        let target = u32::MAX - 17;
+        let other_target = target - 1;
+        let client = target - 2;
+        let other_client = target - 3;
+        let lease =
+            claim_manual_x11_action(target, client).expect("first target claim should succeed");
+        assert!(claim_manual_x11_action(target, other_client).is_none());
+        assert!(claim_manual_x11_action(other_target, client).is_none());
+        let other_lease = claim_manual_x11_action(other_target, other_target);
+        assert!(other_lease.is_some());
+        drop(lease);
+        let final_lease = claim_manual_x11_action(target, target);
+        assert!(final_lease.is_some());
+        drop(final_lease);
+        drop(other_lease);
+    }
+
+    #[test]
+    fn manual_x11_move_uses_root_client_coordinates_and_skips_static_click_configure() {
+        let source = include_str!("../src/main.rs");
+        assert!(source.contains("connection.translate_coordinates(window_id, root, 0, 0)"));
+        assert!(source.contains("let mut last_geometry = initial;"));
+        assert!(source.contains("if geometry == last_geometry"));
+        assert!(source.contains("finish_manual_x11_action(&connection, target);"));
+        assert!(source.contains(
+            "ManualX11WindowAction::Move => ConfigureWindowAux::new().x(geometry.x).y(geometry.y)"
+        ));
     }
 
     #[test]
