@@ -1867,9 +1867,11 @@ export component GraphWindow inherits Window {
                 commands: root.luna-flat-path;
                 visible: root.show-luna;
                 stroke: DesignTokens.graph-luna;
-                stroke-width: 2px;
+                // Idle/no-change model intervals are deliberately quiet so
+                // the changing segments remain the visual focus.
+                stroke-width: 1px;
                 fill: transparent;
-                opacity: 0.75;
+                opacity: 0.5;
                 stroke-line-cap: round;
                 stroke-line-join: round;
             }
@@ -1903,9 +1905,11 @@ export component GraphWindow inherits Window {
                 commands: root.terra-flat-path;
                 visible: root.show-terra;
                 stroke: DesignTokens.graph-terra;
-                stroke-width: 2px;
+                // Idle/no-change model intervals are deliberately quiet so
+                // the changing segments remain the visual focus.
+                stroke-width: 1px;
                 fill: transparent;
-                opacity: 0.75;
+                opacity: 0.5;
                 stroke-line-cap: round;
                 stroke-line-join: round;
             }
@@ -1939,9 +1943,11 @@ export component GraphWindow inherits Window {
                 commands: root.sol-flat-path;
                 visible: root.show-sol;
                 stroke: DesignTokens.graph-sol;
-                stroke-width: 2px;
+                // Idle/no-change model intervals are deliberately quiet so
+                // the changing segments remain the visual focus.
+                stroke-width: 1px;
                 fill: transparent;
-                opacity: 0.75;
+                opacity: 0.5;
                 stroke-line-cap: round;
                 stroke-line-join: round;
             }

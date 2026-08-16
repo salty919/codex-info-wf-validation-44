@@ -2107,10 +2107,15 @@ fn graph_paths(samples: &[&UsageHistorySample], period_start: i64, period_end: i
         .fold(0.0_f64, f64::max);
     let has_model_data = dollar_max > 0.0;
     let latest = minute.last().copied().unwrap_or_default();
-    let remaining = samples.iter().rev().find_map(|sample| {
-        (sample.remaining_percent.is_finite() && sample.remaining_percent >= 0.0)
-            .then_some(sample.remaining_percent)
-    });
+    let has_remaining_observation = samples
+        .iter()
+        .any(|sample| sample.remaining_percent.is_finite() && sample.remaining_percent >= 0.0);
+    // Use the same smoothed endpoint that is rendered by `remaining-path` so
+    // the right-edge percentage cannot disagree with the visible line after
+    // a non-monotonic reread is clamped.
+    let remaining = has_remaining_observation
+        .then(|| remaining_points.last().map(|(_, value)| *value))
+        .flatten();
     let graph_y = |value: f64, maximum: f64| -> f32 {
         if maximum > 0.0 {
             ((99.0 - value / maximum * 98.0) / 100.0).clamp(0.01, 0.99) as f32
@@ -2851,7 +2856,33 @@ fn graph_points(
             }
         }
     }
-    smooth_remaining_points(&points)
+    // Keep the observed change events as the anchors for the quota trend.
+    // Repeated snapshots describe a hold, not another point on the visible
+    // trend; retaining every one of them makes the line look like a staircase
+    // when the provider reports the same percentage for several minutes.
+    // Collapse those runs before smoothing so each segment connects one
+    // change point to the next.
+    smooth_remaining_points(&collapse_remaining_change_points(&points))
+}
+
+fn collapse_remaining_change_points(points: &[(i64, f64)]) -> Vec<(i64, f64)> {
+    if points.len() < 2 {
+        return points.to_vec();
+    }
+
+    let mut collapsed = Vec::with_capacity(points.len());
+    collapsed.push(points[0]);
+    for (index, &(timestamp, raw)) in points.iter().enumerate().skip(1) {
+        let previous = collapsed.last().expect("first point is present").1;
+        // Remaining quota is monotonic between resets. Clamp a transient
+        // upward reread before deciding whether this is a visible change.
+        let value = raw.min(previous);
+        let is_period_end = index + 1 == points.len();
+        if value < previous || is_period_end {
+            collapsed.push((timestamp, value));
+        }
+    }
+    collapsed
 }
 
 fn graph_path_from_points(
@@ -6794,8 +6825,8 @@ mod tests {
     use super::{
         account_window_title, active_thread_model_counts, active_thread_rows_at,
         add_recovery_usage, automatic_refresh_interval, clamp_graph_preview_size,
-        collect_session_file, complete_rollout_prefix_len, current_label_connector_path,
-        detail_window_title, fetch_active_thread_update_for_paths,
+        collapse_remaining_change_points, collect_session_file, complete_rollout_prefix_len,
+        current_label_connector_path, detail_window_title, fetch_active_thread_update_for_paths,
         fetch_active_thread_update_for_paths_and_state, fixed_resize_decision, format_elapsed,
         format_estimated_cost, format_model_usage_columns, format_percent, format_period_label,
         graph_paths, graph_paths_for_selection, graph_period_end, graph_points,
@@ -10529,6 +10560,63 @@ mod tests {
     }
 
     #[test]
+    fn remaining_graph_collapses_unchanged_runs_between_change_points() {
+        let samples = [
+            UsageHistorySample::new(0, 1_000, 100.0, ModelDollarTotals::default()),
+            UsageHistorySample::new(60, 1_000, 90.0, ModelDollarTotals::default()),
+            UsageHistorySample::new(120, 1_000, 90.0, ModelDollarTotals::default()),
+            UsageHistorySample::new(180, 1_000, 70.0, ModelDollarTotals::default()),
+        ];
+        let references = samples.iter().collect::<Vec<_>>();
+        let points = graph_points(&references, 0, 240, 100.0, |sample| {
+            sample.remaining_percent
+        });
+
+        // The unchanged 90% snapshot is not a visible anchor. The endpoint
+        // remains explicit so the rendered line reaches the current-time edge.
+        assert_eq!(
+            points
+                .iter()
+                .map(|(timestamp, _)| *timestamp)
+                .collect::<Vec<_>>(),
+            vec![0, 60, 180, 240]
+        );
+        let path = graph_paths(&references, 0, 240).remaining;
+        assert!(!path.contains("L50.00"));
+        assert!(path.contains("L25.00") && path.contains("L75.00"));
+    }
+
+    #[test]
+    fn remaining_change_point_collapse_clamps_upward_rereads() {
+        let points = collapse_remaining_change_points(&[
+            (0, 100.0),
+            (60, 80.0),
+            (120, 85.0),
+            (180, 70.0),
+            (240, 70.0),
+        ]);
+        assert_eq!(
+            points,
+            vec![(0, 100.0), (60, 80.0), (180, 70.0), (240, 70.0)]
+        );
+    }
+
+    #[test]
+    fn remaining_label_matches_smoothed_path_endpoint() {
+        let samples = [
+            UsageHistorySample::new(0, 1_000, 100.0, ModelDollarTotals::default()),
+            UsageHistorySample::new(60, 1_000, 0.0, ModelDollarTotals::default()),
+            // A transient upward reread must not move the line endpoint back
+            // above the last monotonic value.
+            UsageHistorySample::new(120, 1_000, 10.0, ModelDollarTotals::default()),
+        ];
+        let references = samples.iter().collect::<Vec<_>>();
+        let paths = graph_paths(&references, 0, 120);
+        assert_eq!(paths.current_remaining_label, "0%");
+        assert!(paths.remaining.ends_with("L100.00 99.00"));
+    }
+
+    #[test]
     fn remaining_markers_interpolate_each_integer_boundary() {
         let first = UsageHistorySample::new(0, 1_000, 100.0, ModelDollarTotals::default());
         let second = UsageHistorySample::new(60, 1_000, 99.0, ModelDollarTotals::default());
@@ -11525,6 +11613,23 @@ mod tests {
         assert!(toggle.contains("text: root.label;"));
         assert!(!toggle.contains("strings.on"));
         assert!(!toggle.contains("strings.off"));
+    }
+
+    #[test]
+    fn graph_idle_model_paths_use_quiet_strokes() {
+        let source = include_str!("../ui/components.slint");
+        let graph = source
+            .split("export component GraphWindow inherits Window {")
+            .nth(1)
+            .expect("GraphWindow");
+        for path_name in ["luna-flat-path", "terra-flat-path", "sol-flat-path"] {
+            let path = graph
+                .split("Path {")
+                .find(|body| body.contains(&format!("commands: root.{path_name};")))
+                .expect(path_name);
+            assert!(path.contains("stroke-width: 1px;"), "{path_name}");
+            assert!(path.contains("opacity: 0.5;"), "{path_name}");
+        }
     }
 
     #[test]
