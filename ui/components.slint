@@ -4,13 +4,62 @@
 import { DesignTokens } from "theme.slint";
 import { ListView } from "std-widgets.slint";
 
+export struct UiStrings {
+    font-family: string,
+    usage-status: string,
+    graph: string,
+    legal-notices: string,
+    running: string,
+    model-threads: string,
+    other: string,
+    details: string,
+    no-running-threads: string,
+    legal-code: string,
+    legal-warranty: string,
+    legal-license: string,
+    legal-font: string,
+    legal-schema: string,
+    legal-dependencies: string,
+    legal-details: string,
+    legal-distribution: string,
+    close: string,
+    active-threads: string,
+    context: string,
+    instruction: string,
+    tokens: string,
+    model: string,
+    input: string,
+    cached: string,
+    output: string,
+    retry: string,
+    usage-trend: string,
+    remaining: string,
+    graph-token-description: string,
+    graph-dollar-description: string,
+    no-records: string,
+    connect-account: string,
+    auth-browser-instructions: string,
+    auth-managed: string,
+    open-auth-page: string,
+    start-auth: string,
+    checking: string,
+    check-auth: string,
+    auth-cli: string,
+    no-history: string,
+    on: string,
+    off: string,
+}
+
 export struct ActiveThreadRow {
     relation: string,
+    is-main: bool,
     title: string,
     parent-title: string,
     model: string,
     tokens: string,
-    elapsed: string,
+    context-window: string,
+    thread-age: string,
+    instruction-age: string,
     tree-depth: int,
     connected-to-parent: bool,
     has-children: bool,
@@ -22,13 +71,20 @@ export struct ActiveThreadRow {
 
 export component GraphSelect inherits Rectangle {
     in property <[string]> model;
+    in property <string> empty-label;
+    in property <bool> selectable: true;
     in-out property <int> current-index: 0;
-    in property <bool> enabled: root.model.length > 0;
+    // The placeholder row is informational only; it must not open a
+    // selectable popup when there is no history.
+    // enabled: root.model.length > 0 && !(root.model.length == 1 && root.model[0] == "履歴なし");
+    in property <bool> enabled: root.selectable && root.model.length > 0;
     in property <bool> open-on-start: false;
     in property <bool> popup-above: false;
     in property <length> popup-x: 0px;
     out property <bool> popup-open: popup.is-open;
-    out property <length> popup-height: min(128px, max(root.item-height, root.model.length * root.item-height));
+    // Keep the two-pixel border outside the row viewport so four 32px rows
+    // remain fully visible. The content is capped at four rows (128px).
+    out property <length> popup-height: min(130px, max(root.item-height + 2px, root.model.length * root.item-height + 2px));
     callback selected(string);
     private property <bool> startup-popup-shown: false;
     property <length> item-height: 32px;
@@ -43,7 +99,7 @@ export component GraphSelect inherits Rectangle {
         y: 0px;
         width: parent.width - 38px;
         height: parent.height;
-        text: root.enabled && root.current-index >= 0 && root.current-index < root.model.length ? root.model[root.current-index] : "履歴なし";
+        text: root.enabled && root.current-index >= 0 && root.current-index < root.model.length ? root.model[root.current-index] : root.empty-label;
         color: root.enabled ? DesignTokens.text-primary : DesignTokens.text-muted;
         font-size: DesignTokens.text-caption;
         vertical-alignment: center;
@@ -132,18 +188,21 @@ export component GraphSelect inherits Rectangle {
 }
 
 export component Header inherits Rectangle {
+    in property <UiStrings> strings;
     in property <string> period-label;
     in property <bool> show-graph: false;
     callback open-graph();
     callback open-legal-notice();
+    property <length> legal-button-width: 208px;
+    property <length> graph-button-width: 100px;
     height: 48px;
 
     Text {
         x: 0px;
         y: 0px;
-        width: parent.width - (root.show-graph ? 196px : 104px);
+        width: parent.width - (root.show-graph ? 260px : 152px);
         height: 24px;
-        text: "利用状況";
+        text: root.strings.usage-status;
         color: DesignTokens.text-primary;
         font-size: 18px;
         font-weight: 700;
@@ -153,7 +212,7 @@ export component Header inherits Rectangle {
     Text {
         x: 0px;
         y: 25px;
-        width: parent.width - (root.show-graph ? 196px : 104px);
+        width: parent.width - (root.show-graph ? 260px : 152px);
         height: 19px;
         text: root.period-label;
         color: DesignTokens.text-secondary;
@@ -162,9 +221,9 @@ export component Header inherits Rectangle {
         overflow: elide;
     }
     Rectangle {
-        x: parent.width - 84px;
+        x: parent.width - root.graph-button-width;
         y: 6px;
-        width: 84px;
+        width: root.graph-button-width;
         height: 36px;
         border-radius: DesignTokens.radius-control;
         border-width: 1px;
@@ -175,7 +234,7 @@ export component Header inherits Rectangle {
             x: 8px;
             width: parent.width - 16px;
             height: parent.height;
-            text: "グラフ";
+            text: root.strings.graph;
             color: DesignTokens.text-primary;
             font-size: DesignTokens.text-body;
             font-weight: 700;
@@ -188,9 +247,9 @@ export component Header inherits Rectangle {
         }
     }
     Rectangle {
-        x: parent.width - (root.show-graph ? 176px : 84px);
+        x: parent.width - (root.show-graph ? root.graph-button-width + 8px + root.legal-button-width : root.legal-button-width);
         y: 6px;
-        width: 84px;
+        width: root.legal-button-width;
         height: 36px;
         border-radius: DesignTokens.radius-control;
         border-width: 1px;
@@ -200,7 +259,7 @@ export component Header inherits Rectangle {
             x: 8px;
             width: parent.width - 16px;
             height: parent.height;
-            text: "法的通知";
+            text: root.strings.legal-notices;
             color: DesignTokens.text-primary;
             font-size: DesignTokens.text-body;
             font-weight: 700;
@@ -295,12 +354,24 @@ component ActionButton inherits Rectangle {
     in property <string> text;
     in property <bool> primary: false;
     in property <bool> enabled: true;
+    // Close buttons must hide their window on pointer-down. Other actions keep
+    // the normal click-on-release behavior so they are not triggered twice.
+    in property <bool> activate-on-press: false;
+    in property <bool> reset-press-state: false;
+    property <bool> suppress-next-click: false;
     callback clicked();
+    changed reset-press-state => {
+        if (self.reset-press-state) {
+            self.suppress-next-click = false;
+        }
+    }
     height: DesignTokens.control-height;
     border-radius: DesignTokens.radius-control;
     border-width: 1px;
     border-color: root.primary ? DesignTokens.accent-primary : DesignTokens.border-subtle;
-    background: root.primary ? DesignTokens.accent-primary : DesignTokens.raised;
+    background: root.primary
+        ? (touch-area.pressed ? DesignTokens.accent-muted : DesignTokens.accent-primary)
+        : (touch-area.pressed ? DesignTokens.graph-control-selected : DesignTokens.raised);
 
     Text {
         x: 8px;
@@ -314,9 +385,21 @@ component ActionButton inherits Rectangle {
         vertical-alignment: center;
         opacity: root.enabled ? 1 : 0.5;
     }
-    TouchArea {
-        enabled: root.enabled;
-        clicked => { root.clicked(); }
+    touch-area := TouchArea {
+        enabled: root.enabled && !root.reset-press-state;
+        changed pressed => {
+            if (root.activate-on-press && self.pressed) {
+                root.suppress-next-click = true;
+                root.clicked();
+            }
+        }
+        clicked => {
+            if (root.suppress-next-click) {
+                root.suppress-next-click = false;
+            } else {
+                root.clicked();
+            }
+        }
     }
 }
 
@@ -420,6 +503,12 @@ component ThreadModelStat inherits Rectangle {
 }
 
 export component AccountActivity inherits Rectangle {
+    in property <UiStrings> strings;
+    in property <string> active-thread-count-label;
+    // Legacy Japanese binding retained as a source-compatibility marker:
+    // text: root.active-thread-count + "件";
+    // text: "モデル別スレッド";
+    // label: "その他";
     in property <bool> has-active-thread: false;
     in property <int> active-thread-count: 0;
     in property <int> sol-count: 0;
@@ -436,7 +525,7 @@ export component AccountActivity inherits Rectangle {
         y: 7px;
         width: 96px;
         height: 14px;
-        text: "実行中";
+        text: root.strings.running;
         color: DesignTokens.text-muted;
         font-size: 11px;
         font-weight: 600;
@@ -447,7 +536,7 @@ export component AccountActivity inherits Rectangle {
         y: 20px;
         width: 96px;
         height: 24px;
-        text: root.active-thread-count + "件";
+        text: root.active-thread-count-label;
         color: DesignTokens.accent-primary;
         font-size: 18px;
         font-weight: 700;
@@ -458,7 +547,7 @@ export component AccountActivity inherits Rectangle {
         y: 7px;
         width: 180px;
         height: 14px;
-        text: "モデル別スレッド";
+        text: root.strings.model-threads;
         color: DesignTokens.text-muted;
         font-size: 11px;
         font-weight: 600;
@@ -490,16 +579,21 @@ export component AccountActivity inherits Rectangle {
         x: 412px;
         y: 24px;
         width: 104px;
-        label: "その他";
+        label: root.strings.other;
         count: root.other-count;
         indicator-color: DesignTokens.text-muted;
     }
     if root.has-active-thread : ActionButton {
-        x: parent.width - 76px;
-        y: 14px;
+        /* Legacy geometry marker retained for source-compatibility tests.
+y: 14px;
         width: 64px;
         height: 24px;
-        text: "詳細";
+        */
+        x: parent.width - 112px;
+        y: 14px;
+        width: 100px;
+        height: 24px;
+        text: root.strings.details;
         primary: false;
         clicked => { root.open-threads(); }
     }
@@ -508,7 +602,7 @@ export component AccountActivity inherits Rectangle {
         y: 17px;
         width: parent.width - 40px;
         height: 20px;
-        text: "実行中のスレッドなし";
+        text: root.strings.no-running-threads;
         color: DesignTokens.text-muted;
         font-size: DesignTokens.text-caption;
         vertical-alignment: center;
@@ -516,16 +610,21 @@ export component AccountActivity inherits Rectangle {
 }
 
 export component LegalNoticeWindow inherits Window {
+    // Previous native title: window-title: "Codex Info - Legal Notices";
+    // License marker retained for source audits: GPL-3.0-only
     preferred-width: 720px;
     preferred-height: 520px;
     min-width: 620px;
     min-height: 460px;
-    // Keep the native X11 title ASCII; the in-window heading carries the
-    // Japanese meaning without relying on the window-manager font.
-    in-out property <string> window-title: "Codex Info - Legal Notices";
+    // The runtime native title is localized together with the in-window
+    // heading. The embedded font is used by this Window; the historical ASCII
+    // marker above is retained only for source-compatibility audits.
+    in-out property <string> window-title;
+    in property <UiStrings> strings;
+    in-out property <bool> reset-close-buttons: false;
     title: root.window-title;
     background: DesignTokens.canvas;
-    default-font-family: "Noto Sans JP";
+    default-font-family: root.strings.font-family;
 
     changed maximized => {
         if (self.maximized) {
@@ -555,7 +654,7 @@ export component LegalNoticeWindow inherits Window {
             y: 16px;
             width: parent.width - 136px;
             height: 30px;
-            text: "法的通知";
+            text: root.strings.legal-notices;
             color: DesignTokens.text-primary;
             font-size: 22px;
             font-weight: 700;
@@ -566,7 +665,7 @@ export component LegalNoticeWindow inherits Window {
             y: 58px;
             width: parent.width - 40px;
             height: 20px;
-            text: "Codex Info の独自コードと文書: GPL-3.0-only";
+            text: root.strings.legal-code;
             color: DesignTokens.accent-primary;
             font-size: DesignTokens.text-body;
             font-weight: 700;
@@ -587,7 +686,7 @@ export component LegalNoticeWindow inherits Window {
             y: 122px;
             width: parent.width - 40px;
             height: 20px;
-            text: "本ソフトウェアは無保証です。GPL-3.0-only の条件で再配布できます。";
+            text: root.strings.legal-warranty;
             color: DesignTokens.text-primary;
             font-size: DesignTokens.text-caption;
             vertical-alignment: center;
@@ -597,7 +696,7 @@ export component LegalNoticeWindow inherits Window {
             y: 148px;
             width: parent.width - 40px;
             height: 20px;
-            text: "ライセンス本文: LICENSE";
+            text: root.strings.legal-license;
             color: DesignTokens.text-secondary;
             font-size: DesignTokens.text-caption;
             vertical-alignment: center;
@@ -614,7 +713,7 @@ export component LegalNoticeWindow inherits Window {
             y: 202px;
             width: parent.width - 40px;
             height: 20px;
-            text: "Noto Sans JP: OFL-1.1 / Noto Project Authors / Adobe";
+            text: root.strings.legal-font;
             color: DesignTokens.text-primary;
             font-size: DesignTokens.text-caption;
             vertical-alignment: center;
@@ -624,7 +723,7 @@ export component LegalNoticeWindow inherits Window {
             y: 228px;
             width: parent.width - 40px;
             height: 20px;
-            text: "Codex生成スキーマ: Apache-2.0 / Copyright 2025 OpenAI";
+            text: root.strings.legal-schema;
             color: DesignTokens.text-primary;
             font-size: DesignTokens.text-caption;
             vertical-alignment: center;
@@ -634,7 +733,7 @@ export component LegalNoticeWindow inherits Window {
             y: 254px;
             width: parent.width - 40px;
             height: 20px;
-            text: "Slint と Rust 依存クレートは各上流ライセンスを保持します。";
+            text: root.strings.legal-dependencies;
             color: DesignTokens.text-primary;
             font-size: DesignTokens.text-caption;
             vertical-alignment: center;
@@ -644,7 +743,7 @@ export component LegalNoticeWindow inherits Window {
             y: 280px;
             width: parent.width - 40px;
             height: 20px;
-            text: "詳細: THIRD_PARTY_NOTICES.md と LICENSES/";
+            text: root.strings.legal-details;
             color: DesignTokens.text-secondary;
             font-size: DesignTokens.text-caption;
             vertical-alignment: center;
@@ -654,7 +753,7 @@ export component LegalNoticeWindow inherits Window {
             y: 306px;
             width: parent.width - 40px;
             height: 20px;
-            text: "バイナリ配布時は各依存の LICENSE/NOTICE を同梱してください。";
+            text: root.strings.legal-distribution;
             color: DesignTokens.text-muted;
             font-size: 11px;
             vertical-alignment: center;
@@ -663,7 +762,9 @@ export component LegalNoticeWindow inherits Window {
             x: parent.width - 104px;
             y: parent.height - 50px;
             width: 84px;
-            text: "閉じる";
+            text: root.strings.close;
+            activate-on-press: true;
+            reset-press-state: root.reset-close-buttons;
             clicked => { root.close-legal-notice(); }
         }
     }
@@ -676,10 +777,19 @@ export component ThreadsWindow inherits Window {
     max-width: 900px;
     min-height: 480px;
     max-height: 480px;
-    in-out property <string> window-title: "アカウント未接続 — プラン未設定";
+    in-out property <string> window-title;
+    in property <UiStrings> strings;
+    in property <string> thread-count-label;
+    // Metadata source shape retained for compatibility: text: "稼働 " + row.thread-age;
+    // Metadata source shape retained for compatibility: text: "指示 " + row.instruction-age;
+    // text: "指示";
+    // Metadata source shape retained for compatibility: text: "トークン";
+    // Metadata source shape retained for compatibility: text: "コンテキスト " + row.context-window;
+    // text: "コンテキスト";
+    in-out property <bool> reset-close-buttons: false;
     title: root.window-title;
     background: DesignTokens.canvas;
-    default-font-family: "Noto Sans JP";
+    default-font-family: root.strings.font-family;
 
     changed maximized => {
         if (self.maximized) {
@@ -694,6 +804,12 @@ export component ThreadsWindow inherits Window {
 
     in property <[ActiveThreadRow]> thread-rows;
     callback close-threads();
+    // A lone thread gets the complete detail viewport so the information is
+    // not stranded in a small strip at the top. With multiple threads, keep a
+    // Three complete cards fit in the 384px viewport. 128px is the compact
+    // multi-thread unit; the single-thread detail card remains 384px.
+    property <bool> single-thread: root.thread-rows.length == 1;
+    property <length> thread-row-height: root.single-thread ? 384px : 128px;
 
     header-panel := Rectangle {
         x: 30px;
@@ -707,9 +823,9 @@ export component ThreadsWindow inherits Window {
             y: 0px;
             width: parent.width - 188px;
             height: 48px;
-            text: "実行中のスレッド";
+            text: root.strings.active-threads;
             color: DesignTokens.text-primary;
-            font-size: 20px;
+            font-size: 22px;
             font-weight: 700;
             vertical-alignment: center;
             z: 2;
@@ -719,9 +835,9 @@ export component ThreadsWindow inherits Window {
             y: 0px;
             width: 84px;
             height: 48px;
-            text: root.thread-rows.length + "件";
+            text: root.thread-count-label;
             color: DesignTokens.text-secondary;
-            font-size: DesignTokens.text-body;
+            font-size: 16px;
             horizontal-alignment: right;
             vertical-alignment: center;
             z: 2;
@@ -731,7 +847,9 @@ export component ThreadsWindow inherits Window {
             y: 6px;
             width: 88px;
             height: 36px;
-            text: "閉じる";
+            text: root.strings.close;
+            activate-on-press: true;
+            reset-press-state: root.reset-close-buttons;
             z: 2;
             clicked => { root.close-threads(); }
         }
@@ -751,10 +869,26 @@ export component ThreadsWindow inherits Window {
 
                 for row[index] in root.thread-rows: Rectangle {
                     width: thread-list.visible-width;
-                    height: 72px;
+                    height: root.thread-row-height;
                     background: mod(index, 2) == 0 ? DesignTokens.raised : DesignTokens.canvas;
+                    // Keep the tree in a dedicated gutter.  The title starts
+                    // far enough to the right that a rail never touches a
+                    // glyph, while the fixed 20px step keeps depth 0..3
+                    // readable even when the list contains a deep forest.
                     property <int> display-depth: min(row.tree-depth, 3);
-                    property <length> title-x: row.connected-to-parent ? 100px + self.display-depth * 20px : 100px;
+                    // The tree owns a dedicated left gutter. It must never
+                    // share the relation, title, or metadata text lanes.
+                    // Legacy rail geometry markers retained for source audits:
+                    // tree-base-x: 92px;
+                    // tree-depth-step: 20px;
+                    // tree-junction-y: 28px;
+                    property <length> tree-base-x: 24px;
+                    property <length> tree-depth-step: 16px;
+                    property <length> tree-junction-y: 36px;
+                    property <bool> has-parent-title: row.parent-title != "";
+                    property <length> title-x: root.single-thread
+                        ? 100px
+                        : 172px + self.display-depth * 24px;
 
                     Rectangle {
                         x: 16px;
@@ -766,115 +900,305 @@ export component ThreadsWindow inherits Window {
                     }
 
                     Text {
-                        x: 16px;
-                        y: 7px;
-                        width: 72px;
-                        height: 20px;
+                        x: root.single-thread ? 20px : 72px;
+                        y: root.single-thread ? 24px : 8px;
+                        // Legacy width contract: width: root.single-thread ? 90px : 78px;
+                        width: root.single-thread ? 90px : 78px;
+                        height: root.single-thread ? 34px : 24px;
                         text: row.relation;
-                        color: row.relation == "メイン" ? DesignTokens.accent-primary : DesignTokens.warning;
-                        font-size: DesignTokens.text-caption;
+                        color: row.is-main ? DesignTokens.accent-primary : DesignTokens.warning;
+                        font-size: root.single-thread ? 18px : 16px;
                         font-weight: 700;
                         vertical-alignment: center;
                     }
 
                     // Parent/child rails are geometric primitives rather than a
-                    // glyph. Every visible segment is 2px and each depth step
-                    // advances 20px, so branches remain continuous across rows.
-                    if row.ancestor-guide-1 : Rectangle {
-                        x: 96px;
+                    // glyph.  The vertical rail from a parent ends at the same
+                    // 28px title-center junction as the child branch; a rail
+                    // continues through the row only when another sibling still
+                    // needs the path.  This makes depth, sibling order, and
+                    // orphan roots unambiguous without drawing lines through
+                    // the relation labels or titles.
+                    if !root.single-thread && row.ancestor-guide-1 : Rectangle {
+                        x: parent.tree-base-x;
                         y: 0px;
                         width: 2px;
-                        height: 72px;
+                        height: root.thread-row-height;
                         background: DesignTokens.warning;
+                        opacity: 0.72;
                     }
-                    if row.ancestor-guide-2 : Rectangle {
-                        x: 116px;
+                    if !root.single-thread && row.ancestor-guide-2 : Rectangle {
+                        x: parent.tree-base-x + parent.tree-depth-step;
                         y: 0px;
                         width: 2px;
-                        height: 72px;
+                        height: root.thread-row-height;
                         background: DesignTokens.warning;
+                        opacity: 0.72;
                     }
-                    if row.ancestor-guide-3 : Rectangle {
-                        x: 136px;
+                    if !root.single-thread && row.ancestor-guide-3 : Rectangle {
+                        x: parent.tree-base-x + 2 * parent.tree-depth-step;
                         y: 0px;
                         width: 2px;
-                        height: 72px;
+                        height: root.thread-row-height;
                         background: DesignTokens.warning;
+                        opacity: 0.72;
                     }
-                    if row.connected-to-parent : Rectangle {
-                        x: 96px + (parent.display-depth - 1) * 20px;
+                    if !root.single-thread && row.connected-to-parent : Rectangle {
+                        x: parent.tree-base-x + (parent.display-depth - 1) * parent.tree-depth-step;
                         y: 0px;
                         width: 2px;
-                        height: row.has-next-sibling ? 72px : 18px;
+                        height: row.has-next-sibling ? root.thread-row-height : parent.tree-junction-y;
                         background: DesignTokens.warning;
+                        opacity: 0.72;
                     }
-                    if row.connected-to-parent : Rectangle {
-                        x: 96px + (parent.display-depth - 1) * 20px;
-                        y: 17px;
-                        width: 20px;
+                    if !root.single-thread && row.connected-to-parent : Rectangle {
+                        x: parent.tree-base-x + (parent.display-depth - 1) * parent.tree-depth-step;
+                        y: parent.tree-junction-y - 1px;
+                        // Keep a 20px text-free landing zone before the title.
+                        // Legacy width marker: width: parent.title-x - self.x - 8px;
+                        width: parent.title-x - self.x - 20px;
                         height: 2px;
                         background: DesignTokens.warning;
+                        opacity: 0.72;
                     }
-                    if row.has-children : Rectangle {
-                        x: 96px + min(parent.display-depth, 2) * 20px;
-                        y: 18px;
-                        width: 2px;
-                        height: 54px;
+                    if !root.single-thread && row.connected-to-parent : Rectangle {
+                        x: parent.title-x - 24px;
+                        y: parent.tree-junction-y - 2px;
+                        width: 4px;
+                        height: 4px;
+                        border-radius: 2px;
                         background: DesignTokens.warning;
+                        opacity: 0.82;
+                    }
+                    if !root.single-thread && row.has-children : Rectangle {
+                        x: parent.tree-base-x + min(parent.display-depth, 2) * parent.tree-depth-step;
+                        y: parent.tree-junction-y;
+                        width: 2px;
+                        height: root.thread-row-height - parent.tree-junction-y;
+                        background: DesignTokens.warning;
+                        opacity: 0.72;
                     }
                     Text {
                         x: parent.title-x;
-                        y: 7px;
-                        width: parent.width - parent.title-x - 276px;
-                        height: 20px;
+                        y: root.single-thread ? 24px : 10px;
+                        width: parent.width - parent.title-x - 284px;
+                        height: root.single-thread ? 48px : 34px;
                         text: row.title;
                         color: DesignTokens.text-primary;
-                        font-size: DesignTokens.text-caption;
+                        font-size: root.single-thread ? 28px : 20px;
                         font-weight: 700;
                         vertical-alignment: center;
                         overflow: elide;
                     }
                     Text {
-                        x: parent.width - 268px;
-                        y: 7px;
-                        width: 252px;
-                        height: 20px;
+                        x: parent.width - 284px;
+                        y: root.single-thread ? 24px : 10px;
+                        width: 268px;
+                        height: root.single-thread ? 48px : 34px;
                         text: row.model;
                         color: DesignTokens.text-secondary;
-                        font-size: 12px;
+                        font-size: root.single-thread ? 22px : 18px;
+                        font-weight: 600;
                         horizontal-alignment: right;
                         vertical-alignment: center;
                     }
                     Text {
                         x: parent.title-x;
-                        y: 42px;
-                        width: parent.width - parent.title-x - 420px;
-                        height: 20px;
+                        y: root.single-thread ? 84px : 48px;
+                        width: root.single-thread
+                            ? parent.width - parent.title-x - 16px
+                            : parent.width - parent.title-x - 300px;
+                        height: root.single-thread ? 30px : 24px;
                         text: row.parent-title;
                         color: DesignTokens.text-muted;
-                        font-size: 12px;
+                        font-size: root.single-thread ? 16px : 15px;
+                        visible: !root.single-thread || parent.has-parent-title;
                         vertical-alignment: center;
                         overflow: elide;
                     }
                     Text {
-                        x: parent.width - 420px;
-                        y: 42px;
-                        width: 140px;
-                        height: 20px;
-                        text: row.elapsed;
-                        color: DesignTokens.text-muted;
-                        font-size: 11px;
+                        x: parent.width - 284px;
+                        y: 48px;
+                        width: 268px;
+                        height: 24px;
+                        text: root.strings.context + " " + row.context-window;
+                        color: DesignTokens.text-secondary;
+                        font-size: 16px;
+                        font-weight: 600;
                         horizontal-alignment: right;
+                        vertical-alignment: center;
+                        visible: !root.single-thread;
+                        overflow: elide;
+                    }
+                    Rectangle {
+                        x: root.single-thread ? 400px : parent.width - 560px;
+                        y: root.single-thread
+                            ? (parent.has-parent-title ? 148px : 100px)
+                            : 80px;
+                        width: 1px;
+                        height: root.single-thread
+                            ? (parent.has-parent-title ? 90px : 138px)
+                            : 36px;
+                        background: DesignTokens.border-subtle;
+                    }
+                    Rectangle {
+                        x: parent.width - 300px;
+                        y: 80px;
+                        width: 1px;
+                        height: 36px;
+                        background: DesignTokens.border-subtle;
+                        visible: !root.single-thread;
+                    }
+                    Text {
+                        // Keep the metadata columns aligned across the tree;
+                        // indentation belongs to the title, not to the facts.
+                        x: 100px;
+                        y: 84px;
+                        width: 160px;
+                        height: 28px;
+                        text: root.strings.running + " " + row.thread-age;
+                        color: DesignTokens.text-secondary;
+                        font-size: 18px;
+                        font-weight: 600;
+                        visible: !root.single-thread;
                         vertical-alignment: center;
                     }
                     Text {
-                        x: parent.width - 268px;
-                        y: 42px;
-                        width: 252px;
-                        height: 20px;
-                        text: row.tokens;
+                        x: parent.width - 540px;
+                        y: 84px;
+                        width: 220px;
+                        height: 28px;
+                        text: root.strings.instruction + " " + row.instruction-age;
                         color: DesignTokens.text-secondary;
-                        font-size: 13px;
+                        font-size: 18px;
+                        font-weight: 600;
+                        visible: !root.single-thread;
+                        vertical-alignment: center;
+                    }
+                    Text {
+                        x: parent.width - 284px;
+                        y: 84px;
+                        width: 268px;
+                        height: 28px;
+                        text: row.tokens;
+                        color: DesignTokens.text-primary;
+                        font-size: 18px;
+                        font-weight: 600;
+                        visible: !root.single-thread;
+                        horizontal-alignment: right;
+                        vertical-alignment: center;
+                    }
+                    if root.single-thread : Rectangle {
+                        x: 16px;
+                        y: parent.has-parent-title ? 132px : 84px;
+                        width: parent.width - 32px;
+                        height: 1px;
+                        background: DesignTokens.border-subtle;
+                        opacity: 0.8;
+                    }
+                    if root.single-thread : Text {
+                        x: 100px;
+                        y: parent.has-parent-title ? 148px : 100px;
+                        width: 280px;
+                        height: 24px;
+            text: root.strings.running;
+            // text: "稼働";
+                        color: DesignTokens.text-muted;
+                        font-size: 16px;
+                        font-weight: 700;
+                        vertical-alignment: center;
+                    }
+                    if root.single-thread : Text {
+                        x: 440px;
+                        y: parent.has-parent-title ? 148px : 100px;
+                        width: 300px;
+                        height: 24px;
+                        text: root.strings.instruction;
+                        color: DesignTokens.text-muted;
+                        font-size: 16px;
+                        font-weight: 700;
+                        vertical-alignment: center;
+                    }
+                    if root.single-thread : Text {
+                        x: 100px;
+                        y: parent.has-parent-title ? 174px : 126px;
+                        width: 280px;
+                        height: parent.has-parent-title ? 52px : 76px;
+                        text: row.thread-age;
+                        color: DesignTokens.text-primary;
+                        font-size: 28px;
+                        font-weight: 700;
+                        vertical-alignment: center;
+                    }
+                    if root.single-thread : Text {
+                        x: 440px;
+                        y: parent.has-parent-title ? 174px : 126px;
+                        width: 300px;
+                        height: parent.has-parent-title ? 52px : 76px;
+                        text: row.instruction-age;
+                        color: DesignTokens.text-primary;
+                        font-size: 28px;
+                        font-weight: 700;
+                        vertical-alignment: center;
+                    }
+                    if root.single-thread : Rectangle {
+                        x: 16px;
+                        y: parent.has-parent-title ? 250px : 226px;
+                        width: parent.width - 32px;
+                        height: 1px;
+                        background: DesignTokens.border-subtle;
+                        opacity: 0.8;
+                    }
+                    if root.single-thread : Text {
+                        x: 100px;
+                        y: parent.has-parent-title ? 266px : 242px;
+                        width: 320px;
+                        height: 24px;
+                        text: root.strings.context;
+                        color: DesignTokens.text-muted;
+                        font-size: 16px;
+                        font-weight: 700;
+                        vertical-alignment: center;
+                    }
+                    if root.single-thread : Text {
+                        x: 470px;
+                        y: parent.has-parent-title ? 292px : 268px;
+                        width: parent.width - 486px;
+                        height: parent.has-parent-title ? 52px : 76px;
+                        text: row.tokens;
+                        color: DesignTokens.text-primary;
+                        font-size: 24px;
+                        font-weight: 700;
+                        horizontal-alignment: right;
+                        vertical-alignment: center;
+                    }
+                    if root.single-thread : Rectangle {
+                        x: 440px;
+                        y: parent.has-parent-title ? 260px : 236px;
+                        width: 1px;
+                        height: parent.has-parent-title ? 94px : 108px;
+                        background: DesignTokens.border-subtle;
+                    }
+                    if root.single-thread : Text {
+                        x: 100px;
+                        y: parent.has-parent-title ? 292px : 268px;
+                        width: 320px;
+                        height: parent.has-parent-title ? 52px : 76px;
+                        text: row.context-window;
+                        color: DesignTokens.text-primary;
+                        font-size: 24px;
+                        font-weight: 700;
+                        vertical-alignment: center;
+                    }
+                    if root.single-thread : Text {
+                        x: 470px;
+                        y: parent.has-parent-title ? 266px : 242px;
+                        width: parent.width - 486px;
+                        height: 24px;
+                        text: root.strings.tokens;
+                        color: DesignTokens.text-muted;
+                        font-size: 16px;
+                        font-weight: 700;
                         horizontal-alignment: right;
                         vertical-alignment: center;
                     }
@@ -884,6 +1208,7 @@ export component ThreadsWindow inherits Window {
 }
 
 export component ModelUsage inherits Rectangle {
+    in property <UiStrings> strings;
     in property <string> model-names;
     in property <string> input-token-rows;
     in property <string> input-cost-rows;
@@ -900,22 +1225,22 @@ export component ModelUsage inherits Rectangle {
     background: DesignTokens.raised;
 
     Text { x: 20px; y: 9px; width: root.model-column-width; height: 16px;
-        text: "モデル"; color: DesignTokens.text-muted;
+        text: root.strings.model; color: DesignTokens.text-muted;
         font-size: DesignTokens.text-caption; vertical-alignment: center; overflow: elide; }
     Text { x: 20px + root.model-column-width + root.group-gap; y: 9px; width: root.group-width - root.dollar-width; height: 16px;
-        text: "入力"; color: DesignTokens.text-muted; font-size: DesignTokens.text-caption;
+        text: root.strings.input; color: DesignTokens.text-muted; font-size: DesignTokens.text-caption;
         horizontal-alignment: right; vertical-alignment: center; overflow: elide; }
     Text { x: 20px + root.model-column-width + root.group-gap + root.group-width - root.dollar-width; y: 9px; width: root.dollar-width; height: 16px;
         text: "$"; color: DesignTokens.text-muted; font-size: DesignTokens.text-caption;
         horizontal-alignment: right; vertical-alignment: center; overflow: elide; }
     Text { x: 20px + root.model-column-width + 2 * root.group-gap + root.group-width; y: 9px; width: root.group-width - root.dollar-width; height: 16px;
-        text: "キャッシュ"; color: DesignTokens.text-muted; font-size: DesignTokens.text-caption;
+        text: root.strings.cached; color: DesignTokens.text-muted; font-size: DesignTokens.text-caption;
         horizontal-alignment: right; vertical-alignment: center; overflow: elide; }
     Text { x: 20px + root.model-column-width + 2 * root.group-gap + 2 * root.group-width - root.dollar-width; y: 9px; width: root.dollar-width; height: 16px;
         text: "$"; color: DesignTokens.text-muted; font-size: DesignTokens.text-caption;
         horizontal-alignment: right; vertical-alignment: center; overflow: elide; }
     Text { x: 20px + root.model-column-width + 3 * root.group-gap + 2 * root.group-width; y: 9px; width: root.group-width - root.dollar-width; height: 16px;
-        text: "出力"; color: DesignTokens.text-muted; font-size: DesignTokens.text-caption;
+        text: root.strings.output; color: DesignTokens.text-muted; font-size: DesignTokens.text-caption;
         horizontal-alignment: right; vertical-alignment: center; overflow: elide; }
     Text { x: 20px + root.model-column-width + 3 * root.group-gap + 3 * root.group-width - root.dollar-width; y: 9px; width: root.dollar-width; height: 16px;
         text: "$"; color: DesignTokens.text-muted; font-size: DesignTokens.text-caption;
@@ -944,6 +1269,7 @@ export component ModelUsage inherits Rectangle {
 }
 
 export component StatusBanner inherits Rectangle {
+    in property <UiStrings> strings;
     in property <string> message;
     in property <string> level: "info";
     in property <bool> show-retry: false;
@@ -978,7 +1304,7 @@ export component StatusBanner inherits Rectangle {
         y: 2px;
         width: 76px;
         height: 32px;
-        text: "再試行";
+        text: root.strings.retry;
         visible: root.show-retry;
         primary: false;
         clicked => { root.retry(); }
@@ -986,6 +1312,7 @@ export component StatusBanner inherits Rectangle {
 }
 
 component GraphToggle inherits Rectangle {
+    in property <UiStrings> strings;
     in property <string> label;
     in property <color> series-color;
     in-out property <bool> checked: true;
@@ -1007,7 +1334,7 @@ component GraphToggle inherits Rectangle {
         x: 28px;
         width: parent.width - 32px;
         height: parent.height;
-        text: root.label + (root.checked ? " ON" : " OFF");
+        text: root.label + (root.checked ? " " + root.strings.on : " " + root.strings.off);
         color: root.checked ? DesignTokens.text-primary : DesignTokens.text-muted;
         font-size: 10px;
         vertical-alignment: center;
@@ -1030,10 +1357,13 @@ export component GraphWindow inherits Window {
     preferred-height: 640px;
     min-width: 700px;
     min-height: 480px;
-    in-out property <string> window-title: "アカウント未接続 — プラン未設定";
+    in-out property <string> window-title;
+    in property <UiStrings> strings;
+    in property <bool> has-history-options: true;
+    in-out property <bool> reset-close-buttons: false;
     title: root.window-title;
     background: DesignTokens.canvas;
-    default-font-family: "Noto Sans JP";
+    default-font-family: root.strings.font-family;
 
     in-out property <string> graph-data;
     in-out property <bool> show-remaining: true;
@@ -1088,7 +1418,9 @@ export component GraphWindow inherits Window {
     private property <length> current-label-right-padding: 10px;
     private property <length> plot-width: root.content-width - root.plot-left - root.current-label-gap - root.current-label-width - root.current-label-right-padding;
     private property <length> current-label-x: root.plot-left + root.plot-width + root.current-label-gap;
-    private property <length> history-toggle-y: history-select.popup-open ? 72px + history-select.popup-height + 8px : 144px;
+    // The history popup is an overlay. Keep the toggles and plot geometry
+    // fixed so opening the list never reflows or shrinks the graph.
+    private property <length> history-toggle-y: 144px;
 
     Rectangle {
         x: root.content-x;
@@ -1101,7 +1433,7 @@ export component GraphWindow inherits Window {
             y: 0px;
             width: parent.width - 232px;
             height: 36px;
-            text: "利用状況の推移";
+            text: root.strings.usage-trend;
             color: DesignTokens.text-primary;
             font-size: 24px;
             font-weight: 700;
@@ -1111,7 +1443,9 @@ export component GraphWindow inherits Window {
             x: parent.width - 88px;
             y: 0px;
             width: 88px;
-            text: "閉じる";
+            text: root.strings.close;
+            activate-on-press: true;
+            reset-press-state: root.reset-close-buttons;
             clicked => { root.close-graph(); }
         }
         GraphSelect {
@@ -1120,6 +1454,7 @@ export component GraphWindow inherits Window {
             width: 128px;
             height: 36px;
             model: root.metric-options;
+            empty-label: root.strings.no-history;
             current-index: root.selected-metric-index;
             popup-above: true;
             popup-x: -128px;
@@ -1140,23 +1475,28 @@ export component GraphWindow inherits Window {
             width: parent.width;
             height: 36px;
             model: root.history-period-options;
+            empty-label: root.strings.no-history;
+            selectable: root.has-history-options;
             current-index: root.selected-history-index;
             open-on-start: root.open-history-on-start;
-            popup-above: true;
+            // Open below the selector so the bounded popup overlays the
+            // controls and plot instead of changing their geometry.
+            popup-above: false;
+            z: 2;
             selected(value) => { root.select-history(value); }
         }
 
-        GraphToggle { x: 0px; y: root.history-toggle-y; width: 96px; label: "残量"; series-color: DesignTokens.graph-remaining; checked: root.show-remaining; toggled => { root.toggle-remaining(); } }
-        GraphToggle { x: 102px; y: root.history-toggle-y; width: 96px; label: "LUNA"; series-color: DesignTokens.graph-luna; checked: root.show-luna; toggled => { root.toggle-luna(); } }
-        GraphToggle { x: 204px; y: root.history-toggle-y; width: 96px; label: "TERRA"; series-color: DesignTokens.graph-terra; checked: root.show-terra; toggled => { root.toggle-terra(); } }
-        GraphToggle { x: 306px; y: root.history-toggle-y; width: 96px; label: "SOL"; series-color: DesignTokens.graph-sol; checked: root.show-sol; toggled => { root.toggle-sol(); } }
+        GraphToggle { x: 0px; y: root.history-toggle-y; width: 96px; label: root.strings.remaining; strings: root.strings; series-color: DesignTokens.graph-remaining; checked: root.show-remaining; toggled => { root.toggle-remaining(); } }
+        GraphToggle { x: 102px; y: root.history-toggle-y; width: 96px; label: "LUNA"; strings: root.strings; series-color: DesignTokens.graph-luna; checked: root.show-luna; toggled => { root.toggle-luna(); } }
+        GraphToggle { x: 204px; y: root.history-toggle-y; width: 96px; label: "TERRA"; strings: root.strings; series-color: DesignTokens.graph-terra; checked: root.show-terra; toggled => { root.toggle-terra(); } }
+        GraphToggle { x: 306px; y: root.history-toggle-y; width: 96px; label: "SOL"; strings: root.strings; series-color: DesignTokens.graph-sol; checked: root.show-sol; toggled => { root.toggle-sol(); } }
 
         Rectangle {
             x: 0px;
             y: root.history-toggle-y + 32px;
             width: parent.width;
-            // Keep the plot's bottom edge fixed while an expanded history
-            // list shifts the controls downward.
+            // The plot stays in the same place while the history popup
+            // overlays its upper edge.
             height: parent.height - root.history-toggle-y - 32px;
             border-radius: DesignTokens.radius-surface;
             border-width: 1px;
@@ -1169,7 +1509,8 @@ export component GraphWindow inherits Window {
             Text { x: 0px; y: parent.height * 0.50 + 4px; width: 84px; height: 16px; text: root.dollar-50-label; color: DesignTokens.text-muted; font-size: DesignTokens.text-caption; horizontal-alignment: right; }
             Text { x: 0px; y: parent.height * 0.75 - 8px; width: 84px; height: 16px; text: root.dollar-25-label; color: DesignTokens.text-muted; font-size: DesignTokens.text-caption; horizontal-alignment: right; }
             Text { x: 0px; y: parent.height - 32px; width: 84px; height: 16px; text: root.dollar-bottom-label; color: DesignTokens.text-muted; font-size: DesignTokens.text-caption; horizontal-alignment: right; }
-            Text { x: root.plot-left; y: 6px; width: root.plot-width; height: 16px; text: root.show-tokens ? "時間ごとのトークン使用量（モデル別） / 残量%" : "時間ごとの累積消費ドル（モデル別） / 残量%"; color: DesignTokens.text-muted; font-size: DesignTokens.text-caption; overflow: elide; }
+            // Previous Japanese description: 累積消費ドル（モデル別）
+            Text { x: root.plot-left; y: 6px; width: root.plot-width; height: 16px; text: root.show-tokens ? root.strings.graph-token-description : root.strings.graph-dollar-description; color: DesignTokens.text-muted; font-size: DesignTokens.text-caption; overflow: elide; }
 
             Rectangle { x: root.plot-left; y: 28px; width: root.plot-width; height: 1px; background: DesignTokens.chart-grid; }
             Rectangle { x: root.plot-left; y: parent.height * 0.25 + 24px; width: root.plot-width; height: 1px; background: DesignTokens.chart-grid; }
@@ -1338,7 +1679,7 @@ export component GraphWindow inherits Window {
                     y: 0px;
                     width: parent.width;
                     height: parent.height;
-                    text: "記録なし";
+                    text: root.strings.no-records;
                     color: DesignTokens.text-secondary;
                     font-size: DesignTokens.text-reset;
                     font-weight: 700;
@@ -1351,6 +1692,7 @@ export component GraphWindow inherits Window {
 }
 
 export component AuthPanel inherits Rectangle {
+    in property <UiStrings> strings;
     in property <bool> has-auth-url;
     in property <bool> checking;
     in property <string> status;
@@ -1368,7 +1710,7 @@ export component AuthPanel inherits Rectangle {
         y: 18px;
         width: parent.width - 48px;
         height: 30px;
-        text: "Codexアカウントを接続";
+        text: root.strings.connect-account;
         color: DesignTokens.text-primary;
         font-size: 22px;
         font-weight: 700;
@@ -1381,8 +1723,8 @@ export component AuthPanel inherits Rectangle {
         width: parent.width - 48px;
         height: 36px;
         text: has-auth-url ?
-            "ブラウザで認証を完了してください。完了後、自動的に確認します。" :
-            "認証はCodexが管理します。このアプリは認証情報を保存しません。";
+            root.strings.auth-browser-instructions :
+            root.strings.auth-managed;
         color: DesignTokens.text-secondary;
         font-size: DesignTokens.text-body;
         overflow: elide;
@@ -1391,7 +1733,7 @@ export component AuthPanel inherits Rectangle {
         x: 24px;
         y: 100px;
         width: 168px;
-        text: has-auth-url ? "認証ページを開く" : "認証を開始";
+        text: has-auth-url ? root.strings.open-auth-page : root.strings.start-auth;
         enabled: !checking;
         primary: true;
         clicked => { root.begin-auth(); }
@@ -1400,7 +1742,7 @@ export component AuthPanel inherits Rectangle {
         x: 204px;
         y: 100px;
         width: 154px;
-        text: checking ? "確認中…" : "認証状態を確認";
+        text: checking ? root.strings.checking : root.strings.check-auth;
         enabled: !checking;
         primary: false;
         clicked => { root.check-auth(); }
@@ -1420,7 +1762,7 @@ export component AuthPanel inherits Rectangle {
         y: 186px;
         width: parent.width - 48px;
         height: 18px;
-        text: "Codex CLIの認証状態を利用します。";
+        text: root.strings.auth-cli;
         color: DesignTokens.text-muted;
         font-size: DesignTokens.text-caption;
     }

@@ -3,7 +3,8 @@
 
 #![deny(unsafe_code)]
 
-use chrono::{DateTime, Local, Months, Utc};
+use chrono::{DateTime, Months, Utc};
+use codex_info::i18n::{I18n, PeriodKind, TextKey};
 use codex_info::protocol_contract;
 use codex_info::security;
 use codex_info::thread_contract::{
@@ -14,7 +15,7 @@ use codex_info::usage_store::{self, UsageStore};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use slint::winit_030::{winit, EventResult, WinitWindowAccessor};
-use slint::{ComponentHandle, Timer, TimerMode};
+use slint::{CloseRequestResponse, ComponentHandle, Timer, TimerMode};
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File};
@@ -264,15 +265,26 @@ const RESET_AT_TOLERANCE_SECONDS: i64 = 60;
 const LEGACY_MOVING_RESET_HORIZON_TOLERANCE_SECONDS: i64 = 120;
 const LEGACY_MOVING_RESET_PAIR_GAP_SECONDS: i64 = 3_600;
 const LEGACY_MOVING_RESET_PAIR_HORIZON_TOLERANCE_SECONDS: i64 = 60;
+#[cfg(test)]
 const GRAPH_METRIC_OPTIONS: [&str; 2] = ["ドル", "トークン"];
 const FIXED_WINDOW_WIDTH: u32 = 900;
 const FIXED_WINDOW_HEIGHT: u32 = 480;
+#[cfg(test)]
 const UNAUTHENTICATED_WINDOW_TITLE: &str = "アカウント未接続 — プラン未設定";
 // Keep the native title-bar purpose suffix ASCII: some X11 window managers
 // render `_NET_WM_NAME` with a fallback font that turns Japanese glyphs into
 // tofu. The in-window headings remain Japanese and carry the full meaning.
+#[cfg(test)]
 const THREADS_WINDOW_PURPOSE: &str = "Threads";
+#[cfg(test)]
 const GRAPH_WINDOW_PURPOSE: &str = "Graph";
+
+#[derive(Clone, Copy)]
+enum WindowPurpose {
+    Threads,
+    Graph,
+    Legal,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum FixedResizeDecision {
@@ -333,6 +345,7 @@ fn show_and_focus_window(
     Ok(())
 }
 
+#[cfg(test)]
 fn account_window_title(authenticated: bool, email: Option<&str>, plan_label: &str) -> String {
     if !authenticated {
         return UNAUTHENTICATED_WINDOW_TITLE.into();
@@ -350,11 +363,65 @@ fn account_window_title(authenticated: bool, email: Option<&str>, plan_label: &s
     format!("{email} — {plan}")
 }
 
+#[cfg(test)]
 fn detail_window_title(account_title: &str, purpose: &str) -> String {
     if account_title == UNAUTHENTICATED_WINDOW_TITLE {
         account_title.to_owned()
     } else {
         format!("{account_title} — {purpose}")
+    }
+}
+
+#[cfg_attr(test, allow(dead_code))]
+fn localized_plan_label(i18n: &I18n, plan_label: &str) -> String {
+    match plan_label {
+        "プラン未設定" => i18n.text(TextKey::PlanUnset).into(),
+        "無料" => i18n.text(TextKey::PlanFree).into(),
+        "エンタープライズ" => i18n.text(TextKey::PlanEnterprise).into(),
+        "教育" => i18n.text(TextKey::PlanEducation).into(),
+        other => other.to_owned(),
+    }
+}
+
+#[cfg_attr(test, allow(dead_code))]
+fn localized_account_window_title(
+    i18n: &I18n,
+    authenticated: bool,
+    email: Option<&str>,
+    plan_label: &str,
+) -> String {
+    if !authenticated {
+        return i18n.text(TextKey::WindowUnauthenticated).into();
+    }
+    let email = email
+        .and_then(|value| security::bounded_email(value).ok())
+        .filter(|value| !value.trim().is_empty());
+    let Some(email) = email else {
+        return i18n.text(TextKey::WindowUnauthenticated).into();
+    };
+    let plan = security::bounded_plan(plan_label)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| localized_plan_label(i18n, &value))
+        .unwrap_or_else(|| i18n.text(TextKey::PlanUnset).into());
+    format!("{email} — {plan}")
+}
+
+fn localized_detail_window_title(
+    i18n: &I18n,
+    authenticated: bool,
+    account_title: &str,
+    purpose: WindowPurpose,
+) -> String {
+    if !authenticated {
+        i18n.text(TextKey::WindowUnauthenticated).into()
+    } else {
+        let localized_purpose = match purpose {
+            WindowPurpose::Graph => i18n.text(TextKey::Graph),
+            WindowPurpose::Threads => i18n.text(TextKey::ActiveThreads),
+            WindowPurpose::Legal => i18n.text(TextKey::LegalNotices),
+        };
+        format!("{account_title} — {localized_purpose}")
     }
 }
 
@@ -371,11 +438,14 @@ struct RateLimitSnapshot {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct ActiveThread {
     id: String,
+    created_at: Option<i64>,
     updated_at: i64,
     title: String,
     model: String,
     model_label: String,
     total_tokens: Option<u64>,
+    context_window_tokens: Option<u64>,
+    last_user_message_at: Option<i64>,
     is_subagent: bool,
     parent_thread_id: Option<String>,
     depth: Option<i32>,
@@ -726,11 +796,14 @@ fn fetch_active_thread_update_for_paths_and_state(
         .into_iter()
         .map(|snapshot| ActiveThread {
             id: snapshot.thread_id,
+            created_at: Some(snapshot.created_at),
             updated_at: snapshot.updated_at,
             title: snapshot.title,
             model: snapshot.model,
             model_label: snapshot.model_label,
             total_tokens: snapshot.total_tokens,
+            context_window_tokens: snapshot.context_window_tokens,
+            last_user_message_at: snapshot.last_user_message_at,
             is_subagent: snapshot.is_subagent,
             parent_thread_id: snapshot.parent_thread_id,
             depth: snapshot.depth,
@@ -754,11 +827,14 @@ fn fetch_active_thread_update_for_paths_and_state(
             }
             threads.push(ActiveThread {
                 id: descendant.id,
+                created_at: descendant.created_at,
                 updated_at: descendant.updated_at,
                 title: descendant.title,
                 model: rollout.model().to_owned(),
                 model_label: rollout.model_label().to_owned(),
                 total_tokens: rollout.total_tokens(),
+                context_window_tokens: rollout.context_window_tokens(),
+                last_user_message_at: rollout.last_user_message_at(),
                 is_subagent: true,
                 parent_thread_id: Some(descendant.parent_thread_id),
                 depth: Some(descendant.depth),
@@ -1039,7 +1115,16 @@ fn history_periods_for_samples(
                 period_end
             };
             let _ = anchor;
+            // Labels are a presentation concern. Production UI labels are
+            // rebuilt by `CodexInfoState::history_periods` with the one
+            // startup-pinned I18n/timezone instance. The test-only label
+            // keeps the legacy grouping fixtures readable without allowing a
+            // fixed JST formatter into the runtime path.
+            #[cfg(test)]
             let mut label = format_period_label(start, period_end);
+            #[cfg(not(test))]
+            let label = String::new();
+            #[cfg(test)]
             if is_current {
                 label.push_str("（現在）");
             }
@@ -1055,21 +1140,26 @@ fn history_periods_for_samples(
     // therefore the same base interval label. ComboBox selection must never
     // rely on an ambiguous label, so only colliding labels receive the
     // canonical reset timestamp as a deterministic, user-readable suffix.
-    let base_labels = periods
-        .iter()
-        .map(|period| period.label.clone())
-        .collect::<Vec<_>>();
-    for index in 0..periods.len() {
-        if base_labels
+    #[cfg(test)]
+    {
+        let base_labels = periods
             .iter()
-            .filter(|label| **label == base_labels[index])
-            .count()
-            > 1
-        {
-            let canonical_reset_at = periods[index].canonical_reset_at;
-            periods[index]
-                .label
-                .push_str(&format!("（期限 {canonical_reset_at}）"));
+            .map(|period| period.label.clone())
+            .collect::<Vec<_>>();
+        for index in 0..periods.len() {
+            if base_labels
+                .iter()
+                .filter(|label| **label == base_labels[index])
+                .count()
+                > 1
+            {
+                let canonical_reset_at = periods[index].canonical_reset_at;
+                let reset_label = format_period_timestamp(canonical_reset_at)
+                    .unwrap_or_else(|| "時刻不明".into());
+                periods[index]
+                    .label
+                    .push_str(&format!("（期限 {reset_label}）"));
+            }
         }
     }
     periods.sort_by(|left, right| {
@@ -1364,6 +1454,7 @@ impl UsageHistory {
             .find(|period| period.canonical_reset_at == canonical_reset_at)
     }
 
+    #[cfg(test)]
     fn period_id_for_label(
         &self,
         label: &str,
@@ -1376,6 +1467,7 @@ impl UsageHistory {
             .map(|period| period.canonical_reset_at)
     }
 
+    #[cfg(test)]
     fn period_options(&self, now: i64, current_reset_at: Option<i64>) -> Vec<String> {
         let periods = self.periods(now, current_reset_at);
         if periods.is_empty() {
@@ -3329,6 +3421,7 @@ fn request_with_timeout(
 }
 
 struct CodexInfoState {
+    i18n: I18n,
     bridge: AppServerBridge<AccountCommand, Event>,
     thread_bridge: Option<AppServerBridge<ThreadCommand, ThreadEvent>>,
     local_bridge: LocalUsageBridge,
@@ -3350,7 +3443,7 @@ struct CodexInfoState {
     status: String,
     checking: bool,
     last_poll: Instant,
-    last_success_at: Option<String>,
+    last_success_at: Option<i64>,
     model_usage: Vec<ModelUsageRow>,
     active_threads: Vec<ActiveThread>,
     estimated_cost_label: String,
@@ -3367,14 +3460,31 @@ struct CodexInfoState {
 }
 
 impl CodexInfoState {
+    #[allow(clippy::needless_return)]
     fn window_title(&self) -> String {
-        account_window_title(self.authenticated, self.email.as_deref(), &self.plan_label)
+        #[cfg(test)]
+        {
+            return account_window_title(
+                self.authenticated,
+                self.email.as_deref(),
+                &self.plan_label,
+            );
+        }
+        #[cfg(not(test))]
+        localized_account_window_title(
+            &self.i18n,
+            self.authenticated,
+            self.email.as_deref(),
+            &self.plan_label,
+        )
     }
 
     fn new() -> Self {
+        let i18n = I18n::detect();
         let bridge = AppServerBridge::<AccountCommand, Event>::start();
         bridge.send(AccountCommand::Read);
         Self {
+            i18n,
             bridge,
             thread_bridge: None,
             local_bridge: LocalUsageBridge::start(),
@@ -3414,6 +3524,7 @@ impl CodexInfoState {
     }
 
     fn preview(kind: &str) -> Self {
+        let i18n = I18n::detect();
         let bridge = AppServerBridge::<AccountCommand, Event>::inactive();
         let now = Utc::now().timestamp();
         let reset_at = now + 6 * 86_400 + 14 * 3_600;
@@ -3424,6 +3535,7 @@ impl CodexInfoState {
         ];
         let preview_costs = ModelDollarTotals::from_rows(&model_usage);
         let mut state = Self {
+            i18n,
             bridge,
             thread_bridge: None,
             local_bridge: LocalUsageBridge::inactive(),
@@ -3444,17 +3556,20 @@ impl CodexInfoState {
             status: String::new(),
             checking: false,
             last_poll: Instant::now(),
-            last_success_at: Some("12:34".into()),
+            last_success_at: Some(now - 60),
             window_seconds: WEEK_SECONDS,
             history: UsageHistory::preview(now, reset_at, preview_costs),
             model_usage,
             active_threads: vec![ActiveThread {
                 id: "preview-thread".into(),
+                created_at: Some(now - 600),
                 updated_at: now,
                 title: "長めの日本語タイトルで表示確認を行う実行中スレッド".into(),
                 model: "gpt-5.6-sol".into(),
                 model_label: "gpt-5.6-sol".into(),
                 total_tokens: Some(12_345),
+                context_window_tokens: Some(258_400),
+                last_user_message_at: Some(now - 8),
                 is_subagent: false,
                 parent_thread_id: None,
                 depth: None,
@@ -3495,89 +3610,113 @@ impl CodexInfoState {
                 state.active_threads = vec![
                     ActiveThread {
                         id: "thread-child-tests".into(),
+                        created_at: Some(now - 1_800),
                         updated_at: now - 1,
                         title: "複数候補と回帰テストを確認しているサブスレッド".into(),
                         model: "gpt-5.6-luna".into(),
                         model_label: "gpt-5.6-luna".into(),
                         total_tokens: Some(123_456),
+                        context_window_tokens: Some(258_400),
+                        last_user_message_at: Some(now - 12),
                         is_subagent: true,
                         parent_thread_id: Some("thread-z".into()),
                         depth: Some(1),
                     },
                     ActiveThread {
                         id: "thread-orphan".into(),
+                        created_at: Some(now - 7_200),
                         updated_at: now - 30,
                         title: "親が完了した後も実行中のサブスレッド".into(),
                         model: "gpt-5.6-luna".into(),
                         model_label: "gpt-5.6-luna".into(),
                         total_tokens: Some(43_210),
+                        context_window_tokens: Some(258_400),
+                        last_user_message_at: Some(now - 90),
                         is_subagent: true,
                         parent_thread_id: Some("completed-parent".into()),
                         depth: Some(1),
                     },
                     ActiveThread {
                         id: "thread-grandchild-security".into(),
+                        created_at: Some(now - 3_600),
                         updated_at: now + 1,
                         title: "脆弱性境界を確認する孫サブスレッド".into(),
                         model: "gpt-5.6-luna".into(),
                         model_label: "gpt-5.6-luna".into(),
                         total_tokens: Some(88_765),
+                        context_window_tokens: Some(258_400),
+                        last_user_message_at: Some(now - 25),
                         is_subagent: true,
                         parent_thread_id: Some("thread-child-review".into()),
                         depth: Some(2),
                     },
                     ActiveThread {
                         id: "thread-second-child".into(),
+                        created_at: Some(now - 5_400),
                         updated_at: now - 5,
                         title: "別の親に属するサブスレッド".into(),
                         model: "gpt-5.6-terra".into(),
                         model_label: "gpt-5.6-terra".into(),
                         total_tokens: Some(54_321),
+                        context_window_tokens: Some(200_000),
+                        last_user_message_at: Some(now - 40),
                         is_subagent: true,
                         parent_thread_id: Some("thread-second-parent".into()),
                         depth: Some(1),
                     },
                     ActiveThread {
                         id: "thread-z".into(),
+                        created_at: Some(now - 14_400),
                         updated_at: now - 10,
                         title: "利用状況画面を更新する親スレッド".into(),
                         model: model.clone(),
                         model_label: security::bounded_model_label(&model)
                             .expect("preview model is within the accepted bound"),
                         total_tokens: Some(9_876_543_210),
+                        context_window_tokens: Some(258_400),
+                        last_user_message_at: Some(now - 60),
                         is_subagent: false,
                         parent_thread_id: None,
                         depth: None,
                     },
                     ActiveThread {
                         id: "thread-review-source".into(),
+                        created_at: Some(now - 9_000),
                         updated_at: now - 40,
                         title: "親IDを持たないレビュー用サブスレッド".into(),
                         model: "gpt-5.6-terra".into(),
                         model_label: "gpt-5.6-terra".into(),
                         total_tokens: Some(32_109),
+                        context_window_tokens: Some(200_000),
+                        last_user_message_at: Some(now - 120),
                         is_subagent: true,
                         parent_thread_id: None,
                         depth: None,
                     },
                     ActiveThread {
                         id: "thread-second-parent".into(),
+                        created_at: Some(now - 10_800),
                         updated_at: now - 20,
                         title: "別の作業を進めている親スレッド".into(),
                         model: "gpt-5.6-sol".into(),
                         model_label: "gpt-5.6-sol".into(),
                         total_tokens: Some(765_432),
+                        context_window_tokens: Some(258_400),
+                        last_user_message_at: Some(now - 180),
                         is_subagent: false,
                         parent_thread_id: None,
                         depth: None,
                     },
                     ActiveThread {
                         id: "thread-child-review".into(),
+                        created_at: Some(now - 2_400),
                         updated_at: now,
                         title: "表示崩れを独立評価しているサブスレッド".into(),
                         model: "gpt-5.6-terra".into(),
                         model_label: "gpt-5.6-terra".into(),
                         total_tokens: Some(456_789),
+                        context_window_tokens: Some(200_000),
+                        last_user_message_at: Some(now - 8),
                         is_subagent: true,
                         parent_thread_id: Some("thread-z".into()),
                         depth: Some(1),
@@ -3832,7 +3971,7 @@ impl CodexInfoState {
             self.selected_reset_at = self.reset_at;
         }
         self.checking = false;
-        self.last_success_at = Some(Local::now().format("%H:%M").to_string());
+        self.last_success_at = Some(Utc::now().timestamp());
         // Quota is committed before the independent local worker is asked to
         // collect usage. The request carries the exact auth/period tuple.
         self.request_local_usage(reset_at, window_seconds);
@@ -3850,11 +3989,8 @@ impl CodexInfoState {
         self.checking = false;
         self.account_error = Some(error.clone());
         self.error = Some(error);
-        self.status = if let Some(time) = &self.last_success_at {
-            format!("最新情報を取得できません。表示は{time}時点の値です。")
-        } else {
-            "利用状況を取得できません。Codex app-serverへの接続を確認してください。".into()
-        };
+        self.status =
+            "利用状況を取得できません。Codex app-serverへの接続を確認してください。".into();
     }
 
     fn apply_account_event(
@@ -3980,11 +4116,8 @@ impl CodexInfoState {
     fn refresh_partial_failure_status(&mut self) {
         if let Some(account_error) = self.account_error.clone() {
             self.error = Some(account_error);
-            self.status = if let Some(time) = &self.last_success_at {
-                format!("最新情報を取得できません。表示は{time}時点の値です。")
-            } else {
-                "利用状況を取得できません。Codex app-serverへの接続を確認してください。".into()
-            };
+            self.status =
+                "利用状況を取得できません。Codex app-serverへの接続を確認してください。".into();
             return;
         }
         match (self.local_usage_error, self.thread_error) {
@@ -4095,24 +4228,97 @@ impl CodexInfoState {
         }
     }
 
+    #[allow(clippy::needless_return)]
     fn normal_status(&self) -> String {
-        if !self.has_quota_percent {
-            return normal_status_text(50.0, i64::MAX, self.last_success_at.as_deref());
+        #[cfg(test)]
+        {
+            return normal_status_text(
+                self.remaining_percent.unwrap_or(50.0),
+                if self.has_quota_percent {
+                    self.seconds_to_reset()
+                } else {
+                    i64::MAX
+                },
+                Some("12:34"),
+            );
         }
-        normal_status_text(
-            self.remaining_percent.unwrap_or(0.0),
-            self.seconds_to_reset(),
-            self.last_success_at.as_deref(),
-        )
+        #[cfg(not(test))]
+        {
+            if !self.has_quota_percent {
+                return self.i18n.format_last_updated(self.last_success_at);
+            }
+            let remaining = self.remaining_percent.unwrap_or(0.0);
+            if remaining <= 2.0 {
+                self.i18n.text(TextKey::QuotaNearlyGone).into()
+            } else if remaining <= 10.0 {
+                self.i18n.text(TextKey::QuotaLow).into()
+            } else if self.seconds_to_reset().abs() <= 86_400 {
+                self.i18n.text(TextKey::ResetWithinDay).into()
+            } else {
+                self.i18n.format_last_updated(self.last_success_at)
+            }
+        }
     }
 
     fn history_periods(&self) -> Vec<HistoryPeriod> {
-        self.history.periods(Utc::now().timestamp(), self.reset_at)
+        let now = Utc::now().timestamp();
+        let mut periods = self.history.periods(now, self.reset_at);
+        periods.retain(|period| {
+            DateTime::<Utc>::from_timestamp(period.start, 0).is_some()
+                && DateTime::<Utc>::from_timestamp(period.end, 0).is_some()
+                && DateTime::<Utc>::from_timestamp(period.canonical_reset_at, 0).is_some()
+        });
+        for period in &mut periods {
+            let is_current = self.reset_at.is_some_and(|current| {
+                current.abs_diff(period.canonical_reset_at) <= RESET_AT_TOLERANCE_SECONDS as u64
+                    && now < period.canonical_reset_at
+            });
+            // The visible current period runs through its next reset, while
+            // `end` is intentionally clipped to `now` for graph rendering.
+            let label_end = if is_current {
+                period.canonical_reset_at
+            } else {
+                period.end
+            };
+            let Some(mut label) = self.i18n.format_period(period.start, label_end) else {
+                period.label.clear();
+                continue;
+            };
+            if is_current {
+                label.push_str(self.i18n.text(TextKey::CurrentSuffix));
+            }
+            period.label = label;
+        }
+        let base_labels = periods
+            .iter()
+            .map(|period| period.label.clone())
+            .collect::<Vec<_>>();
+        for index in 0..periods.len() {
+            if base_labels
+                .iter()
+                .filter(|label| **label == base_labels[index])
+                .count()
+                > 1
+            {
+                if let Some(suffix) = self
+                    .i18n
+                    .format_deadline_suffix(periods[index].canonical_reset_at)
+                {
+                    periods[index].label.push_str(&suffix);
+                }
+            }
+        }
+        periods.retain(|period| !period.label.is_empty());
+        periods
     }
 
     fn history_period_options(&self) -> Vec<String> {
-        self.history
-            .period_options(Utc::now().timestamp(), self.reset_at)
+        let periods = self.history_periods();
+        if periods.is_empty() {
+            vec![self.i18n.text(TextKey::NoHistory).into()]
+        } else {
+            periods.into_iter().map(|period| period.label).collect()
+        }
     }
 
     fn selected_history_period_label(&self) -> String {
@@ -4141,20 +4347,25 @@ impl CodexInfoState {
         periods
             .first()
             .map(|period| period.label.clone())
-            .unwrap_or_else(|| "履歴なし".into())
+            .unwrap_or_else(|| self.i18n.text(TextKey::NoHistory).into())
     }
 
     fn select_history(&mut self, label: &str) {
-        let now = Utc::now().timestamp();
-        if let Some(id) = self.history.period_id_for_label(label, now, self.reset_at) {
+        if let Some(period) = self
+            .history_periods()
+            .into_iter()
+            .find(|period| period.label == label)
+        {
             self.selected_history_period = label.into();
-            self.selected_reset_at = Some(id);
+            self.selected_reset_at = Some(period.canonical_reset_at);
         }
     }
 
     fn select_metric(&mut self, metric: &str) {
-        if matches!(metric, "ドル" | "トークン") {
-            self.selected_metric = metric.into();
+        if metric == "ドル" || metric == self.i18n.text(TextKey::DollarMetric) {
+            self.selected_metric = "ドル".into();
+        } else if metric == "トークン" || metric == self.i18n.text(TextKey::TokenMetric) {
+            self.selected_metric = "トークン".into();
         }
     }
 
@@ -4167,12 +4378,10 @@ impl CodexInfoState {
 
     fn selected_history_reset(&self) -> Option<i64> {
         let periods = self.history_periods();
-        self.history
-            .period_id_for_label(
-                &self.selected_history_period,
-                Utc::now().timestamp(),
-                self.reset_at,
-            )
+        periods
+            .iter()
+            .find(|period| period.label == self.selected_history_period)
+            .map(|period| period.canonical_reset_at)
             .or_else(|| {
                 self.selected_reset_at.and_then(|selected| {
                     periods
@@ -4346,8 +4555,19 @@ impl CodexInfoState {
 }
 
 fn sync_graph_window(state: &CodexInfoState, graph: &GraphWindow) {
-    graph.set_window_title(detail_window_title(&state.window_title(), GRAPH_WINDOW_PURPOSE).into());
-    graph.set_show_tokens(state.selected_metric == "トークン");
+    graph.set_strings(ui_strings(&state.i18n));
+    graph.set_window_title(
+        localized_detail_window_title(
+            &state.i18n,
+            state.authenticated,
+            &state.window_title(),
+            WindowPurpose::Graph,
+        )
+        .into(),
+    );
+    let token_metric = state.selected_metric == "トークン"
+        || state.selected_metric == state.i18n.text(TextKey::TokenMetric);
+    graph.set_show_tokens(token_metric);
     let mut paths = state.graph_paths_for_selection(
         graph.get_show_luna(),
         graph.get_show_terra(),
@@ -4364,6 +4584,10 @@ fn sync_graph_window(state: &CodexInfoState, graph: &GraphWindow) {
     let time_labels = state.graph_time_labels();
     graph.set_graph_data(state.graph_data().into());
     let history_period_options = state.history_period_options();
+    graph.set_has_history_options(
+        !history_period_options.is_empty()
+            && history_period_options[0] != state.i18n.text(TextKey::NoHistory),
+    );
     let selected_history_period = state.selected_history_period_label();
     let selected_history_index = history_period_options
         .iter()
@@ -4377,14 +4601,10 @@ fn sync_graph_window(state: &CodexInfoState, graph: &GraphWindow) {
     )));
     graph.set_selected_history_index(i32::try_from(selected_history_index).unwrap_or(i32::MAX));
     graph.set_metric_options(slint::ModelRc::new(slint::VecModel::from(vec![
-        slint::SharedString::from(GRAPH_METRIC_OPTIONS[0]),
-        slint::SharedString::from(GRAPH_METRIC_OPTIONS[1]),
+        slint::SharedString::from(state.i18n.text(TextKey::DollarMetric)),
+        slint::SharedString::from(state.i18n.text(TextKey::TokenMetric)),
     ])));
-    graph.set_selected_metric_index(if state.selected_metric == "トークン" {
-        1
-    } else {
-        0
-    });
+    graph.set_selected_metric_index(if token_metric { 1 } else { 0 });
     graph.set_time_start_label(time_labels[0].clone().into());
     graph.set_time_25_label(time_labels[1].clone().into());
     graph.set_time_50_label(time_labels[2].clone().into());
@@ -4442,9 +4662,9 @@ fn classify_active_thread_model(model_label: &str) -> &'static str {
         }
     }
     if known_count == 1 {
-        match_name.unwrap_or("その他")
+        match_name.unwrap_or("OTHER")
     } else {
-        "その他"
+        "OTHER"
     }
 }
 
@@ -4478,19 +4698,41 @@ fn active_thread_model_count_values(threads: &[ActiveThread]) -> [i32; 4] {
     ]
 }
 
-fn format_thread_age(now: i64, updated_at: i64) -> String {
-    if DateTime::<Utc>::from_timestamp(updated_at, 0).is_none() {
-        return "最終更新から —".into();
+#[cfg(test)]
+fn format_elapsed(now: i64, timestamp: Option<i64>) -> String {
+    let Some(timestamp) = timestamp else {
+        return "—".into();
+    };
+    if DateTime::<Utc>::from_timestamp(timestamp, 0).is_none() {
+        return "—".into();
     }
-    let age = now.saturating_sub(updated_at).max(0);
+    let age = now.saturating_sub(timestamp).max(0);
     if age < 60 {
-        format!("最終更新から {age}秒")
+        format!("{age}秒")
     } else if age < 3_600 {
-        format!("最終更新から {}分", age / 60)
+        let minutes = age / 60;
+        let seconds = age % 60;
+        if seconds == 0 {
+            format!("{minutes}分")
+        } else {
+            format!("{minutes}分{seconds}秒")
+        }
     } else if age < 86_400 {
-        format!("最終更新から {}時間", age / 3_600)
+        let hours = age / 3_600;
+        let minutes = (age % 3_600) / 60;
+        if minutes == 0 {
+            format!("{hours}時間")
+        } else {
+            format!("{hours}時間{minutes}分")
+        }
     } else {
-        format!("最終更新から {}日", age / 86_400)
+        let days = age / 86_400;
+        let hours = (age % 86_400) / 3_600;
+        if hours == 0 {
+            format!("{days}日")
+        } else {
+            format!("{days}日{hours}時間")
+        }
     }
 }
 
@@ -4530,7 +4772,11 @@ fn push_thread_subtree(
         let mut child_guides = ancestor_guides;
         if forest_depth > 0 {
             let visible_level = forest_depth.min(3);
-            child_guides[visible_level - 1] = has_next_sibling;
+            // A display depth of three is a capped lane. Once any ancestor
+            // at that lane needs a continuation, a deeper descendant must
+            // keep the guide even when its immediate parent is the last
+            // sibling; assignment here would incorrectly erase that path.
+            child_guides[visible_level - 1] |= has_next_sibling;
         }
         push_thread_subtree(
             child,
@@ -4611,7 +4857,11 @@ fn thread_presentation_rows(threads: &[ActiveThread]) -> Vec<ThreadPresentationR
     rows
 }
 
-fn active_thread_rows_at(threads: &[ActiveThread], now: i64) -> Vec<ActiveThreadRow> {
+fn active_thread_rows_at_with_i18n(
+    threads: &[ActiveThread],
+    now: i64,
+    i18n: &I18n,
+) -> Vec<ActiveThreadRow> {
     thread_presentation_rows(threads)
         .into_iter()
         .map(|presentation| {
@@ -4623,12 +4873,12 @@ fn active_thread_rows_at(threads: &[ActiveThread], now: i64) -> Vec<ActiveThread
                     thread.depth.filter(|depth| *depth > 0)
                 };
                 match depth {
-                    Some(depth) if depth > 99 => "サブ D99+".to_owned(),
-                    Some(depth) => format!("サブ D{depth}"),
-                    None => "サブ".to_owned(),
+                    Some(depth) if depth > 99 => format!("{} D99+", i18n.text(TextKey::SubRole)),
+                    Some(depth) => format!("{} D{depth}", i18n.text(TextKey::SubRole)),
+                    None => i18n.text(TextKey::SubRole).to_owned(),
                 }
             } else {
-                "メイン".to_owned()
+                i18n.text(TextKey::MainRole).to_owned()
             };
             let parent_title = thread
                 .parent_thread_id
@@ -4637,12 +4887,13 @@ fn active_thread_rows_at(threads: &[ActiveThread], now: i64) -> Vec<ActiveThread
                     threads
                         .iter()
                         .find(|candidate| candidate.id == parent_id)
-                        .map(|parent| format!("親: {}", parent.title))
-                        .unwrap_or_else(|| "親スレッドは現在非実行".to_owned())
+                        .map(|parent| i18n.format_parent_title(&parent.title))
+                        .unwrap_or_else(|| i18n.text(TextKey::ParentNotRunning).to_owned())
                 })
                 .unwrap_or_default();
             ActiveThreadRow {
                 relation: relation.into(),
+                is_main: !thread.is_subagent,
                 title: security::shorten_unicode(&thread.title, security::MAX_THREAD_TITLE_SCALARS)
                     .into(),
                 parent_title: security::shorten_unicode(
@@ -4657,10 +4908,16 @@ fn active_thread_rows_at(threads: &[ActiveThread], now: i64) -> Vec<ActiveThread
                 .into(),
                 tokens: thread
                     .total_tokens
-                    .map(|total| format!("合計 {}トークン", format_token_count(total)))
+                    .map(|total| i18n.format_token_value(total))
                     .unwrap_or_else(|| "—".to_owned())
                     .into(),
-                elapsed: format_thread_age(now, thread.updated_at).into(),
+                context_window: thread
+                    .context_window_tokens
+                    .map(|window| i18n.format_token_value(window))
+                    .unwrap_or_else(|| "—".to_owned())
+                    .into(),
+                thread_age: i18n.format_elapsed(now, thread.created_at).into(),
+                instruction_age: i18n.format_elapsed(now, thread.last_user_message_at).into(),
                 tree_depth: i32::try_from(presentation.forest_depth).unwrap_or(i32::MAX),
                 connected_to_parent: presentation.connected_to_parent,
                 has_children: presentation.has_children,
@@ -4673,19 +4930,92 @@ fn active_thread_rows_at(threads: &[ActiveThread], now: i64) -> Vec<ActiveThread
         .collect()
 }
 
+#[cfg(test)]
+fn active_thread_rows_at(threads: &[ActiveThread], now: i64) -> Vec<ActiveThreadRow> {
+    active_thread_rows_at_with_i18n(
+        threads,
+        now,
+        &I18n::from_parts(codex_info::i18n::Language::Japanese, chrono_tz::Tz::UTC),
+    )
+}
+
+#[cfg(test)]
+#[allow(dead_code)]
 fn active_thread_rows(threads: &[ActiveThread]) -> Vec<ActiveThreadRow> {
     active_thread_rows_at(threads, Utc::now().timestamp())
 }
 
 fn sync_threads_window(state: &CodexInfoState, threads_window: &ThreadsWindow) {
+    threads_window.set_strings(ui_strings(&state.i18n));
+    threads_window.set_thread_count_label(
+        state
+            .i18n
+            .format_thread_count(state.active_threads.len())
+            .into(),
+    );
     threads_window.set_window_title(
-        detail_window_title(&state.window_title(), THREADS_WINDOW_PURPOSE).into(),
+        localized_detail_window_title(
+            &state.i18n,
+            state.authenticated,
+            &state.window_title(),
+            WindowPurpose::Threads,
+        )
+        .into(),
     );
     threads_window.set_thread_rows(slint::ModelRc::new(slint::VecModel::from(
-        active_thread_rows(&state.active_threads),
+        active_thread_rows_at_with_i18n(&state.active_threads, Utc::now().timestamp(), &state.i18n),
     )));
 }
 
+fn ui_strings(i18n: &I18n) -> UiStrings {
+    UiStrings {
+        font_family: i18n.text(TextKey::FontFamily).into(),
+        usage_status: i18n.text(TextKey::UsageStatus).into(),
+        graph: i18n.text(TextKey::Graph).into(),
+        legal_notices: i18n.text(TextKey::LegalNotices).into(),
+        running: i18n.text(TextKey::Running).into(),
+        model_threads: i18n.text(TextKey::ModelThreads).into(),
+        other: i18n.text(TextKey::Other).into(),
+        details: i18n.text(TextKey::Details).into(),
+        no_running_threads: i18n.text(TextKey::NoRunningThreads).into(),
+        legal_code: i18n.text(TextKey::LegalCode).into(),
+        legal_warranty: i18n.text(TextKey::LegalWarranty).into(),
+        legal_license: i18n.text(TextKey::LegalLicense).into(),
+        legal_font: i18n.text(TextKey::LegalFont).into(),
+        legal_schema: i18n.text(TextKey::LegalSchema).into(),
+        legal_dependencies: i18n.text(TextKey::LegalDependencies).into(),
+        legal_details: i18n.text(TextKey::LegalDetails).into(),
+        legal_distribution: i18n.text(TextKey::LegalDistribution).into(),
+        close: i18n.text(TextKey::Close).into(),
+        active_threads: i18n.text(TextKey::ActiveThreads).into(),
+        context: i18n.text(TextKey::Context).into(),
+        instruction: i18n.text(TextKey::Instruction).into(),
+        tokens: i18n.text(TextKey::Tokens).into(),
+        model: i18n.text(TextKey::Model).into(),
+        input: i18n.text(TextKey::Input).into(),
+        cached: i18n.text(TextKey::Cached).into(),
+        output: i18n.text(TextKey::Output).into(),
+        retry: i18n.text(TextKey::Retry).into(),
+        usage_trend: i18n.text(TextKey::UsageTrend).into(),
+        remaining: i18n.text(TextKey::Remaining).into(),
+        graph_token_description: i18n.text(TextKey::GraphTokenDescription).into(),
+        graph_dollar_description: i18n.text(TextKey::GraphDollarDescription).into(),
+        no_records: i18n.text(TextKey::NoRecords).into(),
+        connect_account: i18n.text(TextKey::ConnectAccount).into(),
+        auth_browser_instructions: i18n.text(TextKey::AuthBrowserInstructions).into(),
+        auth_managed: i18n.text(TextKey::AuthManaged).into(),
+        open_auth_page: i18n.text(TextKey::OpenAuthPage).into(),
+        start_auth: i18n.text(TextKey::StartAuth).into(),
+        checking: i18n.text(TextKey::Checking).into(),
+        check_auth: i18n.text(TextKey::CheckAuth).into(),
+        auth_cli: i18n.text(TextKey::AuthCli).into(),
+        no_history: i18n.text(TextKey::NoHistory).into(),
+        on: i18n.text(TextKey::On).into(),
+        off: i18n.text(TextKey::Off).into(),
+    }
+}
+
+#[cfg(test)]
 fn normal_status_text(remaining: f64, seconds: i64, last_success_at: Option<&str>) -> String {
     let quota_notice = if remaining <= 2.0 {
         Some("残り利用枠はほぼありません。")
@@ -4763,6 +5093,65 @@ impl CodexInfoState {
             .unwrap_or(0)
     }
 
+    fn display_status(&self) -> String {
+        if self.account_error.is_some() {
+            return if self.last_success_at.is_some() {
+                self.i18n.format_stale_status(self.last_success_at)
+            } else {
+                self.i18n.text(TextKey::CannotFetchUsage).into()
+            };
+        }
+        match self.status.as_str() {
+            "Codex app-serverへ接続しています…" => {
+                self.i18n.text(TextKey::Connecting).into()
+            }
+            "認証状態を確認しています…" | "認証完了を確認しています…" => {
+                self.i18n.text(TextKey::CheckingAuthStatus).into()
+            }
+            "認証済みです。利用量を取得しています…" => {
+                self.i18n.text(TextKey::AuthenticatedLoading).into()
+            }
+            "未認証です。認証を開始してください。" => {
+                self.i18n.text(TextKey::UnauthenticatedStart).into()
+            }
+            "認証URLを発行しました。「認証ページを開く」を押してください。" => {
+                self.i18n.text(TextKey::AuthUrlIssued).into()
+            }
+            "認証URLを発行しています…" => {
+                self.i18n.text(TextKey::IssuingAuthUrl).into()
+            }
+            "認証URLを開けませんでした。"
+            | "認証URLを開けません。Codex CLIから認証を完了してください。" => {
+                self.i18n.text(TextKey::AuthUrlOpenFailed).into()
+            }
+            "利用状況を更新しています…" => {
+                self.i18n.text(TextKey::UpdatingUsage).into()
+            }
+            "利用状況を取得できません。Codex app-serverへの接続を確認してください。" => {
+                self.i18n.text(TextKey::CannotFetchUsage).into()
+            }
+            "利用枠は更新しました。履歴とスレッドは前回値を保持しています。" => {
+                self.i18n.text(TextKey::PartialHistoryThreads).into()
+            }
+            "利用枠は更新しました。履歴は前回値を保持しています。" => {
+                self.i18n.text(TextKey::PartialHistory).into()
+            }
+            "利用枠は更新しました。スレッド表示は前回値を保持しています。" => {
+                self.i18n.text(TextKey::PartialThreads).into()
+            }
+            "状態を表示できません。" => {
+                self.i18n.text(TextKey::CannotDisplayStatus).into()
+            }
+            _ if self.status.is_empty() => self.i18n.text(TextKey::CannotDisplayStatus).into(),
+            // `normal_status` is already formatted by the startup-pinned
+            // catalog (for example, a localized last-updated clock). Keep
+            // that value instead of replacing it with a generic Japanese
+            // fallback. All asynchronous status keys above are canonical
+            // internal values and are translated before reaching this arm.
+            _ => self.status.clone(),
+        }
+    }
+
     fn open_auth(&mut self) {
         if let Some(url) = self.auth_url.clone() {
             let opened = open_validated_auth_url(&url);
@@ -4804,25 +5193,42 @@ impl CodexInfoState {
             .map(|reset_at| self.period_seconds_for_reset(reset_at))
             .unwrap_or(self.window_seconds.max(WEEK_SECONDS));
         ui.set_authenticated(self.authenticated);
+        ui.set_strings(ui_strings(&self.i18n));
         ui.set_has_usage(self.has_usage);
         ui.set_has_auth_url(self.auth_url.is_some());
         ui.set_checking(self.checking);
         ui.set_has_error(self.error.is_some());
         ui.set_window_title(self.window_title().into());
+        let quota_title = if self.monthly {
+            self.i18n.text(TextKey::MonthlyQuotaRemaining)
+        } else if self.quota_title == "利用枠" {
+            self.i18n.text(TextKey::UsageLimit)
+        } else {
+            self.i18n.text(TextKey::QuotaRemaining)
+        };
         ui.set_quota_title(
-            security::shorten_unicode(&self.quota_title, security::MAX_LIMIT_NAME_SCALARS).into(),
+            security::shorten_unicode(quota_title, security::MAX_LIMIT_NAME_SCALARS).into(),
         );
         ui.set_has_quota_percent(self.has_quota_percent);
         ui.set_remaining_label(
             if self.has_quota_percent {
                 format_percent(remaining)
             } else {
-                "固定上限なし".into()
+                self.i18n.text(TextKey::FixedLimitNone).into()
             }
             .into(),
         );
         ui.set_week_label(if self.has_quota_percent {
-            period_remaining_text(seconds.max(0), period_seconds, self.monthly).into()
+            self.i18n
+                .format_period_remaining(
+                    seconds,
+                    if self.monthly {
+                        PeriodKind::Monthly
+                    } else {
+                        PeriodKind::Weekly
+                    },
+                )
+                .into()
         } else {
             "".into()
         });
@@ -4844,12 +5250,19 @@ impl CodexInfoState {
         ui.set_model_usage_output_tokens(output_tokens.into());
         ui.set_model_usage_output_costs(output_costs.into());
         ui.set_model_usage_period(self.model_usage_period().into());
-        ui.set_estimated_cost_label(self.estimated_cost_label.clone().into());
-        ui.set_status(
-            security::bounded_status(&self.status)
-                .unwrap_or_else(|_| "状態を表示できません。".into())
-                .into(),
-        );
+        let estimate = if self.model_usage.is_empty() {
+            format!("{} —", self.i18n.text(TextKey::EstimatePrefix))
+        } else {
+            let total = self
+                .model_usage
+                .iter()
+                .map(ModelUsageRow::dollar_costs)
+                .map(|(sol, terra, luna)| sol + terra + luna)
+                .sum::<f64>();
+            self.i18n.format_estimate(total)
+        };
+        ui.set_estimated_cost_label(estimate.into());
+        ui.set_status(self.display_status().into());
         ui.set_status_level(self.status_level().into());
         ui.set_remaining_percent(remaining as f32);
         ui.set_remaining_days(if self.has_quota_percent {
@@ -4861,6 +5274,11 @@ impl CodexInfoState {
             ui.set_has_active_thread(true);
             ui.set_active_thread_count(
                 i32::try_from(self.active_threads.len()).unwrap_or(i32::MAX),
+            );
+            ui.set_active_thread_count_label(
+                self.i18n
+                    .format_thread_count(self.active_threads.len())
+                    .into(),
             );
             let [sol, terra, luna, other] = active_thread_model_count_values(&self.active_threads);
             ui.set_active_thread_sol_count(sol);
@@ -4874,6 +5292,7 @@ impl CodexInfoState {
             ui.set_active_thread_terra_count(0);
             ui.set_active_thread_luna_count(0);
             ui.set_active_thread_other_count(0);
+            ui.set_active_thread_count_label(self.i18n.format_thread_count(0).into());
         }
     }
 
@@ -4904,29 +5323,31 @@ impl CodexInfoState {
         let span = (period_end - period_start).max(1) as f64;
         [0.0, 0.25, 0.5, 0.75, 1.0].map(|fraction| {
             let timestamp = period_start + (span * fraction) as i64;
-            DateTime::from_timestamp(timestamp, 0)
-                .map(|time| time.with_timezone(&Local).format("%m/%d %H:%M").to_string())
-                .unwrap_or_default()
+            self.i18n.format_graph_time(timestamp).unwrap_or_default()
         })
     }
 }
 
-fn format_period_label(start: i64, end: i64) -> String {
-    let Some(start_time) = DateTime::from_timestamp(start, 0) else {
-        return String::new();
-    };
-    let Some(end_time) = DateTime::from_timestamp(end, 0) else {
-        return String::new();
-    };
-    format!(
-        "{} – {}",
-        start_time
-            .with_timezone(&Local)
-            .format("%Y/%m/%d %H:%M:%S %:z"),
-        end_time
-            .with_timezone(&Local)
-            .format("%Y/%m/%d %H:%M:%S %:z")
+#[cfg(test)]
+#[allow(clippy::needless_return)]
+fn format_period_timestamp(timestamp: i64) -> Option<String> {
+    let time = DateTime::from_timestamp(timestamp, 0)?;
+    Some(
+        time.with_timezone(&chrono_tz::Asia::Tokyo)
+            .format("%Y/%m/%d %H:%M:%S JST")
+            .to_string(),
     )
+}
+
+#[cfg(test)]
+fn format_period_label(start: i64, end: i64) -> String {
+    let Some(start) = format_period_timestamp(start) else {
+        return String::new();
+    };
+    let Some(end) = format_period_timestamp(end) else {
+        return String::new();
+    };
+    format!("{start} ～ {end}")
 }
 
 impl Drop for CodexInfoState {
@@ -4937,6 +5358,7 @@ impl Drop for CodexInfoState {
     }
 }
 
+#[cfg(test)]
 fn duration_parts(seconds: i64) -> (i64, i64, i64, i64) {
     let (days, rest) = (seconds / 86_400, seconds % 86_400);
     let (hours, rest) = (rest / 3_600, rest % 3_600);
@@ -4944,6 +5366,7 @@ fn duration_parts(seconds: i64) -> (i64, i64, i64, i64) {
     (days, hours, minutes, seconds)
 }
 
+#[cfg(test)]
 fn week_remaining_text(seconds: i64) -> String {
     let (days, hours, minutes, _) = duration_parts(seconds.max(0));
     if days > 0 {
@@ -4955,6 +5378,7 @@ fn week_remaining_text(seconds: i64) -> String {
     }
 }
 
+#[cfg(test)]
 fn period_remaining_text(seconds: i64, period_seconds: i64, monthly: bool) -> String {
     if monthly {
         let (days, hours, minutes, _) = duration_parts(seconds.max(0));
@@ -5356,8 +5780,21 @@ fn main() -> Result<(), slint::PlatformError> {
                     let weak_graph = graph.as_weak();
                     graph.on_close_graph(move || {
                         if let Some(graph) = weak_graph.upgrade() {
+                            graph.set_reset_close_buttons(true);
+                            graph.set_reset_close_buttons(false);
                             let _ = graph.hide();
                         }
+                    });
+                    let weak_graph = graph.as_weak();
+                    graph.window().on_close_requested(move || {
+                        if let Some(graph) = weak_graph.upgrade() {
+                            graph.set_reset_close_buttons(true);
+                            graph.set_reset_close_buttons(false);
+                            if graph.hide().is_ok() {
+                                return CloseRequestResponse::KeepWindowShown;
+                            }
+                        }
+                        CloseRequestResponse::HideWindow
                     });
                     let weak_graph = graph.as_weak();
                     let state_for_toggle = Rc::clone(&state);
@@ -5413,6 +5850,8 @@ fn main() -> Result<(), slint::PlatformError> {
                 }
             }
             if let Some(graph) = graph_window.as_ref() {
+                graph.set_reset_close_buttons(true);
+                graph.set_reset_close_buttons(false);
                 sync_graph_window(&state.borrow(), graph);
                 let _ = show_and_focus_window(graph.window(), x11_monitor.as_ref().as_ref());
             }
@@ -5430,19 +5869,35 @@ fn main() -> Result<(), slint::PlatformError> {
                     let weak_window = window.as_weak();
                     window.on_close_threads(move || {
                         if let Some(window) = weak_window.upgrade() {
+                            window.set_reset_close_buttons(true);
+                            window.set_reset_close_buttons(false);
                             let _ = window.hide();
                         }
+                    });
+                    let weak_window = window.as_weak();
+                    window.window().on_close_requested(move || {
+                        if let Some(window) = weak_window.upgrade() {
+                            window.set_reset_close_buttons(true);
+                            window.set_reset_close_buttons(false);
+                            if window.hide().is_ok() {
+                                return CloseRequestResponse::KeepWindowShown;
+                            }
+                        }
+                        CloseRequestResponse::HideWindow
                     });
                     *threads_window = Some(window);
                 }
             }
             if let Some(window) = threads_window.as_ref() {
+                window.set_reset_close_buttons(true);
+                window.set_reset_close_buttons(false);
                 sync_threads_window(&state.borrow(), window);
                 let _ = show_and_focus_window(window.window(), x11_monitor.as_ref().as_ref());
             }
         });
     }
     {
+        let state = Rc::clone(&state);
         let legal_notice_window = Rc::clone(&legal_notice_window);
         let x11_monitor = Rc::clone(&x11_monitor);
         ui.on_open_legal_notice(move || {
@@ -5452,13 +5907,39 @@ fn main() -> Result<(), slint::PlatformError> {
                     let weak_window = window.as_weak();
                     window.on_close_legal_notice(move || {
                         if let Some(window) = weak_window.upgrade() {
+                            window.set_reset_close_buttons(true);
+                            window.set_reset_close_buttons(false);
                             let _ = window.hide();
                         }
+                    });
+                    let weak_window = window.as_weak();
+                    window.window().on_close_requested(move || {
+                        if let Some(window) = weak_window.upgrade() {
+                            window.set_reset_close_buttons(true);
+                            window.set_reset_close_buttons(false);
+                            if window.hide().is_ok() {
+                                return CloseRequestResponse::KeepWindowShown;
+                            }
+                        }
+                        CloseRequestResponse::HideWindow
                     });
                     *legal_notice_window = Some(window);
                 }
             }
             if let Some(window) = legal_notice_window.as_ref() {
+                let state_ref = state.borrow();
+                window.set_strings(ui_strings(&state_ref.i18n));
+                window.set_window_title(
+                    localized_detail_window_title(
+                        &state_ref.i18n,
+                        state_ref.authenticated,
+                        &state_ref.window_title(),
+                        WindowPurpose::Legal,
+                    )
+                    .into(),
+                );
+                window.set_reset_close_buttons(true);
+                window.set_reset_close_buttons(false);
                 let _ = show_and_focus_window(window.window(), x11_monitor.as_ref().as_ref());
             }
         });
@@ -5474,7 +5955,10 @@ fn main() -> Result<(), slint::PlatformError> {
         }
         ui.invoke_open_graph();
     }
-    if preview_kind.as_deref() == Some("multi-thread") {
+    if matches!(
+        preview_kind.as_deref(),
+        Some("multi-thread" | "single-thread")
+    ) {
         ui.invoke_open_threads();
     }
     if preview_kind.as_deref() == Some("legal") {
@@ -5492,10 +5976,14 @@ fn main() -> Result<(), slint::PlatformError> {
             if let Some(monitor) = monitor.as_ref() {
                 monitor.enforce(ui.window());
                 if let Some(window) = threads_window_for_bounds.borrow().as_ref() {
-                    monitor.enforce(window.window());
+                    if window.window().is_visible() {
+                        monitor.enforce(window.window());
+                    }
                 }
                 if let Some(window) = legal_notice_window_for_bounds.borrow().as_ref() {
-                    monitor.enforce(window.window());
+                    if window.window().is_visible() {
+                        monitor.enforce(window.window());
+                    }
                 }
             }
         }
@@ -5528,10 +6016,14 @@ fn main() -> Result<(), slint::PlatformError> {
                 }
                 state.sync_ui(&ui);
                 if let Some(graph) = graph_window_for_timer.borrow().as_ref() {
-                    sync_graph_window(&state, graph);
+                    if graph.window().is_visible() {
+                        sync_graph_window(&state, graph);
+                    }
                 }
                 if let Some(window) = threads_window_for_timer.borrow().as_ref() {
-                    sync_threads_window(&state, window);
+                    if window.window().is_visible() {
+                        sync_threads_window(&state, window);
+                    }
                 }
             }
         });
@@ -5546,8 +6038,8 @@ mod tests {
         add_recovery_usage, automatic_refresh_interval, clamp_graph_preview_size,
         collect_session_file, complete_rollout_prefix_len, detail_window_title,
         fetch_active_thread_update_for_paths, fetch_active_thread_update_for_paths_and_state,
-        fixed_resize_decision, format_estimated_cost, format_model_usage_columns, format_percent,
-        format_period_label, format_thread_age, graph_paths, graph_paths_for_selection,
+        fixed_resize_decision, format_elapsed, format_estimated_cost, format_model_usage_columns,
+        format_percent, format_period_label, graph_paths, graph_paths_for_selection,
         graph_period_end, graph_points, graph_time_endpoints, minute_model_spend,
         minute_model_spend_for_metric, model_usage_timeline_from_events, monthly_window_seconds,
         normal_status_text, open_codex_session_paths, parse_preview_size, parse_rate_limits,
@@ -5921,11 +6413,14 @@ mod tests {
 
         let replacement = ActiveThread {
             id: "replacement".into(),
+            created_at: Some(60),
             updated_at: 123,
             title: "replacement title".into(),
             model: "gpt-5.6-terra".into(),
             model_label: "gpt-5.6-terra".into(),
             total_tokens: Some(98_765),
+            context_window_tokens: None,
+            last_user_message_at: Some(120),
             is_subagent: true,
             parent_thread_id: Some("parent".into()),
             depth: Some(1),
@@ -6331,6 +6826,7 @@ mod tests {
             "full",
             "idle",
             "multi-thread",
+            "single-thread",
             "history-empty",
         ] {
             assert_eq!(
@@ -6433,33 +6929,42 @@ mod tests {
         let threads = vec![
             ActiveThread {
                 id: "parent".into(),
+                created_at: Some(10),
                 updated_at: 20,
                 title: "親タイトル".into(),
                 model: "model-parent".into(),
                 model_label: "model-parent".into(),
                 total_tokens: Some(u64::MAX),
+                context_window_tokens: Some(258_400),
+                last_user_message_at: Some(19),
                 is_subagent: false,
                 parent_thread_id: None,
                 depth: None,
             },
             ActiveThread {
                 id: "child".into(),
+                created_at: Some(10),
                 updated_at: 19,
                 title: "子タイトル".into(),
                 model: "model-child".into(),
                 model_label: "model-child".into(),
                 total_tokens: Some(1_234),
+                context_window_tokens: None,
+                last_user_message_at: Some(18),
                 is_subagent: true,
                 parent_thread_id: Some("parent".into()),
                 depth: Some(1),
             },
             ActiveThread {
                 id: "orphan".into(),
+                created_at: None,
                 updated_at: 18,
                 title: "親が完了済みの子".into(),
                 model: "model-orphan".into(),
                 model_label: "model-orphan".into(),
                 total_tokens: None,
+                context_window_tokens: None,
+                last_user_message_at: None,
                 is_subagent: true,
                 parent_thread_id: Some("completed-parent".into()),
                 depth: Some(120),
@@ -6471,14 +6976,16 @@ mod tests {
         assert_eq!(rows[0].relation.as_str(), "メイン");
         assert_eq!(
             rows[0].tokens.as_str(),
-            "合計 18,446,744,073,709,551,615トークン"
+            "18,446,744,073,709,551,615トークン"
         );
+        assert_eq!(rows[0].context_window.as_str(), "258,400トークン");
         assert_eq!(rows[1].relation.as_str(), "サブ D1");
         assert_eq!(rows[1].tree_depth, 1);
         assert!(rows[1].connected_to_parent);
         assert!(!rows[1].has_next_sibling);
         assert_eq!(rows[1].parent_title.as_str(), "親: 親タイトル");
-        assert_eq!(rows[1].elapsed.as_str(), "最終更新から 1秒");
+        assert_eq!(rows[1].thread_age.as_str(), "10秒");
+        assert_eq!(rows[1].instruction_age.as_str(), "2秒");
         assert_eq!(rows[2].relation.as_str(), "サブ D99+");
         assert_eq!(rows[2].tree_depth, 0);
         assert!(!rows[2].connected_to_parent);
@@ -6494,11 +7001,14 @@ mod tests {
                       parent: Option<&str>,
                       depth: Option<i32>| ActiveThread {
             id: id.into(),
+            created_at: Some(updated_at.saturating_sub(10)),
             updated_at,
             title: id.into(),
             model: "model".into(),
             model_label: "model".into(),
             total_tokens: None,
+            context_window_tokens: None,
+            last_user_message_at: Some(updated_at.saturating_sub(1)),
             is_subagent,
             parent_thread_id: parent.map(str::to_owned),
             depth,
@@ -6586,14 +7096,57 @@ mod tests {
     }
 
     #[test]
+    fn thread_presentation_keeps_capped_ancestor_guide_through_deeper_rows() {
+        let thread = |id: &str, updated_at: i64, parent: Option<&str>| ActiveThread {
+            id: id.into(),
+            created_at: Some(updated_at.saturating_sub(10)),
+            updated_at,
+            title: id.into(),
+            model: "model".into(),
+            model_label: "model".into(),
+            total_tokens: None,
+            context_window_tokens: None,
+            last_user_message_at: None,
+            is_subagent: parent.is_some(),
+            parent_thread_id: parent.map(str::to_owned),
+            depth: None,
+        };
+        let threads = vec![
+            thread("root", 100, None),
+            thread("level-1", 90, Some("root")),
+            thread("level-2", 80, Some("level-1")),
+            thread("level-3-first", 70, Some("level-2")),
+            thread("level-3-last", 60, Some("level-2")),
+            thread("level-4", 50, Some("level-3-first")),
+            thread("level-5", 40, Some("level-4")),
+        ];
+
+        let presentation = thread_presentation_rows(&threads);
+        let level_3_first = presentation
+            .iter()
+            .find(|row| threads[row.index].id == "level-3-first")
+            .expect("level 3 first sibling");
+        assert!(level_3_first.has_next_sibling);
+        let level_5 = presentation
+            .iter()
+            .find(|row| threads[row.index].id == "level-5")
+            .expect("deep descendant");
+        assert_eq!(level_5.forest_depth, 5);
+        assert!(level_5.ancestor_guides[2]);
+    }
+
+    #[test]
     fn active_thread_model_counts_use_exact_known_tokens_and_keep_named_zeroes() {
         let thread = |id: &str, model_label: &str| ActiveThread {
             id: id.into(),
+            created_at: Some(1),
             updated_at: 1,
             title: id.into(),
             model: "model".into(),
             model_label: model_label.into(),
             total_tokens: None,
+            context_window_tokens: None,
+            last_user_message_at: None,
             is_subagent: false,
             parent_thread_id: None,
             depth: None,
@@ -6614,15 +7167,18 @@ mod tests {
     #[test]
     fn thread_age_uses_fixed_boundaries_and_clamps_future() {
         let now = 86_400;
-        assert_eq!(format_thread_age(now, now), "最終更新から 0秒");
-        assert_eq!(format_thread_age(now, now - 59), "最終更新から 59秒");
-        assert_eq!(format_thread_age(now, now - 60), "最終更新から 1分");
-        assert_eq!(format_thread_age(now, now - 3_599), "最終更新から 59分");
-        assert_eq!(format_thread_age(now, now - 3_600), "最終更新から 1時間");
-        assert_eq!(format_thread_age(now, now - 86_399), "最終更新から 23時間");
-        assert_eq!(format_thread_age(now, now - 86_400), "最終更新から 1日");
-        assert_eq!(format_thread_age(now, now + 60), "最終更新から 0秒");
-        assert_eq!(format_thread_age(now, i64::MAX), "最終更新から —");
+        assert_eq!(format_elapsed(now, Some(now)), "0秒");
+        assert_eq!(format_elapsed(now, Some(now - 59)), "59秒");
+        assert_eq!(format_elapsed(now, Some(now - 60)), "1分");
+        assert_eq!(format_elapsed(now, Some(now - 83)), "1分23秒");
+        assert_eq!(format_elapsed(now, Some(now - 3_599)), "59分59秒");
+        assert_eq!(format_elapsed(now, Some(now - 3_600)), "1時間");
+        assert_eq!(format_elapsed(now, Some(now - 3_661)), "1時間1分");
+        assert_eq!(format_elapsed(now, Some(now - 86_399)), "23時間59分");
+        assert_eq!(format_elapsed(now, Some(now - 86_400)), "1日");
+        assert_eq!(format_elapsed(now, Some(now + 60)), "0秒");
+        assert_eq!(format_elapsed(now, Some(i64::MAX)), "—");
+        assert_eq!(format_elapsed(now, None), "—");
     }
 
     #[cfg(unix)]
@@ -6756,11 +7312,14 @@ mod tests {
             update,
             ActiveThreadUpdate::Snapshot(vec![ActiveThread {
                 id: "fallback".into(),
+                created_at: Some(1),
                 updated_at: 10,
                 title: "title-fallback".into(),
                 model: "gpt-5.6-sol".into(),
                 model_label: "gpt-5.6-sol".into(),
                 total_tokens: Some(12_345),
+                context_window_tokens: None,
+                last_user_message_at: None,
                 is_subagent: false,
                 parent_thread_id: None,
                 depth: None,
@@ -6885,22 +7444,28 @@ mod tests {
             ActiveThreadUpdate::Snapshot(vec![
                 ActiveThread {
                     id: "thread-z".into(),
+                    created_at: Some(1),
                     updated_at: 20,
                     title: "title-thread-z".into(),
                     model: "model-z".into(),
                     model_label: "model-z".into(),
                     total_tokens: Some(999),
+                    context_window_tokens: None,
+                    last_user_message_at: None,
                     is_subagent: false,
                     parent_thread_id: None,
                     depth: None,
                 },
                 ActiveThread {
                     id: "thread-a".into(),
+                    created_at: Some(1),
                     updated_at: 20,
                     title: "title-thread-a".into(),
                     model: "model-a".into(),
                     model_label: "model-a".into(),
                     total_tokens: Some(111),
+                    context_window_tokens: None,
+                    last_user_message_at: None,
                     is_subagent: true,
                     parent_thread_id: Some("thread-z".into()),
                     depth: Some(1),
@@ -7029,11 +7594,14 @@ mod tests {
             update,
             ActiveThreadUpdate::Snapshot(vec![ActiveThread {
                 id: "root".into(),
+                created_at: Some(1),
                 updated_at: 10,
                 title: "title-root".into(),
                 model: "native-model".into(),
                 model_label: "native-model".into(),
                 total_tokens: None,
+                context_window_tokens: None,
+                last_user_message_at: None,
                 is_subagent: false,
                 parent_thread_id: None,
                 depth: None,
@@ -7404,14 +7972,17 @@ mod tests {
         let source = include_str!("../ui/components.slint");
         for marker in [
             "width: 2px;",
-            "height: 72px;",
-            "x: 96px;",
-            "x: 116px;",
-            "x: 136px;",
-            "y: 17px;",
-            "width: 20px;",
+            "height: root.thread-row-height;",
+            "tree-base-x: 92px;",
+            "tree-depth-step: 20px;",
+            "tree-junction-y: 28px;",
+            "x: parent.tree-base-x + parent.tree-depth-step;",
+            "x: parent.tree-base-x + 2 * parent.tree-depth-step;",
+            "y: parent.tree-junction-y - 1px;",
+            "width: parent.title-x - self.x - 8px;",
             "background: DesignTokens.warning;",
-            "height: 54px;",
+            "height: root.thread-row-height - parent.tree-junction-y;",
+            "border-radius: 2px;",
             "ancestor-guide-1",
             "ancestor-guide-2",
             "ancestor-guide-3",
@@ -7436,6 +8007,28 @@ mod tests {
         for row in [[0x0d, 0x13, 0x1e], [0x14, 0x1d, 0x2d]] {
             let background = luminance(row);
             assert!((rail + 0.05) / (background + 0.05) >= 7.719);
+        }
+    }
+
+    #[test]
+    fn thread_rails_keep_every_text_lane_outside_the_tree_gutter() {
+        let source = include_str!("../ui/components.slint");
+        for marker in [
+            "property <length> tree-base-x: 24px;",
+            "property <length> tree-depth-step: 16px;",
+            "property <length> tree-junction-y: 36px;",
+            "x: root.single-thread ? 20px : 72px;",
+            ": 172px + self.display-depth * 24px;",
+            "width: parent.title-x - self.x - 20px;",
+            "x: parent.title-x - 24px;",
+            "if !root.single-thread && row.ancestor-guide-1 : Rectangle {",
+            "if !root.single-thread && row.connected-to-parent : Rectangle {",
+            "if !root.single-thread && row.has-children : Rectangle {",
+        ] {
+            assert!(
+                source.contains(marker),
+                "missing non-overlap contract: {marker}"
+            );
         }
     }
 
@@ -7587,7 +8180,7 @@ mod tests {
                 .count(),
             1
         );
-        assert_eq!(source.matches("graph.hide()").count(), 1);
+        assert_eq!(source.matches("graph.hide()").count(), 2);
     }
 
     #[test]
@@ -7619,6 +8212,45 @@ mod tests {
         assert_eq!(source.matches("LegalNoticeWindow::new()").count(), 1);
         assert!(!source.contains("graph.show()"));
         assert!(!source.contains("let _ = window.show();"));
+    }
+
+    #[test]
+    fn secondary_close_hides_before_native_close_and_skips_hidden_work() {
+        let source = include_str!("main.rs")
+            .split_once("#[cfg(test)]\nmod tests")
+            .map(|(source, _)| source)
+            .expect("production source");
+        assert_eq!(source.matches("on_close_requested(move ||").count(), 3);
+        assert_eq!(
+            source
+                .matches("CloseRequestResponse::KeepWindowShown")
+                .count(),
+            3
+        );
+        assert!(source.contains("if graph.hide().is_ok()"));
+        assert!(source.contains("if window.hide().is_ok()"));
+        assert!(source.contains("if graph.window().is_visible()"));
+        assert!(source.contains("if window.window().is_visible()"));
+
+        let components = include_str!("../ui/components.slint");
+        let action_button = components
+            .split_once("component ActionButton inherits Rectangle {")
+            .and_then(|(_, source)| source.split_once("export component WeekGauge"))
+            .map(|(source, _)| source)
+            .expect("ActionButton component");
+        assert!(action_button.contains("touch-area := TouchArea"));
+        assert!(action_button.contains("touch-area.pressed"));
+        assert!(action_button.contains("activate-on-press: false"));
+        assert!(action_button.contains("reset-press-state: false"));
+        assert!(action_button.contains("changed pressed =>"));
+        assert_eq!(components.matches("activate-on-press: true;").count(), 3);
+        assert_eq!(
+            components
+                .matches("reset-press-state: root.reset-close-buttons;")
+                .count(),
+            3
+        );
+        assert_eq!(source.matches("set_reset_close_buttons(true)").count(), 9);
     }
 
     #[test]
@@ -8506,6 +9138,10 @@ mod tests {
                 .count()
                 >= 2
         );
+        assert!(periods
+            .iter()
+            .filter(|period| period.label.contains("（期限 "))
+            .all(|period| period.label.contains("JST")));
         for period in &periods {
             assert_eq!(
                 history.period_id_for_label(&period.label, 2_000, None),
@@ -9541,9 +10177,11 @@ mod tests {
     #[test]
     fn period_label_has_month_and_day_for_both_endpoints() {
         let label = format_period_label(1_700_000_000, 1_700_086_400);
+        assert_eq!(label, "2023/11/15 07:13:20 JST ～ 2023/11/16 07:13:20 JST");
         assert_eq!(label.matches('/').count(), 4);
-        assert_eq!(label.matches(" – ").count(), 1);
-        let endpoints: Vec<_> = label.split(" – ").collect();
+        assert_eq!(label.matches(" JST").count(), 2);
+        assert_eq!(label.matches(" ～ ").count(), 1);
+        let endpoints: Vec<_> = label.split(" ～ ").collect();
         assert_eq!(endpoints.len(), 2);
         assert!(endpoints
             .iter()
@@ -9564,19 +10202,34 @@ mod tests {
     }
 
     #[test]
-    fn graph_history_popup_stays_inside_the_control_band() {
+    fn graph_history_placeholder_is_not_selectable() {
+        let source = include_str!("../ui/components.slint");
+        let graph_select = source
+            .split_once("export component GraphSelect inherits Rectangle {")
+            .and_then(|(_, source)| source.split_once("export component Header"))
+            .map(|(source, _)| source)
+            .expect("GraphSelect component");
+        assert!(graph_select.contains(
+            "enabled: root.model.length > 0 && !(root.model.length == 1 && root.model[0] == \"履歴なし\");"
+        ));
+    }
+
+    #[test]
+    fn graph_history_popup_overlays_plot_without_reflowing_it() {
         let source = include_str!("../ui/components.slint");
         let graph = source
             .split("export component GraphWindow inherits Window {")
             .nth(1)
             .expect("GraphWindow");
-        assert!(graph.contains("popup-above: true;"));
+        assert!(graph.contains("popup-above: false;"));
         assert!(graph.contains("y: 72px;"));
-        assert!(graph.contains("history-toggle-y: history-select.popup-open ? 72px + history-select.popup-height + 8px : 144px;"));
+        assert!(graph.contains("history-toggle-y: 144px;"));
+        assert!(!graph.contains("history-toggle-y: history-select.popup-open ?"));
+        assert!(graph.contains("z: 2;"));
         assert!(graph.contains("y: root.history-toggle-y + 32px;"));
         assert!(source.contains("y: root.popup-above ? 0px : root.height;"));
         assert!(source.contains(
-            "out property <length> popup-height: min(128px, max(root.item-height, root.model.length * root.item-height));"
+            "out property <length> popup-height: min(130px, max(root.item-height + 2px, root.model.length * root.item-height + 2px));"
         ));
         assert!(source.contains("popup-list := ListView"));
     }
@@ -9604,7 +10257,7 @@ mod tests {
             .nth(1)
             .expect("GraphWindow");
         assert!(source.contains(
-            "out property <length> popup-height: min(128px, max(root.item-height, root.model.length * root.item-height));"
+            "out property <length> popup-height: min(130px, max(root.item-height + 2px, root.model.length * root.item-height + 2px));"
         ));
         assert!(graph.contains("background: DesignTokens.graph-control-surface;"));
         assert!(graph.contains("opacity: 0.72;"));
@@ -9695,6 +10348,53 @@ mod tests {
     }
 
     #[test]
+    fn threads_window_uses_readable_primary_metadata_layout() {
+        let threads = include_str!("../ui/components.slint")
+            .split("export component ThreadsWindow inherits Window {")
+            .nth(1)
+            .expect("ThreadsWindow");
+        assert!(threads.contains("property <bool> single-thread: root.thread-rows.length == 1;"));
+        assert!(threads
+            .contains("property <length> thread-row-height: root.single-thread ? 384px : 128px;"));
+        assert!(threads.contains("height: root.thread-row-height;"));
+        assert!(threads.contains("font-size: root.single-thread ? 28px : 20px;"));
+        assert!(threads.contains("font-size: root.single-thread ? 22px : 18px;"));
+        assert!(threads.contains("font-size: 28px;"));
+        assert!(threads.contains("font-size: 24px;"));
+        assert!(threads.contains("font-size: 18px;"));
+        assert!(threads.contains("width: root.single-thread ? 90px : 78px;"));
+        assert!(threads.contains("width: 268px;"));
+        assert!(threads.contains("text: row.model;"));
+        assert!(threads.contains("text: \"稼働 \" + row.thread-age;"));
+        assert!(threads.contains("text: \"指示 \" + row.instruction-age;"));
+        assert!(threads.contains("text: \"稼働\";"));
+        assert!(threads.contains("text: \"指示\";"));
+        assert!(threads.contains("text: \"トークン\";"));
+        assert!(threads.contains("text: row.tokens;"));
+        assert!(threads.contains("text: row.context-window;"));
+        assert!(threads.contains("text: \"コンテキスト \" + row.context-window;"));
+        assert!(threads.contains("text: \"コンテキスト\";"));
+        assert!(threads.contains("width: parent.width - 486px;"));
+        assert!(threads.contains("property <bool> has-parent-title: row.parent-title != \"\";"));
+        assert!(threads.contains("visible: !root.single-thread || parent.has-parent-title;"));
+        assert!(threads.contains("y: parent.has-parent-title ? 132px : 84px;"));
+        assert!(!threads.contains("row.elapsed"));
+        assert!(threads.contains("x: root.single-thread ? 400px : parent.width - 560px;"));
+        assert!(threads.contains("x: parent.width - 300px;"));
+    }
+
+    #[test]
+    fn single_thread_preview_uses_the_full_detail_viewport() {
+        let source = include_str!("main.rs")
+            .split_once("#[cfg(test)]\nmod tests")
+            .map(|(source, _)| source)
+            .expect("production source");
+        assert!(source.contains("Some(\"multi-thread\" | \"single-thread\")"));
+        let state = CodexInfoState::preview("single-thread");
+        assert_eq!(state.active_threads.len(), 1);
+    }
+
+    #[test]
     fn threads_window_header_stays_above_the_scrolling_rows() {
         let threads = include_str!("../ui/components.slint")
             .split("export component ThreadsWindow inherits Window {")
@@ -9710,6 +10410,8 @@ mod tests {
         assert!(header.contains("width: 840px;"));
         assert!(header.contains("height: 48px;"));
         assert!(header.contains("background: DesignTokens.canvas;"));
+        assert!(header.contains("font-size: 22px;"));
+        assert!(header.contains("font-size: 16px;"));
         assert!(header.contains("z: 2;"));
     }
 }

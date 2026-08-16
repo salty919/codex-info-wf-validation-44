@@ -3,6 +3,8 @@
 
 # Codex Info（Rust / X Window / WSLg）
 
+English quick start: [README.en.md](README.en.md) · 多言語化仕様: [docs/LOCALIZATION.md](docs/LOCALIZATION.md)
+
 Codex App ServerからChatGPT/Codexアカウントのレート制限と週次または月間のリセット時刻を取得し、WSLのX Windowに表示します。WebサーバーやTkinterは使いません。UIはRustの宣言的GUIツールキットSlintで構成しています。
 
 ## 起動
@@ -34,7 +36,7 @@ CODEX_INFO_DATA_DIR="$PWD/data" ./run.sh
 - WSLgまたはXサーバー（`DISPLAY`が設定されていること）
 - `codex` CLI（`codex app-server --stdio`が実行できること）
 
-日本語表示用のNoto Sans JPフォントを`assets/`に同梱しているため、ホスト側の日本語フォント追加インストールは不要です。
+日本語・韓国語表示に必要なフォントは`assets/`へ同梱し、Slintへ埋め込んでいます。通常はホスト側へフォントを追加インストールする必要はありません。フォントの著作権とライセンスは[第三者ライセンス通知](THIRD_PARTY_NOTICES.md)と[assets/NOTICE.txt](assets/NOTICE.txt)を確認してください。
 
 初回起動時にCargoが依存クレートを取得・ビルドします。画面が出ない場合は次を確認してください。
 
@@ -57,9 +59,17 @@ codex app-server --help
 
 ## 表示と更新
 
+### 言語・時刻・日本語表示
+
+- 固定UI文言は起動時に`LC_ALL` → `LC_MESSAGES` → `LANG`の順で決めたホストlocaleへ合わせます。日本語、英語、中国語（簡体）、韓国語、スペイン語、フランス語、ドイツ語、ポルトガル語、イタリア語、ロシア語に対応し、未対応locale・`C`・`POSIX`は英語へフォールバックします。`LANGUAGE`は参照しません。
+- localeはプロセス起動時に一度だけ確定します。実行中に環境変数を変更しても、画面内で言語が混在することはありません。変更後は再起動してください。
+- 絶対時刻と履歴期間は起動時に解決したホストのIANA timezoneで表示し、経過時間と残り時間はUTCの差分を各言語の単位へ変換します。`TZ`へ`Asia/Tokyo`などのIANA timezoneを指定すると、WSLのtimezoneを明示できます。無効な`TZ`は安全にUTCへフォールバックします。
+- 日本語表示を明示的に確認する場合は、`LANG=ja_JP.UTF-8 LC_ALL= TZ=Asia/Tokyo ./run.sh`を使います。`LC_ALL`を空にしない場合は`LC_ALL`が優先されます。
+- 固定文言の一覧、localeの境界、DSTをまたぐ時刻表示、日本語フォントの確認手順は[多言語化仕様](docs/LOCALIZATION.md)にまとめています。
+
 - 残り時間は日・時・分で読みやすく表示
 - レート制限は1分ごとに再取得
-- 認証済みのnative Window titleはMainが`<email> — <localized plan>`、Threadsが`<email> — <localized plan> — Threads`、Graphが`<email> — <localized plan> — Graph`です。用途の日本語は各Window内の見出しで表示します。未認証・初期・logout時は全Windowで「アカウント未接続 — プラン未設定」となります。HeaderとAccountActivityにはemail/planを重複表示しません。
+- 認証済みのnative Window titleはMainが`<email> — <localized plan>`、Threads/Graph/Legalが同じidentityに起動時localeの用途名を付けます。用途名はWindow内見出しにも表示し、同じidentityをHeaderとAccountActivityへ重複表示しません。未認証・初期・logout時は全Windowで「アカウント未接続 — プラン未設定」（localeに応じた翻訳）となります。
 - 認証済み画面の「グラフ」ボタンから1つのグラフウインドウを開きます。残り利用枠・LUNA/TERRA/SOLを個別にON/OFFでき、初期状態は全系列ONです。ドル表示は各モデルの入力・キャッシュ・出力合計を独立した平滑化ラインで描き、表示中モデルの個別最大値へ縦軸を合わせます。リセット直後（0）から現在時刻まで表示します
 - グラフの1分サンプルはSQLite（`history/usage_history.sqlite3`）へ保存し、JSONは後方互換の読み込み・移行元として扱います。同一リセット期間・同一分は最大値を保持して再計測で減少しません。通常起動で削除されるのは3か月より古い行だけです。グラフ上部の「ドル／トークン」で、ドルは累積額、トークンは各モデルの時間帯別使用量へ切り替えられます（初期値はドル）。
 - `CODEX_INFO_DATA_DIR`を指定すると、そのディレクトリ配下へ履歴を保存します。既存の`CODEX_HOME/history`（または`CODEX_INFO_MIGRATE_FROM`）からの移行は追加・冪等で、移行元は変更・削除しません
@@ -84,5 +94,7 @@ Main/Threads画面はclient 900×480px固定（初期・最小・最大900×480�
 Copyright (C) 2026 salty919
 
 別途明記された第三者素材を除き、このリポジトリの独自コードと文書は[GNU General Public License version 3](LICENSE)のみに基づいて提供されます（SPDX: `GPL-3.0-only`）。著作権一覧は[COPYRIGHT](COPYRIGHT)を参照してください。
+
+日本語での参照には[GNU GPLv3 日本語案内](LICENSE.ja.md)を用意しています。これは法的な正文ではなく、正式な条件・定義・免責は常に英語の[LICENSE](LICENSE)を優先してください。
 
 同梱フォント、Codex CLIから生成したプロトコルスキーマ、Slint、およびRust依存クレートには、それぞれのライセンスが引き続き適用されます。詳細は[第三者ライセンス通知](THIRD_PARTY_NOTICES.md)を参照してください。
