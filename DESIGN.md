@@ -116,11 +116,11 @@ UIはSlintの宣言的コンポーネントで構成する。Rust側はCodex app
 
 ## レイアウト規則
 
-以下のpixel値は、複数thread表示を受けて確定した固定Main/Threads 900×480と既存Graph layoutを基準に、固定/最小/拡大/無駄余白抑制/線幅差を有限検査する設計値である。900px幅の本文は840pxで、固定Windowへ追加した幅を全て情報領域へ渡す。
+以下のpixel値は、複数thread表示を受けて確定した論理pixel基準の固定Main/Threads 900×480と既存Graph layoutを基準に、固定/最小/拡大/無駄余白抑制/線幅差を有限検査する設計値である。900論理px幅の本文は840論理pxで、固定Windowへ追加した幅を全て情報領域へ渡す。実際のX11 client物理pxはOSのDPI倍率に従う。
 
-- Window寸法はX11のclient content pixelsを指し、title bar/frameを含まない。WSLg/X11を対象platformとし、論理/物理pixel比を`WINIT_X11_SCALE_FACTOR=1`へ固定する。検証は`xwininfo` client geometryと`WM_NORMAL_HINTS`の両方を使い、DPI/monitor移動の前後で端数丸めを発生させない。
-- MainWindowとThreadsWindowはclient 900×480px固定（初期・最小・最大900×480）とし、外部環境値によるscale変更を許可しない。モニター間の移動でclient寸法を変化させない。
-- 固定WindowのSlint min/max hintsとwinit non-resizable設定はclient 900×480を宣言し、X11 `_NET_WM_STATE`の最大化/全画面をstate monitorで除去する。winit `Resized` event guardは、正確な900×480と最小化のzero-dimensionだけをPropagateし、他のnon-zero mismatchをPreventDefaultして同じcallback内でunderlying winit `request_inner_size(PhysicalSize(900,480))`を一度だけ要求する。このevent-triggered requestは許可するが、timer/Slint `Window::set_size`による修復、非表示化、破棄・再生成、時間pollingによる再試行は行わない。
+- Window寸法はX11のclient content logical pixelsを指し、title bar/frameを含まない。WSLg/X11を対象platformとし、winitのscale factorをOS設定へ委譲する。Xft.dpiがあればそれを使い、なければXRandRのモニター寸法から倍率を算出する。検証は`xwininfo` client geometry、現在のscale factor、`WM_NORMAL_HINTS`を併用し、物理寸法が`round(logical × scale)`になることを確認する。
+- MainWindowとThreadsWindowはclient 900×480 logical px固定（初期・最小・最大）とし、物理client寸法は現在のOS倍率に合わせる。モニター間の移動やDPI変更では、論理寸法を維持したまま物理寸法だけを変更する。
+- 固定WindowのSlint min/max hintsとwinit non-resizable設定はlogical 900×480を宣言し、X11 `_NET_WM_STATE`の最大化/全画面をstate monitorで除去する。winit `Resized` event guardは現在のscale factorから算出した物理900×480の一致と最小化のzero-dimensionだけをPropagateし、他のnon-zero mismatchをPreventDefaultして同じcallback内でunderlying winit `request_inner_size`を一度だけ要求する。このevent-triggered requestは許可するが、timer/Slint `Window::set_size`による修復、非表示化、破棄・再生成、時間pollingによる再試行は行わない。
 - GraphWindowはclient 940×640pxを初期サイズ、700×480pxを最小サイズ、上限なしとして通常操作のリサイズを許可する。四隅は28px角の対角リサイズ領域を辺より優先し、方向カーソル、hover tint、隅の小さなブラケットで操作位置を示す。ネイティブタイトルバーは使わず、ボタン以外の画面領域から移動し、画面内操作記号で最小化・最大化／復元・閉じるを操作する。preview指定は初期サイズのレイアウト検証用に使う。
 - 本文は最大840pxで左右中央寄せし、900px幅では左右30pxを確保する。本文カードは同じ左端・右端を共有し、Headerのアカウント表示をタイトルと重ねない。
 - 認証済み画面はHeader、RemainingQuota、WeekGauge、AccountActivity、ModelUsage、StatusBannerの順に縦積みする。各部品はそれぞれ48/96/56/52/100/36px、間隔8pxとし、全表示時は`48+96+56+52+100+36+8×5=428px`。上20px＋スタック428px＋内部安全余裕12px＋下20px＝480pxでMainWindowに収める。履歴なし時はModelUsageを生成しない。

@@ -88,7 +88,7 @@ codex app-server --help
 
 ## Windowサイズとプレビュー
 
-ネイティブタイトルバーは全Windowで無効にし、ボタン以外の画面領域をドラッグして移動できます。Main/Threads/Legalはclient 900×480pxまたは720×520pxで固定し、最大化・リサイズ操作を表示しません。Graphはclient 940×640pxを初期値、700×480pxを最小値、上限なしとし、四隅の広い対角領域または辺からリサイズできます。Graphの最大化／復元は現在モニターの物理サイズ・位置へ適用し、仮想デスクトップ全体を描画しません。状態別の確認には`CODEX_INFO_PREVIEW=auth|normal|warning|reset-warning|error|zero|full|monthly|unlimited|idle|legal`を使い、グラフ表示は`CODEX_INFO_PREVIEW=graph|graph-old`で確認できます。`CODEX_INFO_PREVIEW_SIZE`はGraphの初期サイズを上書きするレイアウト検証用です。メイン画面の指定例は`CODEX_INFO_PREVIEW=normal ./run.sh`です。
+ネイティブタイトルバーは全Windowで無効にし、ボタン以外の画面領域をドラッグして移動できます。Main/Threads/Legalはlogical client 900×480または720×520で固定し、物理サイズはOSのDPI／拡大率に連動します。最大化・リサイズ操作は表示しません。Graphはlogical client 940×640を初期値、700×480を最小値、上限なしとし、四隅の広い対角領域または辺からリサイズできます。Graphの最大化／復元は現在モニターの物理サイズ・位置へ適用し、仮想デスクトップ全体を描画しません。状態別の確認には`CODEX_INFO_PREVIEW=auth|normal|warning|reset-warning|error|zero|full|monthly|unlimited|idle|legal`を使い、グラフ表示は`CODEX_INFO_PREVIEW=graph|graph-old`で確認できます。`CODEX_INFO_PREVIEW_SIZE`はGraphの初期サイズを上書きするレイアウト検証用です。メイン画面の指定例は`CODEX_INFO_PREVIEW=normal ./run.sh`です。
 
 ## UIを調整する場所
 

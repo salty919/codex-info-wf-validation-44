@@ -6,10 +6,13 @@ set -euo pipefail
 
 BASE_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 
-# WSLg exposes both Wayland and X11. Force X11 so winit does not select a
-# broken Wayland/EGL path on installations where the GPU driver is unavailable.
-export WINIT_UNIX_BACKEND="x11"
-export WINIT_X11_SCALE_FACTOR="1"
+# WSLg exposes both Wayland and X11.  winit 0.30 selects Wayland whenever
+# WAYLAND_DISPLAY or WAYLAND_SOCKET is set; WINIT_UNIX_BACKEND was removed in
+# winit 0.29 and therefore cannot force the backend anymore.  This project
+# intentionally builds only the X11 backend, so make that choice explicit.
+# Leave the X11 scale factor unset so winit follows the OS Xft.dpi setting
+# (and falls back to XRandR when no Xft.dpi value is available).
+unset WAYLAND_DISPLAY WAYLAND_SOCKET WINIT_X11_SCALE_FACTOR
 export LIBGL_ALWAYS_SOFTWARE="1"
 export MESA_LOADER_DRIVER_OVERRIDE="llvmpipe"
 

@@ -324,6 +324,33 @@ fn fixed_resize_decision_for_size(
     }
 }
 
+fn physical_size_for_logical(
+    logical_width: u32,
+    logical_height: u32,
+    scale_factor: f64,
+) -> (u32, u32) {
+    let scale_factor = if scale_factor.is_finite() && scale_factor > 0.0 {
+        scale_factor
+    } else {
+        1.0
+    };
+    let size = winit::dpi::LogicalSize::new(logical_width as f64, logical_height as f64)
+        .to_physical::<u32>(scale_factor);
+    (size.width, size.height)
+}
+
+fn fixed_resize_decision_for_scale(
+    width: u32,
+    height: u32,
+    logical_width: u32,
+    logical_height: u32,
+    scale_factor: f64,
+) -> FixedResizeDecision {
+    let (expected_width, expected_height) =
+        physical_size_for_logical(logical_width, logical_height, scale_factor);
+    fixed_resize_decision_for_size(width, height, expected_width, expected_height)
+}
+
 fn install_fixed_window_guard(window: &slint::Window) {
     install_window_size_guard(window, FIXED_WINDOW_WIDTH, FIXED_WINDOW_HEIGHT);
 }
@@ -785,14 +812,20 @@ fn install_window_size_guard(window: &slint::Window, expected_width: u32, expect
         let winit::event::WindowEvent::Resized(size) = event else {
             return EventResult::Propagate;
         };
-        match fixed_resize_decision_for_size(
+        let scale_factor = slint_window
+            .with_winit_window(|winit_window| winit_window.scale_factor())
+            .unwrap_or(1.0);
+        match fixed_resize_decision_for_scale(
             size.width,
             size.height,
             expected_width,
             expected_height,
+            scale_factor,
         ) {
             FixedResizeDecision::Propagate => EventResult::Propagate,
             FixedResizeDecision::RejectAndRestore => {
+                let (expected_width, expected_height) =
+                    physical_size_for_logical(expected_width, expected_height, scale_factor);
                 let _ = slint_window.with_winit_window(|winit_window| {
                     winit_window.set_resizable(false);
                     let _ = winit_window.request_inner_size(winit::dpi::PhysicalSize::new(
@@ -7161,13 +7194,14 @@ mod tests {
         add_recovery_usage, automatic_refresh_interval, clamp_graph_preview_size,
         collapse_remaining_change_points, collect_session_file, complete_rollout_prefix_len,
         current_label_connector_path, detail_window_title, fetch_active_thread_update_for_paths,
-        fetch_active_thread_update_for_paths_and_state, fixed_resize_decision, format_elapsed,
-        format_estimated_cost, format_model_usage_columns, format_percent, format_period_label,
-        graph_paths, graph_paths_for_selection, graph_period_end, graph_points,
-        graph_time_endpoints, minute_model_spend, minute_model_spend_for_metric,
-        model_usage_timeline_from_events, monthly_window_seconds, native_account_window_title,
-        normal_status_text, open_codex_session_paths, parse_preview_size, parse_rate_limits,
-        parse_resize_direction, period_remaining_text, plan_type_label, preview_model_row,
+        fetch_active_thread_update_for_paths_and_state, fixed_resize_decision,
+        fixed_resize_decision_for_scale, format_elapsed, format_estimated_cost,
+        format_model_usage_columns, format_percent, format_period_label, graph_paths,
+        graph_paths_for_selection, graph_period_end, graph_points, graph_time_endpoints,
+        minute_model_spend, minute_model_spend_for_metric, model_usage_timeline_from_events,
+        monthly_window_seconds, native_account_window_title, normal_status_text,
+        open_codex_session_paths, parse_preview_size, parse_rate_limits, parse_resize_direction,
+        period_remaining_text, physical_size_for_logical, plan_type_label, preview_model_row,
         read_recovery_entries, recovery_timed_usage, remaining_graph_points, remaining_graph_y,
         remaining_marker_positions, remaining_marker_positions_on_points, request_with_timeout,
         same_rollout_identity, separate_current_label_positions, session_event_model,
@@ -9083,6 +9117,21 @@ mod tests {
     }
 
     #[test]
+    fn fixed_resize_decision_follows_the_current_os_scale_factor() {
+        assert_eq!(physical_size_for_logical(900, 480, 1.0), (900, 480));
+        assert_eq!(physical_size_for_logical(900, 480, 1.25), (1125, 600));
+        assert_eq!(physical_size_for_logical(900, 480, 2.5), (2250, 1200));
+        assert_eq!(
+            fixed_resize_decision_for_scale(2250, 1200, 900, 480, 2.5),
+            FixedResizeDecision::Propagate
+        );
+        assert_eq!(
+            fixed_resize_decision_for_scale(900, 480, 900, 480, 2.5),
+            FixedResizeDecision::RejectAndRestore
+        );
+    }
+
+    #[test]
     fn graph_resize_handles_cover_all_edges_and_corners() {
         let directions = [
             ("north", winit::window::ResizeDirection::North),
@@ -9652,8 +9701,8 @@ mod tests {
         assert!(run.contains("exec \"$CODEX_INFO_CARGO\" run --manifest-path"));
         assert!(run.contains("$HOME/.cargo/bin/cargo"));
         assert!(run.contains("rustup which cargo"));
-        assert!(run.contains(r#"export WINIT_X11_SCALE_FACTOR="1""#));
-        assert!(!run.contains("WINIT_X11_SCALE_FACTOR+x"));
+        assert!(run.contains("unset WAYLAND_DISPLAY WAYLAND_SOCKET WINIT_X11_SCALE_FACTOR"));
+        assert!(!run.contains("export WINIT_X11_SCALE_FACTOR"));
         assert!(run.contains("--release --locked"));
         assert!(!run.contains("for attempt"));
         assert!(!run.contains("sleep 1"));
