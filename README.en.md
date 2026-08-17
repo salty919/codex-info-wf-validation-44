@@ -15,9 +15,18 @@ cd codex_info_v2
 ./run.sh
 ```
 
-The host needs Rust/Cargo, an X11 display (WSLg is supported), and a `codex`
+The host needs Rust/Cargo (the launcher also checks the standard Rustup
+toolchain location), an X11 display (WSLg is supported), and a `codex`
 CLI that can run `codex app-server --stdio`. Authentication remains owned by
 the Codex CLI; this application does not save passwords, API keys, or tokens.
+
+If Rustup is not installed, install it and load its environment before running
+the launcher:
+
+```bash
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+source "$HOME/.cargo/env"
+```
 
 ## Localization and time zones
 

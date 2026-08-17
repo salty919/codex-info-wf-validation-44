@@ -3053,57 +3053,108 @@ fn smooth_remaining_points_with_activity(
 
     let mut smoothed = points.to_vec();
     let mut interpolated = vec![false; points.len()];
+    let active_duration_between = |start: usize, end: usize| {
+        (start..end)
+            .filter(|segment| active_segments.get(*segment).copied().unwrap_or(false))
+            .map(|segment| {
+                points[segment + 1]
+                    .0
+                    .saturating_sub(points[segment].0)
+                    .max(0) as f64
+            })
+            .sum::<f64>()
+    };
+    let latest_active_drop_rate = |before: usize| {
+        (1..=before).rev().find_map(|end| {
+            let drop = points[end - 1].1 - points[end].1;
+            if drop <= 0.0 {
+                return None;
+            }
+            let duration = active_duration_between(end - 1, end);
+            (duration > f64::EPSILON).then_some(drop / duration)
+        })
+    };
 
     // A model can advance through several minute buckets while the quota
-    // endpoint is still the previous reread. Treat a repeated active value as
-    // a missed sample and fill it from the nearest surrounding lower endpoint.
-    // For example, `1 -> 1 -> 3` becomes `1 -> 2 -> 3`. We only search through
-    // contiguous active segments, so an actual idle period is never sloped.
-    for index in 1..points.len() - 1 {
+    // endpoint is still the previous reread. Treat a repeated value as a
+    // missed sample and fill it from the nearest surrounding lower endpoint.
+    // For example, `1 -> 1 -> 3` becomes `1 -> 2 -> 3`.
+    //
+    // The search deliberately crosses short idle intervals. The line must not
+    // slope while every model is idle, but an idle interval between two active
+    // samples must not prevent the active samples on either side from being
+    // completed. Interpolation therefore advances by active duration rather
+    // than wall-clock duration: active segments slope, idle segments hold the
+    // last value.
+    for index in 1..points.len() {
         if interpolated[index] {
             continue;
         }
-        let before_active = active_segments.get(index - 1).copied().unwrap_or(false);
-        let after_active = active_segments.get(index).copied().unwrap_or(false);
-        if !before_active
-            || !after_active
-            || points[index - 1].0 == points[index].0
-            || points[index].0 == points[index + 1].0
-            || points[index - 1].1 != points[index].1
-        {
+        if points[index - 1].0 == points[index].0 || points[index - 1].1 != points[index].1 {
             continue;
         }
 
         let left_index = index - 1;
         let left_value = points[left_index].1;
         let mut right_index = index + 1;
-        while right_index < points.len()
-            && points[right_index].1 >= left_value
-            && right_index > 0
-            && active_segments
-                .get(right_index - 1)
-                .copied()
-                .unwrap_or(false)
-        {
+        while right_index < points.len() && points[right_index].1 >= left_value {
             right_index += 1;
         }
-        if right_index >= points.len()
-            || points[right_index].0 <= points[left_index].0
-            || points[right_index].1 >= left_value
-        {
+        let terminal_extrapolation = right_index >= points.len();
+        if terminal_extrapolation {
+            right_index = points.len() - 1;
+        }
+        if right_index <= left_index || points[right_index].0 <= points[left_index].0 {
             continue;
         }
 
-        let left_timestamp = points[left_index].0 as f64;
-        let right_timestamp = points[right_index].0 as f64;
-        let right_value = points[right_index].1;
+        let active_duration = active_duration_between(left_index, right_index);
+        if active_duration <= f64::EPSILON {
+            continue;
+        }
+        let right_value = if terminal_extrapolation {
+            let Some(rate) = latest_active_drop_rate(left_index) else {
+                continue;
+            };
+            (left_value - rate * active_duration).max(0.0)
+        } else {
+            let value = points[right_index].1;
+            if value >= left_value {
+                continue;
+            }
+            value
+        };
+
+        let mut active_elapsed = 0.0;
         for point_index in index..right_index {
-            let fraction = ((points[point_index].0 as f64 - left_timestamp)
-                / (right_timestamp - left_timestamp))
-                .clamp(0.0, 1.0);
+            if point_index > left_index
+                && active_segments
+                    .get(point_index - 1)
+                    .copied()
+                    .unwrap_or(false)
+            {
+                active_elapsed += points[point_index]
+                    .0
+                    .saturating_sub(points[point_index - 1].0)
+                    .max(0) as f64;
+            }
+            let fraction = (active_elapsed / active_duration).clamp(0.0, 1.0);
             smoothed[point_index].1 = left_value + (right_value - left_value) * fraction;
             interpolated[point_index] = true;
         }
+        if terminal_extrapolation {
+            // There is no future quota endpoint yet, but an active terminal
+            // plateau is still a missing sample. Carry forward the most recent
+            // measured active drop rate so the line does not pretend that
+            // consumption stopped at the final reread. Clamp at zero because
+            // the quota cannot become negative.
+            smoothed[right_index].1 = right_value;
+            interpolated[right_index] = true;
+        }
+        // For a measured lower endpoint the loop above stops before
+        // right_index, so a later pass can use it as the next anchor without
+        // accumulating floating-point error. A terminal extrapolation writes
+        // its synthetic endpoint explicitly above.
     }
 
     for index in 1..points.len() - 1 {
@@ -9597,8 +9648,10 @@ mod tests {
     #[test]
     fn run_script_has_one_exec_without_retry_loop() {
         let run = include_str!("../run.sh");
-        assert_eq!(run.matches("cargo run --manifest-path").count(), 1);
-        assert!(run.contains("exec cargo run --manifest-path"));
+        assert_eq!(run.matches("run --manifest-path").count(), 1);
+        assert!(run.contains("exec \"$CODEX_INFO_CARGO\" run --manifest-path"));
+        assert!(run.contains("$HOME/.cargo/bin/cargo"));
+        assert!(run.contains("rustup which cargo"));
         assert!(run.contains(r#"export WINIT_X11_SCALE_FACTOR="1""#));
         assert!(!run.contains("WINIT_X11_SCALE_FACTOR+x"));
         assert!(run.contains("--release --locked"));
@@ -11045,12 +11098,112 @@ mod tests {
                 (60, 90.0),
                 (120, 85.0),
                 (180, 80.0),
-                (240, 80.0)
+                (240, 70.0)
             ]
         );
         assert_eq!(
             graph_paths(&references, 0, 240).remaining,
-            "M0.00 1.00 L25.00 10.80 L50.00 15.70 L75.00 20.60 L100.00 20.60"
+            "M0.00 1.00 L25.00 10.80 L50.00 15.70 L75.00 20.60 L100.00 30.40"
+        );
+    }
+
+    #[test]
+    fn remaining_graph_terminal_extrapolation_never_goes_below_zero() {
+        let samples = [
+            UsageHistorySample::new(0, 1_000, 100.0, ModelDollarTotals::default()),
+            UsageHistorySample::new(
+                60,
+                1_000,
+                10.0,
+                ModelDollarTotals {
+                    sol: 1.0,
+                    ..ModelDollarTotals::default()
+                },
+            ),
+            UsageHistorySample::new(
+                120,
+                1_000,
+                0.0,
+                ModelDollarTotals {
+                    sol: 2.0,
+                    ..ModelDollarTotals::default()
+                },
+            ),
+            // An active terminal plateau would extrapolate below zero without
+            // the quota floor. Zero is the lower bound even while usage moves.
+            UsageHistorySample::new(
+                180,
+                1_000,
+                0.0,
+                ModelDollarTotals {
+                    sol: 3.0,
+                    ..ModelDollarTotals::default()
+                },
+            ),
+        ];
+        let references = samples.iter().collect::<Vec<_>>();
+
+        let points = remaining_graph_points(&references, 0, 180);
+        assert!(points.iter().all(|(_, value)| *value >= 0.0));
+        assert_eq!(points.last(), Some(&(180, 0.0)));
+    }
+
+    #[test]
+    fn remaining_graph_interpolates_across_an_idle_sampling_gap() {
+        let samples = [
+            UsageHistorySample::new(0, 1_000, 100.0, ModelDollarTotals::default()),
+            UsageHistorySample::new(
+                60,
+                1_000,
+                90.0,
+                ModelDollarTotals {
+                    sol: 1.0,
+                    ..ModelDollarTotals::default()
+                },
+            ),
+            // The model advances again, but the quota reread repeats. This is
+            // a missing sample, not a reason to draw a horizontal fold.
+            UsageHistorySample::new(
+                120,
+                1_000,
+                90.0,
+                ModelDollarTotals {
+                    sol: 2.0,
+                    ..ModelDollarTotals::default()
+                },
+            ),
+            // No model advances in this interval. The completed line must
+            // hold its value here rather than inventing a quota slope.
+            UsageHistorySample::new(
+                180,
+                1_000,
+                90.0,
+                ModelDollarTotals {
+                    sol: 2.0,
+                    ..ModelDollarTotals::default()
+                },
+            ),
+            UsageHistorySample::new(
+                240,
+                1_000,
+                80.0,
+                ModelDollarTotals {
+                    sol: 3.0,
+                    ..ModelDollarTotals::default()
+                },
+            ),
+        ];
+        let references = samples.iter().collect::<Vec<_>>();
+
+        assert_eq!(
+            remaining_graph_points(&references, 0, 240),
+            vec![
+                (0, 100.0),
+                (60, 90.0),
+                (120, 85.0),
+                (180, 85.0),
+                (240, 80.0)
+            ]
         );
     }
 
