@@ -1150,6 +1150,7 @@ pub struct ValidatedRollout {
     model: String,
     model_label: String,
     total_tokens: Option<u64>,
+    context_usage_tokens: Option<u64>,
     context_window_tokens: Option<u64>,
     last_user_message_at: Option<i64>,
 }
@@ -1171,6 +1172,10 @@ impl ValidatedRollout {
         self.total_tokens
     }
 
+    pub fn context_usage_tokens(&self) -> Option<u64> {
+        self.context_usage_tokens
+    }
+
     pub fn context_window_tokens(&self) -> Option<u64> {
         self.context_window_tokens
     }
@@ -1185,6 +1190,7 @@ struct RolloutState {
     last_task_running: Option<bool>,
     last_model: Option<String>,
     last_total_tokens: Option<u64>,
+    last_context_usage_tokens: Option<u64>,
     last_context_window_tokens: Option<u64>,
     last_user_message_at: Option<i64>,
 }
@@ -1201,6 +1207,7 @@ fn finish_rollout(state: RolloutState) -> Result<ValidatedRollout, RolloutError>
         model,
         model_label,
         total_tokens: state.last_total_tokens,
+        context_usage_tokens: state.last_context_usage_tokens,
         context_window_tokens: state.last_context_window_tokens,
         last_user_message_at: state.last_user_message_at,
     })
@@ -1351,6 +1358,16 @@ fn apply_known_rollout_event(
                 .and_then(Value::as_u64)
                 .ok_or(RolloutError::InvalidKnownEvent)?;
             state.last_total_tokens = Some(total_tokens);
+            state.last_context_usage_tokens = match info.get("last_token_usage") {
+                Some(last_usage) => Some(
+                    last_usage
+                        .as_object()
+                        .and_then(|usage| usage.get("total_tokens"))
+                        .and_then(Value::as_u64)
+                        .ok_or(RolloutError::InvalidKnownEvent)?,
+                ),
+                None => None,
+            };
             if let Some(context_window) = info.get("model_context_window") {
                 state.last_context_window_tokens = Some(
                     context_window
@@ -1396,6 +1413,7 @@ pub struct ActiveThreadSnapshot {
     pub model: String,
     pub model_label: String,
     pub total_tokens: Option<u64>,
+    pub context_usage_tokens: Option<u64>,
     pub context_window_tokens: Option<u64>,
     pub last_user_message_at: Option<i64>,
     pub is_subagent: bool,
@@ -1487,6 +1505,7 @@ where
             model: rollout.model().to_owned(),
             model_label: rollout.model_label().to_owned(),
             total_tokens: rollout.total_tokens(),
+            context_usage_tokens: rollout.context_usage_tokens(),
             context_window_tokens: rollout.context_window_tokens(),
             last_user_message_at: rollout.last_user_message_at(),
             is_subagent: candidate.is_subagent(),
@@ -3108,15 +3127,18 @@ mod tests {
             json!({"type":"task_started"}),
             json!({"type":"event_msg","payload":{"type":"token_count","info":{
                 "total_token_usage":{"total_tokens":10},
+                "last_token_usage":{"total_tokens":8},
                 "model_context_window":128000
             }}}),
             json!({"type":"event_msg","payload":{"type":"token_count","info":{
                 "total_token_usage":{"total_tokens":20},
+                "last_token_usage":{"total_tokens":18},
                 "model_context_window":258400
             }}}),
         ];
         let parsed = parse_rollout(&rollout_bytes(&events)).unwrap();
         assert_eq!(parsed.total_tokens(), Some(20));
+        assert_eq!(parsed.context_usage_tokens(), Some(18));
         assert_eq!(parsed.context_window_tokens(), Some(258_400));
 
         let without_field = parse_rollout(&rollout_bytes(&[
@@ -3130,6 +3152,7 @@ mod tests {
         ]))
         .unwrap();
         assert_eq!(without_field.total_tokens(), Some(30));
+        assert_eq!(without_field.context_usage_tokens(), None);
         assert_eq!(without_field.context_window_tokens(), None);
     }
 
@@ -3216,6 +3239,7 @@ mod tests {
                 model: "不明".to_owned(),
                 model_label: "不明".to_owned(),
                 total_tokens: None,
+                context_usage_tokens: None,
                 context_window_tokens: None,
                 last_user_message_at: None,
             })
@@ -3375,6 +3399,7 @@ mod tests {
                 model: "winner-model".to_owned(),
                 model_label: "winner-model".to_owned(),
                 total_tokens: Some(42),
+                context_usage_tokens: None,
                 context_window_tokens: None,
                 last_user_message_at: None,
                 is_subagent: false,
@@ -3413,6 +3438,7 @@ mod tests {
                 model: "model-a".to_owned(),
                 model_label: "model-a".to_owned(),
                 total_tokens: Some(111),
+                context_usage_tokens: None,
                 context_window_tokens: None,
                 last_user_message_at: None,
                 is_subagent: false,
@@ -3448,6 +3474,7 @@ mod tests {
                 model: "model-only".to_owned(),
                 model_label: "model-only".to_owned(),
                 total_tokens: None,
+                context_usage_tokens: None,
                 context_window_tokens: None,
                 last_user_message_at: None,
                 is_subagent: false,

@@ -651,10 +651,108 @@ fn minimize_window(window: &slint::Window) {
     let _ = window.with_winit_window(|winit_window| winit_window.set_minimized(true));
 }
 
-fn toggle_maximize_window(window: &slint::Window) {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct GraphRestoreGeometry {
+    position: Option<winit::dpi::PhysicalPosition<i32>>,
+    size: winit::dpi::PhysicalSize<u32>,
+}
+
+#[derive(Debug, Default)]
+struct GraphMaximizeState {
+    restore: Option<GraphRestoreGeometry>,
+    maximized: bool,
+}
+
+fn graph_monitor_geometry(
+    window: &slint::Window,
+) -> Option<(
+    winit::dpi::PhysicalPosition<i32>,
+    winit::dpi::PhysicalSize<u32>,
+)> {
+    window
+        .with_winit_window(|winit_window| {
+            let monitor = winit_window
+                .current_monitor()
+                .filter(|monitor| {
+                    let size = monitor.size();
+                    size.width > 1 && size.height > 1
+                })
+                .or_else(|| {
+                    winit_window.available_monitors().find(|monitor| {
+                        let size = monitor.size();
+                        size.width > 1 && size.height > 1
+                    })
+                })?;
+            let size = monitor.size();
+            Some((monitor.position(), size))
+        })
+        .flatten()
+}
+
+fn graph_restore_geometry(window: &slint::Window) -> Option<GraphRestoreGeometry> {
+    window
+        .with_winit_window(|winit_window| {
+            Some(GraphRestoreGeometry {
+                position: winit_window.outer_position().ok(),
+                size: winit_window.inner_size(),
+            })
+        })
+        .flatten()
+}
+
+/// Maximizes Graph to the active monitor instead of asking the X11 window
+/// manager to use the virtual desktop root. WSLg can expose a root that spans
+/// several monitors; native `_NET_WM_STATE_MAXIMIZED_*` then gives Slint a
+/// surface much wider than the actual monitor and the software renderer can
+/// appear to freeze. This keeps the maximize/restore interaction intact while
+/// choosing the real monitor geometry for the client surface.
+fn toggle_graph_maximize(
+    window: &slint::Window,
+    graph: &GraphWindow,
+    state: &Rc<RefCell<GraphMaximizeState>>,
+) {
+    if state.borrow().maximized {
+        let restore = state.borrow_mut().restore.take();
+        if let Some(restore) = restore {
+            let _ = window.with_winit_window(|winit_window| {
+                // Clear a maximize state that may have been set by the window
+                // manager before restoring the user's previous geometry.
+                if winit_window.is_maximized() {
+                    winit_window.set_maximized(false);
+                }
+                if let Some(position) = restore.position {
+                    winit_window.set_outer_position(position);
+                }
+                let _ = winit_window.request_inner_size(restore.size);
+            });
+        }
+        state.borrow_mut().maximized = false;
+        graph.set_app_maximized(false);
+        return;
+    }
+
+    let Some((position, size)) = graph_monitor_geometry(window) else {
+        // A monitor can be unavailable during display hot-plugging. Do not
+        // fall back to native maximize here: that would reintroduce the
+        // virtual-root resize this path is designed to avoid.
+        return;
+    };
+
+    let restore = graph_restore_geometry(window);
     let _ = window.with_winit_window(|winit_window| {
-        winit_window.set_maximized(!winit_window.is_maximized());
+        // Graph is not left in native maximized state. Applying the monitor's
+        // physical geometry directly avoids the virtual-root resize entirely.
+        if winit_window.is_maximized() {
+            winit_window.set_maximized(false);
+        }
+        winit_window.set_outer_position(position);
+        let _ = winit_window.request_inner_size(size);
     });
+    let mut graph_state = state.borrow_mut();
+    graph_state.restore = restore;
+    graph_state.maximized = true;
+    drop(graph_state);
+    graph.set_app_maximized(true);
 }
 
 fn parse_resize_direction(direction: &str) -> Option<winit::window::ResizeDirection> {
@@ -857,6 +955,7 @@ struct ActiveThread {
     model: String,
     model_label: String,
     total_tokens: Option<u64>,
+    context_usage_tokens: Option<u64>,
     context_window_tokens: Option<u64>,
     last_user_message_at: Option<i64>,
     is_subagent: bool,
@@ -1215,6 +1314,7 @@ fn fetch_active_thread_update_for_paths_and_state(
             model: snapshot.model,
             model_label: snapshot.model_label,
             total_tokens: snapshot.total_tokens,
+            context_usage_tokens: snapshot.context_usage_tokens,
             context_window_tokens: snapshot.context_window_tokens,
             last_user_message_at: snapshot.last_user_message_at,
             is_subagent: snapshot.is_subagent,
@@ -1246,6 +1346,7 @@ fn fetch_active_thread_update_for_paths_and_state(
                 model: rollout.model().to_owned(),
                 model_label: rollout.model_label().to_owned(),
                 total_tokens: rollout.total_tokens(),
+                context_usage_tokens: rollout.context_usage_tokens(),
                 context_window_tokens: rollout.context_window_tokens(),
                 last_user_message_at: rollout.last_user_message_at(),
                 is_subagent: true,
@@ -1586,7 +1687,6 @@ fn history_periods_for_samples(
 
 #[derive(Debug, Default)]
 struct UsageHistory {
-    path: Option<PathBuf>,
     db_path: Option<PathBuf>,
     samples: Vec<UsageHistorySample>,
     startup_maintenance_done: bool,
@@ -1594,135 +1694,28 @@ struct UsageHistory {
 
 impl UsageHistory {
     fn load() -> Self {
-        let mut history = Self::load_from_paths(usage_history_path(), usage_history_db_path());
-        history.migrate_legacy_history();
+        let mut history = Self::load_from_db_path(usage_history_db_path());
         history.startup_maintenance(Utc::now());
         history
     }
 
-    /// Performs an additive, idempotent import when a portable data directory
-    /// is configured. The legacy database and JSON are never modified or
-    /// deleted; the destination is merged by the composite primary key.
-    fn migrate_legacy_history(&mut self) {
-        let Some(destination_db) = self.db_path.as_ref() else {
-            return;
-        };
-        let Some(destination_root) = destination_db.parent().and_then(Path::parent) else {
-            return;
-        };
-        if let Some(parent) = destination_db.parent() {
-            let _ = fs::create_dir_all(parent);
-        }
-        let Some(legacy_root) = legacy_usage_root() else {
-            return;
-        };
-        let Some(legacy_history) = legacy_root.join("history").canonicalize().ok() else {
-            return;
-        };
-        let Some(destination_history) = destination_db
-            .parent()
-            .and_then(|path| path.canonicalize().ok())
-        else {
-            return;
-        };
-        if legacy_history == destination_history {
-            return;
-        }
-
-        let marker = destination_root
-            .join("history")
-            .join("usage_history_v1.migrated");
-        if marker.exists() {
-            return;
-        }
-
-        let legacy_db = legacy_history.join("usage_history.sqlite3");
-        let legacy_json = legacy_history.join("usage_history.json");
-        let Ok(mut store) = UsageStore::open(destination_db) else {
-            return;
-        };
-        let mut imported = 0usize;
-        let mut failed = false;
-        if legacy_db.is_file() {
-            match store.import_v1_sqlite(&legacy_db) {
-                Ok(count) => imported = imported.saturating_add(count),
-                Err(error) => {
-                    eprintln!("v1 SQLite migration skipped: {error}");
-                    failed = true;
-                }
-            }
-        }
-        if legacy_json.is_file() {
-            match store.import_v1_json(&legacy_json) {
-                Ok(count) => imported = imported.saturating_add(count),
-                Err(error) => {
-                    eprintln!("v1 JSON migration skipped: {error}");
-                    failed = true;
-                }
-            }
-        }
-        if failed {
-            return;
-        }
-        if let Ok(samples) = store.load_all() {
-            self.samples.clear();
-            for sample in samples {
-                merge_exact_sample(&mut self.samples, UsageHistorySample::from_store(sample));
-            }
-            self.normalize();
-        }
-        if let Some(parent) = marker.parent() {
-            let _ = fs::create_dir_all(parent);
-        }
-        let marker_contents = format!(
-            "{{\"source\":\"{}\",\"imported_rows\":{},\"completed_at\":{}}}\n",
-            legacy_history.display(),
-            imported,
-            Utc::now().timestamp()
-        );
-        let _ = fs::write(marker, marker_contents);
-        self.save();
-    }
-
-    fn load_from_paths(path: Option<PathBuf>, db_path: Option<PathBuf>) -> Self {
-        let database_samples = db_path
+    fn load_from_db_path(db_path: Option<PathBuf>) -> Self {
+        let samples = db_path
             .as_ref()
             .and_then(|path| UsageStore::open(path).ok())
             .and_then(|store| store.load_all().ok())
             .unwrap_or_default();
-        let json_samples = path
-            .as_ref()
-            .and_then(|path| fs::read_to_string(path).ok())
-            .and_then(|contents| serde_json::from_str::<Vec<UsageHistorySample>>(&contents).ok())
-            .unwrap_or_default();
 
-        // Keep each persisted primary-key row in memory. Near reset periods
-        // are merged only by display selection, so JSON migration cannot
-        // make an existing DB row disappear.
-        let mut samples = Vec::new();
-        for sample in json_samples {
-            if sample.is_valid() {
-                merge_exact_sample(&mut samples, sample);
-            }
-        }
-        for database_sample in database_samples
+        let samples = samples
             .into_iter()
             .map(UsageHistorySample::from_store)
-        {
-            // DB側のモデル累積値を優先しつつ、DB移行前のJSONにしかない
-            // 残量計測値を欠測(-1)で上書きしない。
-            merge_exact_sample(&mut samples, database_sample);
-        }
+            .collect();
         let mut history = Self {
-            path,
             db_path,
             samples,
             startup_maintenance_done: false,
         };
         history.normalize();
-        if !history.samples.is_empty() {
-            history.save();
-        }
         history
     }
 
@@ -1731,30 +1724,43 @@ impl UsageHistory {
         let preview_period =
             |period_reset: i64, period_start: i64, period_end: i64, cost_scale: f64| {
                 let elapsed = period_end.saturating_sub(period_start).max(1) as f64;
-                fractions.into_iter().map(move |fraction| {
-                    // プレビュー点を現在時刻までの実測可能な範囲へ分散し、
-                    // 未来の点を現在時刻へ丸めて同一X座標に重ねない。
-                    let timestamp = period_start + (elapsed * fraction) as i64;
-                    let used_percent = 10.0 + 76.0 * fraction;
-                    let sol_scale = (0.18 + 0.82 * fraction) * cost_scale;
-                    let terra_scale = (1.0 - 0.65 * fraction).max(0.1) * cost_scale;
-                    let luna_scale = (0.35 + 0.65 * (1.0 - fraction).powi(2)).max(0.1) * cost_scale;
-                    UsageHistorySample::new_with_usage(
-                        timestamp,
-                        period_reset,
-                        100.0 - used_percent,
-                        ModelDollarTotals {
-                            sol: costs.sol * sol_scale,
-                            terra: costs.terra * terra_scale,
-                            luna: costs.luna * luna_scale,
-                        },
-                        ModelTokenTotals {
-                            sol: (159_278_976.0 * sol_scale) as u64,
-                            terra: (30_885_887.0 * terra_scale) as u64,
-                            luna: (155_294_770.0 * luna_scale) as u64,
-                        },
-                    )
-                })
+                fractions
+                    .into_iter()
+                    .enumerate()
+                    .map(move |(index, fraction)| {
+                        // プレビュー点を現在時刻までの実測可能な範囲へ分散し、
+                        // 未来の点を現在時刻へ丸めて同一X座標に重ねない。
+                        let timestamp = period_start + (elapsed * fraction) as i64;
+                        // The graph preview deliberately includes one repeated
+                        // quota endpoint while model totals continue to advance.
+                        // This exercises the missing-sample interpolation path in
+                        // the actual X11 image instead of only in unit tests.
+                        let used_percent = [16.0, 31.0, 31.0, 51.0, 51.0, 86.0][index];
+                        // Keep one model snapshot unchanged to show the
+                        // legitimate idle interval as horizontal, while the
+                        // later repeated quota value still exercises active
+                        // interpolation.
+                        let scale_fraction = if index == 2 { 0.28 } else { fraction };
+                        let sol_scale = (0.18 + 0.82 * scale_fraction) * cost_scale;
+                        let terra_scale = (1.0 - 0.65 * scale_fraction).max(0.1) * cost_scale;
+                        let luna_scale =
+                            (0.35 + 0.65 * (1.0 - scale_fraction).powi(2)).max(0.1) * cost_scale;
+                        UsageHistorySample::new_with_usage(
+                            timestamp,
+                            period_reset,
+                            100.0 - used_percent,
+                            ModelDollarTotals {
+                                sol: costs.sol * sol_scale,
+                                terra: costs.terra * terra_scale,
+                                luna: costs.luna * luna_scale,
+                            },
+                            ModelTokenTotals {
+                                sol: (159_278_976.0 * sol_scale) as u64,
+                                terra: (30_885_887.0 * terra_scale) as u64,
+                                luna: (155_294_770.0 * luna_scale) as u64,
+                            },
+                        )
+                    })
             };
         let previous_reset_at = reset_at.saturating_sub(WEEK_SECONDS);
         let previous = preview_period(
@@ -1771,7 +1777,6 @@ impl UsageHistory {
         );
         let samples = previous.chain(current).collect();
         Self {
-            path: None,
             db_path: None,
             samples,
             startup_maintenance_done: true,
@@ -1948,43 +1953,18 @@ impl UsageHistory {
     }
 
     fn save(&self) {
-        if let Some(path) = &self.db_path {
-            if let Ok(mut store) = UsageStore::open(path) {
-                let samples = self
-                    .samples
-                    .iter()
-                    .map(UsageHistorySample::to_store)
-                    .collect::<Vec<_>>();
-                if store.upsert_samples(&samples).is_ok() {
-                    return;
-                }
-            }
-        }
-        let Some(path) = &self.path else {
+        let Some(path) = &self.db_path else {
             return;
         };
-        let Some(parent) = path.parent() else {
-            return;
-        };
-        if fs::create_dir_all(parent).is_err() {
-            return;
-        }
-        let Ok(contents) = serde_json::to_vec_pretty(&self.samples) else {
-            return;
-        };
-        let temporary = path.with_extension("json.tmp");
-        if fs::write(&temporary, contents).is_ok() {
-            let _ = fs::rename(temporary, path);
+        if let Ok(mut store) = UsageStore::open(path) {
+            let samples = self
+                .samples
+                .iter()
+                .map(UsageHistorySample::to_store)
+                .collect::<Vec<_>>();
+            let _ = store.upsert_samples(&samples);
         }
     }
-}
-
-fn usage_history_path() -> Option<PathBuf> {
-    Some(
-        usage_data_root()?
-            .join("history")
-            .join("usage_history.json"),
-    )
 }
 
 fn usage_history_db_path() -> Option<PathBuf> {
@@ -2028,13 +2008,6 @@ fn usage_data_root() -> Option<PathBuf> {
         .map(PathBuf::from)
         .unwrap_or_else(default_codex_root);
     prepared_data_root(path)
-}
-
-fn legacy_usage_root() -> Option<PathBuf> {
-    let path = std::env::var_os("CODEX_INFO_MIGRATE_FROM")
-        .map(PathBuf::from)
-        .unwrap_or_else(default_codex_root);
-    validated_configured_root(path)
 }
 
 fn three_months_before_utc(now: DateTime<Utc>) -> i64 {
@@ -2087,9 +2060,7 @@ struct UnusedIntervalPosition {
 }
 
 fn graph_paths(samples: &[&UsageHistorySample], period_start: i64, period_end: i64) -> GraphPaths {
-    let remaining_points = graph_points(samples, period_start, period_end, 100.0, |sample| {
-        sample.remaining_percent
-    });
+    let remaining_points = remaining_graph_points(samples, period_start, period_end);
     let raw_minute = graph_time_endpoints(
         minute_model_spend_for_metric(samples, false),
         period_start,
@@ -2188,6 +2159,26 @@ fn graph_paths_for_selection(
         period_start,
         period_end,
     );
+    // Keep the remaining line on the same activity metric as the visible
+    // model lines. A legacy row with dollars but no token counters must not
+    // make the token graph slope while every visible model line is flat.
+    let remaining_points =
+        remaining_graph_points_for_metric(samples, period_start, period_end, show_tokens);
+    let has_remaining_observation = samples
+        .iter()
+        .any(|sample| sample.remaining_percent.is_finite() && sample.remaining_percent >= 0.0);
+    if has_remaining_observation {
+        if let Some(remaining) = remaining_points.last().map(|(_, value)| *value) {
+            paths.remaining =
+                graph_path_from_points(&remaining_points, period_start, period_end, 100.0);
+            paths.remaining_markers =
+                remaining_marker_positions_on_points(&remaining_points, period_start, period_end);
+            paths.current_remaining_label = format_percent(remaining);
+            let normalized = ((99.0 - remaining * 0.98) / 100.0).clamp(0.01, 0.99) as f32;
+            paths.current_remaining_y = normalized;
+            paths.current_remaining_point_y = normalized;
+        }
+    }
     paths.unused_intervals = unused_interval_positions(&minute, period_start, period_end);
     let maximum = minute
         .iter()
@@ -2328,7 +2319,7 @@ fn remaining_marker_positions_on_points(
 
     // Pathと同じ平滑化済み点列を走査し、各整数%境界をその線分上で補間する。
     for &(timestamp, current) in points.iter().skip(1) {
-        if timestamp > previous_timestamp && current < previous_value {
+        if timestamp >= previous_timestamp && current < previous_value {
             let mut boundary = previous_value.floor() as i32;
             if (previous_value - boundary as f64).abs() <= f64::EPSILON {
                 boundary -= 1;
@@ -2815,7 +2806,24 @@ fn format_metric_value(value: f64, show_tokens: bool) -> String {
     }
 }
 
+#[cfg(test)]
 fn graph_points(
+    samples: &[&UsageHistorySample],
+    period_start: i64,
+    period_end: i64,
+    maximum: f64,
+    value: impl Fn(&UsageHistorySample) -> f64,
+) -> Vec<(i64, f64)> {
+    smooth_remaining_points(&collapse_remaining_change_points(&raw_graph_points(
+        samples,
+        period_start,
+        period_end,
+        maximum,
+        value,
+    )))
+}
+
+fn raw_graph_points(
     samples: &[&UsageHistorySample],
     period_start: i64,
     period_end: i64,
@@ -2856,15 +2864,280 @@ fn graph_points(
             }
         }
     }
-    // Keep the observed change events as the anchors for the quota trend.
-    // Repeated snapshots describe a hold, not another point on the visible
-    // trend; retaining every one of them makes the line look like a staircase
-    // when the provider reports the same percentage for several minutes.
-    // Collapse those runs before smoothing so each segment connects one
-    // change point to the next.
-    smooth_remaining_points(&collapse_remaining_change_points(&points))
+    points
 }
 
+/// Builds the remaining-quota line from the same cumulative model snapshots
+/// used by the SOL/TERRA/LUNA lines. Model snapshots define active versus idle
+/// intervals: idle intervals stay horizontal, while remaining samples in
+/// contiguous active intervals are connected by straight lines. If model
+/// usage advances while a quota reread repeats, the repeated value is treated
+/// as a stale/missed sample and interpolated between the surrounding changes;
+/// a `1 -> 1 -> 3` sequence therefore becomes `1 -> 2 -> 3`, not a false
+/// horizontal-then-drop corner. This prevents sampling folds from appearing
+/// as real instantaneous quota changes.
+fn remaining_graph_points(
+    samples: &[&UsageHistorySample],
+    period_start: i64,
+    period_end: i64,
+) -> Vec<(i64, f64)> {
+    remaining_graph_points_for_metric(samples, period_start, period_end, false)
+}
+
+fn remaining_graph_points_for_metric(
+    samples: &[&UsageHistorySample],
+    period_start: i64,
+    period_end: i64,
+    show_tokens: bool,
+) -> Vec<(i64, f64)> {
+    let raw_remaining = raw_graph_points(samples, period_start, period_end, 100.0, |sample| {
+        sample.remaining_percent
+    });
+    if raw_remaining.len() < 2 {
+        return raw_remaining;
+    }
+
+    let model_points = graph_time_endpoints(
+        minute_model_spend_for_metric(samples, show_tokens),
+        period_start,
+        period_end,
+    );
+    let remaining_by_timestamp = raw_remaining.iter().copied().collect::<BTreeMap<_, _>>();
+
+    let initial_remaining = remaining_by_timestamp
+        .get(&period_start)
+        .copied()
+        .unwrap_or(100.0)
+        .clamp(0.0, 100.0);
+    if model_points.len() < 2 {
+        return vec![
+            (period_start, initial_remaining),
+            (period_end, initial_remaining),
+        ];
+    }
+
+    // Walk the same minute intervals used by the model paths. A segment is
+    // active only when at least one cumulative model value increases across
+    // that interval; quota rereads in an idle segment are ignored. Idle model
+    // intervals remain horizontal, while repeated active quota samples are
+    // completed by interpolation in the smoothing pass below.
+    let mut points = vec![(period_start, initial_remaining)];
+    let mut active_segments = Vec::with_capacity(model_points.len() + 1);
+    let mut previous_remaining = initial_remaining;
+    let mut previous_model = model_points[0];
+    let mut previous_timestamp = period_start;
+    for current_model in model_points.iter().copied().skip(1) {
+        let timestamp = current_model.timestamp;
+        if timestamp <= previous_timestamp {
+            previous_model = current_model;
+            continue;
+        }
+        let model_changed = current_model.sol > previous_model.sol
+            || current_model.terra > previous_model.terra
+            || current_model.luna > previous_model.luna;
+        let synthetic_zero_gap = previous_timestamp == period_start
+            && timestamp.saturating_sub(previous_timestamp) > 60
+            && previous_model.sol == 0.0
+            && previous_model.terra == 0.0
+            && previous_model.luna == 0.0
+            && model_changed;
+        let active = model_changed && !synthetic_zero_gap;
+        let next_remaining = if model_changed {
+            latest_remaining_for_model_change(
+                &remaining_by_timestamp,
+                timestamp,
+                Some(previous_timestamp),
+            )
+            .filter(|value| value.is_finite())
+            .map(|value| previous_remaining.min(value.clamp(0.0, 100.0)))
+            .unwrap_or(previous_remaining)
+        } else {
+            previous_remaining
+        };
+
+        if synthetic_zero_gap {
+            // Keep an unobserved reset-to-first-use gap horizontal, then make
+            // the first observed quota value explicit at its real timestamp.
+            points.push((timestamp, previous_remaining));
+            active_segments.push(false);
+            if next_remaining != previous_remaining {
+                points.push((timestamp, next_remaining));
+                active_segments.push(false);
+            }
+        } else {
+            points.push((timestamp, next_remaining));
+            active_segments.push(active);
+        }
+        previous_remaining = next_remaining;
+        previous_model = current_model;
+        previous_timestamp = timestamp;
+    }
+
+    if previous_timestamp < period_end {
+        points.push((period_end, previous_remaining));
+        active_segments.push(false);
+    }
+
+    collapse_repeated_idle_remaining_points(&mut points, &mut active_segments);
+    smooth_remaining_points_with_activity(&points, &active_segments)
+}
+
+fn collapse_repeated_idle_remaining_points(
+    points: &mut Vec<(i64, f64)>,
+    active_segments: &mut Vec<bool>,
+) {
+    let mut index = 1;
+    while index + 1 < points.len() {
+        let repeated = points[index - 1].1 == points[index].1;
+        let is_vertical_boundary =
+            points[index - 1].0 == points[index].0 || points[index].0 == points[index + 1].0;
+        let joins_idle_segments = active_segments.get(index - 1) == Some(&false)
+            && active_segments.get(index) == Some(&false);
+        if repeated && !is_vertical_boundary && joins_idle_segments {
+            points.remove(index);
+            active_segments.remove(index);
+        } else {
+            index += 1;
+        }
+    }
+}
+
+fn latest_remaining_for_model_change(
+    remaining_by_timestamp: &BTreeMap<i64, f64>,
+    change_timestamp: i64,
+    previous_change: Option<i64>,
+) -> Option<f64> {
+    // Model snapshots are grouped into minute buckets before their change
+    // points are drawn. Match quota observations to that same bucket so a
+    // sample at t=100 is not lost when its model point is drawn at t=60.
+    let change_bucket = change_timestamp.div_euclid(60) * 60;
+    let bucket_candidate = remaining_by_timestamp
+        .iter()
+        .filter(|(observed_at, value)| {
+            value.is_finite()
+                && observed_at.div_euclid(60) * 60 == change_bucket
+                && previous_change.is_none_or(|previous| {
+                    observed_at.div_euclid(60) * 60 > previous.div_euclid(60) * 60
+                        || **observed_at > previous
+                })
+        })
+        .map(|(_, value)| *value)
+        .next_back();
+    if bucket_candidate.is_some() {
+        return bucket_candidate;
+    }
+
+    // If a bucket has no quota reread, a later observation in the active
+    // interval is still a valid endpoint. This fallback is deliberately not
+    // used for the first model change: pre-change observations belong to an
+    // idle interval and must not create a delayed slope.
+    previous_change.and_then(|previous| {
+        remaining_by_timestamp
+            .iter()
+            .filter(|(observed_at, value)| {
+                value.is_finite() && **observed_at > previous && **observed_at <= change_timestamp
+            })
+            .map(|(_, value)| *value)
+            .next_back()
+    })
+}
+
+fn smooth_remaining_points_with_activity(
+    points: &[(i64, f64)],
+    active_segments: &[bool],
+) -> Vec<(i64, f64)> {
+    debug_assert_eq!(active_segments.len(), points.len().saturating_sub(1));
+    if points.len() < 3 {
+        return points.to_vec();
+    }
+
+    let mut smoothed = points.to_vec();
+    let mut interpolated = vec![false; points.len()];
+
+    // A model can advance through several minute buckets while the quota
+    // endpoint is still the previous reread. Treat a repeated active value as
+    // a missed sample and fill it from the nearest surrounding lower endpoint.
+    // For example, `1 -> 1 -> 3` becomes `1 -> 2 -> 3`. We only search through
+    // contiguous active segments, so an actual idle period is never sloped.
+    for index in 1..points.len() - 1 {
+        if interpolated[index] {
+            continue;
+        }
+        let before_active = active_segments.get(index - 1).copied().unwrap_or(false);
+        let after_active = active_segments.get(index).copied().unwrap_or(false);
+        if !before_active
+            || !after_active
+            || points[index - 1].0 == points[index].0
+            || points[index].0 == points[index + 1].0
+            || points[index - 1].1 != points[index].1
+        {
+            continue;
+        }
+
+        let left_index = index - 1;
+        let left_value = points[left_index].1;
+        let mut right_index = index + 1;
+        while right_index < points.len()
+            && points[right_index].1 >= left_value
+            && right_index > 0
+            && active_segments
+                .get(right_index - 1)
+                .copied()
+                .unwrap_or(false)
+        {
+            right_index += 1;
+        }
+        if right_index >= points.len()
+            || points[right_index].0 <= points[left_index].0
+            || points[right_index].1 >= left_value
+        {
+            continue;
+        }
+
+        let left_timestamp = points[left_index].0 as f64;
+        let right_timestamp = points[right_index].0 as f64;
+        let right_value = points[right_index].1;
+        for point_index in index..right_index {
+            let fraction = ((points[point_index].0 as f64 - left_timestamp)
+                / (right_timestamp - left_timestamp))
+                .clamp(0.0, 1.0);
+            smoothed[point_index].1 = left_value + (right_value - left_value) * fraction;
+            interpolated[point_index] = true;
+        }
+    }
+
+    for index in 1..points.len() - 1 {
+        let before_active = active_segments.get(index - 1).copied().unwrap_or(false);
+        let after_active = active_segments.get(index).copied().unwrap_or(false);
+        if !before_active
+            || !after_active
+            || points[index - 1].0 == points[index].0
+            || points[index].0 == points[index + 1].0
+            // Keep the explicitly interpolated line intact. A second moving
+            // average would move its surrounding anchors and reintroduce a
+            // fold at the edge of the completed sampling gap.
+            || interpolated[index.saturating_sub(1)]
+            || interpolated[index]
+            || interpolated[index + 1]
+        {
+            continue;
+        }
+        let average = (smoothed[index - 1].1 + (2.0 * points[index].1) + points[index + 1].1) / 4.0;
+        smoothed[index].1 = average.min(smoothed[index - 1].1);
+    }
+
+    for index in 1..smoothed.len() {
+        let active = active_segments.get(index - 1).copied().unwrap_or(false);
+        if !active && smoothed[index - 1].0 != smoothed[index].0 {
+            smoothed[index].1 = smoothed[index - 1].1;
+        } else if active {
+            smoothed[index].1 = smoothed[index].1.min(smoothed[index - 1].1);
+        }
+    }
+    smoothed
+}
+
+#[cfg(test)]
 fn collapse_remaining_change_points(points: &[(i64, f64)]) -> Vec<(i64, f64)> {
     if points.len() < 2 {
         return points.to_vec();
@@ -2913,6 +3186,7 @@ fn remaining_graph_y(remaining: f64) -> f64 {
     (99.0 - remaining * 0.98).clamp(1.0, 99.0)
 }
 
+#[cfg(test)]
 fn smooth_remaining_points(points: &[(i64, f64)]) -> Vec<(i64, f64)> {
     if points.len() < 3 {
         return points.to_vec();
@@ -4119,6 +4393,7 @@ impl CodexInfoState {
                 model: "gpt-5.6-sol".into(),
                 model_label: "gpt-5.6-sol".into(),
                 total_tokens: Some(12_345),
+                context_usage_tokens: Some(12_345),
                 context_window_tokens: Some(258_400),
                 last_user_message_at: Some(now - 8),
                 is_subagent: false,
@@ -4167,6 +4442,7 @@ impl CodexInfoState {
                         model: "gpt-5.6-luna".into(),
                         model_label: "gpt-5.6-luna".into(),
                         total_tokens: Some(123_456),
+                        context_usage_tokens: Some(123_456),
                         context_window_tokens: Some(258_400),
                         last_user_message_at: Some(now - 12),
                         is_subagent: true,
@@ -4181,6 +4457,7 @@ impl CodexInfoState {
                         model: "gpt-5.6-luna".into(),
                         model_label: "gpt-5.6-luna".into(),
                         total_tokens: Some(43_210),
+                        context_usage_tokens: Some(43_210),
                         context_window_tokens: Some(258_400),
                         last_user_message_at: Some(now - 90),
                         is_subagent: true,
@@ -4195,6 +4472,7 @@ impl CodexInfoState {
                         model: "gpt-5.6-luna".into(),
                         model_label: "gpt-5.6-luna".into(),
                         total_tokens: Some(88_765),
+                        context_usage_tokens: Some(88_765),
                         context_window_tokens: Some(258_400),
                         last_user_message_at: Some(now - 25),
                         is_subagent: true,
@@ -4209,6 +4487,7 @@ impl CodexInfoState {
                         model: "gpt-5.6-terra".into(),
                         model_label: "gpt-5.6-terra".into(),
                         total_tokens: Some(54_321),
+                        context_usage_tokens: Some(54_321),
                         context_window_tokens: Some(200_000),
                         last_user_message_at: Some(now - 40),
                         is_subagent: true,
@@ -4224,6 +4503,7 @@ impl CodexInfoState {
                         model_label: security::bounded_model_label(&model)
                             .expect("preview model is within the accepted bound"),
                         total_tokens: Some(9_876_543_210),
+                        context_usage_tokens: Some(245_000),
                         context_window_tokens: Some(258_400),
                         last_user_message_at: Some(now - 60),
                         is_subagent: false,
@@ -4238,6 +4518,7 @@ impl CodexInfoState {
                         model: "gpt-5.6-terra".into(),
                         model_label: "gpt-5.6-terra".into(),
                         total_tokens: Some(32_109),
+                        context_usage_tokens: Some(32_109),
                         context_window_tokens: Some(200_000),
                         last_user_message_at: Some(now - 120),
                         is_subagent: true,
@@ -4252,6 +4533,7 @@ impl CodexInfoState {
                         model: "gpt-5.6-sol".into(),
                         model_label: "gpt-5.6-sol".into(),
                         total_tokens: Some(765_432),
+                        context_usage_tokens: Some(75_432),
                         context_window_tokens: Some(258_400),
                         last_user_message_at: Some(now - 180),
                         is_subagent: false,
@@ -4266,6 +4548,7 @@ impl CodexInfoState {
                         model: "gpt-5.6-terra".into(),
                         model_label: "gpt-5.6-terra".into(),
                         total_tokens: Some(456_789),
+                        context_usage_tokens: Some(156_789),
                         context_window_tokens: Some(200_000),
                         last_user_message_at: Some(now - 8),
                         is_subagent: true,
@@ -5508,15 +5791,12 @@ fn active_thread_rows_at_with_i18n(
                     .map(|total| i18n.format_token_value(total))
                     .unwrap_or_else(|| "—".to_owned())
                     .into(),
-                context_usage: match (thread.total_tokens, thread.context_window_tokens) {
+                context_usage: match (thread.context_usage_tokens, thread.context_window_tokens) {
                     (Some(used), Some(window)) if window > 0 => format!(
                         "{} / {}",
                         i18n.format_context_usage(used, window),
                         i18n.format_token_value(window)
                     ),
-                    (None, Some(window)) if window > 0 => {
-                        format!("— / {}", i18n.format_token_value(window))
-                    }
                     _ => "—".to_owned(),
                 }
                 .into(),
@@ -6413,6 +6693,7 @@ fn main() -> Result<(), slint::PlatformError> {
     // One graph window owns the three model toggles. The initial state keeps
     // every series enabled, preserving the combined cumulative view.
     let graph_window = Rc::new(RefCell::new(None::<GraphWindow>));
+    let graph_maximize_state = Rc::new(RefCell::new(GraphMaximizeState::default()));
     let threads_window = Rc::new(RefCell::new(None::<ThreadsWindow>));
     let legal_notice_window = Rc::new(RefCell::new(None::<LegalNoticeWindow>));
     let x11_monitor = Rc::new(X11WindowStateMonitor::connect());
@@ -6458,6 +6739,7 @@ fn main() -> Result<(), slint::PlatformError> {
     {
         let state = Rc::clone(&state);
         let graph_window = Rc::clone(&graph_window);
+        let graph_maximize_state = Rc::clone(&graph_maximize_state);
         let x11_monitor = Rc::clone(&x11_monitor);
         let graph_old_preview = preview_kind.as_deref() == Some("graph-old");
         let graph_period_preview =
@@ -6498,9 +6780,10 @@ fn main() -> Result<(), slint::PlatformError> {
                         }
                     });
                     let weak_graph = graph.as_weak();
+                    let graph_maximize_state = Rc::clone(&graph_maximize_state);
                     graph.on_toggle_maximize_window(move || {
                         if let Some(graph) = weak_graph.upgrade() {
-                            toggle_maximize_window(graph.window());
+                            toggle_graph_maximize(graph.window(), &graph, &graph_maximize_state);
                         }
                     });
                     let weak_graph = graph.as_weak();
@@ -6834,19 +7117,20 @@ mod tests {
         model_usage_timeline_from_events, monthly_window_seconds, native_account_window_title,
         normal_status_text, open_codex_session_paths, parse_preview_size, parse_rate_limits,
         parse_resize_direction, period_remaining_text, plan_type_label, preview_model_row,
-        read_recovery_entries, recovery_timed_usage, remaining_graph_y, remaining_marker_positions,
-        remaining_marker_positions_on_points, request_with_timeout, same_rollout_identity,
-        separate_current_label_positions, session_event_model, session_event_type,
-        session_jsonl_files, session_token_snapshot, smooth_model_spend, smooth_remaining_points,
-        split_metric_line_paths, stacked_area_path, thread_presentation_rows,
-        three_months_before_utc, unused_interval_positions, week_remaining_text, ActiveThread,
-        ActiveThreadUpdate, CodexInfoState, Event, FixedResizeDecision, GraphPaths, GraphWindow,
-        HourlyModelSpend, LocalUsageResult, ManualX11Geometry, ManualX11WindowAction,
-        ModelDollarTotals, ModelTokenTotals, ModelUsageRow, ModelUsageTotals, RpcReadEvent,
-        SessionTraversalBudget, TokenSnapshot, UnusedIntervalPosition, UsageEvent, UsageHistory,
-        UsageHistorySample, UsageStore, FIXED_WINDOW_HEIGHT, FIXED_WINDOW_WIDTH,
-        GRAPH_METRIC_OPTIONS, GRAPH_WINDOW_PURPOSE, LOCAL_ESTIMATE_PRICE_VERSION,
-        THREADS_WINDOW_PURPOSE, UNAUTHENTICATED_WINDOW_TITLE, WEEK_SECONDS,
+        read_recovery_entries, recovery_timed_usage, remaining_graph_points, remaining_graph_y,
+        remaining_marker_positions, remaining_marker_positions_on_points, request_with_timeout,
+        same_rollout_identity, separate_current_label_positions, session_event_model,
+        session_event_type, session_jsonl_files, session_token_snapshot, smooth_model_spend,
+        smooth_remaining_points, split_metric_line_paths, stacked_area_path,
+        thread_presentation_rows, three_months_before_utc, unused_interval_positions,
+        week_remaining_text, ActiveThread, ActiveThreadUpdate, CodexInfoState, Event,
+        FixedResizeDecision, GraphPaths, GraphWindow, HourlyModelSpend, LocalUsageResult,
+        ManualX11Geometry, ManualX11WindowAction, ModelDollarTotals, ModelTokenTotals,
+        ModelUsageRow, ModelUsageTotals, RpcReadEvent, SessionTraversalBudget, TokenSnapshot,
+        UnusedIntervalPosition, UsageEvent, UsageHistory, UsageHistorySample, UsageStore,
+        FIXED_WINDOW_HEIGHT, FIXED_WINDOW_WIDTH, GRAPH_METRIC_OPTIONS, GRAPH_WINDOW_PURPOSE,
+        LOCAL_ESTIMATE_PRICE_VERSION, THREADS_WINDOW_PURPOSE, UNAUTHENTICATED_WINDOW_TITLE,
+        WEEK_SECONDS,
     };
     use super::{
         claim_manual_x11_action, forbidden_x11_states, manual_resize_geometry,
@@ -7213,6 +7497,7 @@ mod tests {
             model: "gpt-5.6-terra".into(),
             model_label: "gpt-5.6-terra".into(),
             total_tokens: Some(98_765),
+            context_usage_tokens: None,
             context_window_tokens: None,
             last_user_message_at: Some(120),
             is_subagent: true,
@@ -7757,6 +8042,7 @@ mod tests {
                 model: "model-parent".into(),
                 model_label: "model-parent".into(),
                 total_tokens: Some(u64::MAX),
+                context_usage_tokens: Some(225_000),
                 context_window_tokens: Some(258_400),
                 last_user_message_at: Some(19),
                 is_subagent: false,
@@ -7771,6 +8057,7 @@ mod tests {
                 model: "model-child".into(),
                 model_label: "model-child".into(),
                 total_tokens: Some(1_234),
+                context_usage_tokens: None,
                 context_window_tokens: None,
                 last_user_message_at: Some(18),
                 is_subagent: true,
@@ -7785,6 +8072,7 @@ mod tests {
                 model: "model-orphan".into(),
                 model_label: "model-orphan".into(),
                 total_tokens: None,
+                context_usage_tokens: None,
                 context_window_tokens: None,
                 last_user_message_at: None,
                 is_subagent: true,
@@ -7800,8 +8088,9 @@ mod tests {
             rows[0].tokens.as_str(),
             "18,446,744,073,709,551,615トークン"
         );
-        assert_eq!(rows[0].context_usage.as_str(), "100% / 258,400トークン");
+        assert_eq!(rows[0].context_usage.as_str(), "87.1% / 258,400トークン");
         assert_eq!(rows[1].relation.as_str(), "サブ D1");
+        assert_eq!(rows[1].context_usage.as_str(), "—");
         assert_eq!(rows[1].tree_depth, 1);
         assert!(rows[1].connected_to_parent);
         assert!(!rows[1].has_next_sibling);
@@ -7829,6 +8118,7 @@ mod tests {
             model: "model".into(),
             model_label: "model".into(),
             total_tokens: None,
+            context_usage_tokens: None,
             context_window_tokens: None,
             last_user_message_at: Some(updated_at.saturating_sub(1)),
             is_subagent,
@@ -7927,6 +8217,7 @@ mod tests {
             model: "model".into(),
             model_label: "model".into(),
             total_tokens: None,
+            context_usage_tokens: None,
             context_window_tokens: None,
             last_user_message_at: None,
             is_subagent: parent.is_some(),
@@ -7967,6 +8258,7 @@ mod tests {
             model: "model".into(),
             model_label: model_label.into(),
             total_tokens: None,
+            context_usage_tokens: None,
             context_window_tokens: None,
             last_user_message_at: None,
             is_subagent: false,
@@ -8140,6 +8432,7 @@ mod tests {
                 model: "gpt-5.6-sol".into(),
                 model_label: "gpt-5.6-sol".into(),
                 total_tokens: Some(12_345),
+                context_usage_tokens: None,
                 context_window_tokens: None,
                 last_user_message_at: None,
                 is_subagent: false,
@@ -8272,6 +8565,7 @@ mod tests {
                     model: "model-z".into(),
                     model_label: "model-z".into(),
                     total_tokens: Some(999),
+                    context_usage_tokens: None,
                     context_window_tokens: None,
                     last_user_message_at: None,
                     is_subagent: false,
@@ -8286,6 +8580,7 @@ mod tests {
                     model: "model-a".into(),
                     model_label: "model-a".into(),
                     total_tokens: Some(111),
+                    context_usage_tokens: None,
                     context_window_tokens: None,
                     last_user_message_at: None,
                     is_subagent: true,
@@ -8422,6 +8717,7 @@ mod tests {
                 model: "native-model".into(),
                 model_label: "native-model".into(),
                 total_tokens: None,
+                context_usage_tokens: None,
                 context_window_tokens: None,
                 last_user_message_at: None,
                 is_subagent: false,
@@ -8986,6 +9282,11 @@ mod tests {
             1
         );
         assert!(rust_source.contains("install_resizable_window(graph.window());"));
+        assert!(rust_source.contains("fn toggle_graph_maximize("));
+        assert!(rust_source.contains(".current_monitor()"));
+        assert!(rust_source.contains("winit_window.request_inner_size(size)"));
+        assert!(rust_source.contains("graph.set_app_maximized(true)"));
+        assert!(!rust_source.contains("fn toggle_maximize_window("));
         assert!(!rust_source
             .contains("install_window_size_guard(graph.window(), graph_width, graph_height);"));
         assert!(rust_source.contains(
@@ -9154,6 +9455,8 @@ mod tests {
         assert!(graph.contains("preferred-width: 940px;"));
         assert!(graph.contains("min-height: 480px;"));
         assert!(graph.contains("preferred-height: 640px;"));
+        assert!(graph.contains("in-out property <bool> app-maximized: false;"));
+        assert!(graph.contains("maximized: root.app-maximized;"));
         for marker in [
             "max-width: 940px;",
             "max-height: 640px;",
@@ -9842,7 +10145,7 @@ mod tests {
 
     #[test]
     fn startup_maintenance_prunes_before_the_calendar_cutoff_only_once() {
-        let (json_path, db_path) = test_history_paths("startup-maintenance");
+        let db_path = test_history_path("startup-maintenance");
         let now = Utc.with_ymd_and_hms(2024, 5, 31, 12, 34, 56).unwrap();
         let cutoff = three_months_before_utc(now);
         let samples = [
@@ -9880,8 +10183,7 @@ mod tests {
             .unwrap();
         drop(store);
 
-        let mut history =
-            UsageHistory::load_from_paths(Some(json_path.clone()), Some(db_path.clone()));
+        let mut history = UsageHistory::load_from_db_path(Some(db_path.clone()));
         history.startup_maintenance(now);
 
         assert_eq!(
@@ -9902,13 +10204,13 @@ mod tests {
             .samples
             .iter()
             .any(|sample| sample.timestamp == cutoff - 1));
-        let _ = fs::remove_dir_all(json_path.parent().unwrap());
+        let _ = fs::remove_dir_all(db_path.parent().unwrap());
     }
 
     #[test]
     fn startup_maintenance_still_bounds_visible_memory_when_store_pruning_fails() {
-        let (json_path, _db_path) = test_history_paths("startup-maintenance-error");
-        let db_path = json_path.parent().unwrap().join("not-a-database");
+        let db_path = test_history_path("startup-maintenance-error");
+        let db_path = db_path.parent().unwrap().join("not-a-database");
         fs::create_dir_all(&db_path).unwrap();
         let now = Utc.with_ymd_and_hms(2024, 5, 31, 12, 34, 56).unwrap();
         let sample = |timestamp| UsageHistorySample {
@@ -9923,7 +10225,6 @@ mod tests {
             luna_tokens: 0,
         };
         let mut history = UsageHistory {
-            path: None,
             db_path: Some(db_path.clone()),
             samples: vec![
                 sample(1),
@@ -9937,7 +10238,7 @@ mod tests {
 
         assert_eq!(history.samples.len(), 1);
         assert_eq!(history.samples[0].timestamp, now.timestamp());
-        let _ = fs::remove_dir_all(json_path.parent().unwrap());
+        let _ = fs::remove_dir_all(db_path.parent().unwrap());
     }
 
     fn write_recovery_ledger(name: &str, rows: &[serde_json::Value]) -> PathBuf {
@@ -10074,29 +10375,19 @@ mod tests {
         let _ = fs::remove_file(path);
     }
 
-    fn test_history_paths(name: &str) -> (PathBuf, PathBuf) {
+    fn test_history_path(name: &str) -> PathBuf {
         static NEXT_ID: AtomicU64 = AtomicU64::new(0);
         let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
         let root = std::env::temp_dir().join(format!(
             "codex-info-history-{name}-{}-{id}",
             std::process::id()
         ));
-        (
-            root.join("usage_history.json"),
-            root.join("usage_history.sqlite3"),
-        )
-    }
-
-    fn history_keys(samples: &[super::usage_store::UsageHistorySample]) -> BTreeSet<(i64, i64)> {
-        samples
-            .iter()
-            .map(|sample| (sample.reset_at, sample.timestamp))
-            .collect()
+        root.join("usage_history.sqlite3")
     }
 
     #[test]
     fn sqlite_history_cutoff_and_period_list_integration() {
-        let (json_path, db_path) = test_history_paths("cutoff-period-list");
+        let db_path = test_history_path("cutoff-period-list");
         let now = Utc.with_ymd_and_hms(2024, 5, 31, 12, 34, 56).unwrap();
         let cutoff = three_months_before_utc(now);
         let record = |timestamp, reset_at, remaining_percent| UsageHistorySample {
@@ -10127,8 +10418,7 @@ mod tests {
             .unwrap();
         drop(store);
 
-        let mut history =
-            UsageHistory::load_from_paths(Some(json_path.clone()), Some(db_path.clone()));
+        let mut history = UsageHistory::load_from_db_path(Some(db_path.clone()));
         history.startup_maintenance(now);
         assert_eq!(
             history
@@ -10159,12 +10449,47 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![cutoff, now.timestamp(), now.timestamp() + 1]
         );
-        let _ = fs::remove_dir_all(json_path.parent().unwrap());
+        let _ = fs::remove_dir_all(db_path.parent().unwrap());
+    }
+
+    #[test]
+    fn usage_history_uses_sqlite_only_and_does_not_touch_json() {
+        let db_path = test_history_path("sqlite-only");
+        let json_path = db_path.with_extension("json");
+        let legacy_contents = br#"[{"timestamp":1,"reset_at":2}]"#.to_vec();
+        fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+        fs::write(&json_path, &legacy_contents).unwrap();
+
+        let sqlite_sample = UsageHistorySample::new(
+            1_700_000_120,
+            1_700_200_000,
+            70.0,
+            ModelDollarTotals {
+                sol: 4.0,
+                terra: 5.0,
+                luna: 6.0,
+            },
+        );
+        let store = UsageStore::open(&db_path).unwrap();
+        store.upsert_sample(&sqlite_sample.to_store()).unwrap();
+        drop(store);
+
+        let mut history = UsageHistory::load_from_db_path(Some(db_path.clone()));
+        assert_eq!(history.samples, vec![sqlite_sample]);
+        history.record(UsageHistorySample::new(
+            1_700_000_180,
+            1_700_200_000,
+            60.0,
+            ModelDollarTotals::default(),
+        ));
+        assert_eq!(fs::read(&json_path).unwrap(), legacy_contents);
+
+        let _ = fs::remove_dir_all(db_path.parent().unwrap());
     }
 
     #[test]
     fn history_period_grouping_boundary_and_label_mapping_are_unambiguous() {
-        let (json_path, db_path) = test_history_paths("period-grouping-contract");
+        let db_path = test_history_path("period-grouping-contract");
         let samples = [1_000, 1_060, 1_061, 1_121, 1_122].map(|reset_at| {
             UsageHistorySample::new(100, reset_at, 80.0, ModelDollarTotals::default())
         });
@@ -10178,7 +10503,7 @@ mod tests {
             )
             .unwrap();
         drop(store);
-        let history = UsageHistory::load_from_paths(Some(json_path.clone()), Some(db_path));
+        let history = UsageHistory::load_from_db_path(Some(db_path.clone()));
 
         let periods = history.periods(2_000, None);
         assert_eq!(
@@ -10220,12 +10545,12 @@ mod tests {
             UsageHistory::default().period_options(2_000, None),
             vec!["履歴なし"]
         );
-        let _ = fs::remove_dir_all(json_path.parent().unwrap());
+        let _ = fs::remove_dir_all(db_path.parent().unwrap());
     }
 
     #[test]
     fn period_list_hides_legacy_moving_resets_but_keeps_real_singletons_and_db_rows() {
-        let (json_path, db_path) = test_history_paths("rolling-reset-artifacts");
+        let db_path = test_history_path("rolling-reset-artifacts");
         let base = 1_699_999_980;
         let stable_reset = base + 400_000;
         let ghost_one = base + 120 + WEEK_SECONDS + 23;
@@ -10255,7 +10580,7 @@ mod tests {
             .unwrap();
         drop(store);
 
-        let history = UsageHistory::load_from_paths(Some(json_path.clone()), Some(db_path.clone()));
+        let history = UsageHistory::load_from_db_path(Some(db_path.clone()));
         let period_ids = history
             .periods(base + 300, None)
             .into_iter()
@@ -10275,52 +10600,7 @@ mod tests {
                 .len(),
             5
         );
-        let _ = fs::remove_dir_all(json_path.parent().unwrap());
-    }
-
-    #[test]
-    fn json_migration_is_idempotent_and_keeps_the_db_set_as_a_superset() {
-        let (json_path, db_path) = test_history_paths("migration");
-        let json_only = UsageHistorySample::new(
-            1_700_000_060,
-            1_700_100_000,
-            80.0,
-            ModelDollarTotals::default(),
-        );
-        let db_only = UsageHistorySample::new(
-            1_700_000_120,
-            1_700_200_000,
-            70.0,
-            ModelDollarTotals {
-                sol: 4.0,
-                terra: 5.0,
-                luna: 6.0,
-            },
-        );
-
-        let store = UsageStore::open(&db_path).unwrap();
-        store.upsert_sample(&db_only.to_store()).unwrap();
-        let db_before = history_keys(&store.load_all().unwrap());
-        drop(store);
-        fs::write(
-            &json_path,
-            serde_json::to_vec(&vec![json_only.clone()]).unwrap(),
-        )
-        .unwrap();
-
-        let first_load =
-            UsageHistory::load_from_paths(Some(json_path.clone()), Some(db_path.clone()));
-        let after_first = history_keys(&UsageStore::open(&db_path).unwrap().load_all().unwrap());
-        assert!(after_first.is_superset(&db_before));
-        assert!(after_first.contains(&(json_only.reset_at, json_only.timestamp)));
-        drop(first_load);
-
-        let second_load =
-            UsageHistory::load_from_paths(Some(json_path.clone()), Some(db_path.clone()));
-        let after_second = history_keys(&UsageStore::open(&db_path).unwrap().load_all().unwrap());
-        assert_eq!(after_second, after_first);
-        drop(second_load);
-        let _ = fs::remove_dir_all(json_path.parent().unwrap());
+        let _ = fs::remove_dir_all(db_path.parent().unwrap());
     }
 
     #[test]
@@ -10375,6 +10655,42 @@ mod tests {
             .windows(2)
             .all(|pair| pair[0].timestamp < pair[1].timestamp));
         assert!(history.samples.iter().all(|sample| sample.timestamp <= now));
+    }
+
+    #[test]
+    fn graph_preview_contains_a_repeated_quota_sample_with_advancing_models() {
+        let now = 1_700_000_000;
+        let reset_at = now + 6 * 86_400;
+        let history = UsageHistory::preview(
+            now,
+            reset_at,
+            ModelDollarTotals {
+                sol: 100.0,
+                terra: 50.0,
+                luna: 25.0,
+            },
+        );
+        let current = history
+            .samples
+            .iter()
+            .filter(|sample| sample.reset_at == reset_at)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            current
+                .iter()
+                .map(|sample| sample.remaining_percent)
+                .collect::<Vec<_>>(),
+            [84.0, 69.0, 69.0, 49.0, 49.0, 14.0]
+        );
+        assert!(current
+            .windows(2)
+            .all(|pair| pair[0].sol_dollars <= pair[1].sol_dollars));
+        assert!(current
+            .windows(2)
+            .any(|pair| pair[0].sol_dollars == pair[1].sol_dollars));
+        assert!(current
+            .windows(2)
+            .any(|pair| pair[0].sol_dollars < pair[1].sol_dollars));
     }
 
     #[test]
@@ -10544,7 +10860,7 @@ mod tests {
         let paths = graph_paths(&[&first, &latest], 0, 3_900);
         assert!(paths.remaining.starts_with("M0.00 1.00"));
         assert!(paths.remaining.contains("L15.38"));
-        assert!(!paths.remaining.contains("L15.38 1.00 L15.38"));
+        assert!(paths.remaining.contains("L15.38 1.00 L15.38"));
         assert!(paths.remaining.contains("L100.00"));
         assert!(paths.sol.starts_with("M0.00 99.00"));
         assert!(paths.sol.contains("L100.00"));
@@ -10560,7 +10876,7 @@ mod tests {
     }
 
     #[test]
-    fn remaining_graph_collapses_unchanged_runs_between_change_points() {
+    fn remaining_graph_stays_flat_when_models_never_change() {
         let samples = [
             UsageHistorySample::new(0, 1_000, 100.0, ModelDollarTotals::default()),
             UsageHistorySample::new(60, 1_000, 90.0, ModelDollarTotals::default()),
@@ -10568,22 +10884,218 @@ mod tests {
             UsageHistorySample::new(180, 1_000, 70.0, ModelDollarTotals::default()),
         ];
         let references = samples.iter().collect::<Vec<_>>();
-        let points = graph_points(&references, 0, 240, 100.0, |sample| {
-            sample.remaining_percent
-        });
-
-        // The unchanged 90% snapshot is not a visible anchor. The endpoint
-        // remains explicit so the rendered line reaches the current-time edge.
+        // Quota rereads during an entirely idle model history cannot create a
+        // slope. The production path must collapse the whole period to one
+        // horizontal segment rather than relying on the legacy helper.
         assert_eq!(
-            points
-                .iter()
-                .map(|(timestamp, _)| *timestamp)
-                .collect::<Vec<_>>(),
-            vec![0, 60, 180, 240]
+            remaining_graph_points(&references, 0, 240),
+            vec![(0, 100.0), (240, 100.0)]
         );
         let path = graph_paths(&references, 0, 240).remaining;
-        assert!(!path.contains("L50.00"));
-        assert!(path.contains("L25.00") && path.contains("L75.00"));
+        assert_eq!(path, "M0.00 1.00 L100.00 1.00");
+    }
+
+    #[test]
+    fn remaining_graph_holds_idle_flat_and_connects_active_change_points() {
+        let samples = [
+            UsageHistorySample::new(0, 1_000, 100.0, ModelDollarTotals::default()),
+            UsageHistorySample::new(60, 1_000, 95.0, ModelDollarTotals::default()),
+            UsageHistorySample::new(
+                120,
+                1_000,
+                90.0,
+                ModelDollarTotals {
+                    sol: 1.0,
+                    terra: 0.0,
+                    luna: 0.0,
+                },
+            ),
+            UsageHistorySample::new(
+                180,
+                1_000,
+                85.0,
+                ModelDollarTotals {
+                    sol: 1.0,
+                    terra: 0.0,
+                    luna: 0.0,
+                },
+            ),
+            UsageHistorySample::new(
+                240,
+                1_000,
+                80.0,
+                ModelDollarTotals {
+                    sol: 2.0,
+                    terra: 0.0,
+                    luna: 0.0,
+                },
+            ),
+        ];
+        let references = samples.iter().collect::<Vec<_>>();
+        let points = remaining_graph_points(&references, 0, 240);
+
+        assert_eq!(
+            points,
+            vec![
+                (0, 100.0),
+                (60, 100.0),
+                (120, 90.0),
+                (180, 90.0),
+                (240, 80.0)
+            ]
+        );
+        let path = graph_paths(&references, 0, 240).remaining;
+        assert_eq!(
+            path,
+            "M0.00 1.00 L25.00 1.00 L50.00 10.80 L75.00 10.80 L100.00 20.60"
+        );
+    }
+
+    #[test]
+    fn remaining_graph_aligns_quota_with_minute_bucket_model_changes() {
+        let mut initial = UsageHistorySample::new(0, 1_000, 100.0, ModelDollarTotals::default());
+        let mut idle = UsageHistorySample::new(0, 1_000, 95.0, ModelDollarTotals::default());
+        let mut first_active = UsageHistorySample::new(
+            0,
+            1_000,
+            90.0,
+            ModelDollarTotals {
+                sol: 1.0,
+                ..ModelDollarTotals::default()
+            },
+        );
+        let mut second_active = UsageHistorySample::new(
+            0,
+            1_000,
+            80.0,
+            ModelDollarTotals {
+                sol: 2.0,
+                ..ModelDollarTotals::default()
+            },
+        );
+        // Keep quota observations at their actual timestamps while model
+        // snapshots are drawn at minute-bucket starts (60 and 120).
+        initial.timestamp = 0;
+        idle.timestamp = 40;
+        first_active.timestamp = 100;
+        second_active.timestamp = 160;
+        let samples = [initial, idle, first_active, second_active];
+        let references = samples.iter().collect::<Vec<_>>();
+
+        assert_eq!(
+            remaining_graph_points(&references, 0, 240),
+            vec![(0, 100.0), (60, 90.0), (120, 80.0), (240, 80.0)]
+        );
+        assert_eq!(
+            graph_paths(&references, 0, 240).remaining,
+            "M0.00 1.00 L25.00 10.80 L50.00 20.60 L100.00 20.60"
+        );
+    }
+
+    #[test]
+    fn remaining_graph_interpolates_repeated_active_quota_samples() {
+        let samples = [
+            UsageHistorySample::new(0, 1_000, 100.0, ModelDollarTotals::default()),
+            UsageHistorySample::new(
+                60,
+                1_000,
+                90.0,
+                ModelDollarTotals {
+                    sol: 1.0,
+                    ..ModelDollarTotals::default()
+                },
+            ),
+            // Model usage continues, but the quota reread is unchanged. Treat
+            // the repeated value as a missed sample and interpolate it from
+            // the surrounding endpoints instead of drawing a false fold.
+            UsageHistorySample::new(
+                120,
+                1_000,
+                90.0,
+                ModelDollarTotals {
+                    sol: 2.0,
+                    ..ModelDollarTotals::default()
+                },
+            ),
+            UsageHistorySample::new(
+                180,
+                1_000,
+                80.0,
+                ModelDollarTotals {
+                    sol: 3.0,
+                    ..ModelDollarTotals::default()
+                },
+            ),
+            UsageHistorySample::new(
+                240,
+                1_000,
+                80.0,
+                ModelDollarTotals {
+                    sol: 4.0,
+                    ..ModelDollarTotals::default()
+                },
+            ),
+        ];
+        let references = samples.iter().collect::<Vec<_>>();
+
+        assert_eq!(
+            remaining_graph_points(&references, 0, 240),
+            vec![
+                (0, 100.0),
+                (60, 90.0),
+                (120, 85.0),
+                (180, 80.0),
+                (240, 80.0)
+            ]
+        );
+        assert_eq!(
+            graph_paths(&references, 0, 240).remaining,
+            "M0.00 1.00 L25.00 10.80 L50.00 15.70 L75.00 20.60 L100.00 20.60"
+        );
+    }
+
+    #[test]
+    fn remaining_graph_smooths_the_line_at_internal_model_change_points() {
+        let samples = [
+            UsageHistorySample::new(0, 1_000, 100.0, ModelDollarTotals::default()),
+            UsageHistorySample::new(
+                60,
+                1_000,
+                90.0,
+                ModelDollarTotals {
+                    sol: 1.0,
+                    ..ModelDollarTotals::default()
+                },
+            ),
+            UsageHistorySample::new(
+                120,
+                1_000,
+                80.0,
+                ModelDollarTotals {
+                    sol: 2.0,
+                    ..ModelDollarTotals::default()
+                },
+            ),
+            UsageHistorySample::new(
+                180,
+                1_000,
+                60.0,
+                ModelDollarTotals {
+                    sol: 3.0,
+                    ..ModelDollarTotals::default()
+                },
+            ),
+        ];
+        let references = samples.iter().collect::<Vec<_>>();
+        let points = remaining_graph_points(&references, 0, 180);
+
+        // The internal 120-second change point is smoothed from its two
+        // neighboring active endpoints: (90 + 2*80 + 60) / 4 = 77.5.
+        assert_eq!(
+            points,
+            vec![(0, 100.0), (60, 90.0), (120, 77.5), (180, 60.0)]
+        );
+        assert!(points.windows(2).all(|pair| pair[0].1 >= pair[1].1));
     }
 
     #[test]
@@ -10612,8 +11124,8 @@ mod tests {
         ];
         let references = samples.iter().collect::<Vec<_>>();
         let paths = graph_paths(&references, 0, 120);
-        assert_eq!(paths.current_remaining_label, "0%");
-        assert!(paths.remaining.ends_with("L100.00 99.00"));
+        assert_eq!(paths.current_remaining_label, "100%");
+        assert!(paths.remaining.ends_with("L100.00 1.00"));
     }
 
     #[test]
@@ -10761,7 +11273,7 @@ mod tests {
 
         let zero = UsageHistorySample::new(120, 0, 70.0, ModelDollarTotals::default());
         let all_zero = graph_paths(&[&zero], 0, 300);
-        assert_eq!(all_zero.current_remaining_label, "70%");
+        assert_eq!(all_zero.current_remaining_label, "100%");
         assert!(all_zero.current_sol_label.is_empty());
         assert!(all_zero.current_terra_label.is_empty());
         assert!(all_zero.current_luna_label.is_empty());
@@ -10941,6 +11453,77 @@ mod tests {
         assert_eq!(graph.current_luna_label, "8,000");
         assert_eq!(graph.current_terra_label, "4,000");
         assert_eq!(graph.current_sol_label, "2,000");
+    }
+
+    #[test]
+    fn token_remaining_line_stays_flat_when_only_dollar_rows_move() {
+        let samples = [
+            UsageHistorySample::new_with_usage(
+                0,
+                1_000,
+                100.0,
+                ModelDollarTotals::default(),
+                ModelTokenTotals::default(),
+            ),
+            UsageHistorySample::new_with_usage(
+                60,
+                1_000,
+                90.0,
+                ModelDollarTotals {
+                    sol: 1.0,
+                    terra: 0.0,
+                    luna: 0.0,
+                },
+                ModelTokenTotals::default(),
+            ),
+        ];
+        let references = samples.iter().collect::<Vec<_>>();
+        let dollars = graph_paths_for_selection(&references, 0, 60, true, true, true, false);
+        let tokens = graph_paths_for_selection(&references, 0, 60, true, true, true, true);
+
+        assert_eq!(dollars.current_remaining_label, "90%");
+        assert_eq!(tokens.current_remaining_label, "100%");
+        assert!(tokens.remaining.ends_with("L100.00 1.00"));
+    }
+
+    #[test]
+    fn token_remaining_line_connects_token_change_points() {
+        let samples = [
+            UsageHistorySample::new_with_usage(
+                0,
+                1_000,
+                100.0,
+                ModelDollarTotals::default(),
+                ModelTokenTotals::default(),
+            ),
+            UsageHistorySample::new_with_usage(
+                100,
+                1_000,
+                90.0,
+                ModelDollarTotals::default(),
+                ModelTokenTotals {
+                    sol: 100,
+                    ..ModelTokenTotals::default()
+                },
+            ),
+            UsageHistorySample::new_with_usage(
+                160,
+                1_000,
+                80.0,
+                ModelDollarTotals::default(),
+                ModelTokenTotals {
+                    sol: 200,
+                    ..ModelTokenTotals::default()
+                },
+            ),
+        ];
+        let references = samples.iter().collect::<Vec<_>>();
+        let tokens = graph_paths_for_selection(&references, 0, 240, true, true, true, true);
+
+        assert_eq!(
+            tokens.remaining,
+            "M0.00 1.00 L25.00 10.80 L50.00 20.60 L100.00 20.60"
+        );
     }
 
     #[test]
@@ -11630,6 +12213,27 @@ mod tests {
             assert!(path.contains("stroke-width: 1px;"), "{path_name}");
             assert!(path.contains("opacity: 0.5;"), "{path_name}");
         }
+    }
+
+    #[test]
+    fn remaining_graph_stroke_overlays_small_boundary_markers() {
+        let source = include_str!("../ui/components.slint");
+        let graph = source
+            .split("export component GraphWindow inherits Window {")
+            .nth(1)
+            .expect("GraphWindow");
+        let marker_start = graph
+            .find("for marker in root.remaining-markers: Rectangle {")
+            .expect("remaining marker loop");
+        let path_start = graph[marker_start..]
+            .find("commands: root.remaining-path;")
+            .map(|offset| marker_start + offset)
+            .expect("remaining path");
+        assert!(path_start > marker_start);
+        let marker_block = &graph[marker_start..path_start];
+        assert!(marker_block.contains("width: 2px;"));
+        assert!(marker_block.contains("height: 2px;"));
+        assert!(marker_block.contains("border-radius: 1px;"));
     }
 
     #[test]
