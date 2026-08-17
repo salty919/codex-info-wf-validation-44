@@ -1570,6 +1570,10 @@ export component GraphWindow inherits Window {
     in-out property <bool> show-luna: true;
     in-out property <bool> show-terra: true;
     in-out property <bool> show-sol: true;
+    // Graph uses app-side monitor geometry for maximize/restore. Keeping the
+    // visual state separate from Window.maximized avoids asking X11 to size
+    // the frameless surface to WSLg's virtual desktop root.
+    in-out property <bool> app-maximized: false;
     in-out property <bool> show-tokens: false;
     in-out property <string> remaining-path;
     in-out property <[RemainingMarker]> remaining-markers;
@@ -1689,7 +1693,7 @@ export component GraphWindow inherits Window {
             x: parent.width - 108px;
             y: 4px;
             show-maximize: true;
-            maximized: root.maximized;
+            maximized: root.app-maximized;
             minimize => { root.minimize-window(); }
             toggle-maximize => { root.toggle-maximize-window(); }
             close => { root.close-window(); }
@@ -1969,6 +1973,17 @@ export component GraphWindow inherits Window {
                 stroke-line-cap: round;
                 stroke-line-join: round;
             }
+            for marker in root.remaining-markers: Rectangle {
+                x: root.plot-left + root.plot-width * marker.x / 100 - 1px;
+                y: 28px + (parent.height - 52px) * marker.y / 100 - 1px;
+                width: 2px;
+                height: 2px;
+                border-radius: 1px;
+                background: DesignTokens.graph-remaining;
+                visible: root.show-remaining;
+            }
+            // Draw the continuous stroke after the boundary markers so marker
+            // squares cannot make a straight sampling interval look stepped.
             Path {
                 x: root.plot-left;
                 y: 28px;
@@ -1985,15 +2000,6 @@ export component GraphWindow inherits Window {
                 fill: transparent;
                 stroke-line-cap: round;
                 stroke-line-join: round;
-            }
-            for marker in root.remaining-markers: Rectangle {
-                x: root.plot-left + root.plot-width * marker.x / 100 - 2px;
-                y: 28px + (parent.height - 52px) * marker.y / 100 - 2px;
-                width: 4px;
-                height: 4px;
-                border-radius: 2px;
-                background: DesignTokens.graph-remaining;
-                visible: root.show-remaining;
             }
             Text { x: root.plot-left; y: parent.height - 22px; width: 96px; height: 16px; text: root.time-start-label; color: DesignTokens.text-muted; font-size: 10px; horizontal-alignment: left; }
             Text { x: root.plot-left + root.plot-width * 0.25 - 48px; y: parent.height - 22px; width: 96px; height: 16px; text: root.time-25-label; color: DesignTokens.text-muted; font-size: 10px; horizontal-alignment: center; }

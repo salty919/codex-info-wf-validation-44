@@ -440,48 +440,6 @@ pub fn group_reset_periods(samples: &[UsageHistorySample]) -> Vec<ResetPeriod> {
     build_reset_periods(samples)
 }
 
-fn json_sample(value: &serde_json::Value) -> Result<UsageHistorySample> {
-    let object = value
-        .as_object()
-        .ok_or_else(|| UsageStoreError::InvalidImport("each sample must be an object".into()))?;
-    let required_i64 = |name: &str| {
-        object
-            .get(name)
-            .and_then(serde_json::Value::as_i64)
-            .ok_or_else(|| UsageStoreError::InvalidImport(format!("missing integer field {name}")))
-    };
-    let required_f64 = |name: &str| {
-        object
-            .get(name)
-            .and_then(serde_json::Value::as_f64)
-            .ok_or_else(|| UsageStoreError::InvalidImport(format!("missing number field {name}")))
-    };
-    let optional_u64 = |name: &str| match object.get(name) {
-        None => Ok(0),
-        Some(value) => value.as_u64().ok_or_else(|| {
-            UsageStoreError::InvalidImport(format!("{name} must be a non-negative integer"))
-        }),
-    };
-    let remaining_percent = match object.get("remaining_percent") {
-        None | Some(serde_json::Value::Null) => None,
-        Some(value) => Some(value.as_f64().ok_or_else(|| {
-            UsageStoreError::InvalidImport("remaining_percent must be a number or null".into())
-        })?),
-    };
-
-    Ok(UsageHistorySample {
-        timestamp: required_i64("timestamp")?,
-        reset_at: required_i64("reset_at")?,
-        remaining_percent,
-        sol_dollars: required_f64("sol_dollars")?,
-        terra_dollars: required_f64("terra_dollars")?,
-        luna_dollars: required_f64("luna_dollars")?,
-        sol_tokens: optional_u64("sol_tokens")?,
-        terra_tokens: optional_u64("terra_tokens")?,
-        luna_tokens: optional_u64("luna_tokens")?,
-    })
-}
-
 /// Persistent SQLite storage for minute-level usage samples.
 pub struct UsageStore {
     connection: Connection,
@@ -533,7 +491,8 @@ impl UsageStore {
         let mut connection = Connection::open(path)?;
         let transaction = connection.transaction()?;
         transaction.execute_batch(SCHEMA)?;
-        // Migrate v1 tables additively; existing rows and dollar values remain.
+        // A database must already have the current schema. Older formats are
+        // intentionally not migrated or read.
         for column in ["sol_tokens", "terra_tokens", "luna_tokens"] {
             let present: bool = transaction.query_row(
                 "SELECT EXISTS(SELECT 1 FROM pragma_table_info('usage_history') WHERE name = ?1)",
@@ -541,12 +500,9 @@ impl UsageStore {
                 |row| row.get(0),
             )?;
             if !present {
-                transaction.execute(
-                    &format!(
-                        "ALTER TABLE usage_history ADD COLUMN {column} INTEGER NOT NULL DEFAULT 0"
-                    ),
-                    [],
-                )?;
+                return Err(UsageStoreError::InvalidImport(
+                    "database schema mismatch".into(),
+                ));
             }
         }
         transaction.commit()?;
@@ -669,50 +625,13 @@ impl UsageStore {
         Ok(())
     }
 
-    /// Imports already-decoded v1 samples without replacing existing data.
+    /// Inserts already-decoded samples without replacing existing data.
     ///
-    /// This is the common migration boundary: validation happens before the
-    /// transaction starts, and the same composite key is merged idempotently.
+    /// Validation happens before the transaction starts, and the same
+    /// composite key is merged idempotently.
     pub fn import_samples(&mut self, samples: &[UsageHistorySample]) -> Result<usize> {
         self.upsert_samples(samples)?;
         Ok(samples.len())
-    }
-
-    /// Imports a v1 SQLite database containing the legacy `usage_history`
-    /// table. The source is read completely before writing, so migration is
-    /// additive even when it is run repeatedly.
-    pub fn import_v1_sqlite<P: AsRef<Path>>(&mut self, path: P) -> Result<usize> {
-        let source = Connection::open(path)?;
-        let mut statement = source.prepare(
-            "SELECT timestamp, reset_at, remaining_percent, sol_dollars, \
-                    terra_dollars, luna_dollars, \
-                    0 AS sol_tokens, 0 AS terra_tokens, 0 AS luna_tokens \
-             FROM usage_history ORDER BY reset_at ASC, timestamp ASC",
-        )?;
-        let mut rows = statement.query([])?;
-        let mut samples = Vec::new();
-        while let Some(row) = rows.next()? {
-            let Some(sample) = valid_sample_from_row(row)? else {
-                return Err(UsageStoreError::InvalidImport(
-                    "invalid v1 SQLite sample".into(),
-                ));
-            };
-            samples.push(sample);
-        }
-        self.import_samples(&samples)
-    }
-
-    /// Imports a v1 JSON array, or an object with a `samples` array.
-    pub fn import_v1_json<P: AsRef<Path>>(&mut self, path: P) -> Result<usize> {
-        let contents = fs::read_to_string(path)?;
-        let value: serde_json::Value = serde_json::from_str(&contents)
-            .map_err(|error| UsageStoreError::InvalidImport(error.to_string()))?;
-        let values = value
-            .as_array()
-            .or_else(|| value.get("samples").and_then(serde_json::Value::as_array))
-            .ok_or_else(|| UsageStoreError::InvalidImport("expected a samples array".into()))?;
-        let samples = values.iter().map(json_sample).collect::<Result<Vec<_>>>()?;
-        self.import_samples(&samples)
     }
 
     fn commit_durable_state_inner(
@@ -941,21 +860,50 @@ mod tests {
     }
 
     #[test]
-    fn opening_v1_database_adds_zero_token_columns_without_losing_dollars() {
-        let path = database_path("v1-migration");
-        {
-            fs::create_dir_all(path.parent().unwrap()).unwrap();
-            let connection = Connection::open(&path).unwrap();
-            connection
-                .execute_batch(
-                    "CREATE TABLE usage_history (timestamp INTEGER NOT NULL, reset_at INTEGER NOT NULL, remaining_percent REAL, sol_dollars REAL NOT NULL, terra_dollars REAL NOT NULL, luna_dollars REAL NOT NULL, PRIMARY KEY(reset_at, timestamp)); INSERT INTO usage_history VALUES (1700000060, 1700604800, 75.0, 1.25, 2.0, 3.0);",
-                )
-                .unwrap();
-        }
-        let rows = UsageStore::open(&path).unwrap().load_all().unwrap();
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].sol_dollars, 1.25);
-        assert_eq!(rows[0].sol_tokens, 0);
+    fn opening_an_old_schema_is_rejected_without_migration() {
+        let path = database_path("old-schema");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE usage_history (
+                    timestamp INTEGER NOT NULL,
+                    reset_at INTEGER NOT NULL,
+                    remaining_percent REAL,
+                    sol_dollars REAL NOT NULL,
+                    terra_dollars REAL NOT NULL,
+                    luna_dollars REAL NOT NULL,
+                    PRIMARY KEY (reset_at, timestamp)
+                );
+                INSERT INTO usage_history
+                    (timestamp, reset_at, remaining_percent,
+                     sol_dollars, terra_dollars, luna_dollars)
+                VALUES (1700000060, 1700000000, 75.0, 1.25, 2.0, 3.0);",
+            )
+            .unwrap();
+        drop(connection);
+
+        assert!(UsageStore::open(&path).is_err());
+        let connection = Connection::open(&path).unwrap();
+        let token_columns: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('usage_history')
+                 WHERE name IN ('sol_tokens', 'terra_tokens', 'luna_tokens')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(token_columns, 0);
+        let durable_tables: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type = 'table' AND name = 'durable_state'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(durable_tables, 0);
+        drop(connection);
         remove_database(&path);
     }
 
@@ -1259,89 +1207,37 @@ mod wave_b_correction_tests {
         }
     }
 
-    fn sample_value(
-        timestamp: i64,
-        reset_at: i64,
-        remaining_percent: Option<f64>,
-        sol_dollars: f64,
-        terra_dollars: f64,
-        luna_dollars: f64,
-    ) -> serde_json::Value {
-        serde_json::json!({
-            "timestamp": timestamp,
-            "reset_at": reset_at,
-            "remaining_percent": remaining_percent,
-            "sol_dollars": sol_dollars,
-            "terra_dollars": terra_dollars,
-            "luna_dollars": luna_dollars,
-            "input_tokens": 1,
-            "cached_input_tokens": 1,
-            "output_tokens": 1,
-            "prompt_tokens": 1,
-            "cache_read_tokens": 1,
-            "completion_tokens": 1,
-            "sol_input_tokens": 1,
-            "sol_cached_input_tokens": 1,
-            "sol_output_tokens": 1,
-            "terra_input_tokens": 1,
-            "terra_cached_input_tokens": 1,
-            "terra_output_tokens": 1,
-            "luna_input_tokens": 1,
-            "luna_cached_input_tokens": 1,
-            "luna_output_tokens": 1,
-            "sol_tokens": 1,
-            "terra_tokens": 1,
-            "luna_tokens": 1,
-            "tokens": 1
-        })
-    }
-
     fn sample(
         timestamp: i64,
         reset_at: i64,
         remaining_percent: Option<f64>,
         sol_dollars: f64,
     ) -> UsageHistorySample {
-        json_sample(&sample_value(
+        UsageHistorySample {
             timestamp,
             reset_at,
             remaining_percent,
             sol_dollars,
-            sol_dollars + 1.0,
-            sol_dollars + 2.0,
-        ))
-        .expect("fixture must satisfy the legacy input contract")
+            terra_dollars: sol_dollars + 1.0,
+            luna_dollars: sol_dollars + 2.0,
+            sol_tokens: 1,
+            terra_tokens: 1,
+            luna_tokens: 1,
+        }
     }
 
     fn overflowing_token_sample() -> UsageHistorySample {
-        let mut value = sample_value(1_700_000_123, 1_700_000_000, Some(50.0), 1.0, 2.0, 3.0);
-        let object = value
-            .as_object_mut()
-            .expect("sample fixture must be an object");
-        for key in [
-            "input_tokens",
-            "cached_input_tokens",
-            "output_tokens",
-            "prompt_tokens",
-            "cache_read_tokens",
-            "completion_tokens",
-            "sol_input_tokens",
-            "sol_cached_input_tokens",
-            "sol_output_tokens",
-            "terra_input_tokens",
-            "terra_cached_input_tokens",
-            "terra_output_tokens",
-            "luna_input_tokens",
-            "luna_cached_input_tokens",
-            "luna_output_tokens",
-            "sol_tokens",
-            "terra_tokens",
-            "luna_tokens",
-            "tokens",
-        ] {
-            object.insert(key.to_owned(), serde_json::json!(u64::MAX));
+        UsageHistorySample {
+            timestamp: 1_700_000_123,
+            reset_at: 1_700_000_000,
+            remaining_percent: Some(50.0),
+            sol_dollars: 1.0,
+            terra_dollars: 2.0,
+            luna_dollars: 3.0,
+            sol_tokens: u64::MAX,
+            terra_tokens: u64::MAX,
+            luna_tokens: u64::MAX,
         }
-        json_sample(&value).expect("token-overflow fixture must parse at the input boundary")
     }
 
     fn history_rows(path: &Path) -> Vec<(i64, i64, Option<f64>, f64, f64, f64)> {
@@ -1400,52 +1296,6 @@ mod wave_b_correction_tests {
                 )
             })
             .collect()
-    }
-
-    fn create_v1_database(path: &Path) {
-        let connection = Connection::open(path).expect("v1 database connection");
-        connection
-            .execute_batch(
-                "PRAGMA user_version = 1;
-                CREATE TABLE usage_history (
-                    timestamp INTEGER NOT NULL,
-                    reset_at INTEGER NOT NULL,
-                    remaining_percent REAL,
-                    sol_dollars REAL NOT NULL,
-                    terra_dollars REAL NOT NULL,
-                    luna_dollars REAL NOT NULL,
-                    PRIMARY KEY(reset_at, timestamp)
-                );
-                INSERT INTO usage_history
-                    (timestamp, reset_at, remaining_percent, sol_dollars, terra_dollars, luna_dollars)
-                VALUES (1700000060, 1700000000, 75.0, 1.25, 2.50, 3.75);",
-            )
-            .expect("create v1 fixture");
-    }
-
-    #[test]
-    fn legacy_inputs_and_method_signatures_remain_usable() {
-        let path = database_path("compatibility");
-        let now = Utc.timestamp_opt(1_715_156_800, 0).single().unwrap();
-        let legacy_input: UsageHistorySample = json_sample(&sample_value(
-            1_715_156_700,
-            1_715_156_000,
-            Some(75.0),
-            1.0,
-            2.0,
-            3.0,
-        ))
-        .unwrap();
-        let mut store = UsageStore::open(&path).unwrap();
-        store.upsert_sample(&legacy_input).unwrap();
-        store
-            .upsert_samples(std::slice::from_ref(&legacy_input))
-            .unwrap();
-        assert_eq!(store.load_recent_history(now).unwrap().len(), 1);
-        assert_eq!(store.load_three_month_history(now).unwrap().len(), 1);
-        assert_eq!(UsageStore::group_reset_periods(&[legacy_input]).len(), 1);
-        drop(store);
-        cleanup(&path);
     }
 
     #[test]
@@ -1600,78 +1450,6 @@ mod wave_b_correction_tests {
     }
 
     #[test]
-    fn recent_read_filters_invalid_values_from_unchecked_v1_rows_without_deleting_rows() {
-        let path = database_path("recent-invalid-v1");
-        let connection = Connection::open(&path).unwrap();
-        connection
-            .execute_batch(
-                "PRAGMA user_version = 1;
-                CREATE TABLE usage_history (
-                    timestamp INTEGER NOT NULL,
-                    reset_at INTEGER NOT NULL,
-                    remaining_percent REAL,
-                    sol_dollars REAL NOT NULL,
-                    terra_dollars REAL NOT NULL,
-                    luna_dollars REAL NOT NULL,
-                    PRIMARY KEY(reset_at, timestamp)
-                );
-                INSERT INTO usage_history
-                    (timestamp, reset_at, remaining_percent, sol_dollars, terra_dollars, luna_dollars)
-                VALUES (1700000060, 1700000000, 75.0, 1.25, 2.50, 3.75);",
-            )
-            .unwrap();
-        drop(connection);
-        let store = UsageStore::open(&path).unwrap();
-        assert_eq!(store.load_all().unwrap().len(), 1);
-        drop(store);
-
-        let connection = Connection::open(&path).unwrap();
-        connection.execute("DELETE FROM usage_history", []).unwrap();
-        connection
-            .execute(
-                "INSERT INTO usage_history
-                    (timestamp, reset_at, remaining_percent, sol_dollars, terra_dollars, luna_dollars)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                params![0_i64, 100_i64, 50.0, 1.0, 2.0, 3.0],
-            )
-            .unwrap();
-        connection
-            .execute(
-                "INSERT INTO usage_history
-                    (timestamp, reset_at, remaining_percent, sol_dollars, terra_dollars, luna_dollars)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                params![900_i64, 0_i64, 50.0, 1.0, 2.0, 3.0],
-            )
-            .unwrap();
-        connection
-            .execute(
-                "INSERT INTO usage_history
-                    (timestamp, reset_at, remaining_percent, sol_dollars, terra_dollars, luna_dollars, sol_tokens)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                params![800_i64, 100_i64, 50.0, 1.0, 2.0, 3.0, -1_i64],
-            )
-            .unwrap();
-        let before_count: i64 = connection
-            .query_row("SELECT COUNT(*) FROM usage_history", [], |row| row.get(0))
-            .unwrap();
-        assert_eq!(before_count, 3);
-        drop(connection);
-
-        let store = UsageStore::open(&path).unwrap();
-        let now = Utc.timestamp_opt(1_000, 0).single().unwrap();
-        assert!(store.load_recent_three_months(now).unwrap().is_empty());
-        drop(store);
-
-        let connection = Connection::open(&path).unwrap();
-        let after_count: i64 = connection
-            .query_row("SELECT COUNT(*) FROM usage_history", [], |row| row.get(0))
-            .unwrap();
-        assert_eq!(after_count, 3);
-        drop(connection);
-        cleanup(&path);
-    }
-
-    #[test]
     fn grouping_has_sixty_second_boundary_canonical_ids_and_explicit_order() {
         let samples = vec![
             sample(100, 1_000, Some(1.0), 1.0),
@@ -1732,303 +1510,7 @@ mod wave_b_correction_tests {
     }
 
     #[test]
-    fn json_import_rejects_present_invalid_tokens_without_default_or_partial_write() {
-        let mut missing_token_value =
-            sample_value(1_700_000_010, 1_700_000_000, Some(80.0), 1.0, 2.0, 3.0);
-        let missing_token_object = missing_token_value
-            .as_object_mut()
-            .expect("sample fixture must be an object");
-        for name in ["sol_tokens", "terra_tokens", "luna_tokens"] {
-            missing_token_object.remove(name);
-        }
-        let missing_tokens =
-            json_sample(&missing_token_value).expect("missing token fields remain accepted");
-        assert_eq!(missing_tokens.sol_tokens, 0);
-        assert_eq!(missing_tokens.terra_tokens, 0);
-        assert_eq!(missing_tokens.luna_tokens, 0);
-
-        let path = database_path("json-invalid-token-import");
-        let import_path = database_path("json-invalid-token-import-json");
-        let mut seed = UsageStore::open(&path).unwrap();
-        seed.import_samples(&[sample(1_700_000_000, 1_700_000_000, Some(90.0), 1.0)])
-            .unwrap();
-        drop(seed);
-        let baseline = history_rows(&path);
-        let invalid_cases = vec![
-            ("sol_tokens", serde_json::json!(-1)),
-            ("terra_tokens", serde_json::json!(-1)),
-            ("luna_tokens", serde_json::json!(-1)),
-            ("sol_tokens", serde_json::Value::Null),
-            ("sol_tokens", serde_json::json!("not-a-number")),
-            ("sol_tokens", serde_json::json!(false)),
-            ("sol_tokens", serde_json::json!(1.5)),
-        ];
-
-        for (index, (name, invalid_value)) in invalid_cases.into_iter().enumerate() {
-            let valid_timestamp = 1_700_001_000 + (index as i64 * 2);
-            let invalid_timestamp = valid_timestamp + 1;
-            let valid = sample_value(valid_timestamp, 1_700_001_000, Some(80.0), 9.0, 10.0, 11.0);
-            let mut invalid = sample_value(
-                invalid_timestamp,
-                1_700_001_000,
-                Some(70.0),
-                12.0,
-                13.0,
-                14.0,
-            );
-            invalid
-                .as_object_mut()
-                .expect("sample fixture must be an object")
-                .insert(name.to_owned(), invalid_value);
-            fs::write(
-                &import_path,
-                serde_json::to_vec(&serde_json::json!([valid, invalid])).unwrap(),
-            )
-            .unwrap();
-
-            let mut store = UsageStore::open(&path).unwrap();
-            let error = store
-                .import_v1_json(&import_path)
-                .expect_err("present invalid token must reject the whole import");
-            assert!(matches!(
-                error,
-                UsageStoreError::InvalidImport(message)
-                    if message == format!("{name} must be a non-negative integer")
-            ));
-            drop(store);
-
-            let after = history_rows(&path);
-            assert_eq!(after, baseline);
-            assert!(!after
-                .iter()
-                .any(|row| row.0 == valid_timestamp || row.0 == invalid_timestamp));
-        }
-
-        cleanup(&path);
-        cleanup(&import_path);
-    }
-
-    #[test]
-    fn sqlite_import_rejects_lossy_or_invalid_rows_without_partial_write() {
-        assert_eq!(
-            numeric_sqlite_value(Value::Integer(9_007_199_254_740_992)),
-            Some(9_007_199_254_740_992.0)
-        );
-        assert_eq!(
-            numeric_sqlite_value(Value::Integer(9_007_199_254_740_993)),
-            None
-        );
-        assert_eq!(numeric_sqlite_value(Value::Integer(i64::MAX)), None);
-        assert!(matches!(
-            numeric_sqlite_value(Value::Real(f64::NAN)),
-            Some(value) if value.is_nan()
-        ));
-
-        let target_path = database_path("sqlite-invalid-import-target");
-        let mut target = UsageStore::open(&target_path).unwrap();
-        target
-            .import_samples(&[sample(1_700_000_000, 1_700_000_000, Some(90.0), 1.0)])
-            .unwrap();
-        drop(target);
-        let baseline = history_rows(&target_path);
-        let invalid_cases = [
-            "lossy integer dollar",
-            "negative timestamp",
-            "remaining above 100",
-            "negative dollar",
-        ];
-        let mut source_paths = Vec::new();
-
-        for (index, invalid_case) in invalid_cases.iter().enumerate() {
-            let source_path = database_path(&format!("sqlite-invalid-import-source-{index}"));
-            let source = Connection::open(&source_path).unwrap();
-            source
-                .execute_batch(
-                    "CREATE TABLE usage_history (
-                        timestamp,
-                        reset_at,
-                        remaining_percent,
-                        sol_dollars,
-                        terra_dollars,
-                        luna_dollars
-                    )",
-                )
-                .unwrap();
-            let valid_timestamp = 1_700_001_000 + (index as i64 * 10);
-            let valid_reset_at = 1_700_000_000;
-            source
-                .execute(
-                    "INSERT INTO usage_history
-                        (timestamp, reset_at, remaining_percent, sol_dollars,
-                         terra_dollars, luna_dollars)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                    rusqlite::params![
-                        valid_timestamp,
-                        valid_reset_at,
-                        80.0_f64,
-                        9.0_f64,
-                        10.0_f64,
-                        11.0_f64
-                    ],
-                )
-                .unwrap();
-            match *invalid_case {
-                "lossy integer dollar" => {
-                    source
-                        .execute(
-                            "INSERT INTO usage_history
-                                (timestamp, reset_at, remaining_percent, sol_dollars,
-                                 terra_dollars, luna_dollars)
-                             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                            rusqlite::params![
-                                valid_timestamp + 1,
-                                valid_reset_at + 1,
-                                70.0_f64,
-                                9_007_199_254_740_993_i64,
-                                13.0_f64,
-                                14.0_f64
-                            ],
-                        )
-                        .unwrap();
-                }
-                "negative timestamp" => {
-                    source
-                        .execute(
-                            "INSERT INTO usage_history
-                                (timestamp, reset_at, remaining_percent, sol_dollars,
-                                 terra_dollars, luna_dollars)
-                             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                            rusqlite::params![
-                                -1_i64,
-                                valid_reset_at + 1,
-                                70.0_f64,
-                                12.0_f64,
-                                13.0_f64,
-                                14.0_f64
-                            ],
-                        )
-                        .unwrap();
-                }
-                "remaining above 100" => {
-                    source
-                        .execute(
-                            "INSERT INTO usage_history
-                                (timestamp, reset_at, remaining_percent, sol_dollars,
-                                 terra_dollars, luna_dollars)
-                             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                            rusqlite::params![
-                                valid_timestamp + 1,
-                                valid_reset_at + 1,
-                                101.0_f64,
-                                12.0_f64,
-                                13.0_f64,
-                                14.0_f64
-                            ],
-                        )
-                        .unwrap();
-                }
-                "negative dollar" => {
-                    source
-                        .execute(
-                            "INSERT INTO usage_history
-                                (timestamp, reset_at, remaining_percent, sol_dollars,
-                                 terra_dollars, luna_dollars)
-                             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                            rusqlite::params![
-                                valid_timestamp + 1,
-                                valid_reset_at + 1,
-                                70.0_f64,
-                                -1.0_f64,
-                                13.0_f64,
-                                14.0_f64
-                            ],
-                        )
-                        .unwrap();
-                }
-                _ => unreachable!("fixed invalid case"),
-            }
-            drop(source);
-            source_paths.push(source_path.clone());
-
-            let mut store = UsageStore::open(&target_path).unwrap();
-            let error = store
-                .import_v1_sqlite(&source_path)
-                .expect_err("invalid v1 SQLite sample must reject the whole import");
-            assert!(matches!(
-                error,
-                UsageStoreError::InvalidImport(message)
-                    if message == "invalid v1 SQLite sample"
-            ));
-            drop(store);
-
-            let after = history_rows(&target_path);
-            assert_eq!(after, baseline);
-            assert!(!after
-                .iter()
-                .any(|row| row.0 == valid_timestamp || row.0 == valid_timestamp + 1));
-        }
-
-        for source_path in source_paths {
-            cleanup(&source_path);
-        }
-        cleanup(&target_path);
-    }
-
-    #[test]
-    fn v1_open_import_reopen_and_singleton_are_non_destructive_and_idempotent() {
-        let path = database_path("migration");
-        let import_path = database_path("migration-json");
-        create_v1_database(&path);
-        fs::write(
-            &import_path,
-            serde_json::to_vec(&serde_json::json!({
-                "samples": [sample_value(1_700_000_120, 1_700_000_000, Some(80.0), 9.0, 10.0, 11.0)]
-            }))
-            .unwrap(),
-        )
-        .unwrap();
-        let store = UsageStore::open(&path).unwrap();
-        let original = history_rows(&path);
-        assert_eq!(original.len(), 1);
-        let mut store = store;
-        assert_eq!(store.import_v1_json(&import_path).unwrap(), 1);
-        let after_first_import = history_rows(&path);
-        assert_eq!(after_first_import.len(), 2);
-        assert_eq!(after_first_import[0].3, original[0].3);
-        assert_eq!(after_first_import[0].4, original[0].4);
-        assert_eq!(after_first_import[0].5, original[0].5);
-        assert_eq!(store.import_v1_json(&import_path).unwrap(), 1);
-        assert_eq!(history_rows(&path), after_first_import);
-        drop(store);
-        for _ in 0..3 {
-            let reopened = UsageStore::open(&path).unwrap();
-            assert_eq!(history_rows(&path), after_first_import);
-            drop(reopened);
-        }
-        let mut reopened = UsageStore::open(&path).unwrap();
-        let record = reopened
-            .commit_durable_state(&[], VALID_HASH, r#"{"kind":"migration"}"#)
-            .unwrap();
-        assert_eq!(record.data_generation, 1);
-        assert_eq!(singleton_count(&path), 1);
-        drop(reopened);
-        let reopened_again = UsageStore::open(&path).unwrap();
-        assert_eq!(history_rows(&path), after_first_import);
-        assert_eq!(
-            durable_row(&path),
-            Some((
-                1,
-                VALID_HASH.to_owned(),
-                r#"{"kind":"migration"}"#.to_owned()
-            ))
-        );
-        drop(reopened_again);
-        cleanup(&path);
-        cleanup(&import_path);
-    }
-
-    #[test]
-    fn corrupt_migration_error_preserves_the_original_file() {
+    fn corrupt_database_error_preserves_the_original_file() {
         let path = database_path("corrupt");
         let bytes = b"this is not a sqlite database".to_vec();
         fs::write(&path, &bytes).unwrap();
@@ -2203,122 +1685,6 @@ mod wave_b_correction_tests {
         assert_eq!(history_rows(&path), captured_history);
         assert_eq!(durable_row(&path), captured_durable);
         drop(reopened);
-        cleanup(&path);
-    }
-
-    #[test]
-    fn storage_focus11_v1_migration_failure_rolls_back_all_schema_and_rows() {
-        let path = database_path("storage-focus11-v1-migration-failure");
-        let fixture = Connection::open(&path).unwrap();
-        fixture
-            .execute_batch(
-                "CREATE TABLE usage_history (
-                    timestamp INTEGER NOT NULL,
-                    reset_at INTEGER NOT NULL,
-                    remaining_percent REAL,
-                    sol_dollars REAL NOT NULL,
-                    terra_dollars REAL NOT NULL,
-                    luna_dollars REAL NOT NULL,
-                    TERRA_TOKENS INTEGER NOT NULL DEFAULT 0,
-                    PRIMARY KEY (reset_at, timestamp)
-                );
-                INSERT INTO usage_history (
-                    timestamp, reset_at, remaining_percent,
-                    sol_dollars, terra_dollars, luna_dollars, TERRA_TOKENS
-                ) VALUES (1700000060, 1700000000, 75.0, 1.25, 2.50, 3.75, 11);",
-            )
-            .unwrap();
-        drop(fixture);
-
-        assert!(UsageStore::open(&path).is_err());
-
-        let raw = Connection::open(&path).unwrap();
-        let mut column_statement = raw
-            .prepare("SELECT name FROM pragma_table_info('usage_history') ORDER BY cid")
-            .unwrap();
-        let columns = column_statement
-            .query_map([], |row| row.get::<_, String>(0))
-            .unwrap()
-            .map(|row| row.unwrap())
-            .collect::<Vec<_>>();
-        assert_eq!(
-            columns,
-            vec![
-                "timestamp".to_owned(),
-                "reset_at".to_owned(),
-                "remaining_percent".to_owned(),
-                "sol_dollars".to_owned(),
-                "terra_dollars".to_owned(),
-                "luna_dollars".to_owned(),
-                "TERRA_TOKENS".to_owned(),
-            ]
-        );
-
-        let lowercase_terra_probe: bool = raw
-            .query_row(
-                "SELECT EXISTS(
-                    SELECT 1 FROM pragma_table_info('usage_history')
-                    WHERE name = 'terra_tokens'
-                )",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert!(!lowercase_terra_probe);
-        let sol_probe: bool = raw
-            .query_row(
-                "SELECT EXISTS(
-                    SELECT 1 FROM pragma_table_info('usage_history')
-                    WHERE name = 'sol_tokens'
-                )",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert!(!sol_probe);
-
-        let original_row: (i64, i64, Option<f64>, f64, f64, f64, i64) = raw
-            .query_row(
-                "SELECT timestamp, reset_at, remaining_percent,
-                        sol_dollars, terra_dollars, luna_dollars, TERRA_TOKENS
-                 FROM usage_history",
-                [],
-                |row| {
-                    Ok((
-                        row.get(0)?,
-                        row.get(1)?,
-                        row.get(2)?,
-                        row.get(3)?,
-                        row.get(4)?,
-                        row.get(5)?,
-                        row.get(6)?,
-                    ))
-                },
-            )
-            .unwrap();
-        assert_eq!(
-            original_row,
-            (1700000060, 1700000000, Some(75.0), 1.25, 2.50, 3.75, 11)
-        );
-
-        let mut schema_statement = raw
-            .prepare(
-                "SELECT type, name FROM sqlite_master
-                 WHERE name IN ('usage_history_timestamp_idx', 'durable_state')
-                 ORDER BY name",
-            )
-            .unwrap();
-        let schema_objects = schema_statement
-            .query_map([], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-            })
-            .unwrap()
-            .map(|row| row.unwrap())
-            .collect::<Vec<_>>();
-        assert!(schema_objects.is_empty());
-        drop(column_statement);
-        drop(schema_statement);
-        drop(raw);
         cleanup(&path);
     }
 
@@ -2551,286 +1917,6 @@ mod wave_b_correction_tests {
         assert_eq!(history_rows(&path).len(), before.len() + 1);
         drop(store);
         cleanup(&path);
-    }
-
-    #[test]
-    fn storage_focus11_sql_rows_use_one_semantic_validator() {
-        use chrono::TimeZone;
-
-        let target_path = database_path("storage-focus11-sql-rows-one-validator");
-        let mut store = UsageStore::open(&target_path).unwrap();
-        let fixture = Connection::open(&target_path).unwrap();
-        fixture
-            .execute_batch(
-                "PRAGMA ignore_check_constraints = ON;
-                 INSERT INTO usage_history (
-                    timestamp, reset_at, remaining_percent,
-                    sol_dollars, terra_dollars, luna_dollars,
-                    sol_tokens, terra_tokens, luna_tokens
-                 ) VALUES
-                    (1715156700, 1715156800, 50.0, 1.0, 2.0, 3.0, 7, 8, 9),
-                    (1715156701, 1715156800, -1.0, 1.0, 2.0, 3.0, 0, 0, 0),
-                    (1715156702, 1715156800, 101.0, 1.0, 2.0, 3.0, 0, 0, 0),
-                    (1715156703, 1715156800, 50.0, -1.0, 2.0, 3.0, 0, 0, 0),
-                    (1715156704, 1715156800, 50.0, 1.0, -2.0, 3.0, 0, 0, 0),
-                    (1715156705, 1715156800, 50.0, 1.0, 2.0, -3.0, 0, 0, 0),
-                    (0, 1715156800, 50.0, 1.0, 2.0, 3.0, 0, 0, 0),
-                    (-1, 1715156800, 50.0, 1.0, 2.0, 3.0, 0, 0, 0),
-                    (1715156706, 0, 50.0, 1.0, 2.0, 3.0, 0, 0, 0),
-                    (1715156707, -1, 50.0, 1.0, 2.0, 3.0, 0, 0, 0);",
-            )
-            .unwrap();
-        drop(fixture);
-
-        let expected = UsageHistorySample {
-            timestamp: 1715156700,
-            reset_at: 1715156800,
-            remaining_percent: Some(50.0),
-            sol_dollars: 1.0,
-            terra_dollars: 2.0,
-            luna_dollars: 3.0,
-            sol_tokens: 7,
-            terra_tokens: 8,
-            luna_tokens: 9,
-        };
-        assert_eq!(store.load_all().unwrap(), vec![expected.clone()]);
-        let now = Utc.timestamp_opt(1715156800, 0).single().unwrap();
-        assert_eq!(store.load_recent_three_months(now).unwrap(), vec![expected]);
-
-        let converter = include_str!("usage_store.rs")
-            .split("fn valid_sample_from_row")
-            .nth(1)
-            .unwrap()
-            .split("fn validate_data_hash")
-            .next()
-            .unwrap();
-        let validate_at = converter.find("sample.validate()").unwrap();
-        let before_validate = &converter[..validate_at];
-        let before_validate_compact: String = before_validate
-            .chars()
-            .filter(|character| !character.is_whitespace())
-            .collect();
-        assert_eq!(converter.matches("sample.validate()").count(), 1);
-        assert!(!before_validate_compact.contains("timestamp<"));
-        assert!(!before_validate_compact.contains("timestamp>"));
-        assert!(!before_validate_compact.contains("reset_at<"));
-        assert!(!before_validate_compact.contains("reset_at>"));
-        assert!(!before_validate.contains("if value > 0"));
-        assert!(!before_validate.contains("if value < 0"));
-        assert!(!before_validate.contains("value >= 0.0"));
-        assert!(!before_validate.contains("value < 0.0"));
-        assert!(!before_validate.contains("0.0..=100.0"));
-        assert!(!before_validate.contains("is_finite()"));
-
-        let sql_rows = |path: &std::path::Path| {
-            let connection = Connection::open(path).unwrap();
-            let mut statement = connection
-                .prepare(
-                    "SELECT timestamp, reset_at, remaining_percent,
-                            sol_dollars, terra_dollars, luna_dollars,
-                            sol_tokens, terra_tokens, luna_tokens
-                     FROM usage_history ORDER BY reset_at, timestamp",
-                )
-                .unwrap();
-            statement
-                .query_map([], |row| {
-                    Ok((
-                        row.get::<_, i64>(0)?,
-                        row.get::<_, i64>(1)?,
-                        row.get::<_, Option<f64>>(2)?,
-                        row.get::<_, f64>(3)?,
-                        row.get::<_, f64>(4)?,
-                        row.get::<_, f64>(5)?,
-                        row.get::<_, i64>(6)?,
-                        row.get::<_, i64>(7)?,
-                        row.get::<_, i64>(8)?,
-                    ))
-                })
-                .unwrap()
-                .map(|row| row.unwrap())
-                .collect::<Vec<_>>()
-        };
-        let before_import = sql_rows(&target_path);
-
-        let source_path = database_path("storage-focus11-sql-rows-one-validator-source");
-        let source = Connection::open(&source_path).unwrap();
-        source
-            .execute_batch(
-                "CREATE TABLE usage_history (
-                    timestamp INTEGER,
-                    reset_at INTEGER,
-                    remaining_percent,
-                    sol_dollars,
-                    terra_dollars,
-                    luna_dollars,
-                    sol_tokens INTEGER,
-                    terra_tokens INTEGER,
-                    luna_tokens INTEGER
-                );
-                INSERT INTO usage_history (
-                    timestamp, reset_at, remaining_percent,
-                    sol_dollars, terra_dollars, luna_dollars,
-                    sol_tokens, terra_tokens, luna_tokens
-                ) VALUES
-                    (1715156808, 1715156800, 60.0, 4.0, 5.0, 6.0, 1, 2, 3),
-                    (1715156809, 1715156800, -1.0, 4.0, 5.0, 6.0, 1, 2, 3);",
-            )
-            .unwrap();
-        drop(source);
-
-        assert!(store.import_v1_sqlite(&source_path).is_err());
-        assert_eq!(sql_rows(&target_path), before_import);
-        drop(store);
-        cleanup(&target_path);
-        cleanup(&source_path);
-    }
-
-    #[test]
-    fn storage_focus11_public_sqlite_import_accepts_exact_integer_boundary() {
-        let target_path = database_path("storage-focus11-integer-boundary-target");
-        let mut store = UsageStore::open(&target_path).unwrap();
-
-        let source_path = database_path("storage-focus11-integer-boundary-source");
-        let source = Connection::open(&source_path).unwrap();
-        source
-            .execute_batch(
-                "CREATE TABLE usage_history (
-                    timestamp INTEGER,
-                    reset_at INTEGER,
-                    remaining_percent,
-                    sol_dollars,
-                    terra_dollars,
-                    luna_dollars,
-                    sol_tokens INTEGER,
-                    terra_tokens INTEGER,
-                    luna_tokens INTEGER
-                );
-                INSERT INTO usage_history (
-                    timestamp, reset_at, remaining_percent,
-                    sol_dollars, terra_dollars, luna_dollars,
-                    sol_tokens, terra_tokens, luna_tokens
-                ) VALUES
-                    (1715156000, 1715155000, 100.0,
-                     9007199254740992, 0, 0, 11, 22, 33);",
-            )
-            .unwrap();
-        let source_type: String = source
-            .query_row("SELECT typeof(sol_dollars) FROM usage_history", [], |row| {
-                row.get(0)
-            })
-            .unwrap();
-        assert_eq!(source_type, "integer");
-        drop(source);
-
-        store.import_v1_sqlite(&source_path).unwrap();
-        let target = Connection::open(&target_path).unwrap();
-        let imported = target
-            .query_row(
-                "SELECT timestamp, reset_at, remaining_percent,
-                        sol_dollars, terra_dollars, luna_dollars,
-                        sol_tokens, terra_tokens, luna_tokens,
-                        typeof(sol_dollars)
-                 FROM usage_history",
-                [],
-                |row| {
-                    Ok((
-                        row.get::<_, i64>(0)?,
-                        row.get::<_, i64>(1)?,
-                        row.get::<_, Option<f64>>(2)?,
-                        row.get::<_, f64>(3)?,
-                        row.get::<_, f64>(4)?,
-                        row.get::<_, f64>(5)?,
-                        row.get::<_, i64>(6)?,
-                        row.get::<_, i64>(7)?,
-                        row.get::<_, i64>(8)?,
-                        row.get::<_, String>(9)?,
-                    ))
-                },
-            )
-            .unwrap();
-        assert_eq!(imported.0, 1715156000);
-        assert_eq!(imported.1, 1715155000);
-        assert_eq!(imported.2, Some(100.0));
-        assert_eq!(imported.3, 9007199254740992.0_f64);
-        assert_eq!(imported.4, 0.0);
-        assert_eq!(imported.5, 0.0);
-        assert_eq!(imported.6, 0);
-        assert_eq!(imported.7, 0);
-        assert_eq!(imported.8, 0);
-        assert_eq!(imported.9, "real");
-        drop(target);
-
-        let sql_rows = |path: &std::path::Path| {
-            let connection = Connection::open(path).unwrap();
-            let mut statement = connection
-                .prepare(
-                    "SELECT timestamp, reset_at, remaining_percent,
-                            sol_dollars, terra_dollars, luna_dollars,
-                            sol_tokens, terra_tokens, luna_tokens
-                     FROM usage_history ORDER BY reset_at, timestamp",
-                )
-                .unwrap();
-            statement
-                .query_map([], |row| {
-                    Ok((
-                        row.get::<_, i64>(0)?,
-                        row.get::<_, i64>(1)?,
-                        row.get::<_, Option<f64>>(2)?,
-                        row.get::<_, f64>(3)?,
-                        row.get::<_, f64>(4)?,
-                        row.get::<_, f64>(5)?,
-                        row.get::<_, i64>(6)?,
-                        row.get::<_, i64>(7)?,
-                        row.get::<_, i64>(8)?,
-                    ))
-                })
-                .unwrap()
-                .map(|row| row.unwrap())
-                .collect::<Vec<_>>()
-        };
-        let baseline = sql_rows(&target_path);
-
-        let invalid_source_path = database_path("storage-focus11-integer-boundary-invalid-source");
-        let invalid_source = Connection::open(&invalid_source_path).unwrap();
-        invalid_source
-            .execute_batch(
-                "CREATE TABLE usage_history (
-                    timestamp INTEGER,
-                    reset_at INTEGER,
-                    remaining_percent,
-                    sol_dollars,
-                    terra_dollars,
-                    luna_dollars,
-                    sol_tokens INTEGER,
-                    terra_tokens INTEGER,
-                    luna_tokens INTEGER
-                );
-                INSERT INTO usage_history (
-                    timestamp, reset_at, remaining_percent,
-                    sol_dollars, terra_dollars, luna_dollars,
-                    sol_tokens, terra_tokens, luna_tokens
-                ) VALUES
-                    (1715156001, 1715155001, 99.0, 0, 0, 0, 1, 2, 3),
-                    (1715156002, 1715155002, 98.0,
-                     9007199254740993, 0, 0, 1, 2, 3);",
-            )
-            .unwrap();
-        let invalid_source_type: String = invalid_source
-            .query_row(
-                "SELECT typeof(sol_dollars) FROM usage_history WHERE timestamp = 1715156002",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(invalid_source_type, "integer");
-        drop(invalid_source);
-
-        assert!(store.import_v1_sqlite(&invalid_source_path).is_err());
-        assert_eq!(sql_rows(&target_path), baseline);
-        drop(store);
-        cleanup(&target_path);
-        cleanup(&source_path);
-        cleanup(&invalid_source_path);
     }
 
     #[test]
