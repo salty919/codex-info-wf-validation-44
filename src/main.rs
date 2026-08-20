@@ -3097,21 +3097,12 @@ fn smooth_remaining_points_with_activity(
             })
             .sum::<f64>()
     };
-    let latest_active_drop_rate = |before: usize| {
-        (1..=before).rev().find_map(|end| {
-            let drop = points[end - 1].1 - points[end].1;
-            if drop <= 0.0 {
-                return None;
-            }
-            let duration = active_duration_between(end - 1, end);
-            (duration > f64::EPSILON).then_some(drop / duration)
-        })
-    };
-
     // A model can advance through several minute buckets while the quota
     // endpoint is still the previous reread. Treat a repeated value as a
-    // missed sample and fill it from the nearest surrounding lower endpoint.
-    // For example, `1 -> 1 -> 3` becomes `1 -> 2 -> 3`.
+    // missed sample only when it is bounded by a later, observed lower value.
+    // For example, `1 -> 1 -> 3` becomes `1 -> 2 -> 3`. A terminal plateau
+    // remains at the latest observation: model activity is not evidence that
+    // the service's quota reading has fallen.
     //
     // The search deliberately crosses short idle intervals. The line must not
     // slope while every model is idle, but an idle interval between two active
@@ -3133,9 +3124,10 @@ fn smooth_remaining_points_with_activity(
         while right_index < points.len() && points[right_index].1 >= left_value {
             right_index += 1;
         }
-        let terminal_extrapolation = right_index >= points.len();
-        if terminal_extrapolation {
-            right_index = points.len() - 1;
+        if right_index >= points.len() {
+            // There is no later observed lower quota value. Do not turn the
+            // latest real reading into a consumption-rate estimate.
+            continue;
         }
         if right_index <= left_index || points[right_index].0 <= points[left_index].0 {
             continue;
@@ -3145,17 +3137,9 @@ fn smooth_remaining_points_with_activity(
         if active_duration <= f64::EPSILON {
             continue;
         }
-        let right_value = if terminal_extrapolation {
-            let Some(rate) = latest_active_drop_rate(left_index) else {
-                continue;
-            };
-            (left_value - rate * active_duration).max(0.0)
-        } else {
-            let value = points[right_index].1;
-            if value >= left_value {
-                continue;
-            }
-            value
+        let right_value = points[right_index].1;
+        if right_value >= left_value {
+            continue;
         };
 
         let mut active_elapsed = 0.0;
@@ -3175,19 +3159,9 @@ fn smooth_remaining_points_with_activity(
             smoothed[point_index].1 = left_value + (right_value - left_value) * fraction;
             interpolated[point_index] = true;
         }
-        if terminal_extrapolation {
-            // There is no future quota endpoint yet, but an active terminal
-            // plateau is still a missing sample. Carry forward the most recent
-            // measured active drop rate so the line does not pretend that
-            // consumption stopped at the final reread. Clamp at zero because
-            // the quota cannot become negative.
-            smoothed[right_index].1 = right_value;
-            interpolated[right_index] = true;
-        }
         // For a measured lower endpoint the loop above stops before
         // right_index, so a later pass can use it as the next anchor without
-        // accumulating floating-point error. A terminal extrapolation writes
-        // its synthetic endpoint explicitly above.
+        // accumulating floating-point error.
     }
 
     for index in 1..points.len() - 1 {
@@ -7202,20 +7176,20 @@ mod tests {
         monthly_window_seconds, native_account_window_title, normal_status_text,
         open_codex_session_paths, parse_preview_size, parse_rate_limits, parse_resize_direction,
         period_remaining_text, physical_size_for_logical, plan_type_label, preview_model_row,
-        read_recovery_entries, recovery_timed_usage, remaining_graph_points, remaining_graph_y,
-        remaining_marker_positions, remaining_marker_positions_on_points, request_with_timeout,
-        same_rollout_identity, separate_current_label_positions, session_event_model,
-        session_event_type, session_jsonl_files, session_token_snapshot, smooth_model_spend,
-        smooth_remaining_points, split_metric_line_paths, stacked_area_path,
-        thread_presentation_rows, three_months_before_utc, unused_interval_positions,
-        week_remaining_text, ActiveThread, ActiveThreadUpdate, CodexInfoState, Event,
-        FixedResizeDecision, GraphPaths, GraphWindow, HourlyModelSpend, LocalUsageResult,
-        ManualX11Geometry, ManualX11WindowAction, ModelDollarTotals, ModelTokenTotals,
-        ModelUsageRow, ModelUsageTotals, RpcReadEvent, SessionTraversalBudget, TokenSnapshot,
-        UnusedIntervalPosition, UsageEvent, UsageHistory, UsageHistorySample, UsageStore,
-        FIXED_WINDOW_HEIGHT, FIXED_WINDOW_WIDTH, GRAPH_METRIC_OPTIONS, GRAPH_WINDOW_PURPOSE,
-        LOCAL_ESTIMATE_PRICE_VERSION, THREADS_WINDOW_PURPOSE, UNAUTHENTICATED_WINDOW_TITLE,
-        WEEK_SECONDS,
+        read_recovery_entries, recovery_timed_usage, remaining_graph_points,
+        remaining_graph_points_for_metric, remaining_graph_y, remaining_marker_positions,
+        remaining_marker_positions_on_points, request_with_timeout, same_rollout_identity,
+        separate_current_label_positions, session_event_model, session_event_type,
+        session_jsonl_files, session_token_snapshot, smooth_model_spend, smooth_remaining_points,
+        split_metric_line_paths, stacked_area_path, thread_presentation_rows,
+        three_months_before_utc, unused_interval_positions, week_remaining_text, ActiveThread,
+        ActiveThreadUpdate, CodexInfoState, Event, FixedResizeDecision, GraphPaths, GraphWindow,
+        HourlyModelSpend, LocalUsageResult, ManualX11Geometry, ManualX11WindowAction,
+        ModelDollarTotals, ModelTokenTotals, ModelUsageRow, ModelUsageTotals, RpcReadEvent,
+        SessionTraversalBudget, TokenSnapshot, UnusedIntervalPosition, UsageEvent, UsageHistory,
+        UsageHistorySample, UsageStore, FIXED_WINDOW_HEIGHT, FIXED_WINDOW_WIDTH,
+        GRAPH_METRIC_OPTIONS, GRAPH_WINDOW_PURPOSE, LOCAL_ESTIMATE_PRICE_VERSION,
+        THREADS_WINDOW_PURPOSE, UNAUTHENTICATED_WINDOW_TITLE, WEEK_SECONDS,
     };
     use super::{
         claim_manual_x11_action, forbidden_x11_states, manual_resize_geometry,
@@ -11147,54 +11121,64 @@ mod tests {
                 (60, 90.0),
                 (120, 85.0),
                 (180, 80.0),
-                (240, 70.0)
+                (240, 80.0)
             ]
         );
         assert_eq!(
             graph_paths(&references, 0, 240).remaining,
-            "M0.00 1.00 L25.00 10.80 L50.00 15.70 L75.00 20.60 L100.00 30.40"
+            "M0.00 1.00 L25.00 10.80 L50.00 15.70 L75.00 20.60 L100.00 20.60"
         );
     }
 
     #[test]
-    fn remaining_graph_terminal_extrapolation_never_goes_below_zero() {
+    fn remaining_graph_token_mode_keeps_the_latest_terminal_observation() {
         let samples = [
-            UsageHistorySample::new(0, 1_000, 100.0, ModelDollarTotals::default()),
-            UsageHistorySample::new(
+            UsageHistorySample::new_with_usage(
+                0,
+                1_000,
+                100.0,
+                ModelDollarTotals::default(),
+                ModelTokenTotals::default(),
+            ),
+            UsageHistorySample::new_with_usage(
                 60,
                 1_000,
-                10.0,
-                ModelDollarTotals {
-                    sol: 1.0,
-                    ..ModelDollarTotals::default()
+                99.0,
+                ModelDollarTotals::default(),
+                ModelTokenTotals {
+                    luna: 1,
+                    ..ModelTokenTotals::default()
                 },
             ),
-            UsageHistorySample::new(
+            UsageHistorySample::new_with_usage(
                 120,
                 1_000,
-                0.0,
-                ModelDollarTotals {
-                    sol: 2.0,
-                    ..ModelDollarTotals::default()
+                99.0,
+                ModelDollarTotals::default(),
+                ModelTokenTotals {
+                    luna: 2,
+                    ..ModelTokenTotals::default()
                 },
             ),
-            // An active terminal plateau would extrapolate below zero without
-            // the quota floor. Zero is the lower bound even while usage moves.
-            UsageHistorySample::new(
+            UsageHistorySample::new_with_usage(
                 180,
                 1_000,
-                0.0,
-                ModelDollarTotals {
-                    sol: 3.0,
-                    ..ModelDollarTotals::default()
+                99.0,
+                ModelDollarTotals::default(),
+                ModelTokenTotals {
+                    luna: 3,
+                    ..ModelTokenTotals::default()
                 },
             ),
         ];
         let references = samples.iter().collect::<Vec<_>>();
 
-        let points = remaining_graph_points(&references, 0, 180);
-        assert!(points.iter().all(|(_, value)| *value >= 0.0));
-        assert_eq!(points.last(), Some(&(180, 0.0)));
+        let points = remaining_graph_points_for_metric(&references, 0, 180, true);
+        assert_eq!(points.last(), Some(&(180, 99.0)));
+        assert!(points.iter().all(|(_, remaining)| *remaining >= 99.0));
+        let graph = graph_paths_for_selection(&references, 0, 180, true, true, true, true);
+        assert_eq!(graph.current_remaining_label, "99%");
+        assert!(graph.remaining.ends_with("L100.00 1.98"));
     }
 
     #[test]
