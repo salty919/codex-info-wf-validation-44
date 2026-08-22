@@ -47,6 +47,7 @@ pub enum SecurityErrorKind {
     UnsafePath,
     UnsafeExecutable,
     LimitExceeded,
+    Unterminated,
     #[cfg(test)]
     InvalidNumber,
     #[cfg(test)]
@@ -80,6 +81,7 @@ impl SecurityError {
             SecurityErrorKind::UnsafePath => "unsafe path",
             SecurityErrorKind::UnsafeExecutable => "unsafe executable",
             SecurityErrorKind::LimitExceeded => "security limit exceeded",
+            SecurityErrorKind::Unterminated => "unterminated protected record",
             #[cfg(test)]
             SecurityErrorKind::InvalidNumber => "invalid numeric value",
             #[cfg(test)]
@@ -511,17 +513,17 @@ pub fn resolve_executable_from_path<P: AsRef<OsStr>>(
     Err(SecurityError::new(SecurityErrorKind::UnsafeExecutable))
 }
 
-fn drain_until_newline<R: BufRead>(reader: &mut R) -> Result<(), SecurityError> {
+fn drain_until_newline<R: BufRead>(reader: &mut R) -> Result<bool, SecurityError> {
     loop {
         let buffer = reader
             .fill_buf()
             .map_err(|_| SecurityError::new(SecurityErrorKind::Io))?;
         if buffer.is_empty() {
-            return Ok(());
+            return Ok(false);
         }
         if let Some(position) = buffer.iter().position(|byte| *byte == b'\n') {
             reader.consume(position + 1);
-            return Ok(());
+            return Ok(true);
         }
         let length = buffer.len();
         reader.consume(length);
@@ -559,8 +561,12 @@ pub fn read_bounded_jsonl_record<R: BufRead>(
         if line.len().saturating_add(buffer.len()) > MAX_JSONL_LINE_BYTES {
             let length = buffer.len();
             reader.consume(length);
-            drain_until_newline(reader)?;
-            return Err(SecurityError::new(SecurityErrorKind::LimitExceeded));
+            let terminated = drain_until_newline(reader)?;
+            return Err(SecurityError::new(if terminated {
+                SecurityErrorKind::LimitExceeded
+            } else {
+                SecurityErrorKind::Unterminated
+            }));
         }
         line.extend_from_slice(buffer);
         let length = buffer.len();
@@ -571,13 +577,23 @@ pub fn read_bounded_jsonl_record<R: BufRead>(
     }
     String::from_utf8(line)
         .map(|line| Some((line, terminated)))
-        .map_err(|_| SecurityError::new(SecurityErrorKind::Parse))
+        .map_err(|_| {
+            SecurityError::new(if terminated {
+                SecurityErrorKind::Parse
+            } else {
+                SecurityErrorKind::Unterminated
+            })
+        })
 }
 
 pub fn read_bounded_jsonl_line<R: BufRead>(
     reader: &mut R,
 ) -> Result<Option<String>, SecurityError> {
-    read_bounded_jsonl_record(reader).map(|record| record.map(|(line, _)| line))
+    match read_bounded_jsonl_record(reader)? {
+        Some((line, true)) => Ok(Some(line)),
+        Some((_line, false)) => Err(SecurityError::new(SecurityErrorKind::Unterminated)),
+        None => Ok(None),
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -951,6 +967,32 @@ mod tests {
             read_bounded_jsonl_line(&mut exact_reader).expect("next"),
             Some("next".to_owned())
         );
+    }
+
+    #[test]
+    fn jsonl_reader_rejects_unterminated_invalid_and_oversized_records() {
+        let mut invalid = Cursor::new(vec![b'{', 0xff, b'}']);
+        assert!(matches!(
+            read_bounded_jsonl_record(&mut invalid),
+            Err(error) if error.kind() == SecurityErrorKind::Unterminated
+        ));
+
+        let mut oversized = Cursor::new(vec![b'x'; MAX_JSONL_LINE_BYTES + 1]);
+        assert!(matches!(
+            read_bounded_jsonl_record(&mut oversized),
+            Err(error) if error.kind() == SecurityErrorKind::Unterminated
+        ));
+
+        let mut valid = Cursor::new(b"{}".to_vec());
+        assert!(matches!(
+            read_bounded_jsonl_line(&mut valid),
+            Err(error) if error.kind() == SecurityErrorKind::Unterminated
+        ));
+        let mut rpc = Cursor::new(br#"{"jsonrpc":"2.0"}"#.to_vec());
+        assert!(matches!(
+            RpcLine::read(&mut rpc),
+            Err(error) if error.kind() == SecurityErrorKind::Unterminated
+        ));
     }
 
     #[test]

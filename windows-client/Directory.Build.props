@@ -1,0 +1,8 @@
+<!-- Copyright (C) 2026 salty919 -->
+<!-- SPDX-License-Identifier: GPL-3.0-only -->
+<Project>
+  <PropertyGroup>
+    <RestorePackagesWithLockFile Condition="'$(MSBuildProjectName)' != 'CodexInfo.WindowsClient.Core'">true</RestorePackagesWithLockFile>
+    <Deterministic>true</Deterministic>
+  </PropertyGroup>
+</Project>

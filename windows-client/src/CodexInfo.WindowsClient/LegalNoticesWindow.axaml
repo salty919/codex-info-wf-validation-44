@@ -1,0 +1,72 @@
+<!-- Copyright (C) 2026 salty919 -->
+<!-- SPDX-License-Identifier: GPL-3.0-only -->
+<Window xmlns="https://github.com/avaloniaui"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:vm="using:CodexInfo.WindowsClient.ViewModels"
+        xmlns:core="using:CodexInfo.WindowsClient.Core"
+        x:Class="CodexInfo.WindowsClient.LegalNoticesWindow"
+        x:DataType="vm:LegalNoticesWindowViewModel"
+        Width="760"
+        Height="560"
+        MinWidth="560"
+        MinHeight="400"
+        WindowStartupLocation="CenterOwner"
+        CanResize="False"
+        WindowDecorations="None"
+        ExtendClientAreaToDecorationsHint="True"
+        ExtendClientAreaTitleBarHeightHint="0"
+        Title="Codex Info Legal"
+        FontFamily="{StaticResource JapaneseFont}"
+        Background="#0E141E"
+        Foreground="#E9EFF8">
+  <Window.Styles>
+    <Style Selector="TextBlock.label">
+      <Setter Property="FontSize" Value="13" />
+      <Setter Property="Foreground" Value="#A8B7CA" />
+    </Style>
+    <Style Selector="Border.notice-card">
+      <Setter Property="Background" Value="#151F2D" />
+      <Setter Property="BorderBrush" Value="#263548" />
+      <Setter Property="BorderThickness" Value="1" />
+      <Setter Property="CornerRadius" Value="8" />
+      <Setter Property="Padding" Value="14" />
+    </Style>
+    <Style Selector="Button.window-control">
+      <Setter Property="Width" Value="32" />
+      <Setter Property="Height" Value="30" />
+      <Setter Property="Padding" Value="0" />
+      <Setter Property="FontSize" Value="17" />
+      <Setter Property="Background" Value="Transparent" />
+      <Setter Property="BorderBrush" Value="Transparent" />
+      <Setter Property="Foreground" Value="#A8B7CA" />
+    </Style>
+    <Style Selector="Button.window-control:pointerover">
+      <Setter Property="Background" Value="#263548" />
+      <Setter Property="Foreground" Value="#F2F6FC" />
+    </Style>
+  </Window.Styles>
+  <Grid Margin="24" RowDefinitions="Auto,Auto,*" RowSpacing="12">
+    <Grid ColumnDefinitions="*,Auto" Background="Transparent" PointerPressed="OnTitlePointerPressed">
+      <TextBlock FontSize="24" FontWeight="SemiBold" Text="{Binding Texts.Legal}" />
+      <StackPanel Grid.Column="1" Orientation="Horizontal" Spacing="2">
+        <Button Classes="window-control" Click="OnMinimizeWindow" AutomationProperties.Name="{Binding Texts.Minimize}" Content="—" ToolTip.Tip="{Binding Texts.Minimize}" />
+        <Button Classes="window-control" Click="OnCloseWindow" AutomationProperties.Name="{Binding Texts.Close}" Content="×" ToolTip.Tip="{Binding Texts.Close}" />
+      </StackPanel>
+    </Grid>
+    <TextBlock Grid.Row="1" Classes="label" Text="{Binding DetailsStatusText}" />
+    <ScrollViewer Grid.Row="2" VerticalScrollBarVisibility="Auto">
+      <ItemsControl ItemsSource="{Binding Notices}">
+        <ItemsControl.ItemTemplate>
+          <DataTemplate x:DataType="core:ApiLegalNotice">
+            <Border Classes="notice-card" Margin="0,0,0,12">
+              <StackPanel Spacing="7">
+                <TextBlock FontSize="17" FontWeight="SemiBold" Text="{Binding Name}" />
+                <TextBlock Classes="label" Text="{Binding Text}" TextWrapping="Wrap" />
+              </StackPanel>
+            </Border>
+          </DataTemplate>
+        </ItemsControl.ItemTemplate>
+      </ItemsControl>
+    </ScrollViewer>
+  </Grid>
+</Window>

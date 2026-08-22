@@ -23,6 +23,20 @@ jobs:
     steps:
     - uses: actions/checkout@v4
     - name: Build
-      run: cargo build --verbose
+      run: cargo build --verbose --locked
+    - name: Format check
+      run: cargo fmt --check
+    - name: Check
+      run: cargo check --locked
     - name: Run tests
-      run: cargo test --verbose
+      run: cargo test --verbose --locked
+    - name: Release build
+      run: cargo build --release --locked
+    - name: Recorder daemon live acceptance
+      run: bash scripts/record_daemon_e2e.sh
+    - name: Enforce data protection policy
+      run: bash scripts/data_protection_gate.sh
+    - name: Enforce cross-client regression and independent-review gate
+      run: bash scripts/regression_guard.sh
+    - name: Enforce requirements intake gate
+      run: bash scripts/requirements_intake_guard.sh

@@ -1,0 +1,48 @@
+// Copyright (C) 2026 salty919
+// SPDX-License-Identifier: GPL-3.0-only
+
+using Avalonia;
+using Avalonia.Controls.ApplicationLifetimes;
+using CodexInfo.WindowsClient.Core;
+using CodexInfo.WindowsClient.Localization;
+using CodexInfo.WindowsClient.Settings;
+using CodexInfo.WindowsClient.ViewModels;
+
+namespace CodexInfo.WindowsClient;
+
+public partial class App : Application
+{
+    public static ClientSettingsStore SettingsStore { get; } = new();
+
+    public static ClientSettings CurrentSettings { get; internal set; } = ClientSettings.Default;
+
+    public override void OnFrameworkInitializationCompleted()
+    {
+        if (ApplicationLifetime is IClassicDesktopStyleApplicationLifetime desktop)
+        {
+            var settings = SettingsStore.Load();
+            var preview = PreviewEnvironment.Enabled;
+            // Visual fixtures are deliberately isolated from the user's
+            // persisted setup state.  They must never make a real install
+            // appear configured or contact the account endpoint.
+            CurrentSettings = preview
+                ? settings with
+                {
+                    SetupCompleted = !PreviewEnvironment.IsSetup,
+                    ConnectionConfigured = !PreviewEnvironment.IsSetup,
+                }
+                : settings;
+            LocalizationService.SetLanguage(settings.Language);
+            LocalizationService.SetTimeZone(settings.TimeZoneId);
+            ILoopbackStatusClient client = preview ? new PreviewLoopbackClient() : new LoopbackStatusClient();
+            var supervisor = preview ? null : new ConnectionSupervisor();
+            var viewModel = new MainWindowViewModel(client, client as ILoopbackDetailsClient, supervisor);
+            desktop.MainWindow = new MainWindow
+            {
+                DataContext = viewModel,
+            };
+        }
+
+        base.OnFrameworkInitializationCompleted();
+    }
+}

@@ -3,13 +3,16 @@
 
 use chrono::{DateTime, Months, Utc};
 use rusqlite::types::Value;
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, DatabaseName, OptionalExtension};
+use std::collections::BTreeSet;
 use std::fmt;
 use std::fs;
 use std::fs::OpenOptions;
 use std::path::Path;
 #[cfg(test)]
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS usage_history (
@@ -36,6 +39,7 @@ CREATE TABLE IF NOT EXISTS durable_state (
 "#;
 
 const RESET_GROUP_TOLERANCE_SECONDS: i128 = 60;
+static BACKUP_TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 const UPSERT_SAMPLE: &str = r#"
 INSERT INTO usage_history (
@@ -108,6 +112,16 @@ pub struct DurableRecord {
     pub data_generation: u64,
     pub data_hash: String,
     pub snapshot_json: String,
+}
+
+/// Result of a verified, candidate-database migration.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MigrationReport {
+    pub source_rows: usize,
+    pub candidate_rows: usize,
+    pub source_fingerprint: String,
+    pub candidate_fingerprint: String,
+    pub preserved_backup: std::path::PathBuf,
 }
 
 /// Errors returned while opening or using a usage history database.
@@ -312,6 +326,61 @@ fn valid_sample_from_row(row: &rusqlite::Row<'_>) -> Result<Option<UsageHistoryS
     Ok(Some(sample))
 }
 
+fn samples_fingerprint(samples: &[UsageHistorySample]) -> String {
+    // A deterministic, dependency-free fingerprint is sufficient for the
+    // migration gate: it detects any row/value/order change between the
+    // source and candidate snapshots without persisting credentials or data.
+    let mut hash = 0xcbf29ce484222325_u64;
+    let mut feed = |bytes: &[u8]| {
+        for byte in bytes {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(0x100000001b3);
+        }
+    };
+    for sample in samples {
+        feed(&sample.timestamp.to_le_bytes());
+        feed(&sample.reset_at.to_le_bytes());
+        feed(
+            &sample
+                .remaining_percent
+                .unwrap_or(f64::NAN)
+                .to_bits()
+                .to_le_bytes(),
+        );
+        feed(&sample.sol_dollars.to_bits().to_le_bytes());
+        feed(&sample.terra_dollars.to_bits().to_le_bytes());
+        feed(&sample.luna_dollars.to_bits().to_le_bytes());
+        feed(&sample.sol_tokens.to_le_bytes());
+        feed(&sample.terra_tokens.to_le_bytes());
+        feed(&sample.luna_tokens.to_le_bytes());
+    }
+    format!("{hash:016x}")
+}
+
+fn validate_migration_samples(samples: &[UsageHistorySample]) -> Result<()> {
+    let mut keys = BTreeSet::new();
+    for sample in samples {
+        sample.validate()?;
+        if !keys.insert((sample.reset_at, sample.timestamp)) {
+            return Err(UsageStoreError::InvalidImport(
+                "migration candidate contains duplicate history keys".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn quick_check_database(path: &Path) -> Result<()> {
+    let connection = Connection::open(path)?;
+    let result: String = connection.query_row("PRAGMA quick_check", [], |row| row.get(0))?;
+    if result != "ok" {
+        return Err(UsageStoreError::InvalidImport(format!(
+            "migration candidate quick_check failed: {result}"
+        )));
+    }
+    Ok(())
+}
+
 fn validate_data_hash(data_hash: &str) -> Result<()> {
     if data_hash.len() != 64
         || !data_hash
@@ -489,6 +558,11 @@ impl UsageStore {
         }
 
         let mut connection = Connection::open(path)?;
+        // Multiple Codex Info instances are allowed to observe the same
+        // history DB. SQLite remains the serialization authority; a bounded
+        // busy timeout prevents a transient writer collision from discarding
+        // an otherwise valid batch.
+        connection.busy_timeout(Duration::from_secs(2))?;
         let transaction = connection.transaction()?;
         transaction.execute_batch(SCHEMA)?;
         // A database must already have the current schema. Older formats are
@@ -512,6 +586,302 @@ impl UsageStore {
     /// Alias for callers that prefer constructor-style naming.
     pub fn new<P: AsRef<Path>>(path: P) -> Result<Self> {
         Self::open(path)
+    }
+
+    /// Create bounded, SQLite-consistent backup generations before a
+    /// destructive maintenance operation. The source is never replaced; a
+    /// failed backup leaves all existing generations untouched. Rotation is
+    /// staged inside the same directory and rolled back if any rename fails;
+    /// this matters because a backup failure must not silently consume the
+    /// only older generation that could be used for manual recovery.
+    pub fn backup_generations<P: AsRef<Path>>(path: P, generations: usize) -> Result<()> {
+        let path = path.as_ref();
+        if generations == 0 {
+            return Ok(());
+        }
+        if !path.is_absolute() {
+            return Err(UsageStoreError::InvalidImport(
+                "database backup path must be absolute".into(),
+            ));
+        }
+        let parent = path.parent().ok_or_else(|| {
+            UsageStoreError::InvalidImport("database backup parent is missing".into())
+        })?;
+        let file_name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| UsageStoreError::InvalidImport("database filename is invalid".into()))?;
+
+        // Validate the source without changing it before creating any
+        // temporary or generation file. This rejects corrupt/old-schema input
+        // at the read boundary and leaves every existing generation intact.
+        let source_store = Self::open(path)?;
+        drop(source_store);
+        let source = Connection::open(path)?;
+        source.busy_timeout(Duration::from_secs(2))?;
+        let source_check: String = source.query_row("PRAGMA quick_check", [], |row| row.get(0))?;
+        if source_check != "ok" {
+            return Err(UsageStoreError::InvalidImport(format!(
+                "source database quick_check failed: {source_check}"
+            )));
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::create_dir_all(parent)?;
+            fs::set_permissions(parent, fs::Permissions::from_mode(0o700))?;
+        }
+
+        let counter = BACKUP_TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let temporary = parent.join(format!(
+            ".{file_name}.backup.tmp-{}-{counter}",
+            std::process::id(),
+        ));
+        if fs::symlink_metadata(&temporary).is_ok() {
+            return Err(UsageStoreError::InvalidImport(
+                "stale backup temporary exists; inspect before retry".into(),
+            ));
+        }
+        let backup_result = source.backup(DatabaseName::Main, &temporary, None);
+        if let Err(error) = backup_result {
+            let _ = fs::remove_file(&temporary);
+            return Err(error.into());
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if let Err(error) = fs::set_permissions(&temporary, fs::Permissions::from_mode(0o600)) {
+                let _ = fs::remove_file(&temporary);
+                return Err(error.into());
+            }
+        }
+        if let Err(error) = quick_check_database(&temporary) {
+            let _ = fs::remove_file(&temporary);
+            return Err(error);
+        }
+        drop(source);
+
+        let stage_prefix = format!(
+            ".{file_name}.backup-rotate-{}-{counter}",
+            std::process::id()
+        );
+        let mut staged = Vec::with_capacity(generations);
+        for generation in 1..=generations {
+            let final_path = path.with_extension(format!("sqlite3.bak.{generation}"));
+            let stage_path = parent.join(format!("{stage_prefix}-{generation}"));
+            if fs::symlink_metadata(&stage_path).is_ok() {
+                let _ = fs::remove_file(&temporary);
+                return Err(UsageStoreError::InvalidImport(
+                    "stale backup rotation file exists; inspect before retry".into(),
+                ));
+            }
+            if let Ok(metadata) = fs::symlink_metadata(&final_path) {
+                if metadata.file_type().is_symlink() || !metadata.is_file() {
+                    let _ = fs::remove_file(&temporary);
+                    return Err(UsageStoreError::InvalidImport(
+                        "backup generation is not a regular file".into(),
+                    ));
+                }
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    if metadata.permissions().mode() & 0o077 != 0 {
+                        let _ = fs::remove_file(&temporary);
+                        return Err(UsageStoreError::InvalidImport(
+                            "backup generation is not private".into(),
+                        ));
+                    }
+                }
+                staged.push((final_path, stage_path));
+            }
+        }
+
+        // Move every existing generation out of the way first. Since each
+        // destination is now empty, a later failure can restore the exact
+        // original names without overwriting a racing file.
+        let mut moved = Vec::new();
+        let rotation_result = (|| -> Result<()> {
+            for (final_path, stage_path) in &staged {
+                fs::rename(final_path, stage_path)?;
+                moved.push((final_path.clone(), stage_path.clone()));
+            }
+            let first = path.with_extension("sqlite3.bak.1");
+            fs::rename(&temporary, &first)?;
+            for generation in (2..=generations).rev() {
+                let source_stage = parent.join(format!("{stage_prefix}-{}", generation - 1));
+                if fs::symlink_metadata(&source_stage).is_ok() {
+                    let destination = path.with_extension(format!("sqlite3.bak.{generation}"));
+                    fs::rename(&source_stage, destination)?;
+                }
+            }
+            // The oldest generation is intentionally discarded only after
+            // every retained generation has been installed. Failure to remove
+            // this private staging file is non-fatal; it is not an advertised
+            // generation and can be inspected/cleaned on the next run.
+            let oldest_stage = parent.join(format!("{stage_prefix}-{generations}"));
+            let _ = fs::remove_file(oldest_stage);
+            Ok(())
+        })();
+
+        if let Err(error) = rotation_result {
+            // Restore installed generations to their staging names. The new
+            // generation is moved back to its temporary name so the caller
+            // never observes a partially rotated set on a failed operation.
+            let first = path.with_extension("sqlite3.bak.1");
+            if fs::symlink_metadata(&first).is_ok() {
+                let _ = fs::rename(&first, &temporary);
+            }
+            for generation in 2..=generations {
+                let destination = path.with_extension(format!("sqlite3.bak.{generation}"));
+                let source_stage = parent.join(format!("{stage_prefix}-{}", generation - 1));
+                if fs::symlink_metadata(&destination).is_ok() {
+                    let _ = fs::rename(destination, source_stage);
+                }
+            }
+            for (final_path, stage_path) in moved.into_iter().rev() {
+                if fs::symlink_metadata(&stage_path).is_ok() {
+                    let _ = fs::rename(stage_path, final_path);
+                }
+            }
+            let _ = fs::remove_file(&temporary);
+            for (_, stage_path) in staged {
+                let _ = fs::remove_file(stage_path);
+            }
+            return Err(error);
+        }
+
+        Ok(())
+    }
+
+    /// Migrate through a separately validated candidate database.
+    ///
+    /// The caller supplies an explicit transformation, so no schema or row
+    /// value is guessed implicitly. The source remains untouched until the
+    /// candidate has passed validation, quick_check, row/fingerprint equality
+    /// and reset-period boundary comparison. The old file is retained beside
+    /// the new file for manual rollback; a failure restores the source.
+    pub fn migrate_verified<P, F>(path: P, transform: F) -> Result<MigrationReport>
+    where
+        P: AsRef<Path>,
+        F: FnOnce(&[UsageHistorySample]) -> Result<Vec<UsageHistorySample>>,
+    {
+        let path = path.as_ref();
+        if !path.is_absolute() {
+            return Err(UsageStoreError::InvalidImport(
+                "database path must be absolute".into(),
+            ));
+        }
+        let parent = path.parent().ok_or_else(|| {
+            UsageStoreError::InvalidImport("database migration parent is missing".into())
+        })?;
+        fs::create_dir_all(parent)?;
+        let file_name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| UsageStoreError::InvalidImport("database filename is invalid".into()))?;
+        let pid = std::process::id();
+        let candidate = parent.join(format!(".{file_name}.migration-{pid}.candidate"));
+        let rollback = parent.join(format!(".{file_name}.migration-{pid}.original"));
+        let lock_path = parent.join(format!(".{file_name}.migration.lock"));
+
+        let mut lock_options = OpenOptions::new();
+        lock_options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            lock_options.mode(0o600);
+        }
+        let _lock = lock_options.open(&lock_path).map_err(|error| {
+            UsageStoreError::Io(std::io::Error::new(
+                error.kind(),
+                format!("database migration is already running: {error}"),
+            ))
+        })?;
+
+        let result = (|| {
+            if candidate.exists() || rollback.exists() {
+                return Err(UsageStoreError::InvalidImport(
+                    "stale migration candidate/original exists; inspect before retry".into(),
+                ));
+            }
+            let source_store = Self::open(path)?;
+            let source_samples = source_store.load_all()?;
+            let source_periods = build_reset_periods(&source_samples);
+            let source_fingerprint = samples_fingerprint(&source_samples);
+            let candidate_samples = transform(&source_samples)?;
+            validate_migration_samples(&candidate_samples)?;
+            let mut candidate_store = Self::open(&candidate)?;
+            candidate_store.upsert_samples(&candidate_samples)?;
+            drop(candidate_store);
+            quick_check_database(&candidate)?;
+            let candidate_store = Self::open(&candidate)?;
+            let verified_samples = candidate_store.load_all()?;
+            let candidate_periods = build_reset_periods(&verified_samples);
+            let candidate_fingerprint = samples_fingerprint(&verified_samples);
+            if verified_samples.len() != source_samples.len()
+                || verified_samples.len() != candidate_samples.len()
+                || candidate_fingerprint != samples_fingerprint(&candidate_samples)
+                || source_periods != candidate_periods
+            {
+                return Err(UsageStoreError::InvalidImport(
+                    "migration candidate row/fingerprint/period validation failed".into(),
+                ));
+            }
+            drop(candidate_store);
+            drop(source_store);
+
+            // Preserve the current database before the atomic path switch.
+            Self::backup_generations(path, 3)?;
+            // Keep a separately named old generation for manual rollback.
+            // The source is closed and validated above, so a byte copy here
+            // cannot observe an in-flight transaction. On Unix, replacing the
+            // path with one same-directory rename is the atomic publication
+            // boundary; the old DB remains available at `rollback` and in the
+            // online backup generations. Windows cannot replace an open file
+            // through `rename`, so it uses the conservative two-rename path.
+            let preserve_result = (|| -> Result<()> {
+                fs::copy(path, &rollback)?;
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    fs::set_permissions(&rollback, fs::Permissions::from_mode(0o600))?;
+                }
+                quick_check_database(&rollback)
+            })();
+            if let Err(error) = preserve_result {
+                let _ = fs::remove_file(&rollback);
+                return Err(error);
+            }
+            #[cfg(unix)]
+            {
+                if let Err(error) = fs::rename(&candidate, path) {
+                    let _ = fs::remove_file(&rollback);
+                    return Err(UsageStoreError::Io(error));
+                }
+            }
+            #[cfg(not(unix))]
+            {
+                fs::rename(path, &rollback)?;
+                if let Err(error) = fs::rename(&candidate, path) {
+                    let _ = fs::rename(&rollback, path);
+                    return Err(UsageStoreError::Io(error));
+                }
+            }
+
+            Ok(MigrationReport {
+                source_rows: source_samples.len(),
+                candidate_rows: verified_samples.len(),
+                source_fingerprint,
+                candidate_fingerprint,
+                preserved_backup: rollback,
+            })
+        })();
+
+        if result.is_err() {
+            let _ = fs::remove_file(&candidate);
+        }
+        let _ = fs::remove_file(&lock_path);
+        result
     }
 
     /// Loads all samples in reset-window and timestamp order.
@@ -802,6 +1172,7 @@ mod tests {
     use super::*;
     use chrono::TimeZone;
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Arc, Barrier};
 
     fn database_path(test_name: &str) -> PathBuf {
         static NEXT_ID: AtomicU64 = AtomicU64::new(0);
@@ -964,6 +1335,168 @@ mod tests {
         );
         drop(store);
 
+        assert_eq!(
+            UsageStore::open(&path).unwrap().load_all().unwrap(),
+            vec![first, second]
+        );
+        remove_database(&path);
+    }
+
+    #[test]
+    fn concurrent_collectors_merge_one_minute_without_duplicate_rows() {
+        let path = database_path("concurrent-merge");
+        drop(UsageStore::open(&path).unwrap());
+        let barrier = Arc::new(Barrier::new(2));
+        let first = sample(1_700_000_060, 1_700_604_800, Some(75.0), 1.25);
+        let mut second = first.clone();
+        second.sol_dollars = 4.5;
+        second.sol_tokens = 900;
+        let left_path = path.clone();
+        let left_barrier = Arc::clone(&barrier);
+        let left = std::thread::spawn(move || {
+            let store = UsageStore::open(left_path).unwrap();
+            left_barrier.wait();
+            store.upsert_sample(&first).unwrap();
+        });
+        let right_path = path.clone();
+        let right_barrier = Arc::clone(&barrier);
+        let right = std::thread::spawn(move || {
+            let store = UsageStore::open(right_path).unwrap();
+            right_barrier.wait();
+            store.upsert_sample(&second).unwrap();
+        });
+        left.join().unwrap();
+        right.join().unwrap();
+        let rows = UsageStore::open(&path).unwrap().load_all().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].sol_dollars, 4.5);
+        assert_eq!(rows[0].sol_tokens, 900);
+        remove_database(&path);
+    }
+
+    #[test]
+    fn backup_generations_are_sqlite_consistent_and_bounded() {
+        let path = database_path("backup-generations");
+        let first = sample(1_700_000_060, 1_700_604_800, Some(75.0), 1.25);
+        let store = UsageStore::open(&path).unwrap();
+        store.upsert_sample(&first).unwrap();
+        drop(store);
+        for _ in 0..4 {
+            UsageStore::backup_generations(&path, 3).unwrap();
+        }
+        for generation in 1..=3 {
+            let backup = path.with_extension(format!("sqlite3.bak.{generation}"));
+            assert!(backup.is_file(), "missing backup generation {generation}");
+            let connection = Connection::open(&backup).unwrap();
+            let quick_check: String = connection
+                .query_row("PRAGMA quick_check", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(quick_check, "ok");
+            assert_eq!(
+                UsageStore::open(&backup).unwrap().load_all().unwrap(),
+                vec![first.clone()]
+            );
+        }
+        assert!(!path.with_extension("sqlite3.bak.4").exists());
+        remove_database(&path);
+    }
+
+    #[test]
+    fn failed_backup_rotation_keeps_existing_generation_untouched() {
+        let path = database_path("backup-rotation-failure");
+        let original = sample(1_700_000_060, 1_700_604_800, Some(75.0), 1.25);
+        let store = UsageStore::open(&path).unwrap();
+        store.upsert_sample(&original).unwrap();
+        drop(store);
+        UsageStore::backup_generations(&path, 3).unwrap();
+        let first = path.with_extension("sqlite3.bak.1");
+        let before = fs::read(&first).unwrap();
+
+        // A non-regular generation is rejected before rotation starts. The
+        // current DB and the already usable generation must remain intact.
+        let blocked = path.with_extension("sqlite3.bak.2");
+        fs::create_dir(&blocked).unwrap();
+        assert!(UsageStore::backup_generations(&path, 3).is_err());
+        assert_eq!(fs::read(&first).unwrap(), before);
+        assert_eq!(
+            UsageStore::open(&path).unwrap().load_all().unwrap(),
+            vec![original]
+        );
+        fs::remove_dir(&blocked).unwrap();
+        remove_database(&path);
+    }
+
+    #[test]
+    fn verified_migration_switches_only_after_candidate_validation() {
+        let path = database_path("verified-migration");
+        let original = sample(1_700_000_060, 1_700_604_800, Some(75.0), 1.25);
+        let store = UsageStore::open(&path).unwrap();
+        store.upsert_sample(&original).unwrap();
+        drop(store);
+
+        let report = UsageStore::migrate_verified(&path, |samples| {
+            let mut migrated = samples.to_vec();
+            migrated[0].sol_dollars = 2.5;
+            Ok(migrated)
+        })
+        .unwrap();
+
+        assert_eq!(report.source_rows, 1);
+        assert_eq!(report.candidate_rows, 1);
+        assert!(report.preserved_backup.is_file());
+        let migrated = UsageStore::open(&path).unwrap().load_all().unwrap();
+        assert_eq!(migrated[0].sol_dollars, 2.5);
+        let preserved = UsageStore::open(&report.preserved_backup)
+            .unwrap()
+            .load_all()
+            .unwrap();
+        assert_eq!(preserved, vec![original]);
+        remove_database(&path);
+        let _ = fs::remove_file(report.preserved_backup);
+    }
+
+    #[test]
+    fn invalid_migration_candidate_leaves_source_untouched() {
+        let path = database_path("invalid-migration");
+        let original = sample(1_700_000_060, 1_700_604_800, Some(75.0), 1.25);
+        let store = UsageStore::open(&path).unwrap();
+        store.upsert_sample(&original).unwrap();
+        drop(store);
+
+        let result = UsageStore::migrate_verified(&path, |samples| {
+            let mut migrated = samples.to_vec();
+            migrated[0].remaining_percent = Some(101.0);
+            Ok(migrated)
+        });
+        assert!(result.is_err());
+        assert_eq!(
+            UsageStore::open(&path).unwrap().load_all().unwrap(),
+            vec![original]
+        );
+        assert!(!path
+            .parent()
+            .unwrap()
+            .join(format!(
+                ".{}.migration.lock",
+                path.file_name().unwrap().to_string_lossy()
+            ))
+            .exists());
+        remove_database(&path);
+    }
+
+    #[test]
+    fn migration_that_drops_a_valid_row_is_rejected_before_switch() {
+        let path = database_path("migration-row-drop");
+        let first = sample(1_700_000_060, 1_700_604_800, Some(75.0), 1.25);
+        let second = sample(1_700_000_120, 1_700_604_800, Some(70.0), 2.5);
+        let mut store = UsageStore::open(&path).unwrap();
+        store
+            .upsert_samples(&[first.clone(), second.clone()])
+            .unwrap();
+        drop(store);
+
+        let result = UsageStore::migrate_verified(&path, |samples| Ok(vec![samples[0].clone()]));
+        assert!(result.is_err());
         assert_eq!(
             UsageStore::open(&path).unwrap().load_all().unwrap(),
             vec![first, second]

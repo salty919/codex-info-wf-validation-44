@@ -1,0 +1,139 @@
+<!-- Copyright (C) 2026 salty919 -->
+<!-- SPDX-License-Identifier: GPL-3.0-only -->
+<Window xmlns="https://github.com/avaloniaui"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:vm="using:CodexInfo.WindowsClient.ViewModels"
+        xmlns:core="using:CodexInfo.WindowsClient.Core"
+        xmlns:plot="using:CodexInfo.WindowsClient.Controls"
+        x:Class="CodexInfo.WindowsClient.GraphWindow"
+        x:DataType="vm:GraphWindowViewModel"
+        Width="940"
+        Height="640"
+        MinWidth="700"
+        MinHeight="480"
+        WindowStartupLocation="CenterOwner"
+        CanResize="True"
+        WindowDecorations="None"
+        ExtendClientAreaToDecorationsHint="True"
+        ExtendClientAreaTitleBarHeightHint="0"
+        Title="Codex Info Graph"
+        FontFamily="{StaticResource JapaneseFont}"
+        Background="#0E141E"
+        Foreground="#E9EFF8">
+  <Window.Styles>
+    <Style Selector="TextBlock.label">
+      <Setter Property="FontSize" Value="13" />
+      <Setter Property="Foreground" Value="#A8B7CA" />
+    </Style>
+    <!-- GraphToggle in the native client is a colored line plus a label;
+         do not expose Avalonia's filled checkbox glyph as a second legend. -->
+    <Style Selector="ToggleButton.series-toggle">
+      <Setter Property="Background" Value="Transparent" />
+      <Setter Property="BorderBrush" Value="Transparent" />
+      <Setter Property="Foreground" Value="#E9EFF8" />
+      <Setter Property="FontSize" Value="13" />
+      <Setter Property="Padding" Value="0" />
+      <Setter Property="Height" Value="24" />
+      <Setter Property="Opacity" Value="0.65" />
+    </Style>
+    <Style Selector="ToggleButton.series-toggle:checked">
+      <Setter Property="Opacity" Value="1" />
+    </Style>
+    <Style Selector="ToggleButton.series-toggle:pointerover">
+      <Setter Property="Background" Value="#1C3150" />
+    </Style>
+    <Style Selector="Button.toolbar">
+      <Setter Property="Padding" Value="12,6" />
+      <Setter Property="Background" Value="#294968" />
+      <Setter Property="BorderBrush" Value="#47769F" />
+      <Setter Property="Foreground" Value="#F2F6FC" />
+    </Style>
+    <Style Selector="Button.window-control">
+      <Setter Property="Width" Value="32" />
+      <Setter Property="Height" Value="30" />
+      <Setter Property="Padding" Value="0" />
+      <Setter Property="FontSize" Value="17" />
+      <Setter Property="Background" Value="Transparent" />
+      <Setter Property="BorderBrush" Value="Transparent" />
+      <Setter Property="Foreground" Value="#A8B7CA" />
+    </Style>
+    <Style Selector="Button.window-control:pointerover">
+      <Setter Property="Background" Value="#263548" />
+      <Setter Property="Foreground" Value="#F2F6FC" />
+    </Style>
+  </Window.Styles>
+  <Grid Margin="22" RowDefinitions="Auto,Auto,*" RowSpacing="12">
+    <!-- Keep the title in its own row.  At the minimum width the period,
+         metric, and visibility controls must wrap below it instead of
+         squeezing the title column to zero pixels. -->
+    <Grid ColumnDefinitions="*,Auto" RowDefinitions="Auto,Auto" RowSpacing="8" Background="Transparent" PointerPressed="OnTitlePointerPressed">
+      <StackPanel Spacing="2">
+        <TextBlock FontSize="24" FontWeight="SemiBold" Text="{Binding Texts.Graph}" />
+        <TextBlock Classes="label" Text="{Binding Texts.ModelUsage}" />
+      </StackPanel>
+      <StackPanel Grid.Column="1" Orientation="Horizontal" Spacing="2">
+        <Button Classes="window-control" Click="OnMinimizeWindow" AutomationProperties.Name="{Binding Texts.Minimize}" Content="—" ToolTip.Tip="{Binding Texts.Minimize}" />
+        <Button Classes="window-control" Click="OnMaximizeWindow" AutomationProperties.Name="{Binding Texts.Maximize}" Content="□" ToolTip.Tip="{Binding Texts.Maximize}" />
+        <Button Classes="window-control" Click="OnCloseWindow" AutomationProperties.Name="{Binding Texts.Close}" Content="×" ToolTip.Tip="{Binding Texts.Close}" />
+      </StackPanel>
+      <WrapPanel Grid.Row="1" Grid.ColumnSpan="2" Orientation="Horizontal" ItemHeight="32">
+        <ComboBox Width="190" Margin="0,0,8,0"
+                  ItemsSource="{Binding Periods}"
+                  SelectedItem="{Binding SelectedPeriod}"
+                  IsEnabled="{Binding HasPeriods}"
+                  PlaceholderText="{Binding Texts.ResetTime}"
+                  AutomationProperties.Name="{Binding Texts.ResetTime}"
+                  ToolTip.Tip="{Binding Texts.ResetTime}">
+          <ComboBox.ItemTemplate>
+            <DataTemplate x:DataType="core:ApiHistoryPeriod">
+              <TextBlock Text="{Binding Label}" />
+            </DataTemplate>
+          </ComboBox.ItemTemplate>
+        </ComboBox>
+        <ComboBox Width="110" Margin="0,0,8,0"
+                  ItemsSource="{Binding MetricOptions}"
+                  SelectedItem="{Binding SelectedMetric}"
+                  AutomationProperties.Name="{Binding Texts.ModelUsage}"
+                  ToolTip.Tip="{Binding Texts.ModelUsage}" />
+        <ToggleButton Classes="series-toggle" Margin="0,0,8,0" IsChecked="{Binding ShowRemaining}" AutomationProperties.Name="{Binding Texts.RemainingQuota}" ToolTip.Tip="{Binding Texts.RemainingQuota}" VerticalAlignment="Center">
+          <StackPanel Orientation="Horizontal" Spacing="5"><Border Width="14" Height="4" CornerRadius="2" Background="#56B2F5" VerticalAlignment="Center" /><TextBlock Foreground="#E9EFF8" Text="{Binding Texts.RemainingQuota}" /></StackPanel>
+        </ToggleButton>
+        <ToggleButton Classes="series-toggle" Margin="0,0,8,0" IsChecked="{Binding ShowLuna}" AutomationProperties.Name="LUNA" ToolTip.Tip="LUNA" VerticalAlignment="Center">
+          <StackPanel Orientation="Horizontal" Spacing="5"><Border Width="14" Height="4" CornerRadius="2" Background="#E6A23C" VerticalAlignment="Center" /><TextBlock Foreground="#E9EFF8" Text="LUNA" /></StackPanel>
+        </ToggleButton>
+        <ToggleButton Classes="series-toggle" Margin="0,0,8,0" IsChecked="{Binding ShowTerra}" AutomationProperties.Name="TERRA" ToolTip.Tip="TERRA" VerticalAlignment="Center">
+          <StackPanel Orientation="Horizontal" Spacing="5"><Border Width="14" Height="4" CornerRadius="2" Background="#5DC98A" VerticalAlignment="Center" /><TextBlock Foreground="#E9EFF8" Text="TERRA" /></StackPanel>
+        </ToggleButton>
+        <ToggleButton Classes="series-toggle" IsChecked="{Binding ShowSol}" AutomationProperties.Name="SOL" ToolTip.Tip="SOL" VerticalAlignment="Center">
+          <StackPanel Orientation="Horizontal" Spacing="5"><Border Width="14" Height="4" CornerRadius="2" Background="#A88CF5" VerticalAlignment="Center" /><TextBlock Foreground="#E9EFF8" Text="SOL" /></StackPanel>
+        </ToggleButton>
+      </WrapPanel>
+    </Grid>
+    <TextBlock Grid.Row="1" Classes="label" Text="{Binding DetailsStatusText}" />
+    <Border Grid.Row="2" Background="#151F2D" BorderBrush="#263548" BorderThickness="1" CornerRadius="10" Padding="14">
+      <Grid RowDefinitions="Auto,*" RowSpacing="8">
+        <Grid ColumnDefinitions="*,Auto" ColumnSpacing="12">
+          <TextBlock Classes="label" Text="{Binding MetricAxisText}" />
+        </Grid>
+        <plot:GraphPlotControl Grid.Row="1" Points="{Binding Points}" RemainingLabel="{Binding Texts.RemainingQuota}" IsDollars="{Binding IsDollars}" PeriodStartAt="{Binding SelectedPeriodStartAt}" PeriodEndAt="{Binding SelectedPeriodEndAt}" ShowRemaining="{Binding ShowRemaining}" ShowSol="{Binding ShowSol}" ShowTerra="{Binding ShowTerra}" ShowLuna="{Binding ShowLuna}" AutomationProperties.Name="{Binding Texts.Graph}" IsVisible="{Binding HasPoints}" />
+        <TextBlock Grid.Row="1" Classes="label" HorizontalAlignment="Center" VerticalAlignment="Center" IsVisible="{Binding HasNoPoints}" Text="{Binding Texts.UnavailableDetails}" />
+      </Grid>
+    </Border>
+    <Border Grid.RowSpan="3" Width="18" Height="18" HorizontalAlignment="Left" VerticalAlignment="Top" Margin="-22"
+            Background="Transparent" PointerPressed="OnResizeNorthWest" />
+    <Border Grid.RowSpan="3" Width="18" Height="18" HorizontalAlignment="Right" VerticalAlignment="Top" Margin="-22"
+            Background="Transparent" PointerPressed="OnResizeNorthEast" />
+    <Border Grid.RowSpan="3" Width="18" Height="18" HorizontalAlignment="Left" VerticalAlignment="Bottom" Margin="-22"
+            Background="Transparent" PointerPressed="OnResizeSouthWest" />
+    <Border Grid.RowSpan="3" Width="18" Height="18" HorizontalAlignment="Right" VerticalAlignment="Bottom" Margin="-22"
+            Background="Transparent" PointerPressed="OnResizeSouthEast" />
+    <Border Grid.RowSpan="3" Height="10" HorizontalAlignment="Stretch" VerticalAlignment="Top" Margin="18,-22,18,0"
+            Background="Transparent" PointerPressed="OnResizeNorth" />
+    <Border Grid.RowSpan="3" Height="10" HorizontalAlignment="Stretch" VerticalAlignment="Bottom" Margin="18,0,18,-22"
+            Background="Transparent" PointerPressed="OnResizeSouth" />
+    <Border Grid.RowSpan="3" Width="10" HorizontalAlignment="Left" VerticalAlignment="Stretch" Margin="-22,18,0,18"
+            Background="Transparent" PointerPressed="OnResizeWest" />
+    <Border Grid.RowSpan="3" Width="10" HorizontalAlignment="Right" VerticalAlignment="Stretch" Margin="0,18,-22,18"
+            Background="Transparent" PointerPressed="OnResizeEast" />
+  </Grid>
+</Window>

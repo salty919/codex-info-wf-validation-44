@@ -1,0 +1,141 @@
+# Copyright (C) 2026 salty919
+# SPDX-License-Identifier: GPL-3.0-only
+
+name: Windows client
+
+on:
+  push:
+    branches: ["main"]
+    paths:
+      - "windows-client/**"
+      - "windows-client/installer/**"
+      - "docs/WINDOWS_CLIENT.md"
+      - "docs/WINDOWS_CLIENT_REQUIREMENTS.md"
+      - "docs/REST_API_V1.md"
+      - "THIRD_PARTY_NOTICES.md"
+      - "COPYRIGHT"
+      - "LICENSES/**"
+      - "assets/NOTICE.txt"
+      - "docs/DATA_PROTECTION_POLICY.md"
+      - "docs/REQUIREMENTS_LEDGER.md"
+      - "scripts/data_protection_gate.sh"
+      - "scripts/windows_client_contract_gate.sh"
+      - "scripts/regression_guard.sh"
+      - "scripts/requirements_intake_guard.sh"
+      - "docs/REGRESSION_PREVENTION_POLICY.md"
+      - "docs/AGENT_REQUIREMENTS_TRACKER.md"
+      - "docs/INDEPENDENT_AUDIT_LATEST.md"
+      - ".github/workflows/windows-client.yml"
+  pull_request:
+    branches: ["main"]
+    paths:
+      - "windows-client/**"
+      - "windows-client/installer/**"
+      - "docs/WINDOWS_CLIENT.md"
+      - "docs/WINDOWS_CLIENT_REQUIREMENTS.md"
+      - "docs/REST_API_V1.md"
+      - "THIRD_PARTY_NOTICES.md"
+      - "COPYRIGHT"
+      - "LICENSES/**"
+      - "assets/NOTICE.txt"
+      - "docs/DATA_PROTECTION_POLICY.md"
+      - "docs/REQUIREMENTS_LEDGER.md"
+      - "scripts/data_protection_gate.sh"
+      - "scripts/windows_client_contract_gate.sh"
+      - "scripts/regression_guard.sh"
+      - "scripts/requirements_intake_guard.sh"
+      - "docs/REGRESSION_PREVENTION_POLICY.md"
+      - "docs/AGENT_REQUIREMENTS_TRACKER.md"
+      - "docs/INDEPENDENT_AUDIT_LATEST.md"
+      - ".github/workflows/windows-client.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  core-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Enforce data protection policy
+        run: bash scripts/data_protection_gate.sh
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "10.0.x"
+      - name: Restore locked dependencies
+        run: dotnet restore windows-client/CodexInfo.WindowsClient.sln --locked-mode
+      - name: Test REST client and presentation contract
+        run: dotnet test windows-client/CodexInfo.WindowsClient.sln --no-restore --configuration Release
+      - name: Build desktop client
+        run: dotnet build windows-client/CodexInfo.WindowsClient.sln --no-restore --configuration Release
+      - name: Enforce Windows feature contract
+        run: bash scripts/windows_client_contract_gate.sh
+      - name: Enforce regression and independent-review gate
+        run: bash scripts/regression_guard.sh
+      - name: Enforce requirements intake gate
+        run: bash scripts/requirements_intake_guard.sh
+
+  windows-build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "10.0.x"
+      - name: Restore locked dependencies
+        run: dotnet restore windows-client/CodexInfo.WindowsClient.sln --locked-mode
+      - name: Build Windows client
+        run: dotnet build windows-client/CodexInfo.WindowsClient.sln --no-restore --configuration Release
+      - name: Test REST client and presentation contract
+        run: dotnet test windows-client/CodexInfo.WindowsClient.sln --no-restore --configuration Release
+      - name: Publish framework-dependent Windows client
+        run: dotnet publish windows-client/src/CodexInfo.WindowsClient --no-restore --configuration Release --runtime win-x64 --self-contained false --output artifacts/windows-client
+      - name: Collect third-party notices
+        shell: pwsh
+        run: |
+          ./windows-client/tools/Collect-ThirdPartyNotices.ps1 -Destination ./artifacts/windows-client
+          if (-not (Test-Path ./artifacts/windows-client/THIRD-PARTY-LICENSES/skiasharp.nativeassets.win32-3.119.4-THIRD-PARTY-NOTICES.txt -PathType Leaf)) {
+            throw 'Required SkiaSharp third-party notice was not copied.'
+          }
+      - name: Build single-file installer
+        shell: pwsh
+        run: ./windows-client/tools/Build-WindowsInstaller.ps1 -OutputDirectory artifacts/windows-installer
+      - name: Verify installer artifact
+        shell: pwsh
+        run: |
+          if (-not (Test-Path ./artifacts/windows-installer/CodexInfo.WindowsClient.Setup.exe -PathType Leaf)) {
+            throw 'CodexInfo.WindowsClient.Setup.exe was not produced.'
+          }
+      - name: Smoke-test install and uninstall lifecycle
+        shell: pwsh
+        run: |
+          $setup = (Resolve-Path ./artifacts/windows-installer/CodexInfo.WindowsClient.Setup.exe).Path
+          & $setup --desktop-shortcut
+          if ($LASTEXITCODE -ne 0) { throw "Installer failed with exit code $LASTEXITCODE" }
+          $install = Join-Path $env:LOCALAPPDATA 'Programs\Codex Info Monitor'
+          $start = Join-Path ([Environment]::GetFolderPath('Programs')) 'Codex Info\Codex Info Monitor.lnk'
+          $desktop = Join-Path ([Environment]::GetFolderPath('Desktop')) 'Codex Info Monitor.lnk'
+          $exe = Join-Path $install 'CodexInfo.WindowsClient.exe'
+          $uninstaller = Join-Path $install 'CodexInfo.WindowsClient.Uninstaller.exe'
+          if (-not (Test-Path $exe -PathType Leaf)) { throw 'Installed client executable is missing.' }
+          if (-not (Test-Path $uninstaller -PathType Leaf)) { throw 'Installed uninstaller is missing.' }
+          if (-not (Test-Path $start -PathType Leaf)) { throw 'Start-menu shortcut is missing.' }
+          if (-not (Test-Path $desktop -PathType Leaf)) { throw 'Desktop shortcut is missing.' }
+          $shell = New-Object -ComObject WScript.Shell
+          $shortcut = $shell.CreateShortcut($start)
+          if ($shortcut.TargetPath -ne $exe) { throw 'Start-menu shortcut target is incorrect.' }
+          if ($shortcut.WorkingDirectory -ne $install) { throw 'Start-menu shortcut working directory is incorrect.' }
+          Start-Process -FilePath $start
+          Start-Sleep -Seconds 5
+          $clientProcesses = Get-Process -Name 'CodexInfo.WindowsClient' -ErrorAction SilentlyContinue |
+            Where-Object { $_.Path -eq $exe }
+          if (-not $clientProcesses) { throw 'Start-menu shortcut did not launch the installed client.' }
+          $clientProcesses | Stop-Process -Force
+          & $uninstaller --uninstall
+          if ($LASTEXITCODE -ne 0) { throw "Uninstaller failed with exit code $LASTEXITCODE" }
+          Start-Sleep -Seconds 4
+          if (Test-Path $install) { throw 'Install directory still exists after uninstall.' }
+          if (Test-Path $start) { throw 'Start-menu shortcut still exists after uninstall.' }
+          if (Test-Path $desktop) { throw 'Desktop shortcut still exists after uninstall.' }
+          $key = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\CodexInfo.WindowsClient'
+          if (Test-Path $key) { throw 'Per-user uninstall registration still exists.' }

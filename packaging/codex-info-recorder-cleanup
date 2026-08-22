@@ -1,0 +1,64 @@
+#!/usr/bin/env bash
+# Copyright (C) 2026 salty919
+# SPDX-License-Identifier: GPL-3.0-only
+
+# Remove only a recorder lock whose recorded owner is no longer present.  The
+# recorder itself performs the same check before acquiring its lock; this
+# helper exists for systemd's ExecStartPre/ExecStopPost path so an unclean
+# SIGKILL does not leave a service permanently stuck.  It deliberately never
+# touches the SQLite database or any other history file.
+set -euo pipefail
+
+fail() {
+    echo "codex-info-recorder-cleanup: $*" >&2
+    exit 1
+}
+
+data_root="${CODEX_INFO_DATA_DIR:-${CODEX_HOME:-${HOME:-}/.codex}}"
+[[ -n "$data_root" && "$data_root" == /* ]] || fail "data root must be an absolute path"
+
+history_dir="${data_root%/}/history"
+lock_path="$history_dir/usage_record_daemon.lock"
+
+# -e is false for a dangling symlink, therefore test -L explicitly before
+# deciding that no lock exists.  A symlink or non-regular file is never
+# followed or removed.
+if [[ ! -e "$lock_path" && ! -L "$lock_path" ]]; then
+    exit 0
+fi
+[[ ! -L "$lock_path" ]] || fail "lock is a symlink; refusing cleanup"
+[[ -f "$lock_path" ]] || fail "lock is not a regular file; refusing cleanup"
+
+lock_bytes="$(stat -c '%s' -- "$lock_path" 2>/dev/null)" \
+    || fail "cannot inspect lock"
+(( lock_bytes <= 4096 )) || fail "lock is oversized; refusing cleanup"
+
+lock_contents="$(<"$lock_path")"
+if [[ "$lock_contents" =~ ^[[:space:]]*\{[[:space:]]*\"pid\"[[:space:]]*:[[:space:]]*([0-9]+)[[:space:]]*,[[:space:]]*\"started_at\"[[:space:]]*:[[:space:]]*-?[0-9]+[[:space:]]*\}[[:space:]]*$ ]]; then
+    pid="${BASH_REMATCH[1]}"
+else
+    fail "lock metadata is invalid; refusing cleanup"
+fi
+(( pid > 0 )) || fail "lock PID is invalid; refusing cleanup"
+
+# A live PID is never guessed to be stale.  This also handles the race where
+# an old service is still shutting down while systemd prepares a restart.
+if [[ -d "/proc/$pid" ]]; then
+    fail "lock owner is still alive; refusing cleanup"
+fi
+
+# Match the same file after reading it.  If a new daemon replaced the lock in
+# the meantime, leave that lock alone and let the normal singleton protocol
+# decide what happens next.
+identity_before="$(stat -c '%d:%i' -- "$lock_path" 2>/dev/null)" \
+    || fail "cannot identify lock"
+identity_after="$(stat -c '%d:%i' -- "$lock_path" 2>/dev/null)" \
+    || fail "cannot re-check lock"
+[[ "$identity_before" == "$identity_after" ]] \
+    || fail "lock changed during cleanup; refusing removal"
+
+rm -- "$lock_path"
+if [[ -e "$lock_path" || -L "$lock_path" ]]; then
+    fail "lock could not be removed"
+fi
+exit 0

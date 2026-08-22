@@ -1,0 +1,89 @@
+<!-- Copyright (C) 2026 salty919 -->
+<!-- SPDX-License-Identifier: GPL-3.0-only -->
+<Window xmlns="https://github.com/avaloniaui"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:vm="using:CodexInfo.WindowsClient.ViewModels"
+        xmlns:tree="using:CodexInfo.WindowsClient.Controls"
+        x:Class="CodexInfo.WindowsClient.ThreadsWindow"
+        x:DataType="vm:ThreadsWindowViewModel"
+        Width="900"
+        Height="520"
+        MinWidth="720"
+        MinHeight="420"
+        WindowStartupLocation="CenterOwner"
+        CanResize="False"
+        WindowDecorations="None"
+        ExtendClientAreaToDecorationsHint="True"
+        ExtendClientAreaTitleBarHeightHint="0"
+        Title="Codex Info Threads"
+        FontFamily="{StaticResource JapaneseFont}"
+        Background="#0E141E"
+        Foreground="#E9EFF8">
+  <Window.Styles>
+    <Style Selector="TextBlock.label">
+      <Setter Property="FontSize" Value="13" />
+      <Setter Property="Foreground" Value="#A8B7CA" />
+    </Style>
+    <Style Selector="Border.thread-card">
+      <Setter Property="Background" Value="#151F2D" />
+      <Setter Property="BorderBrush" Value="#263548" />
+      <Setter Property="BorderThickness" Value="1" />
+      <Setter Property="CornerRadius" Value="8" />
+      <Setter Property="Padding" Value="12" />
+    </Style>
+    <Style Selector="Button.window-control">
+      <Setter Property="Width" Value="32" />
+      <Setter Property="Height" Value="30" />
+      <Setter Property="Padding" Value="0" />
+      <Setter Property="FontSize" Value="17" />
+      <Setter Property="Background" Value="Transparent" />
+      <Setter Property="BorderBrush" Value="Transparent" />
+      <Setter Property="Foreground" Value="#A8B7CA" />
+    </Style>
+    <Style Selector="Button.window-control:pointerover">
+      <Setter Property="Background" Value="#263548" />
+      <Setter Property="Foreground" Value="#F2F6FC" />
+    </Style>
+  </Window.Styles>
+  <Grid Margin="24" RowDefinitions="Auto,Auto,*" RowSpacing="12">
+    <Grid ColumnDefinitions="*,Auto" Background="Transparent" PointerPressed="OnTitlePointerPressed">
+      <TextBlock FontSize="24" FontWeight="SemiBold" Text="{Binding Texts.RunningThreads}" />
+      <StackPanel Grid.Column="1" Orientation="Horizontal" Spacing="2">
+        <Button Classes="window-control" Click="OnMinimizeWindow" AutomationProperties.Name="{Binding Texts.Minimize}" Content="—" ToolTip.Tip="{Binding Texts.Minimize}" />
+        <Button Classes="window-control" Click="OnCloseWindow" AutomationProperties.Name="{Binding Texts.Close}" Content="×" ToolTip.Tip="{Binding Texts.Close}" />
+      </StackPanel>
+    </Grid>
+    <TextBlock Grid.Row="1" Classes="label" Text="{Binding DetailsStatusText}" />
+    <ScrollViewer Grid.Row="2" VerticalScrollBarVisibility="Auto">
+      <Grid>
+        <TextBlock Classes="label" HorizontalAlignment="Center" VerticalAlignment="Top" IsVisible="{Binding HasNoThreads}" Text="{Binding EmptyText}" />
+        <ItemsControl IsVisible="{Binding HasThreads}" ItemsSource="{Binding Threads}">
+          <ItemsControl.ItemTemplate>
+            <DataTemplate x:DataType="vm:ThreadItemViewModel">
+              <Border Classes="thread-card" Margin="0,0,0,10">
+                <Grid>
+                  <tree:ThreadTreeControl Width="150" HorizontalAlignment="Left" IsHitTestVisible="False"
+                    TreeDepth="{Binding TreeDepth}" ConnectedToParent="{Binding ConnectedToParent}"
+                    HasChildren="{Binding HasChildren}" HasNextSibling="{Binding HasNextSibling}"
+                    AncestorGuide1="{Binding AncestorGuide1}" AncestorGuide2="{Binding AncestorGuide2}" AncestorGuide3="{Binding AncestorGuide3}" />
+                  <Grid Margin="165,0,0,0" ColumnDefinitions="*,Auto" RowDefinitions="Auto,Auto,Auto,Auto,Auto" RowSpacing="5" ColumnSpacing="14">
+                  <TextBlock FontSize="18" FontWeight="SemiBold" Text="{Binding Title}" TextWrapping="Wrap" />
+                  <TextBlock Grid.Column="1" Classes="label" Text="{Binding Id}" />
+                  <TextBlock Grid.Row="1" Classes="label" Text="{Binding ModelText}" />
+                  <TextBlock Grid.Row="1" Grid.Column="1" Classes="label" Text="{Binding RoleText}" />
+                  <TextBlock Grid.Row="2" Classes="label" Text="{Binding ParentText}" />
+                  <TextBlock Grid.Row="2" Grid.Column="1" Classes="label" Text="{Binding DepthText}" />
+                  <TextBlock Grid.Row="3" Classes="label" Text="{Binding ContextText}" />
+                  <TextBlock Grid.Row="3" Grid.Column="1" Classes="label" Text="{Binding TokenText}" />
+                  <TextBlock Grid.Row="4" Classes="label" Text="{Binding AgeText}" />
+                  <TextBlock Grid.Row="4" Grid.Column="1" Classes="label" Text="{Binding InstructionAgeText}" />
+                  </Grid>
+                </Grid>
+              </Border>
+            </DataTemplate>
+          </ItemsControl.ItemTemplate>
+        </ItemsControl>
+      </Grid>
+    </ScrollViewer>
+  </Grid>
+</Window>

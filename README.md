@@ -3,9 +3,9 @@
 
 # Codex Info（Rust / X Window / WSLg）
 
-English quick start: [README.en.md](README.en.md) · 多言語化仕様: [docs/LOCALIZATION.md](docs/LOCALIZATION.md)
+English quick start: [README.en.md](README.en.md) · 多言語化仕様: [docs/LOCALIZATION.md](docs/LOCALIZATION.md) · データ保護規約: [docs/DATA_PROTECTION_POLICY.md](docs/DATA_PROTECTION_POLICY.md) · 要求台帳: [docs/REQUIREMENTS_LEDGER.md](docs/REQUIREMENTS_LEDGER.md) · 最新監査: [docs/REQUIREMENTS_AUDIT_2026-08-22.md](docs/REQUIREMENTS_AUDIT_2026-08-22.md) · B2B受入: [docs/B2B_RELEASE_ACCEPTANCE.md](docs/B2B_RELEASE_ACCEPTANCE.md) · 顧客運用: [docs/CUSTOMER_OPERATIONS_RUNBOOK.md](docs/CUSTOMER_OPERATIONS_RUNBOOK.md) · トレーサビリティ: [docs/TRACEABILITY_MATRIX.md](docs/TRACEABILITY_MATRIX.md) · リリース判定: [docs/RELEASE_MANIFEST_2026-08-22.md](docs/RELEASE_MANIFEST_2026-08-22.md)
 
-Codex App ServerからChatGPT/Codexアカウントのレート制限と週次または月間のリセット時刻を取得し、WSLのX Windowに表示します。WebサーバーやTkinterは使いません。UIはRustの宣言的GUIツールキットSlintで構成しています。
+Codex App ServerからChatGPT/Codexアカウントのレート制限と週次または月間のリセット時刻を取得し、WSLのX Windowに表示します。UIはRustの宣言的GUIツールキットSlintで構成しています。必要な場合だけ、SSHトンネル経由のWindows監視用にloopback限定の読み取り専用REST APIも開始できます。
 
 ## 起動
 
@@ -20,6 +20,8 @@ cd codex_info_v2
 ```bash
 CODEX_INFO_DATA_DIR="$PWD/data" ./run.sh
 ```
+
+通常起動では、UIまたはRESTのプロセスとは別に記録daemon（`--record-daemon`）が自動起動します。daemonはセッションJSONLの変化がある場合だけ、既定60秒周期でbounded scanし、SQLiteへtransaction/upsertします。複数の`run.sh`やRESTを起動してもsingleton lockで1本に収束します。単体確認は`target/release/codex_info --record-daemon --once`、周期起動は`target/release/codex_info --record-daemon`です。`CODEX_INFO_DAEMON_INTERVAL_SECS`は5〜3600秒へ制限されます。
 
 初回起動時の画面内タイトルは`Codex Info`です。ネイティブタイトルバーは使わず、アプリ内では認証パネルが接続状態を案内します。
 
@@ -64,6 +66,14 @@ codex app-server --help
 
 取得したトークンやパスワードはアプリのファイルへ保存しません。Codex側の認証ストアが管理します。
 
+## データ保護と変更ゲート
+
+履歴DBの一意性、複数collector、app-server停止時の復旧、3世代バックアップ、schema mismatch、migration、prune、障害時の保持境界は[データ保護規約](docs/DATA_PROTECTION_POLICY.md)を正本とします。要求の漏れを防ぐID付き証拠台帳は[要求台帳](docs/REQUIREMENTS_LEDGER.md)にあり、変更時は`bash scripts/data_protection_gate.sh`と台帳記載の全検証を通過しない限り完了扱いにしません。
+
+## Windowsからのイントラネット監視
+
+ Linux / WSL 側でネイティブ画面を維持したまま、Windows クライアントから監視する場合は、`windows-client/` の Avalonia クライアントと loopback 限定 API、SSH ローカルポート転送を使用します。Windows配布物には本体payloadを埋め込んだ `CodexInfo.WindowsClient.Setup.exe` インストーラーを作成し、Startメニュー登録と「アプリと機能」からのアンインストールを提供します。インターネット公開や HTTPS 証明書の設定は必要ありません。Visual Studio Community での build、インストーラー作成、SSH 接続、API 契約、Windows 側の表示仕様は[Windows 監視クライアント](docs/WINDOWS_CLIENT.md)を参照してください。
+
 ## 表示と更新
 
 ### 言語・時刻・日本語表示
@@ -75,7 +85,7 @@ codex app-server --help
 - 残り時間は日・時・分で読みやすく表示
 - レート制限は1分ごとに再取得
 - ネイティブタイトルバーは使わず、各Windowの画面内タイトル領域に埋め込みフォントの見出しと自前の移動・最小化・閉じる操作を配置します。固定Windowには最大化操作を表示しません。
-- 認証済み画面の「グラフ」ボタンから1つのグラフウインドウを開きます。残り利用枠・LUNA/TERRA/SOLは凡例で個別に表示／非表示を切り替え、非表示系列は色とラベルのコントラストを下げて示します。初期状態は全系列表示です。各モデルの入力・キャッシュ・出力合計を独立した累積ラインで描き、表示中モデルの個別最大値をドル軸へ使います。全モデルの累積値が変化しない未使用区間は残量ラインを水平保持し、プロット下地の薄い帯で示します。モデルが進んでいるのに残量サンプルが同じ区間は欠測サンプルとして前後の残量変化から線形補完し、`1→1→3` は `1→中点→3` として折返しや瞬間的な消費を描きません。次の残量変化がまだ取得できない終端のactive区間は直前に確定したactive消費率で暫定補完し、残量は0%未満へ下げません。右端の値は系列色のリーダー線で終端へ結びます。リセット直後（0）から現在時刻まで表示します
+- 認証済み画面の「グラフ」ボタンから1つのグラフウインドウを開きます。残り利用枠・LUNA/TERRA/SOLは凡例で個別に表示／非表示を切り替え、非表示系列は色とラベルのコントラストを下げて示します。初期状態は全系列表示です。各モデルの入力・キャッシュ・出力合計を独立した累積ラインで描き、表示中モデルの個別最大値をドル軸へ使います。全モデルの累積値が変化しない未使用区間は残量ラインを水平保持し、プロット下地の薄い帯で示します。モデルが進んでいるのに残量サンプルが同じ区間は、前後を実測された残量低下値で挟める場合だけ欠測サンプルとして線形補間し、`1→1→3` は `1→中点→3` として折返しや瞬間的な消費を描きません。次の実測値がない終端は最後の実測残量を保持します。右端の値は系列色のリーダー線で終端へ結びます。リセット直後（0）から現在時刻まで表示します
 - グラフの1分サンプルはSQLite（`history/usage_history.sqlite3`）へ保存します。同一リセット期間・同一分は最大値を保持して再計測で減少しません。通常起動で削除されるのは3か月より古い行だけです。グラフ上部の「ドル／トークン」で、ドルは累積額、トークンは各モデルの時間帯別使用量へ切り替えられます（初期値はドル）。
 - `CODEX_INFO_DATA_DIR`を指定すると、そのディレクトリ配下へ履歴を保存します
 - 週次または月間の対象期間の残り時間は、端数も含めた7セルのゲージで表示
@@ -88,7 +98,7 @@ codex app-server --help
 
 ## Windowサイズとプレビュー
 
-ネイティブタイトルバーは全Windowで無効にし、ボタン以外の画面領域をドラッグして移動できます。Main/Threads/Legalはlogical client 900×480または720×520で固定し、物理サイズはOSのDPI／拡大率に連動します。最大化・リサイズ操作は表示しません。Graphはlogical client 940×640を初期値、700×480を最小値、上限なしとし、四隅の広い対角領域または辺からリサイズできます。Graphの最大化／復元は現在モニターの物理サイズ・位置へ適用し、仮想デスクトップ全体を描画しません。状態別の確認には`CODEX_INFO_PREVIEW=auth|normal|warning|reset-warning|error|zero|full|monthly|unlimited|idle|legal`を使い、グラフ表示は`CODEX_INFO_PREVIEW=graph|graph-old`で確認できます。`CODEX_INFO_PREVIEW_SIZE`はGraphの初期サイズを上書きするレイアウト検証用です。メイン画面の指定例は`CODEX_INFO_PREVIEW=normal ./run.sh`です。
+登録top-level surface inventoryはMain、Setup、Settings、Graph、Threads、Legalの正確な6個で、HelpはMain内surface（追加HWND=0）です。runtime open HWNDはMain=1＋open child subset 0..5、合計1..6で、各childはsingleton、5 childを全て開いた時だけ6となります。Main/Setup/Settings/Threads/Legalはlogical client `initial=min=max=900×480` fixed、Graphは`initial=940×640`、`min=700×480`、`max=unbounded`、resizableです。登録された6 surfaceはMinimize/Closeを持ち、native resize/maximize/restoreはGraphだけです。ネイティブタイトルバーは全Windowで無効にし、ボタン以外の画面領域をドラッグして移動できます。物理サイズはOSのDPI／拡大率に連動し、Graphの最大化／復元は現在モニターのwork areaへ適用します。状態別の確認には`CODEX_INFO_PREVIEW=initializing|auth|normal|warning|reset-warning|error|zero|full|monthly|unlimited|idle|legal`を使い、グラフ表示は`CODEX_INFO_PREVIEW=graph|graph-old`で確認できます。`CODEX_INFO_PREVIEW_SIZE`はGraphの初期サイズを上書きするレイアウト検証用です。メイン画面の指定例は`CODEX_INFO_PREVIEW=normal ./run.sh`です。
 
 ## UIを調整する場所
 
@@ -100,4 +110,4 @@ Copyright (C) 2026 salty919
 
 別途明記された第三者素材を除き、このリポジトリの独自コードと文書は[GNU General Public License version 3](LICENSE)（SPDX: `GPL-3.0-only`）で提供します。英語の[LICENSE](LICENSE)がGPLv3の正文であり、正式な条件・定義・免責を定めます。[LICENSE.ja.md](LICENSE.ja.md)は日本語案内です。著作権一覧は[COPYRIGHT](COPYRIGHT)を参照してください。
 
-同梱フォント、Codex CLIから生成したプロトコルスキーマ、Slint、およびRust依存クレートは各上流ライセンスで提供します。ソース・バイナリ配布物には[第三者ライセンス通知](THIRD_PARTY_NOTICES.md)、[assets/NOTICE.txt](assets/NOTICE.txt)、[LICENSES/](LICENSES/)を同梱します。
+同梱フォント、Codex CLIから生成したプロトコルスキーマ、Slint、Rust依存クレート、およびWindowsクライアントの Avalonia / NuGet 依存は各上流ライセンスで提供します。ソース・バイナリ配布物には[第三者ライセンス通知](THIRD_PARTY_NOTICES.md)、[assets/NOTICE.txt](assets/NOTICE.txt)、[LICENSES/](LICENSES/)を同梱します。Windows publish 時は[Windows 監視クライアント](docs/WINDOWS_CLIENT.md)の通知収集手順も実行してください。

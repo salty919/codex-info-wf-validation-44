@@ -1,0 +1,60 @@
+<!-- Copyright (C) 2026 salty919 -->
+<!-- SPDX-License-Identifier: GPL-3.0-only -->
+<Window xmlns="https://github.com/avaloniaui"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:vm="using:CodexInfo.WindowsClient.ViewModels"
+        x:Class="CodexInfo.WindowsClient.SettingsWindow"
+        x:DataType="vm:SettingsViewModel"
+        Width="620" Height="620" MinWidth="560" MinHeight="560"
+        WindowStartupLocation="CenterOwner" CanResize="False"
+        WindowDecorations="None" ExtendClientAreaToDecorationsHint="True" ExtendClientAreaTitleBarHeightHint="0"
+        Title="Codex Info Settings" FontFamily="{StaticResource JapaneseFont}"
+        Background="#0E141E" Foreground="#E9EFF8">
+  <Window.Styles>
+    <Style Selector="TextBlock.label"><Setter Property="FontSize" Value="13" /><Setter Property="Foreground" Value="#A8B7CA" /></Style>
+    <Style Selector="Border.surface"><Setter Property="Background" Value="#151F2D" /><Setter Property="BorderBrush" Value="#2C4258" /><Setter Property="BorderThickness" Value="1" /><Setter Property="CornerRadius" Value="14" /></Style>
+    <Style Selector="Button.primary"><Setter Property="Background" Value="#236B9E" /><Setter Property="BorderBrush" Value="#61B4EB" /><Setter Property="Foreground" Value="#F5FAFF" /><Setter Property="Padding" Value="16,8" /></Style>
+    <Style Selector="Button.secondary"><Setter Property="Background" Value="#1B2A3A" /><Setter Property="BorderBrush" Value="#36516B" /><Setter Property="Foreground" Value="#E9EFF8" /><Setter Property="Padding" Value="16,8" /></Style>
+  </Window.Styles>
+  <Grid Margin="24" RowDefinitions="Auto,*,Auto" RowSpacing="18">
+    <Grid ColumnDefinitions="*,Auto" Background="Transparent" PointerPressed="OnTitlePointerPressed">
+      <StackPanel Orientation="Horizontal" Spacing="10"><TextBlock FontSize="20" Text="⚙" Foreground="#71C7FF" /><StackPanel><TextBlock FontSize="23" FontWeight="SemiBold" Text="{Binding Texts.Settings}" /><TextBlock Classes="label" Text="{Binding Texts.ConnectionEndpoint}" /></StackPanel></StackPanel>
+      <Button Grid.Column="1" Background="Transparent" BorderBrush="Transparent" Foreground="#A8B7CA" Click="OnClose" AutomationProperties.Name="{Binding Texts.Close}" Content="×" FontSize="22" ToolTip.Tip="{Binding Texts.Close}" />
+    </Grid>
+    <ScrollViewer Grid.Row="1" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
+      <Border Classes="surface" Padding="22">
+        <StackPanel Spacing="18">
+        <TextBlock FontSize="17" FontWeight="SemiBold" Text="{Binding Texts.Language}" />
+        <ComboBox ItemsSource="{Binding LanguageOptions}" SelectedValue="{Binding SelectedLanguageCode}" SelectedValueBinding="{Binding LanguageCode}" HorizontalAlignment="Stretch">
+          <ComboBox.ItemTemplate><DataTemplate><TextBlock Text="{Binding LanguageName}" /></DataTemplate></ComboBox.ItemTemplate>
+        </ComboBox>
+        <TextBlock FontSize="17" FontWeight="SemiBold" Text="{Binding Texts.TimeZone}" />
+        <ComboBox ItemsSource="{Binding TimeZoneOptions}" SelectedValue="{Binding SelectedTimeZoneId}" SelectedValueBinding="{Binding Id}" HorizontalAlignment="Stretch" AutomationProperties.Name="{Binding Texts.TimeZone}" ToolTip.Tip="{Binding Texts.TimeZone}">
+          <ComboBox.ItemTemplate><DataTemplate><TextBlock Text="{Binding Label}" /></DataTemplate></ComboBox.ItemTemplate>
+        </ComboBox>
+        <TextBlock Classes="label" Text="{Binding Texts.Appearance}" />
+        <Border Background="#101925" CornerRadius="10" Padding="14">
+          <Grid ColumnDefinitions="Auto,*" ColumnSpacing="10">
+            <TextBlock Text="✦" Foreground="#71C7FF" />
+            <TextBlock Grid.Column="1" Classes="label" Text="{Binding Texts.AppearanceDescription}" TextWrapping="Wrap" />
+          </Grid>
+        </Border>
+        <Border Background="#101F2D" CornerRadius="10" Padding="14">
+          <Grid ColumnDefinitions="*,Auto" RowDefinitions="Auto,Auto" RowSpacing="4" ColumnSpacing="12">
+            <StackPanel><TextBlock FontWeight="SemiBold" Text="{Binding StatusTitle}" /><TextBlock Grid.Row="1" Classes="label" Text="{Binding StatusDetail}" TextWrapping="Wrap" /></StackPanel>
+            <StackPanel Grid.Column="1" Orientation="Horizontal" Spacing="6" VerticalAlignment="Center">
+              <Button Classes="secondary" Click="OnRefresh" AutomationProperties.Name="{Binding Texts.AuthCheck}" ToolTip.Tip="{Binding Texts.AuthCheck}" Content="{Binding Texts.AuthCheck}" />
+              <Button Classes="secondary" Click="OnAuth" IsVisible="{Binding CanAuthenticate}" AutomationProperties.Name="{Binding Texts.AuthStart}" ToolTip.Tip="{Binding Texts.AuthStart}" Content="{Binding Texts.AuthStart}" />
+            </StackPanel>
+          </Grid>
+        </Border>
+        </StackPanel>
+      </Border>
+    </ScrollViewer>
+    <StackPanel Grid.Row="2" Orientation="Horizontal" HorizontalAlignment="Right" Spacing="10">
+      <Button Classes="secondary" Click="OnOpenSetup" AutomationProperties.Name="{Binding Texts.Setup}" ToolTip.Tip="{Binding Texts.Setup}"><TextBlock Text="{Binding Texts.Setup}" /></Button>
+      <Button Classes="secondary" Click="OnOpenLegal" AutomationProperties.Name="{Binding Texts.Legal}" ToolTip.Tip="{Binding Texts.Legal}"><TextBlock Text="{Binding Texts.Legal}" /></Button>
+      <Button Classes="primary" Click="OnSave" AutomationProperties.Name="{Binding Texts.Save}" ToolTip.Tip="{Binding Texts.Save}"><TextBlock Text="{Binding Texts.Save}" /></Button>
+    </StackPanel>
+  </Grid>
+</Window>

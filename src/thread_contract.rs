@@ -1239,8 +1239,57 @@ pub fn parse_rollout_reader<R: BufRead>(
             security::read_bounded_jsonl_record(reader).map_err(|error| match error.kind() {
                 security::SecurityErrorKind::LimitExceeded => RolloutError::LineTooLarge,
                 security::SecurityErrorKind::Parse => RolloutError::InvalidUtf8,
+                security::SecurityErrorKind::Unterminated => RolloutError::UnterminatedLine,
                 _ => RolloutError::InvalidJson,
             })?;
+        let Some((line, terminated)) = record else {
+            break;
+        };
+        if !terminated {
+            return Err(RolloutError::UnterminatedLine);
+        }
+        let value: Value = serde_json::from_str(&line).map_err(|_| RolloutError::InvalidJson)?;
+        apply_rollout_event(&value, &mut state)?;
+    }
+    finish_rollout(state)
+}
+
+/// Parse a live rollout while isolating oversized or invalid-UTF8 records.
+///
+/// Tool output can legitimately exceed the bounded record size.  Those
+/// records are not needed to determine the running/model/token state, and the
+/// bounded reader consumes each complete bad line before returning its error.
+/// Skipping only those two transport-level failures preserves all trustworthy
+/// state around the bad record while retaining strict validation for known
+/// event shapes and unterminated files.
+pub fn parse_rollout_reader_recoverable<R: BufRead>(
+    reader: &mut R,
+    snapshot_bytes: u64,
+) -> Result<ValidatedRollout, RolloutError> {
+    if snapshot_bytes > security::MAX_SESSION_FILE_BYTES {
+        return Err(RolloutError::FileTooLarge);
+    }
+    let mut state = RolloutState::default();
+    loop {
+        let record = match security::read_bounded_jsonl_record(reader) {
+            Ok(record) => record,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    security::SecurityErrorKind::LimitExceeded | security::SecurityErrorKind::Parse
+                ) =>
+            {
+                continue
+            }
+            Err(error) => {
+                return Err(match error.kind() {
+                    security::SecurityErrorKind::LimitExceeded => RolloutError::LineTooLarge,
+                    security::SecurityErrorKind::Parse => RolloutError::InvalidUtf8,
+                    security::SecurityErrorKind::Unterminated => RolloutError::UnterminatedLine,
+                    _ => RolloutError::InvalidJson,
+                });
+            }
+        };
         let Some((line, terminated)) = record else {
             break;
         };
@@ -1459,8 +1508,9 @@ where
 }
 
 /// Select current threads when secure filesystem code has already parsed each
-/// rollout as a bounded stream. Candidate failures remain isolated exactly as
-/// in [`select_active_threads_where`].
+/// rollout as a bounded stream. The complete terminal cycle is the atomic
+/// publication unit: any admitted candidate failure rejects the whole cycle
+/// instead of exposing a partial snapshot.
 pub fn select_active_threads_parsed_where<P, F, E>(
     accumulator: ThreadCycleAccumulator,
     mut is_current: P,
@@ -1514,7 +1564,13 @@ where
         });
     }
 
-    if !snapshots.is_empty() {
+    // A cycle is the unit of publication.  If any candidate that was
+    // admitted to the cycle cannot be parsed/read, publishing the other
+    // candidates would create a partial snapshot and hide data loss.  Keep
+    // the previous complete snapshot at the caller instead.
+    if saw_candidate_failure {
+        ThreadCycleOutcome::CycleError
+    } else if !snapshots.is_empty() {
         ThreadCycleOutcome::Snapshots(snapshots)
     } else if saw_valid_candidate {
         ThreadCycleOutcome::NoThread
@@ -3280,6 +3336,30 @@ mod tests {
     }
 
     #[test]
+    fn recoverable_rollout_parser_keeps_running_state_around_large_tool_output() {
+        let prefix = rollout_bytes(&[
+            json!({"type":"thread_context","model":"gpt-5.6-luna"}),
+            json!({"type":"task_started"}),
+        ]);
+        let oversized = format!(
+            "{{\"type\":\"response_item\",\"payload\":\"{}\"}}\n",
+            "x".repeat(security::MAX_JSONL_LINE_BYTES + 128)
+        );
+        let suffix = rollout_bytes(&[
+            json!({"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"total_tokens":321}}}}),
+        ]);
+        let mut bytes = prefix;
+        bytes.extend_from_slice(oversized.as_bytes());
+        bytes.extend_from_slice(&suffix);
+        let snapshot_bytes = bytes.len() as u64;
+        let parsed = parse_rollout_reader_recoverable(&mut Cursor::new(bytes), snapshot_bytes)
+            .expect("large tool output is an isolated record");
+        assert!(parsed.is_running());
+        assert_eq!(parsed.model(), "gpt-5.6-luna");
+        assert_eq!(parsed.total_tokens(), Some(321));
+    }
+
+    #[test]
     fn thread_c_unknown_well_formed_events_do_not_change_snapshot() {
         let base = [
             json!({"type":"thread_context","model":"model-a"}),
@@ -3366,7 +3446,7 @@ mod tests {
     }
 
     #[test]
-    fn thread_c_candidate_failure_falls_through_in_total_order() {
+    fn thread_c_candidate_failure_rejects_the_complete_cycle() {
         let cycle = terminal_cycle(vec![
             thread_fixture("inactive", 400, "inactive"),
             thread_fixture("parse-error", 300, "parse-error"),
@@ -3389,28 +3469,11 @@ mod tests {
                 _ => return Err(()),
             })
         });
-        assert_eq!(
-            outcome,
-            ThreadCycleOutcome::Snapshots(vec![ActiveThreadSnapshot {
-                thread_id: "winner".to_owned(),
-                created_at: 1,
-                updated_at: 100,
-                title: "winner-title".to_owned(),
-                model: "winner-model".to_owned(),
-                model_label: "winner-model".to_owned(),
-                total_tokens: Some(42),
-                context_usage_tokens: None,
-                context_window_tokens: None,
-                last_user_message_at: None,
-                is_subagent: false,
-                parent_thread_id: None,
-                depth: None,
-            }])
-        );
+        assert_eq!(outcome, ThreadCycleOutcome::CycleError);
     }
 
     #[test]
-    fn thread_c_snapshot_fields_are_atomic_from_one_candidate_and_rollout() {
+    fn thread_c_snapshot_rejects_partial_candidate_reads() {
         let cycle = terminal_cycle(vec![
             thread_fixture("candidate-a", 20, "title-a"),
             thread_fixture("candidate-b", 10, "title-b"),
@@ -3428,24 +3491,7 @@ mod tests {
             ]))
         });
         assert_eq!(reads, ["candidate-a", "candidate-b"]);
-        assert_eq!(
-            outcome,
-            ThreadCycleOutcome::Snapshots(vec![ActiveThreadSnapshot {
-                thread_id: "candidate-a".to_owned(),
-                created_at: 1,
-                updated_at: 20,
-                title: "title-a".to_owned(),
-                model: "model-a".to_owned(),
-                model_label: "model-a".to_owned(),
-                total_tokens: Some(111),
-                context_usage_tokens: None,
-                context_window_tokens: None,
-                last_user_message_at: None,
-                is_subagent: false,
-                parent_thread_id: None,
-                depth: None,
-            }])
-        );
+        assert_eq!(outcome, ThreadCycleOutcome::CycleError);
     }
 
     #[test]

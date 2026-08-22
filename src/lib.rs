@@ -6,6 +6,7 @@
 pub mod i18n;
 pub mod protocol_contract;
 pub mod security;
+pub mod server;
 pub mod thread_contract;
 pub mod thread_state;
 pub mod usage_store;

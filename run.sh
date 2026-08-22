@@ -16,6 +16,13 @@ unset WAYLAND_DISPLAY WAYLAND_SOCKET WINIT_X11_SCALE_FACTOR
 export LIBGL_ALWAYS_SOFTWARE="1"
 export MESA_LOADER_DRIVER_OVERRIDE="llvmpipe"
 
+# An API server launch is consumed by the Windows client. It is always a
+# headless REST process; do not let an inherited debug/UI environment variable
+# accidentally present the native Slint window.
+if [[ -n "${CODEX_INFO_API_LISTEN:-}" ]]; then
+    export CODEX_INFO_REST_SILENT="1"
+fi
+
 CODEX_INFO_CARGO="$(command -v cargo 2>/dev/null || true)"
 if [[ -z "$CODEX_INFO_CARGO" && -n "${HOME:-}" && -x "$HOME/.cargo/bin/cargo" ]]; then
     # Rustup is commonly installed here, but non-login shells do not always

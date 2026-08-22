@@ -1,0 +1,29 @@
+<!-- Copyright (C) 2026 salty919 -->
+<!-- SPDX-License-Identifier: GPL-3.0-only -->
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AssemblyName>CodexInfo.WindowsClient</AssemblyName>
+    <RootNamespace>CodexInfo.WindowsClient</RootNamespace>
+    <RuntimeIdentifiers>win-x64</RuntimeIdentifiers>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\CodexInfo.WindowsClient.Core\CodexInfo.WindowsClient.Core.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <AvaloniaResource Include="..\..\..\assets\NotoSansJP.ttf" Link="Assets\NotoSansJP.ttf" />
+    <AvaloniaResource Include="Assets\NotoSansJP-Medium.ttf" />
+    <AvaloniaResource Include="..\..\..\assets\NotoSansKR.otf" Link="Assets\NotoSansKR.otf" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Avalonia" Version="12.1.1" />
+    <PackageReference Include="Avalonia.Desktop" Version="12.1.1" />
+    <PackageReference Include="Avalonia.Themes.Fluent" Version="12.1.1" />
+  </ItemGroup>
+</Project>

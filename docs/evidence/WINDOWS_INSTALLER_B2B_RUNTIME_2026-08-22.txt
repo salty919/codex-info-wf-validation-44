@@ -1,0 +1,72 @@
+﻿**********************
+Windows PowerShell トランスクリプト開始
+開始時刻: 20260822121321
+ユーザー名: DESKTOP-8TFIR5G\salty
+RunAs ユーザー: DESKTOP-8TFIR5G\salty
+構成名:
+コンピューター: DESKTOP-8TFIR5G (Microsoft Windows NT 10.0.26200.0)
+ホスト アプリケーション: powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File \\wsl.localhost\Ubuntu-26.04\home\salty\code\codex_info_v2\scripts\.windows_installer_b2b_runtime.ps1
+プロセス ID: 5476
+PSVersion: 5.1.26100.9168
+PSEdition: Desktop
+PSCompatibleVersions: 1.0, 2.0, 3.0, 4.0, 5.0, 5.1.26100.9168
+BuildVersion: 10.0.26100.9168
+CLRVersion: 4.0.30319.42000
+WSManStackVersion: 3.0
+PSRemotingProtocolVersion: 2.3
+SerializationVersion: 1.1.0.1
+**********************
+HOST=DESKTOP-8TFIR5G
+USER=salty
+WORK=C:\Users\salty\Downloads\codex-info-b2b-runtime-25b265bc193d4b73b7e843194ea666a0
+SETUP=C:\Users\salty\Downloads\codex-info-test\CodexInfo.WindowsClient.Setup.exe
+INSTALL=C:\Users\salty\AppData\Local\Programs\Codex Info Monitor
+START_MENU=C:\Users\salty\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Codex Info
+SETTINGS=C:\Users\salty\AppData\Local\CodexInfo\settings.json
+PASS: generated Setup.exe is present
+PASS: existing per-user install is present
+PASS: settings sentinel is present before test
+PASS: client process is not running before update
+PASS: no stale staging directory before test
+PASS: no stale previous-generation directory before test
+PASS: success sentinel name is unused before test
+PASS: rollback sentinel name is unused before test
+SETUP_SHA256=3818DEFEB93046D947DDAA165F80105C361C155EAAFF242DFFE01FC2691B814F
+SETTINGS_SHA256_BEFORE=4818DE1C16B9B00826D42FD3CD59DCE4BFD85A82BB43911BCBA6D9A0BE0F09E6
+CLIENT_SHA256_BEFORE=34E235709B56B8DE1EDAD8E40262512C4691BCCE884B3B2B50276CEC9F395568
+SETUP START: update-success
+SETUP END: update-success ExitCode=0
+SETUP STDOUT[update-success]: Installed Codex Info Monitor to C:\Users\salty\AppData\Local\Programs\Codex Info Monitor
+SETUP STDOUT[update-success]: Start menu entry: C:\Users\salty\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Codex Info\Codex Info Monitor.lnk
+PASS: successful update returns exit code 0
+PASS: successful update replaced the old generation
+PASS: updated client executable is present
+PASS: updated client payload hash matches the expected generation
+PASS: settings hash is unchanged after successful update
+PASS: successful update leaves no staging directory
+PASS: successful update leaves no previous-generation directory
+SETUP START: rollback-on-shortcut-conflict
+SETUP END: rollback-on-shortcut-conflict ExitCode=1
+SETUP STDERR[rollback-on-shortcut-conflict]: Codex Info Monitor installer failed: Cannot create 'C:\Users\salty\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Codex Info' because a file or directory with the same name already exists.
+PASS: injected shortcut conflict makes update fail
+PASS: rollback restored the prior installed generation
+PASS: rollback restored the prior client payload
+PASS: settings hash is unchanged after rollback
+PASS: rollback leaves no staging directory
+PASS: rollback leaves no previous-generation directory
+SETUP START: final-clean-install
+SETUP END: final-clean-install ExitCode=0
+SETUP STDOUT[final-clean-install]: Installed Codex Info Monitor to C:\Users\salty\AppData\Local\Programs\Codex Info Monitor
+SETUP STDOUT[final-clean-install]: Start menu entry: C:\Users\salty\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Codex Info\Codex Info Monitor.lnk
+PASS: final clean install returns exit code 0
+PASS: final clean install removes the rollback sentinel
+PASS: settings hash is unchanged after final clean install
+PASS: HKCU uninstall registration remains present
+PASS: HKCU uninstall registration points to the installed directory
+PASS: Start Menu shortcut remains present after final install
+SETTINGS_SHA256_AFTER=4818DE1C16B9B00826D42FD3CD59DCE4BFD85A82BB43911BCBA6D9A0BE0F09E6
+CLIENT_SHA256_FINAL=34E235709B56B8DE1EDAD8E40262512C4691BCCE884B3B2B50276CEC9F395568
+**********************
+Windows PowerShell トランスクリプト終了
+終了時刻: 20260822121328
+**********************
