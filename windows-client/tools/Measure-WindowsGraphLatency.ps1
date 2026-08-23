@@ -98,7 +98,12 @@ if (-not ('CodexInfoWindowsGraphLatencyWin32' -as [type])) {
     Add-Type -AssemblyName System.Drawing
     Add-Type -AssemblyName UIAutomationClient
     Add-Type -AssemblyName UIAutomationTypes
-    Add-Type -ReferencedAssemblies 'System.Drawing' -TypeDefinition @'
+    $drawingReferences = @(
+        [System.Drawing.Bitmap].Assembly.Location
+        [System.Drawing.Size].Assembly.Location
+    ) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -Unique
+    Assert-GraphLatency ($drawingReferences.Count -gt 0) 'System.Drawing implementation assembly could not be resolved.'
+    Add-Type -ReferencedAssemblies $drawingReferences -TypeDefinition @'
 using System;
 using System.Drawing;
 using System.Drawing.Imaging;
