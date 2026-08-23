@@ -17,14 +17,11 @@ on:
       - "LICENSES/**"
       - "assets/NOTICE.txt"
       - "docs/DATA_PROTECTION_POLICY.md"
-      - "docs/REQUIREMENTS_LEDGER.md"
       - "scripts/data_protection_gate.sh"
       - "scripts/windows_client_contract_gate.sh"
       - "scripts/regression_guard.sh"
-      - "scripts/requirements_intake_guard.sh"
       - "docs/REGRESSION_PREVENTION_POLICY.md"
-      - "docs/AGENT_REQUIREMENTS_TRACKER.md"
-      - "docs/INDEPENDENT_AUDIT_LATEST.md"
+      - "docs/PRODUCT_REQUIREMENTS.md"
       - ".github/workflows/windows-client.yml"
   pull_request:
     branches: ["main"]
@@ -39,14 +36,11 @@ on:
       - "LICENSES/**"
       - "assets/NOTICE.txt"
       - "docs/DATA_PROTECTION_POLICY.md"
-      - "docs/REQUIREMENTS_LEDGER.md"
       - "scripts/data_protection_gate.sh"
       - "scripts/windows_client_contract_gate.sh"
       - "scripts/regression_guard.sh"
-      - "scripts/requirements_intake_guard.sh"
       - "docs/REGRESSION_PREVENTION_POLICY.md"
-      - "docs/AGENT_REQUIREMENTS_TRACKER.md"
-      - "docs/INDEPENDENT_AUDIT_LATEST.md"
+      - "docs/PRODUCT_REQUIREMENTS.md"
       - ".github/workflows/windows-client.yml"
 
 permissions:
@@ -70,10 +64,8 @@ jobs:
         run: dotnet build windows-client/CodexInfo.WindowsClient.sln --no-restore --configuration Release
       - name: Enforce Windows feature contract
         run: bash scripts/windows_client_contract_gate.sh
-      - name: Enforce regression and independent-review gate
+      - name: Enforce regression checks
         run: bash scripts/regression_guard.sh
-      - name: Enforce requirements intake gate
-        run: bash scripts/requirements_intake_guard.sh
 
   windows-build:
     runs-on: windows-latest

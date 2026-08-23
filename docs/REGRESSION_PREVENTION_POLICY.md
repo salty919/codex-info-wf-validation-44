@@ -14,7 +14,7 @@
 
 ## 強制ゲート
 
-1. 変更前に `scripts/requirements_intake_guard.sh` の要求抽出ゲートを通し、要求ID・担当サブエージェント・所有ファイル・受入オラクルを`docs/AGENT_REQUIREMENTS_TRACKER.md`へ登録する。抽出ゲートFAIL中の実装開始は禁止する。
+1. 変更前に`docs/PRODUCT_REQUIREMENTS.md`と対象仕様を読み、変更する観測結果と失敗時動作を決める。
 2. 変更後に固定.NET SDKのCore/Presentationテスト、契約ゲート、`git diff --check`、native回帰ゲートを実行する。
 3. インストーラを再発行した場合は、artifactとworkspace publish copyのSHAが一致し、ホストのインストール先SHAも一致することを確認する。
 4. 独立サブエージェントが、実装者のPASS結論を見ずに上表を再評価する。1項目でもFAIL/INCONCLUSIVEなら`RELEASE HOLD`とする。

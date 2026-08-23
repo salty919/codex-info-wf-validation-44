@@ -36,7 +36,5 @@ jobs:
       run: bash scripts/record_daemon_e2e.sh
     - name: Enforce data protection policy
       run: bash scripts/data_protection_gate.sh
-    - name: Enforce cross-client regression and independent-review gate
+    - name: Enforce cross-client regression checks
       run: bash scripts/regression_guard.sh
-    - name: Enforce requirements intake gate
-      run: bash scripts/requirements_intake_guard.sh

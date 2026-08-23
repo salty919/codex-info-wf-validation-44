@@ -269,14 +269,10 @@ when they are unavailable.
 | WIN-ACC-02 | Regression found: every borderless Windows surface must be movable. | Main, Setup, Settings, Graph, Threads, and Legal windows must respond to one native left-button drag on the title region; control hits must not start a move and close/minimize remain clickable. Only Graph exposes native resize/maximize/restore; Help remains Main-internal with no HWND. A source-only handler is insufficient. | Windows geometry/DPI and viewport authority, common title-bar behavior | Fresh host process drag/control/HWND/rect results, contract gate, independent visual review | unverified |
 | WIN-ACC-03 | UX correction: the client must not take control of the user's mouse. | Product code never calls cursor-position or synthetic mouse APIs. Physical-input smoke is opt-in via `-AllowPhysicalInput`; default acceptance runs do not move the host cursor and report movement as unverified rather than PASS. | Window drag behavior and test harness | Static API scan, default smoke SKIP output, independent review | implemented |
 
-### Static evidence boundary (2026-08-22)
+### Acceptance boundary
 
-`docs/evidence/WINDOWS_CLIENT_CURRENT_2026-08-22.md` and
-`scripts/windows_acceptance_e2e.sh` record the current-source test, host-process,
-current image-hash, installer, Start-menu, and keyboard-focus evidence. The
-graph rows are not marked fully verified until the independent parity review
-returns PASS. Physical cursor input remains opt-in and is intentionally not
-run; a source-only or skipped physical test cannot close WIN-ACC-02.
+Automated tests must report a non-zero executed test count. Windows-only behavior requires a fresh Windows run;
+physical cursor input remains opt-in and a skipped physical test is not a PASS for window dragging.
 
 ## Dependency DAG
 

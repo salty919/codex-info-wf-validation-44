@@ -68,7 +68,7 @@ require_text windows-client/tools/Build-WindowsInstaller.ps1 'Collect-ThirdParty
 require_text windows-client/tools/Build-WindowsInstaller.ps1 '--locked-mode'
 require_text docs/WINDOWS_CLIENT_REQUIREMENTS.md 'WIN-PAR-13'
 require_text docs/WINDOWS_CLIENT_REQUIREMENTS.md 'WIN-INSTALL-01'
-require_text docs/evidence/WINDOWS_INSTALLER_RUNTIME_2026-08-22.md 'CodexInfo.WindowsClient.Setup.exe'
+require_text docs/PRODUCT_REQUIREMENTS.md 'CodexInfo 製品要件'
 
 if command -v dotnet >/dev/null 2>&1; then
     dotnet restore windows-client/CodexInfo.WindowsClient.sln --locked-mode

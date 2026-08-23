@@ -3,7 +3,7 @@
 
 # Codex Info（Rust / X Window / WSLg）
 
-English quick start: [README.en.md](README.en.md) · 多言語化仕様: [docs/LOCALIZATION.md](docs/LOCALIZATION.md) · データ保護規約: [docs/DATA_PROTECTION_POLICY.md](docs/DATA_PROTECTION_POLICY.md) · 要求台帳: [docs/REQUIREMENTS_LEDGER.md](docs/REQUIREMENTS_LEDGER.md) · 最新監査: [docs/REQUIREMENTS_AUDIT_2026-08-22.md](docs/REQUIREMENTS_AUDIT_2026-08-22.md) · B2B受入: [docs/B2B_RELEASE_ACCEPTANCE.md](docs/B2B_RELEASE_ACCEPTANCE.md) · 顧客運用: [docs/CUSTOMER_OPERATIONS_RUNBOOK.md](docs/CUSTOMER_OPERATIONS_RUNBOOK.md) · トレーサビリティ: [docs/TRACEABILITY_MATRIX.md](docs/TRACEABILITY_MATRIX.md) · リリース判定: [docs/RELEASE_MANIFEST_2026-08-22.md](docs/RELEASE_MANIFEST_2026-08-22.md)
+English quick start: [README.en.md](README.en.md) · [製品要件](docs/PRODUCT_REQUIREMENTS.md) · [Windowsクライアント](docs/WINDOWS_CLIENT.md) · [REST API](docs/REST_API_V1.md) · [データ保護](docs/DATA_PROTECTION_POLICY.md) · [多言語化](docs/LOCALIZATION.md) · [顧客運用](docs/CUSTOMER_OPERATIONS_RUNBOOK.md)
 
 Codex App ServerからChatGPT/Codexアカウントのレート制限と週次または月間のリセット時刻を取得し、WSLのX Windowに表示します。UIはRustの宣言的GUIツールキットSlintで構成しています。必要な場合だけ、SSHトンネル経由のWindows監視用にloopback限定の読み取り専用REST APIも開始できます。
 
@@ -68,7 +68,7 @@ codex app-server --help
 
 ## データ保護と変更ゲート
 
-履歴DBの一意性、複数collector、app-server停止時の復旧、3世代バックアップ、schema mismatch、migration、prune、障害時の保持境界は[データ保護規約](docs/DATA_PROTECTION_POLICY.md)を正本とします。要求の漏れを防ぐID付き証拠台帳は[要求台帳](docs/REQUIREMENTS_LEDGER.md)にあり、変更時は`bash scripts/data_protection_gate.sh`と台帳記載の全検証を通過しない限り完了扱いにしません。
+履歴DBの一意性、複数collector、app-server停止時の復旧、3世代バックアップ、schema mismatch、migration、prune、障害時の保持境界は[データ保護規約](docs/DATA_PROTECTION_POLICY.md)を正本とします。変更時は`bash scripts/data_protection_gate.sh`で実装と回帰テストを確認します。
 
 ## Windowsからのイントラネット監視
 

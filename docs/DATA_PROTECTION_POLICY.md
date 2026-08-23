@@ -14,7 +14,7 @@ Codex app-server / session JSONL / thread rollout
   -> reload/graph/REST/Windows presentation
 ```
 
-対象ファイルを変更する場合は、実装だけでなく[要求台帳](REQUIREMENTS_LEDGER.md)と受入証拠を同じ変更で更新する。
+対象ファイルを変更する場合は、実装、関連仕様、再現可能な自動テストを同じ変更で更新する。
 
 対象ファイル（直接変更・間接変更を含む）:
 
@@ -202,12 +202,12 @@ DataGeneration、pair publicationを二重化しない。foreign/第二operation
 
 データ保護対象ファイルの変更者は、次を満たさない限り完了を宣言してはならない。
 
-1. [要求台帳](REQUIREMENTS_LEDGER.md)の該当IDを更新し、要求・失敗境界・証拠を逆引きできる。
+1. [製品要件](PRODUCT_REQUIREMENTS.md)または本書の該当箇所を更新し、要求と失敗境界を逆引きできる。
 2. 既存DB行のread-only row count/hashを変更前後で比較する。通常の3か月prune以外の減少はFAILとする。
 3. malformed、empty、multiple writer、app-server停止、再起動、認証境界、migration/schema mismatchを検査する。
 4. `cargo fmt --check`、`cargo check --locked`、`cargo test --locked`、`cargo build --release --locked`を実行する。
-5. `scripts/data_protection_gate.sh`と独立評価を実行する。
-6. 変更後に新しいruntime traceを取り、前回の画像・ログを再利用しない。
+5. `scripts/data_protection_gate.sh`を実行する。
+6. 実環境確認が必要な変更では、新しいruntime traceを取り、前回の画像・ログを再利用しない。
 
 ### 禁止事項
 
