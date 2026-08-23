@@ -94,8 +94,8 @@ source freeze SHA、時刻、独立reviewerを必須にし、positive/negative�
 ## 3. 依存関係
 
 依存セルは次の構文以外を受け付けない。各リストはカンマ区切りのbaseline IDであり、参照なしは
-`—` とする。226行の参照は既存553本を捨てずに型付けし、新規hard 10本を追加した結果、
-`hard_prerequisite=409`、`related_validation_join=154`、総参照 `563` となる。
+`—` とする。現行3冊の226行を再計数した結果、
+`hard_prerequisite=412`、`related_validation_join=165`、総参照 `577` となる。
 
 ```text
 hard_prerequisite=<WIN-X-NNN[,WIN-X-NNN...] or —>; related_validation_join=<WIN-X-NNN[,WIN-X-NNN...] or —>
@@ -186,7 +186,7 @@ entry→re-entry→cancel→close→singleton→abnormal termination→restart/r
 226行すべてに具体10列と補助11列が埋まり、D/K/M 58行・I/J 32行の補助ドメイン台帳が登録され、
 B2B 79行とlegacy-gap 53行のprojectionがconflict台帳からの再展開集合に完全一致し、
 legacy-gap 8 atomic契約が旧source 8件へ1:1 joinされ、
-新depends_on構文が226行で厳格parseされ、hard=409/related=154/total=563、hard-onlyの
+新depends_on構文が226行で厳格parseされ、hard=412/related=165/total=577、hard-onlyの
 cycle=0・backward=0、unknown/self/type-duplicate=0、全target titleの非空・一意joinが成立し、
 仕様未解決が0、製品証拠前提がfixture契約へ変換され、独立抽出突合がPASSになるまで、状態を
 `EXTRACTION_INCOMPLETE` のまま保持する。製品証拠未取得を抽出契約PASSへ丸めず、抽出後の製品受入ゲートへ引き渡す。

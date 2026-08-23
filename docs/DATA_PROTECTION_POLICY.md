@@ -68,8 +68,8 @@ Codex app-server / session JSONL / thread rollout
    要求順序・保持境界は`docs/CUSTOMER_OPERATIONS_RUNBOOK.md`を正本とするが、製品実装・同一release証拠・独立判定が
    未取得の間は`PRODUCT_PENDING`であり、この規約から別commandを推測して補わない。
 9. canonical DB profileごとに`MaintenanceOwner`を1つだけ許可する。起動時pruneの前に、writer admissionを止めた同一排他境界で
-   SQLite online backupを3世代作成・検証する。backup失敗、検証失敗、writer競合時はpruneを実行しない。バックアップは`0600`、DBディレクトリは`0700`とする。
-10. 現行版は旧schemaを暗黙migrationしない。schema mismatchはread/writeを拒否する。将来migrationは別名DB、全行validate、件数/hash/期間境界比較、
+   SQLite online backupを3世代作成・検証する。backup失敗時はpruneを実行しない。検証失敗・writer競合時もpruneを実行しない。バックアップは`0600`、DBディレクトリは`0700`とする。
+10. 現行版は旧schemaを暗黙migrationしない。schema mismatchは拒否する（read/writeを拒否する）。将来migrationは別名DB、全行validate、件数/hash/期間境界比較、
    3世代backup保持、検証後のatomic switchの順序だけを許可する。candidate失敗時はDB、backup、memory、公開rootを旧世代のまま保持する。
 11. スレッドのライブ状態はDB履歴を根拠に再生しない。root/childとも、同一cycleで前後identityを検証した
     eligible Codex workloadの`canonical path -> nonempty ProcessIdentity set`にrolloutが存在し、最後のtask状態が
@@ -262,79 +262,79 @@ RC-150..171の意味を再登録しない。RC-139..149を、データ保護とR
 ### RC-139 / DP-REST-001 — health body schema / limit
 
 - **根拠**: `docs/REST_API_V1.md:80-91,93-108,138-147`、`docs/WINDOWS_DATA_PROTECTION_ROW_CONTRACTS_2026-08-22.md:22,27-33,83`、`docs/atomic-contracts/WIN_E_I_CONCRETE_CONTRACTS_2026-08-22.md:74,79`、`docs/atomic-contracts/WIN_J_M_CONCRETE_CONTRACTS_2026-08-22.md:13`。
-- **状態/入力**: `HealthCandidate→HealthValid/HealthRejected`を固定し、exact path/method、listener owner、body key/type/size、healthが認証・ready・snapshot更新を意味するかを決定する。health固有のschemaと上限値はOPENである。
+- **状態/入力**: `HealthCandidate→HealthValid/HealthRejected`を固定し、exact path/method、listener owner、body key/type/size、healthが認証・ready・snapshot更新を意味するかを決定する。値は§8.2の採用authorityへ移管済みであり、この検出履歴節では再定義しない。
 - **失敗/保持/idempotence**: malformed、oversize、owner不一致、non-JSONはhealth成功を0にし、health表示・connection stateと`DR-LastGoodPair`の保持関係を決める。status/detailsをhealth失敗で更新せず、同一candidateの再入はpublish/writeを増やさない。
-- **identity/oracle/targets**: `DR-AdmissionTuple`、health schema generation、request identityを結び、canonical body/status/header/byte counter、listener owner、DB副作用0を再計算する。対象=`WIN-E-012`, `WIN-I-001`, `WIN-I-006..007`, `WIN-J-001`, `WIN-K-001`, `GLOBAL:AUD-011`。RC overlap=`RC-076,079`（共通limit/headerは部分定義だが、health body schemaは未定義）。
+- **identity/oracle/targets**: `DR-AdmissionTuple`、health schema generation、request identityを結び、canonical body/status/header/byte counter、listener owner、DB副作用0を再計算する。対象=`WIN-E-012`, `WIN-I-001`, `WIN-I-006..007`, `WIN-J-001`, `WIN-K-001`, `GLOBAL:AUD-011`。RC overlap=`RC-076,079`（共通limit/headerの重複監査対象）。採用値のownerは§8.2と`REST_API_V1.md`のDP-REST wire authorityである。
 
 ### RC-140 / DP-REST-002 — server non-2xx / error envelope
 
 - **根拠**: `docs/REST_API_V1.md:78-108,138-140`、`docs/DATA_PROTECTION_POLICY.md:169-176`、`docs/WINDOWS_DATA_PROTECTION_ROW_CONTRACTS_2026-08-22.md:20-23`、`docs/atomic-contracts/WIN_E_I_CONCRETE_CONTRACTS_2026-08-22.md:87`。
-- **状態/入力**: publisher欠落、DB read fault、serialization fault、stale owner、内部timeoutを、`PublisherAvailable→Success`または`PublisherFault→ErrorResponse/Retained`へ分類する。200 `state=error`、non-2xx、切断の選択値はOPENである。
+- **状態/入力**: publisher欠落、DB read fault、serialization fault、stale owner、内部timeoutを、`PublisherAvailable→Success`または`PublisherFault→ErrorResponse/Retained`へ分類する。200 `state=error`ではなく、§8.3のcanonical 500/503または未commit切断を採用する。
 - **失敗/保持/idempotence**: error responseのschema/header/raw body・statusを固定し、raw error/秘密を出さず、失敗時は`DR-LastGoodPair`とDB rootを保持する。error再入でretry loop、DB再生成、二重publishを起こさない。
-- **identity/oracle/targets**: request、`DR-AdmissionTuple`、publisher generationを結び、wire status/body/header、pair hash、DB trace、error classificationを再計算する。対象=`WIN-J-001`, `WIN-J-009`, `WIN-J-016`, `WIN-I-014`, `WIN-I-016`, `WIN-E-012`, `GLOBAL:AUD-011`。RC overlap=`RC-079,080,107`（route/status、DB副作用、ready predicateは部分定義だがserver error envelopeは未定義）。
+- **identity/oracle/targets**: request、`DR-AdmissionTuple`、publisher generationを結び、wire status/body/header、pair hash、DB trace、error classificationを再計算する。対象=`WIN-J-001`, `WIN-J-009`, `WIN-J-016`, `WIN-I-014`, `WIN-I-016`, `WIN-E-012`, `GLOBAL:AUD-011`。RC overlap=`RC-079,080,107`（route/status、DB副作用、ready predicateの重複監査対象）。canonical error envelopeのownerは§8.3とREST APIのServer error responseである。
 
 ### RC-141 / DP-REST-003 — request line/header/body/connection boundary
 
 - **根拠**: `docs/REST_API_V1.md:69-76,88-108`、`docs/WINDOWS_DATA_PROTECTION_ROW_CONTRACTS_2026-08-22.md:83,86`、`docs/atomic-contracts/WIN_E_I_CONCRETE_CONTRACTS_2026-08-22.md:79`、`docs/atomic-contracts/WIN_J_M_CONCRETE_CONTRACTS_2026-08-22.md:13,29`。
-- **状態/入力**: `ConnectionAccepted→RequestBounded→RouteDecision→Response/Rejected`を固定し、request line、request header aggregate、GET body、同時接続、keep-alive/idle、cancel、shutdownの境界値と適用時点を決める。値はOPENである。
+- **状態/入力**: `ConnectionAccepted→RequestBounded→RouteDecision→Response/Rejected`を固定し、request line、request header aggregate、GET body、同時接続、keep-alive/idle、cancel、shutdownの境界値と適用時点を決める。値は§8.4およびREST APIのRequest resource contractへ移管済みである。
 - **失敗/保持/idempotence**: bound超過・malformed・途中切断はmaterialize前に拒否し、DB、memory、pair、設定を変更しない。拒否の再入は同じrequestを二重処理せず、shutdown中は新規admissionを決められた状態へ遷移させる。
-- **identity/oracle/targets**: connection/request identity、listener generation、`DR-AdmissionTuple`を結び、raw wire byte、同時connection数、timeout/keep-alive、CPU/RSS、pair/DB before-afterを採取する。対象=`WIN-I-001`, `WIN-I-006`, `WIN-J-001`, `WIN-J-016`, `WIN-K-001`, `GLOBAL:AUD-021`, `GLOBAL:DP-008`。RC overlap=`RC-076,079,080`（response/local inputとDB副作用でありrequest envelopeは未定義）。
+- **identity/oracle/targets**: connection/request identity、listener generation、`DR-AdmissionTuple`を結び、raw wire byte、同時connection数、timeout/keep-alive、CPU/RSS、pair/DB before-afterを採取する。対象=`WIN-I-001`, `WIN-I-006`, `WIN-J-001`, `WIN-J-016`, `WIN-K-001`, `GLOBAL:AUD-021`, `GLOBAL:DP-008`。RC overlap=`RC-076,079,080`（response/local inputとDB副作用の重複監査対象）。
 
 ### RC-142 / DP-REST-004 — read-only non-SQLite effect set
 
 - **根拠**: `docs/REST_API_V1.md:11-14,88-91,93-108`、`DESIGN.md:130-134`、`docs/WINDOWS_DATA_PROTECTION_ROW_CONTRACTS_2026-08-22.md:22,32-33`、`docs/atomic-contracts/WIN_J_M_CONCRETE_CONTRACTS_2026-08-22.md:28`。
-- **状態/入力**: `ReadOnlyAdmission→EffectAudit→Response/Retained`を固定し、成功・404・405・errorごとのSQLite外副作用（access/error log、metric、cache/temp、atime、filesystem journal、process、network）を`DR-ReadOnlyEffectSet`へ分類する。allow/deny値はOPENである。
+- **状態/入力**: `ReadOnlyAdmission→EffectAudit→Response/Retained`を固定し、成功・404・405・errorごとのSQLite外副作用（access/error log、metric、cache/temp、atime、filesystem journal、process、network）を`DR-ReadOnlyEffectSet`へ分類する。allow/deny値は§8.5およびREST APIのRead-only effect setへ移管済みである。
 - **失敗/保持/idempotence**: allowlist外の副作用を黙って許可せず、決定されたreject/holdへ進め、`DR-LastGoodPair`とDB/rootを保持する。同一requestの再入で未登録副作用や二重publishを発生させない。
-- **identity/oracle/targets**: request、listener/publisher identity、effect category、generationを結び、filesystem/process/network/SQLite/WAL/SHM/row/hashの全before-afterを再計算する。対象=`WIN-I-001`, `WIN-J-001`, `WIN-J-016`, `WIN-E-012`, `GLOBAL:DP-008`, `GLOBAL:AUD-011`。RC overlap=`RC-080`（DB側read-onlyのみで、非SQLite effect setは未定義）。
+- **identity/oracle/targets**: request、listener/publisher identity、effect category、generationを結び、filesystem/process/network/SQLite/WAL/SHM/row/hashの全before-afterを再計算する。対象=`WIN-I-001`, `WIN-J-001`, `WIN-J-016`, `WIN-E-012`, `GLOBAL:DP-008`, `GLOBAL:AUD-011`。RC overlap=`RC-080`（DB側read-onlyとの重複監査対象）。effect ownerは§8.5である。
 
 ### RC-143 / DP-REST-005 — DB profile/account/AuthEpoch storage identity
 
 - **根拠**: `docs/DATA_PROTECTION_POLICY.md:35-43,69,103,127-143`、`docs/REST_API_V1.md:11-14,215-219,235-242`、`docs/LIVE_STATE_DECISION_MATRIX.md:34-37`、`docs/atomic-contracts/WIN_J_M_CONCRETE_CONTRACTS_2026-08-22.md:15-17`。
 - **状態/入力（検出履歴）**: `StorageIdentityCandidate→PartitionAdmitted`または`IdentityConflict→Rejected/Quarantined`を固定し、canonical DB path、profile、account、AuthEpoch/nonceとusage keyのscopeが未決だった。採用値は§8.6のlogical partitionと`(partition_id,reset_at,timestamp)`である。
 - **失敗/保持/idempotence**: identity不一致、同一keyの異なるaccount、profile alias collisionではwrite/upsert/publishを0にし、旧DB、旧root、旧accountの非表示境界を保持する。同一storage identity・同一operationの再入は1回を超えるrow/publishを作らない。
-- **identity/oracle/targets**: storage-binding generation、profile/account/AuthEpoch、lease ownerを結び、同一path・同一keyを用いたcross-profile/account fixtureでpartition、row count、column MAX/COALESCE、visible occurrencesを再計算する。対象=`WIN-J-003..005`, `WIN-J-012..013`, `WIN-J-016`, `WIN-I-016`, `GLOBAL:DP-008`, `GLOBAL:LIVE-001`。RC overlap=`RC-068,069,096,106`（writer/lease/publisher identityでありstorage partitionは未定義）。
+- **identity/oracle/targets**: storage-binding generation、profile/account/AuthEpoch、lease ownerを結び、同一path・同一keyを用いたcross-profile/account fixtureでpartition、row count、column MAX/COALESCE、visible occurrencesを再計算する。対象=`WIN-J-003..005`, `WIN-J-012..013`, `WIN-J-016`, `WIN-I-016`, `GLOBAL:DP-008`, `GLOBAL:LIVE-001`。RC overlap=`RC-068,069,096,106`（writer/lease/publisher identityの重複監査対象）。partition ownerは§8.6である。
 
 ### RC-144 / DP-REST-006 — cursor + SQLite atomic commit
 
 - **根拠**: `docs/DATA_PROTECTION_POLICY.md:53-59,96-105,133-146,188`、`DESIGN.md:79,123`、`docs/WINDOWS_DATA_PROTECTION_ROW_CONTRACTS_2026-08-22.md:16-17,85,89`、`docs/atomic-contracts/WIN_J_M_CONCRETE_CONTRACTS_2026-08-22.md:23-24`。
-- **状態/入力**: `SourceRead→Candidate→DBAndCheckpointCommit→PairCandidate→Published`または`Rollback/Hold`を固定し、source fingerprint/file identity/cursor/AuthEpoch/nonce、row batch、DB transactionのcommit関係を決める。atomic join方式と値はOPENである。
+- **状態/入力**: `SourceRead→Candidate→DBAndCheckpointCommit→PairCandidate→Published`または`Rollback/Hold`を固定し、source fingerprint/file identity/cursor/AuthEpoch/nonce、row batch、DB transactionのcommit関係を決める。atomic join方式は§8.7の採用authorityへ移管済みである。
 - **失敗/保持/idempotence**: DB commit後のcursor失敗、cursor先行後のDB rollback、crash、busy/full/I/Oではcursor、DB、rootを同じ旧世代へ保持し、重複・欠損・推測gapを作らない。同一source checkpointとoperationの再入はidempotentにする。
-- **identity/oracle/targets**: `DR-SourceCheckpoint`、operation generation、`DR-AdmissionTuple`を結び、cursor before/after、transaction id、row/hash、restart trace、publish countを同じevidenceへ入れる。対象=`WIN-J-010..012`, `WIN-J-016`, `WIN-I-016`, `GLOBAL:DP-008`。RC overlap=`RC-065,067,068,074`（cursor/gap/writer/faultを個別に扱うがcommit joinは未定義）。
+- **identity/oracle/targets**: `DR-SourceCheckpoint`、operation generation、`DR-AdmissionTuple`を結び、cursor before/after、transaction id、row/hash、restart trace、publish countを同じevidenceへ入れる。対象=`WIN-J-010..012`, `WIN-J-016`, `WIN-I-016`, `GLOBAL:DP-008`。RC overlap=`RC-065,067,068,074`（cursor/gap/writer/faultの重複監査対象）。commit ownerは§8.7である。
 
 ### RC-145 / DP-REST-007 — generation namespace / parent / monotonicity
 
 - **根拠**: `docs/DATA_PROTECTION_POLICY.md:41-43,112-115,153-159,166-167`、`docs/REST_API_V1.md:11-14,235-242`、`DESIGN.md:132-133`、`docs/WINDOWS_DATA_PROTECTION_ROW_CONTRACTS_2026-08-22.md:19,23`。
-- **状態/入力**: `GenerationCandidate→NamespaceValidated→Published`または`Stale/Regression/Collision→Retained`を固定し、`DataGeneration`、backup generation、`CollectorEpoch`、service/bootstrap generation、`CycleSeq`のnamespace、parent、順序、restore/rollback後の関係を決める。値はOPENである。
+- **状態/入力**: `GenerationCandidate→NamespaceValidated→Published`または`Stale/Regression/Collision→Retained`を固定し、`DataGeneration`、backup generation、`CollectorEpoch`、service/bootstrap generation、`CycleSeq`のnamespace、parent、順序、restore/rollback後の関係を決める。値は§8.8のtyped generation namespaceで採用済みである。
 - **失敗/保持/idempotence**: namespace不明、parent不一致、generation回帰・衝突・stale candidateでは新pairを公開せず`DR-LastGoodPair`を保持する。同一operation/同一candidateの再入はgeneration/publicationを二重化しない。
-- **identity/oracle/targets**: `DR-GenerationNamespace`、base DB hash、operation id、`DR-AdmissionTuple`、RootHashを結び、generation ledgerとDB/backup/pair hashを時系列で再計算する。対象=`WIN-I-016`, `WIN-J-014..016`, `WIN-L-016`, `GLOBAL:DP-008`, `GLOBAL:AUD-011`。RC overlap=`RC-071,073,078,096,106`（各世代・pair・ownerは部分定義で、namespace/parent関係は未定義）。
+- **identity/oracle/targets**: `DR-GenerationNamespace`、base DB hash、operation id、`DR-AdmissionTuple`、RootHashを結び、generation ledgerとDB/backup/pair hashを時系列で再計算する。対象=`WIN-I-016`, `WIN-J-014..016`, `WIN-L-016`, `GLOBAL:DP-008`, `GLOBAL:AUD-011`。RC overlap=`RC-071,073,078,096,106`（各世代・pair・ownerの重複監査対象）。namespace/parent ownerは§8.8である。
 
 ### RC-146 / DP-REST-008 — explicit restore crash journal / re-entry
 
 - **根拠**: `docs/DATA_PROTECTION_POLICY.md:150-161,165-167`、`docs/WINDOWS_DATA_PROTECTION_ROW_CONTRACTS_2026-08-22.md:18-20,88`、`docs/atomic-contracts/WIN_J_M_CONCRETE_CONTRACTS_2026-08-22.md:26-27`。
 - **状態/入力**: 明示restoreを`RestoreIdle→AdmissionClosed→CandidateAudited→CurrentQuarantined→Replaced→PairChecked`または`RestoreFailed→Reconcile`として固定し、operation id、owner、phase、current/candidate path・inode・hash、crash/re-entryを入力にする。restore journal schemaはOPENである。
 - **失敗/保持/idempotence**: 退避後・replace前・reload/pair検証中のcrashや第二restoreではwriter/publishを0にし、現DB、全verified backup、old memory/rootを復元可能に保持する。同一operationのresumeは一回だけ、foreign operationはtakeover/rewriteしない。
-- **identity/oracle/targets**: MaintenanceOwner、operation generation、journal identity、DB generationを結び、各crash boundaryのjournal replay、current DB count、candidate/current hash、switch/publish count、pair検証を再計算する。対象=`WIN-J-006`, `WIN-J-014..015`, `WIN-I-016`, `WIN-L-016`, `GLOBAL:DP-008`。RC overlap=`RC-071,072,073`（backup/migrationまたはrestore順序はあるが、restore固有journal/re-entryは未定義）。
+- **identity/oracle/targets**: MaintenanceOwner、operation generation、journal identity、DB generationを結び、各crash boundaryのjournal replay、current DB count、candidate/current hash、switch/publish count、pair検証を再計算する。対象=`WIN-J-006`, `WIN-J-014..015`, `WIN-I-016`, `WIN-L-016`, `GLOBAL:DP-008`。RC overlap=`RC-071,072,073`（backup/migrationまたはrestore順序の重複監査対象）。restore journal ownerは§8.9である。
 
 ### RC-147 / DP-REST-009 — host reboot daemon re-entry
 
 - **根拠**: `docs/DATA_PROTECTION_POLICY.md:119-142`、`docs/REST_API_V1.md:35-56`、`DESIGN.md:111`、`docs/WINDOWS_DATA_PROTECTION_ROW_CONTRACTS_2026-08-22.md:14-16,83-86`、`docs/atomic-contracts/WIN_J_M_CONCRETE_CONTRACTS_2026-08-22.md:19,22-23`。
-- **状態/入力**: `HostBoot→RecoveryAdmissionClosed→LeaseJournalCursorRevalidated→NewCollectorEpoch→Starting→Running`または`Hold`を固定し、boot/power-loss identity、persisted lease/journal/cursor/hint、DB/root/generationを入力にする。systemd boot orderingとre-entry authorityはOPENである。
+- **状態/入力**: `HostBoot→RecoveryAdmissionClosed→LeaseJournalCursorRevalidated→NewCollectorEpoch→Starting→Running`または`Hold`を固定し、boot/power-loss identity、persisted lease/journal/cursor/hint、DB/root/generationを入力にする。systemd boot orderingとre-entry authorityは§8.10で採用済みである。
 - **失敗/保持/idempotence**: stale lease、未回収journal、cursor/hint不一致、旧publisherの再入は採用せず、旧DB/root/pairを保持する。同一boot/operationの再入はactivation、lease取得、backfill、publishを二重化しない。
-- **identity/oracle/targets**: boot identity、new supervisor/collector epoch、owner nonce、`DR-SourceCheckpoint`、`DR-AdmissionTuple`を結び、reboot/power-loss前後のprocess/lease/journal/cursor/DB/pair traceを再計算する。対象=`WIN-J-010`, `WIN-J-011`, `WIN-J-013`, `WIN-J-016`, `WIN-I-016`, `GLOBAL:DP-008`, `GLOBAL:LIVE-001`。RC overlap=`RC-064,066,071,073`（通常crash/ownerとmaintenance recoveryでありhost reboot re-entryは未定義）。
+- **identity/oracle/targets**: boot identity、new supervisor/collector epoch、owner nonce、`DR-SourceCheckpoint`、`DR-AdmissionTuple`を結び、reboot/power-loss前後のprocess/lease/journal/cursor/DB/pair traceを再計算する。対象=`WIN-J-010`, `WIN-J-011`, `WIN-J-013`, `WIN-J-016`, `WIN-I-016`, `GLOBAL:DP-008`, `GLOBAL:LIVE-001`。RC overlap=`RC-064,066,071,073`（通常crash/ownerとmaintenance recoveryの重複監査対象）。boot recovery ownerは§8.10である。
 
 ### RC-148 / DP-REST-010 — source→DB→pair→HTTP→Windows lineage
 
 - **根拠**: `docs/DATA_PROTECTION_POLICY.md:7-15,110-115,133-146,156-167`、`docs/REST_API_V1.md:11-14,235-242`、`docs/WINDOWS_DATA_PROTECTION_ROW_CONTRACTS_2026-08-22.md:20-23,89`、`docs/atomic-contracts/WIN_E_I_CONCRETE_CONTRACTS_2026-08-22.md:89`、`docs/atomic-contracts/WIN_J_M_CONCRETE_CONTRACTS_2026-08-22.md:26-28`。
-- **状態/入力**: `SourceCandidate→DBTransaction→DataGeneration/RootHash→PublishedPair→HTTPResponse→WindowsAcceptedRoot`を一つのlineage stateとして固定し、source fingerprint/cursor、AuthEpoch、transaction id、DB generation、request id、artifact SHA、表示rootのjoin fieldsを決める。schemaとencodingはOPENである。
+- **状態/入力**: `SourceCandidate→DBTransaction→DataGeneration/RootHash→PublishedPair→HTTPResponse→WindowsAcceptedRoot`を一つのlineage stateとして固定し、source fingerprint/cursor、AuthEpoch、transaction id、DB generation、request id、artifact SHA、表示rootのjoin fieldsを決める。schemaとencodingは§8.11で採用済みである。
 - **失敗/保持/idempotence**: 任意edgeの欠落、foreign generation、時刻逆転、別artifactでは受理・表示・顧客証拠を0にし、`DR-LastGoodPair`、旧DB/root、失敗evidenceを保持する。同じlineageの再入はrow/transaction/publish/displayを二重化しない。
-- **identity/oracle/targets**: `DR-DataRestLineage`、`DR-GenerationNamespace`、`DR-SourceCheckpoint`、`DR-AdmissionTuple`を全edgeへ付与し、全hash・timestamp・before/after・request/response・Windows acceptanceを一つのDAGとして再計算する。対象=`WIN-J-010..016`, `WIN-I-007`, `WIN-I-016`, `WIN-L-016`, `GLOBAL:DP-008`, `GLOBAL:AUD-011`。RC overlap=`RC-078,096,106`（pair atomicityとowner identityは部分定義だが、source→DB→HTTP→Windowsの全lineageは未定義）。
+- **identity/oracle/targets**: `DR-DataRestLineage`、`DR-GenerationNamespace`、`DR-SourceCheckpoint`、`DR-AdmissionTuple`を全edgeへ付与し、全hash・timestamp・before/after・request/response・Windows acceptanceを一つのDAGとして再計算する。対象=`WIN-J-010..016`, `WIN-I-007`, `WIN-I-016`, `WIN-L-016`, `GLOBAL:DP-008`, `GLOBAL:AUD-011`。RC overlap=`RC-078,096,106`（pair atomicityとowner identityの重複監査対象）。lineage ownerは§8.11である。
 
 ### RC-149 / DP-REST-011 — combined low-load scope
 
 - **根拠**: `docs/WINDOWS_DATA_PROTECTION_ROW_CONTRACTS_2026-08-22.md:83,85-86`、`docs/atomic-contracts/WIN_J_M_CONCRETE_CONTRACTS_2026-08-22.md:22`、`docs/DATA_PROTECTION_POLICY.md:58-59,133-135,188`、`docs/REST_API_V1.md:69-108`。
-- **状態/入力**: `LoadProfileDeclared→Measured→InScope/Unsupported`を固定し、daemon-only idleか、REST polling、複数collector/server、maintenance、同時requestを含むcombined profileかを決める。scope、同時数、測定時間、CPU/RSS/work counterのauthority値はOPENである。
+- **状態/入力**: `LoadProfileDeclared→Measured→InScope/Unsupported`を固定し、daemon-only idleか、REST polling、複数collector/server、maintenance、同時requestを含むcombined profileかを決める。supported scopeと上限は§8.12で採用済みである。
 - **失敗/保持/idempotence**: 宣言profile外の実測を製品負荷保証へ昇格せず、超過・測定不能時はデータ/root/pairを変更しない。同じprofileの再測定は追加writer、scan、publishを発生させない。
-- **identity/oracle/targets**: host、artifact SHA、各process owner、`DR-AdmissionTuple`、operation generationを結び、daemon/API/maintenance/collectorのCPU/RSS、request/connection、scan/write/retry、DB/pair hashをcombined traceで再計算する。対象=`WIN-J-010`, `WIN-J-013`, `WIN-J-016`, `WIN-I-001`, `WIN-J-001`, `GLOBAL:DP-008`, `GLOBAL:AUD-011`。RC overlap=`RC-075`（daemon finite boundsのみで、combined scopeは未定義）。
+- **identity/oracle/targets**: host、artifact SHA、各process owner、`DR-AdmissionTuple`、operation generationを結び、daemon/API/maintenance/collectorのCPU/RSS、request/connection、scan/write/retry、DB/pair hashをcombined traceで再計算する。対象=`WIN-J-010`, `WIN-J-013`, `WIN-J-016`, `WIN-I-001`, `WIN-J-001`, `GLOBAL:DP-008`, `GLOBAL:AUD-011`。RC overlap=`RC-075`（daemon finite boundsとの重複監査対象）。supported profile ownerは§8.12である。
 
 ## 8. DP-REST-001..011 採用authority値
 
@@ -375,6 +375,9 @@ publisher欠落、DB/root read fault、stale owner、内部read timeoutはREST�
 canonical 500またはresponse未commit時のconnection abortへ写像する。200 error bodyは使用しない。どのfaultも
 status/detailsの片側だけを進めず、clientはS1+D0やS0+D1を作らない。特に`WIN-I-016`の採用規則は
 `both-valid-and-same-pair→commit both`、それ以外は`retain S0+D0`であり、status-only commitを禁止する。
+この禁止はdata pairのstatus/details store commitに適用する。
+schema-validな`auth_required+authenticated=false`のauth-clearはsecurity visibility transitionとして
+旧account可視値だけを一回で消去してよく、details/store/DB/pair bytesは不変にする（`WIN-I-016`）。
 
 ### 8.4 DP-REST-003 / RC-141 — request resource owner
 

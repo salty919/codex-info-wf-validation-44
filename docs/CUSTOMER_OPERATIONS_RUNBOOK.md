@@ -19,7 +19,8 @@
 ```
 
 成功条件はSlint UIが起動し、server/API prepare、listener、health、status、必要時のauth確認を
-別々に記録してMainのreadyへ到達することである。API到達だけをreadyとしない。
+別々に記録し、`state=ready AND authenticated=true`を満たしてMainのreadyへ到達することである。
+API到達だけをreadyとしない。
 
 ### UIなし（開発用互換起動）
 
@@ -71,8 +72,8 @@ runtime link/loadを0、visible/hidden HWNDを0とする。`record` processはHT
 ### start・status・health・stop・restart
 
 server/API prepare→listener→`GET /v1/health`→`GET /v1/status`→必要時だけauth開始→別のauth確認→
-`ready=true`の順序を固定する。health=到達性、status=状態、auth=認証操作、ready=認証確認後のMain
-状態であり、同じmarkerへ丸めない。
+`state=ready AND authenticated=true`の導出順序を固定する（wire `ready` boolean field=0）。health=到達性、
+status=状態、auth=認証操作、ready=認証確認後のMain状態であり、同じmarkerへ丸めない。
 
 ```bash
 systemctl --user start codex-info-server.target
@@ -139,7 +140,8 @@ settingsの正本keyは次の6個だけである：
 exact tokenである。password/token/key/path/OpenSSH展開値/raw manual host/user/API URL/argv/stderrは
 保存0とする。
 
-Setup→server/API prepare→listener→health→status→auth開始（必要時）→別auth確認→readyの順に進み、
+Setup→server/API prepare→listener→health→status→auth開始（必要時）→別auth確認→
+`state=ready AND authenticated=true`の導出順に進み、
 health/status/authの意味を混同しない。old 4-key、corrupt settings、invalid selectorではWelcome loopへ
 戻さず、Main disconnected + Settings recovery、automatic command=0とする。valid selectorを明示保存
 するまでready/connectionConfiguredを偽装しない。
@@ -156,6 +158,8 @@ health/status/authの意味を混同しない。old 4-key、corrupt settings、i
   行う。recorderはapp/tunnel終了後も継続する。
 
 ## 4. DB backup・restore・migration
+
+DB保護は、source DB・既存backup・historyを失敗時に保持し、検証済みcandidateだけを切り替えることを指す。
 
 DBを直接削除、編集、移動しない。backupはSQLite online-backup契約で世代
 `usage_history.sqlite3.bak.1`〜`.bak.3`を保持し、各世代の`quick_check`、row count、deterministic

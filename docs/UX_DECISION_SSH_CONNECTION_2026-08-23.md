@@ -77,9 +77,11 @@ UIなしのsilent RESTはSlint component/window/event-loopを生成せず、`DIS
 2. server/APIをprepareする。未導入なら利用者の明示操作で同一source releaseのverified `codex-info-server-setup install`を実行し、既導入なら`codex-info-server.target`をstartする。Cargo/repository/manual path入力を要求しない
 3. `codex-info-api.service`のloopback listenerと`codex-info-recorder.service`のactiveを別々に確認する
 4. `GET /v1/health`でAPI到達性だけを確認する
-5. `GET /v1/status`で`auth_required,false`と`ready,true`を区別する
+5. `GET /v1/status`で`state=auth_required,authenticated=false`と
+   `state=ready,authenticated=true`を区別する（wireに`ready` booleanは存在しない）
 6. 必要な場合だけ利用者が認証開始を押す。認証開始の成功をreadyとみなさない
-7. 認証開始とは別の「認証を確認」でlater statusを取得し、`ready,true`の場合だけMain readyとする
+7. 認証開始とは別の「認証を確認」でlater statusを取得し、
+   `state=ready AND authenticated=true`の場合だけMain readyとする
 8. ready後に6-key settingsをatomic保存する。成功済みSetup/app確認は一回だけで、poll・再接続・同一generationの自動再構築ごとにSetupを再表示しない
 
 各stepは同一viewportに現在位置、入力/結果、primary action、Back/Cancelを表示する。成功済み

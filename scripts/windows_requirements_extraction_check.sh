@@ -165,9 +165,15 @@ def fail(message: str) -> None:
     raise SystemExit(f"windows-requirements-extraction-check: FAIL: {message}")
 
 
-def table_rows(path: Path, pattern: re.Pattern[str]) -> list[list[str]]:
+def table_rows(
+    path: Path,
+    pattern: re.Pattern[str],
+    stop_before: tuple[str, ...] = (),
+) -> list[list[str]]:
     result = []
     for line_no, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+        if any(line.startswith(marker) for marker in stop_before):
+            break
         if not pattern.match(line):
             continue
         cells = [cell.strip() for cell in line.strip().strip("|").split("|")]
@@ -252,7 +258,12 @@ expected_contract_sets = {
     CONTRACTS[2]: {rid for rid in baseline_ids if rid.split("-")[1] in {"J", "K", "L", "M"}},
 }
 for path in CONTRACTS:
-    rows = table_rows(path, re.compile(r"^\| WIN-[A-M]-\d{3} \|"))
+    # J–M has a later RC-167〜169 supplementary oracle table whose first
+    # column intentionally repeats source WIN IDs.  It is not part of the
+    # 10-column concrete-contract table and must not be counted as duplicate
+    # product rows.
+    stop_before = ("## RC-167〜169 exact extension",) if path == CONTRACTS[2] else ()
+    rows = table_rows(path, re.compile(r"^\| WIN-[A-M]-\d{3} \|"), stop_before)
     file_ids = {row[0] for row in rows}
     if file_ids != expected_contract_sets[path] or len(rows) != len(expected_contract_sets[path]):
         fail(
@@ -412,7 +423,7 @@ for row in contract_rows:
     hard_edge_count += len(hard_refs)
     related_edge_count += len(related_refs)
 
-if (hard_edge_count, related_edge_count, hard_edge_count + related_edge_count) != (409, 154, 563):
+if (hard_edge_count, related_edge_count, hard_edge_count + related_edge_count) != (412, 165, 577):
     fail(
         "typed dependency counts differ: "
         f"hard={hard_edge_count} related={related_edge_count} "
@@ -457,6 +468,181 @@ if len(dependency_reason_target_ids) > len(baseline_titles):
 
 rows_by_id = {row[0]: row for row in contract_rows}
 
+# The RC-167〜169 companion table is an oracle extension, not a second set of
+# product rows.  Its join key must be explicit so raw Markdown audits cannot
+# mistake the ten source references for duplicate concrete contracts.
+jm_contract_text = CONTRACTS[2].read_text(encoding="utf-8")
+surface_navigation_addendum = "### WIN-M-006 / WIN-M-007 surface-navigation addendum (RC-083)"
+if surface_navigation_addendum not in jm_contract_text:
+    fail(f"{CONTRACTS[2]}: RC-083 Graph/Threads surface-navigation addendum is missing")
+for navigation_fragment in (
+    "WIN-M-012",
+    "action.Back",
+    "title.Close",
+    "keyboard/UIA",
+    "Graphのperiod/metric/toggle",
+    "Threadsのpage/selection",
+    "共有行だけの検査でGraph/Threadsを合格扱いにしない",
+):
+    if navigation_fragment not in jm_contract_text:
+        fail(f"{CONTRACTS[2]}: RC-083 addendum lacks exact fragment: {navigation_fragment}")
+for source_id in ("| source_id=WIN-M-006 | WIN-M-012 |", "| source_id=WIN-M-007 | WIN-M-012 |"):
+    if source_id not in jm_contract_text:
+        fail(f"{CONTRACTS[2]}: RC-083 per-surface projection missing: {source_id}")
+unexpected_exit_marker = "### WIN-J-011 unexpected-exit projection (RC-066)"
+if unexpected_exit_marker not in jm_contract_text:
+    fail(f"{CONTRACTS[2]}: RC-066 unexpected-exit projection is missing")
+for unexpected_exit_fragment in (
+    "source_id=WIN-J-011:unexpected-exit",
+    "StopRequested→Stopped",
+    "unexpected exit is detected within 2 seconds",
+    "exactly one automatic restart is allowed after a 5-second backoff",
+    "restart failure or second unexpected exit latches `Failed`",
+    "only explicit start or a new systemd activation starts a new epoch",
+    "prior complete snapshot, DB, persisted hint, source cursor, and confirmed gap ledger",
+    "never fabricate the stopped interval or a successful gap",
+):
+    if unexpected_exit_fragment not in jm_contract_text:
+        fail(f"{CONTRACTS[2]}: RC-066 projection lacks exact fragment: {unexpected_exit_fragment}")
+reset_hint_marker = "### WIN-J-010 reset-hint/fingerprint/backfill projection (RC-065)"
+if reset_hint_marker not in jm_contract_text:
+    fail(f"{CONTRACTS[2]}: RC-065 reset-hint/backfill projection is missing")
+for reset_hint_fragment in (
+    "source_id=WIN-J-010:reset-hint-backfill",
+    "canonical sessions root regular non-symlink JSONL",
+    "device/inode, size, `mtime_ns`, last complete LF offset, and last complete row SHA-256",
+    "unchanged fingerprint yields scan/write/retry=0",
+    "append resumes at cursor",
+    "rotate/truncate discards cursor and performs one recheck",
+    "backfill latch is consumed once only",
+    "current AuthEpoch, same current source identity, `reset_at > now`",
+    "at most 1024 rows and 1 MiB",
+    "expired/tombstoned or AuthEpoch/nonce mismatch rejects hint scan/backfill write",
+    "existing rows are not rewritten and missing intervals are not fabricated",
+):
+    if reset_hint_fragment not in jm_contract_text:
+        fail(f"{CONTRACTS[2]}: RC-065 projection lacks exact fragment: {reset_hint_fragment}")
+singleton_contention_marker = "### WIN-J-012 / WIN-J-013 singleton-vs-contention projection (RC-068)"
+if singleton_contention_marker not in jm_contract_text:
+    fail(f"{CONTRACTS[2]}: RC-068 singleton/contention projection is missing")
+for singleton_contention_fragment in (
+    "J-012の複数writer試験は、J-013の同一profile recorder二重起動とは別のfixtureである",
+    "J-012行のactor表記「two daemon servers」はこの競合fixtureの許可済みDB writer processを指し、recorder lease ownerを二つ作る意味ではない",
+    "source_id=WIN-J-012:contention",
+    "same DB、unique key `(partition_id,reset_at,timestamp)`",
+    "busy timeout and each attempt deadline `2.000s`",
+    "contention is not a second recorder owner and uses another permitted writer process",
+    "same-callback polling retry=0",
+    "B may reach at most attempt2 only in a later scheduled cycle or explicit operation",
+    "source_id=WIN-J-013:singleton",
+    "singleton scope is canonical DB path + profile",
+    "daemon-A acquires `/fixtures/profile/daemon.lock`, then daemon-B launches",
+    "live owner count<=1",
+    "different profile or different DB is independent",
+    "disabling/bypassing the lease to make a product success is FAIL",
+    "age alone never steals",
+    "all writers of one DB still use J-012 unique/upsert/busy contract",
+):
+    if singleton_contention_fragment not in jm_contract_text:
+        fail(f"{CONTRACTS[2]}: RC-068 projection lacks exact fragment: {singleton_contention_fragment}")
+stale_lock_marker = "### WIN-J-013 stale-lock identity projection (RC-069)"
+if stale_lock_marker not in jm_contract_text:
+    fail(f"{CONTRACTS[2]}: RC-069 stale-lock projection is missing")
+for stale_lock_fragment in (
+    "RC-069はJ-013のsingleton leaseを再定義せず",
+    "source_id=WIN-J-013:stale-lock",
+    "lease is UTF-8 JSON `recorder-lease-v1`, maximum 4 KiB",
+    "`pid`, `process_start`, `owner_nonce`, `canonical_db_path`, `device_or_volume_serial`, and `file_index_or_inode`",
+    "stale recovery requires PID absence or process-start mismatch",
+    "reopen the same path and compare the reopened file identity with the identity recorded at acquisition",
+    "24 hours is diagnostic elapsed time only, never a deletion condition",
+    "age-only deletion, another owner's deletion, path mismatch, or identity mismatch has removal count=0",
+    "lease bypass is not a product success path",
+):
+    if stale_lock_fragment not in jm_contract_text:
+        fail(f"{CONTRACTS[2]}: RC-069 projection lacks exact fragment: {stale_lock_fragment}")
+maintenance_owner_marker = "### WIN-J-006 / WIN-J-014 maintenance-owner projection (RC-070)"
+if maintenance_owner_marker not in jm_contract_text:
+    fail(f"{CONTRACTS[2]}: RC-070 maintenance-owner projection is missing")
+for maintenance_owner_fragment in (
+    "RC-070は起動時maintenanceのownerとprune admissionを",
+    "source_id=WIN-J-006:maintenance-owner",
+    "canonical DB profileの唯一の`MaintenanceOwner`",
+    "prune前にwriter admissionを閉じる",
+    "`online backup candidate → flush → quick_check/schema/row count/deterministic fingerprint/reset-period境界検証 → verified rotation → prune transaction`",
+    "同一activationの新verified BackupGenerationは最大1件",
+    "backup失敗、検証失敗、writer競合ではprune=0",
+    "source_id=WIN-J-014:backup-rotation",
+    "backup files mode=`0600`, DB dir mode=`0700`",
+    "one maintenance activation may publish at most one new generation",
+    "generation sequenceは`0→1→2→3`",
+    "crash/recovery完了前のwriter/prune/publish=0",
+):
+    if maintenance_owner_fragment not in jm_contract_text:
+        fail(f"{CONTRACTS[2]}: RC-070 projection lacks exact fragment: {maintenance_owner_fragment}")
+generation_journal_marker = "### WIN-J-006 / WIN-J-014 backup-generation journal projection (RC-071)"
+if generation_journal_marker not in jm_contract_text:
+    fail(f"{CONTRACTS[2]}: RC-071 backup-generation projection is missing")
+for generation_journal_fragment in (
+    "RC-071はRC-070のowner/admission順序を変更せず",
+    "source_id=WIN-J-006:generation-namespace",
+    "`.bak.1=最新verified`, `.bak.2=次に新しいverified`, `.bak.3=最古verified`",
+    "one activation adds at most one verified generation",
+    "accumulates real-time `0→1→2→3`",
+    "identical snapshot is not duplicated",
+    "source_id=WIN-J-014:rotation-journal",
+    "owner-only `backup-rotation-v1` journal records old rank/path/inode/hash",
+    "crash/restart uses journal and hashes to choose exactly one rollback or roll-forward",
+    "journal reconciliation completes before writer/prune/publish resumes",
+    "explicit restore selects only the latest complete verified generation",
+    "prune/writer/publish before journal recovery=0",
+):
+    if generation_journal_fragment not in jm_contract_text:
+        fail(f"{CONTRACTS[2]}: RC-071 projection lacks exact fragment: {generation_journal_fragment}")
+migration_switch_marker = "### WIN-J-015 migration-switch projection (RC-073)"
+if migration_switch_marker not in jm_contract_text:
+    fail(f"{CONTRACTS[2]}: RC-073 migration-switch projection is missing")
+for migration_switch_fragment in (
+    "RC-073は旧schema拒否、明示candidate成功、candidate/switch/crash失敗の3経路を",
+    "source_id=WIN-J-015:old-schema",
+    "old schema read/write/publish=0",
+    "source_id=WIN-J-015:candidate-success",
+    "explicit `UsageStore::migrate_verified`",
+    "writer/API/UI admission closed",
+    "unique key `(partition_id,reset_at,timestamp)`",
+    "result DataGeneration=DG11 once, pair publication=1",
+    "source_id=WIN-J-015:candidate-failure",
+    "`migration-switch-v1` owner-only 0600 UTF-8 JSON <=64 KiB",
+    "verified commit前はOLD唯一current, switch/delete/publication=0",
+    "current missing/double/empty is held until reconcile",
+    "foreign/second operation is Busy with mutation 0",
+):
+    if migration_switch_fragment not in jm_contract_text:
+        fail(f"{CONTRACTS[2]}: RC-073 projection lacks exact fragment: {migration_switch_fragment}")
+extension_marker = "## RC-167〜169 exact extension for WIN-J-007..016"
+if extension_marker not in jm_contract_text:
+    fail(f"{CONTRACTS[2]}: missing RC-167〜169 extension marker")
+extension_text = jm_contract_text.split(extension_marker, 1)[1]
+extension_text = extension_text.split("## 構造ゲート", 1)[0]
+if re.search(r"^\| WIN-J-\d{3} \|", extension_text, re.MULTILINE):
+    fail(f"{CONTRACTS[2]}: RC extension repeats concrete WIN-J row IDs without source_id prefix")
+extension_source_ids = re.findall(r"^\| (source_id=WIN-J-\d{3}) \|", extension_text, re.MULTILINE)
+expected_extension_source_ids = [f"source_id=WIN-J-{number:03d}" for number in range(7, 17)]
+if extension_source_ids != expected_extension_source_ids:
+    fail(
+        f"{CONTRACTS[2]}: RC extension source_id join differs: "
+        f"actual={extension_source_ids} expected={expected_extension_source_ids}"
+    )
+if "attempt1 full rollback" in extension_text:
+    fail(f"{CONTRACTS[2]}: RC extension makes WIN-J-012 rollback unconditional")
+for extension_fragment in (
+    "BUSY期限超過時だけattempt1=full_rollback",
+    "2秒以内のcommit-within-deadlineはattempt1=commit",
+    "same-cycle retry=0",
+):
+    if extension_fragment not in extension_text:
+        fail(f"{CONTRACTS[2]}: RC extension missing conditional WIN-J-012 busy oracle {extension_fragment}")
+
 
 def require_fragments(row_id: str, *fragments: str) -> None:
     searchable = " ".join(rows_by_id[row_id][1:10])
@@ -465,13 +651,21 @@ def require_fragments(row_id: str, *fragments: str) -> None:
         fail(f"{row_id}: missing semantic anchors {absent}")
 
 
+def require_doc_fragments(path: Path, *fragments: str) -> None:
+    searchable = path.read_text(encoding="utf-8")
+    absent = [fragment for fragment in fragments if fragment not in searchable]
+    if absent:
+        fail(f"{path}: missing cross-row authority anchors {absent}")
+
+
 # High-risk meaning anchors. These supplement, but never replace, independent clause review.
-require_fragments("WIN-B-002", "min(reset_at,now)", "now<reset_at", "now==reset_at", "now>reset_at")
+require_fragments("WIN-B-002", "plot_end=min(quota.reset_at,now)", "now<reset_at", "now==reset_at", "now>reset_at")
 require_fragments("WIN-B-016", "Remaining", "LUNA", "TERRA", "SOL", "同時")
 require_fragments("WIN-B-017", "Remaining→LUNA→TERRA→SOL")
 require_fragments("WIN-B-019", "0..100", "独立")
 require_fragments("WIN-B-020", "表示中", "最大")
 require_fragments("WIN-C-020", "起動直後", "10秒", "3秒", "in-flight")
+require_fragments("WIN-C-020", "busy=true,enabled=false", "localized busy label/icon", "UIA busy/disabled", "focus/cursor/old_rootを保持", "late root updateはFAIL")
 require_fragments("WIN-D-003", "parent_thread_id", "context_usage_tokens", "context_window_tokens", "is_subagent")
 require_fragments("WIN-E-010", "ssh.exe", "-N", "-L", "8787:127.0.0.1:8787", "listener_owner_typed_join=(WIN-J-010.daemon_lease,WIN-J-013.singleton_owner_lease,WIN-J-016.REST_publisher_bootstrap_generation_cycle_tuple)", "cycle_tuple=(ProfileScopeId,AccountScopeId,StorageEpoch,SupervisorLeaseIdentity,CollectorEpoch,CycleSeq)")
 require_fragments("WIN-E-002", "profile_enum=[none,wsl,sshConfigAlias]", "health→status→auth-start→separate-auth-check→ready")
@@ -488,15 +682,22 @@ require_fragments("WIN-E-007", "safe_argv=[ssh.exe,-o,BatchMode=yes,-N,-L,8787:1
 require_fragments("WIN-E-008", "argv_user_empty=[ssh.exe,-o,BatchMode=yes,-N,-L,8787:127.0.0.1:8787,codex-lab]", "argv_user_present=[ssh.exe,-o,BatchMode=yes,-N,-L,8787:127.0.0.1:8787,alice_qa@codex-lab]", "rendered_copy_empty=\"ssh.exe -o BatchMode=yes -N -L 8787:127.0.0.1:8787 codex-lab\"", "argv_token_count=7")
 require_fragments("WIN-E-010", "automatic_remote_argv_exact=[ssh.exe,-o,BatchMode=yes,-N,-L,8787:127.0.0.1:8787,<validated alias>]", "argv_token_count=7", "listener_owner_identity_matches_current_supervised_ssh_generation=true", "preexisting_listener_connected_ready=false", "post_exit_rebind_connected_ready=false", "pid_reuse_connected_ready=false", "foreign_listener_adoption=0")
 require_fragments("WIN-E-011", "supervis", "orphan", "SSH_PROCESS_START_OR_EXIT", "error.ssh.process-start-or-exit.cause", "next_launch_auto_reconnect=true", "recorder_continues=true", "same_generation_auto_retry_infinite=0", "listener_owner_identity_matches_current_supervised_ssh_generation=true", "post_exit_rebind_connected_ready=false", "pid_reuse_connected_ready=false", "foreign_listener_adoption=0", "listener_owner_typed_join=(WIN-J-010.daemon_lease,WIN-J-013.singleton_owner_lease,WIN-J-016.REST_publisher_bootstrap_generation_cycle_tuple)")
-require_fragments("WIN-E-012", "/v1/health", "application/json", "no-store", "health_is_reachability_only=true", "sequence_next=status=true", "listener_owner_identity_exact_before_after_each_cycle=true", "ssh_generation_match=true", "wsl_bootstrap_service_generation_and_loopback_owner_match=true", "foreign_listener_accept_count=0", "owner_verification_unavailable_ready=false", "listener_owner_typed_join=(WIN-J-010.daemon_lease,WIN-J-013.singleton_owner_lease,WIN-J-016.REST_publisher_bootstrap_generation_cycle_tuple)")
+require_fragments("WIN-E-012", "/v1/health", "application/json", "no-store", "health_is_reachability_only=true", "sequence_next=status=true", "listener_owner_identity_exact_before_after_each_cycle=true", "remote_listener_owner_check=before_after_each_health_status_details_cycle matches current supervised ssh generation", "wsl_owner_check=profile-specific bootstrap/service generation plus Windows↔WSL loopback path", "foreign/rebound/PID-reused/unverified listener accept count=0", "verification_unavailable=reject", "listener_owner_typed_join=(WIN-J-010.daemon_lease,WIN-J-013.singleton_owner_lease,WIN-J-016.REST_publisher_bootstrap_generation_cycle_tuple)")
 require_fragments("WIN-E-013", "health_status_auth_ready_separate=true", "ready_only_after_separate_auth_check=true", "ready_wire_boolean_field=0", "ready_predicate=state=ready AND authenticated=true", "setup_confirmation_once=true", "setup_loop=0")
+require_fragments("WIN-F-006", "inventory_categories=[GPL,third-party,font,schema,dependency,distribution]", "runtime notice is included under third-party package sources", "no invented privacy notice")
+if "inventory_categories=[GPL,runtime,third-party,font,schema,dependency,distribution]" in " ".join(rows_by_id["WIN-F-006"][1:10]):
+    fail("WIN-F-006: Legal UI retains obsolete seven-category runtime entry")
+require_fragments("WIN-I-014", "status=500", "wire_error_code=internal_error", "failure_class=DB_SERVER_ERROR", "error.data.unavailable.cause", "error.data.unavailable.impact")
+if "failure_class=API_UNREACHABLE" in " ".join(rows_by_id["WIN-I-014"][1:10]):
+    fail("WIN-I-014: HTTP 500 still maps to API_UNREACHABLE")
 require_fragments("WIN-E-014", "WSL_selector=installed_distribution_exact_token", "SSH_selector=literal_Host_alias", "auth_argv_exact={WSL=[wsl.exe,-d,<selector>,--,codex,login],SSH=[ssh.exe,-o,BatchMode=yes,<selector>,codex,login]}", "ArgumentList", "hidden_prompt=0")
-require_fragments("WIN-E-015", "old4_corrupt_invalid_route=Main_disconnected", "Settings_recovery=true", "recovery_command_count=0", "setup_loop=0")
+require_fragments("WIN-E-015", "old4/corrupt/invalid route=Main_disconnected", "old4_corrupt_invalid.Settings_recovery=true", "recovery_command_count=0", "never enter Welcome/Setup loop")
 require_fragments("WIN-E-016", "host", "user", "persisted_occurrence_count=0")
 require_fragments("WIN-E-016", "settings_keys_exact=[language,setupCompleted,connectionConfigured,timeZoneId,connectionProfile,connectionSelector]", "profile_enum=[none,wsl,sshConfigAlias]", "selector_grammar=^[A-Za-z0-9][A-Za-z0-9._-]{0,254}$")
 require_fragments("WIN-F-003", "local", "UTC", "2026/08/22 00:00 +00:00", "2026/08/22 09:00 +09:00")
 require_fragments("WIN-F-004", "API_UNREACHABLE", "error.api.unreachable.impact", "locale=ja")
 require_fragments("WIN-F-008", "language", "setupCompleted", "connectionConfigured", "timeZoneId", "connectionSelector", "selector_atomic=true")
+require_fragments("WIN-M-015", "SETTINGS_SAVE_FAILED", "action.settings.save.retry")
 require_fragments("WIN-F-007", "saved non-secret selector/profile retained only when valid", "one-session raw recovery is not durable completion", "automatic command count=0")
 require_fragments("WIN-G-001", "ja", "en", "zh-Hans", "ko", "es", "fr", "de", "pt", "it", "ru")
 require_fragments("WIN-G-014", "UX-20260823-KEYBOARD-001", "keydown/keyup", "mouse_event_count=0", "setup_profile_step_projection=profile×step visible+enabled Tab projection", "SetupOperationGeneration=monotonic", "stale_completion_commit=0", "RC-121 profile_action_semantics", "action.StartForward is not a catch-all")
@@ -504,23 +705,34 @@ require_fragments("WIN-G-015", "2 logical-pixel", "3:1", "high-contrast")
 require_fragments("WIN-G-016", "reduced-motion")
 require_fragments("WIN-H-002", "self-contained", "外部.NET", "runtime")
 require_fragments("WIN-I-006", "8 KiB", "64 KiB", "32 MiB", "128", "100,000", "256", "3")
-require_fragments("WIN-I-007", "history_periods", "history_samples", "history_gaps", "details_top13", "gap5", "gaps 4096", "details_contract_revision=rest-v1-details-gap-20260823", "estimated_cost_label", "monthly", "LIVE_STATE_DECISION_MATRIX", "THREAD_PIPELINE_FIXTURE_CONTRACT_2026-08-23.md§2.1/§2.2/§3", "process_identity=(pid,starttime_ticks,exe_device,exe_inode)", "publisher_admission=(ProfileScopeId,AccountScopeId,StorageEpoch,SupervisorLeaseIdentity,CollectorEpoch,CycleSeq)", "860d7ec45d6e53357b6f94201154d5a642fee9611bdb7bb410df5f712ea5f249", "76ce097b4412b61b95131c80ae36ddc1768a4fa119591e067f6e3de9d4519d8b", "plan_type_mapping_exact=true", "plan_label_exact_set=true", "plan_label_monthly_same_cycle=true", "period_label_reference_only=true", "period_label_to_id_unique=true", "windows_period_label_reverse_parse=0", "ready wire boolean=0", "native invalid", "complete accepted REST set")
+require_fragments("WIN-I-007", "history_periods", "history_samples", "history_gaps", "details_top13", "gap5", "gaps 4096", "details_contract_revision=rest-v1-details-gap-20260823", "estimated_cost_label", "monthly", "LIVE_STATE_DECISION_MATRIX", "THREAD_PIPELINE_FIXTURE §2.1/§2.2/§3", "process_identity=(pid,starttime_ticks,exe_device,exe_inode)", "publisher_admission=(ProfileScopeId,AccountScopeId,StorageEpoch,SupervisorLeaseIdentity,CollectorEpoch,CycleSeq)", "PlanType exact 15 values and canonical label/monthly mapping", "period labelはreference-only", "period id、sample partition投影内(reset_at,timestamp)", "Windows label reverse parse", "ready wire boolean=0", "native invalid", "完全accepted REST setのmissing-parent")
 require_fragments("WIN-I-013", "input_tokens", "cached_input_tokens", "output_tokens")
 require_fragments("WIN-I-014", "API_UNREACHABLE", "raw_body", "last-good")
-require_fragments("WIN-I-016", "auth_required", "old_account_visible_occurrences=0", "linux_history_db_hash", "LIVE_STATE_DECISION_MATRIX", "publisher_admission=(ProfileScopeId,AccountScopeId,StorageEpoch,SupervisorLeaseIdentity,CollectorEpoch,CycleSeq)", "native duplicate/dangling/cycle/partial", "完全accepted REST setのmissing-parent", "preexisting", "post-exit rebind", "pid reuse", "foreign", "listener_owner_typed_join=(WIN-J-010.daemon_lease,WIN-J-013.singleton_owner_lease,WIN-J-016.REST_publisher_bootstrap_generation_cycle_tuple)")
-require_fragments("WIN-J-006", "backup_generations=3")
-require_fragments("WIN-J-012", "each_attempt_busy_deadline=2.000 s", "attempt1=BUSY_full_rollback", "same_cycle_attempt=1", "same_callback_polling_retry=0", "next normal cycle or explicit operation", "retry_count<=1")
+require_fragments("WIN-I-016", "auth_required", "auth_clearはold account/quota/model/history/thread visible/accessibility occurrence=0", "DB hash=H0", "LIVE_STATE_DECISION_MATRIX", "publisher_admission=(ProfileScopeId,AccountScopeId,StorageEpoch,SupervisorLeaseIdentity,CollectorEpoch,CycleSeq)", "native=[duplicate,dangling,cycle,partial]", "完全accepted REST setのmissing-parent", "preexisting", "post-exit rebind", "pid reuse", "foreign", "listener ProcessIdentity、SSH supervised generationまたはWSL bootstrap/service generation、publisher admission")
+require_fragments("WIN-J-006", "retention_max=3", "BackupGeneration count=1", "new_generation_max_per_activation=1")
+require_fragments("WIN-J-004", "keyは(partition_id,reset_at,timestamp)", "partition_id欠落", "minuteというkey列名を作らない")
+if "keyは(reset_at,timestamp)だけ" in " ".join(rows_by_id["WIN-J-004"][1:10]):
+    fail("WIN-J-004: partition-aware canonical key was narrowed to reset_at/timestamp")
+require_fragments("WIN-J-005", "period+timestamp upsert", "unique key=(partition_id,reset_at,timestamp)")
+if "period+minute upsert" in rows_by_id["WIN-J-005"][2]:
+    fail("WIN-J-005: title still names the forbidden minute-key upsert")
+require_fragments("WIN-J-012", "each_attempt_busy_deadline=2.000 s", "subcase-B attempt1=BUSY_full_rollback", "subcase-A attempt1=commit_within_deadline", "same_cycle_attempt=1", "same_callback_polling_retry=0", "next normal cycle or explicit operation", "retry_count<=1")
 require_fragments("WIN-J-014", "online backup")
 require_fragments("WIN-J-014", "generation_sequence=[0,1,2,3]", "new_generation_max_per_activation=1", "same_activation_duplicate=0", "flush/fsync", "directory-fsync", "rotation journal", "pre-recovery prune/write/publish=0")
-require_fragments("WIN-J-015", "journal_fields=[migration_id,path,inode,old_hash,candidate_hash,phase]", "between_multi_rename", "rollback/roll-forward", "current missing/double/empty DB publication count=0")
-require_fragments("WIN-J-009", "THREAD_PIPELINE_FIXTURE_CONTRACT_2026-08-23.md §2.2", "record_policy_fixture_sha=76ce097b4412b61b95131c80ae36ddc1768a4fa119591e067f6e3de9d4519d8b", "record_policy_cases=[LIVE_OVERSIZE_PROVEN_TOOL_THEN_TERMINAL", "LOCAL_PARTIAL_LATER_SNAPSHOT", "local_model_column_order=[input_tokens,cached_input_tokens,output_tokens,input_dollars,cached_input_dollars,output_dollars]")
+require_fragments("WIN-J-015", "journal schema=migration-switch-v1", "exact keys=[schema_version,operation_id,operation_generation,owner_identity,phase,current_identity,current_sha256,candidate_identity,candidate_sha256,quarantine_identity,quarantine_sha256,parent_data_generation,result_data_generation_or_null,created_at_utc,updated_at_utc]", "rollbackまたはroll-forward", "missing/double/emptyはreconcile完了まで公開0")
+require_fragments("WIN-J-009", "record_policy_sha=76ce097b4412b61b95131c80ae36ddc1768a4fa119591e067f6e3de9d4519d8b", "cases=[LIVE_OVERSIZE_PROVEN_TOOL_THEN_TERMINAL", "LOCAL_PARTIAL_LATER_SNAPSHOT", "local_model_column_order=[input_tokens,cached_input_tokens,output_tokens,input_dollars,cached_input_dollars,output_dollars]")
 require_fragments("WIN-K-015", "Main", "Setup", "Settings", "Graph", "Threads", "Legal")
 require_fragments("WIN-K-002", "profile/selector authority=RC-061..063", "WSL installed distribution exact token", "SSH literal Host alias", "SSH_PROFILE_INVALID", "SSH_PROCESS_START_OR_EXIT", "SSH_HEALTH_UNAVAILABLE", "automatic_remote_argv_exact=[ssh.exe,-o,BatchMode=yes,-N,-L,8787:127.0.0.1:8787,<validated alias>]", "safe_argv_token_count=7", "shell/cmd/PowerShell=0", "BatchMode=yes", "hidden_prompt=0")
 require_fragments("WIN-K-003", "app-wide supervisor owns exactly one bootstrap/tunnel child", "next launch auto reconnect", "orphan_tunnel=0", "recorder_continues=true", "same_generation_auto_retry_infinite=0", "preexisting_listener", "post_exit_rebind", "pid_reuse", "foreign_listener_adoption=0", "owner_verification_unavailable_ready=false")
-require_fragments("WIN-K-004", "health_status_auth_ready_separate=true", "auth-start success alone is not ready", "Setup_confirmation_once=true")
+require_fragments("WIN-K-004", "health_status_auth_ready_separate=true", "auth-start success alone is not ready", "Setup_confirmation_once=true", "auth_requiredでは同一status bodyにplan/quotaの安全値があっても現行account値として表示せず")
+if "安全なquota/plan値だけをauth_requiredとして表示でき" in " ".join(rows_by_id["WIN-K-004"][1:10]):
+    fail("WIN-K-004: auth_required still permits plan/quota display contrary to auth-clear authority")
 require_fragments("WIN-K-010", "help_caller_identity=(PID,HWND,WindowInstanceGeneration)", "destroy_or_reuse_fallback=Main_pre_Help_route_nav.Help", "ShuttingDown_restore=0", "idempotent_close_Back_Escape=true")
 require_fragments("WIN-K-011", "help_caller_identity=(PID,HWND,WindowInstanceGeneration)", "destroy_or_reuse_fallback=Main_pre_Help_route_nav.Help", "ShuttingDown_restore=0", "idempotent_close_Back_Escape=true")
 require_fragments("WIN-K-012", "help_caller_identity=(PID,HWND,WindowInstanceGeneration)", "destroy_or_reuse_fallback=Main_pre_Help_route_nav.Help", "ShuttingDown_restore=0", "idempotent_close_Back_Escape=true")
+require_fragments("WIN-K-012", "UI child windows=[Setup,Settings,Graph,Threads,Legal]", "Help is Main-internal route and never a child HWND")
+if "Help when separate" in " ".join(rows_by_id["WIN-K-012"][1:10]):
+    fail("WIN-K-012: Help is still permitted as a separate child window")
 require_fragments("WIN-K-009", "LIVE_STATE_DECISION_MATRIX", "THREAD_PIPELINE_FIXTURE_CONTRACT", "§2.2/§3", "ProcessIdentity=(pid,starttime_ticks,exe_device,exe_inode)", "Codex Info祖先observer app-server全process除外", "path→owner set", "publisher_admission=(ProfileScopeId,AccountScopeId,StorageEpoch,SupervisorLeaseIdentity,CollectorEpoch,CycleSeq)", "860d7ec45d6e53357b6f94201154d5a642fee9611bdb7bb410df5f712ea5f249", "76ce097b4412b61b95131c80ae36ddc1768a4fa119591e067f6e3de9d4519d8b", "record_policy_cases=[LIVE_OVERSIZE_PROVEN_TOOL_THEN_TERMINAL", "LOCAL_PARTIAL_LATER_SNAPSHOT", "invalid_utf8", "invalid_json", "invalid_envelope", "invalid_state", "oversize_isolation_requires=bounded_streaming+valid_envelope+liveness_nonchanging_proof", "contract_hashes=[native=d9bf9d1429ef", "owner=860d7ec45d6e53357b6f94201154d5a642fee9611bdb7bb410df5f712ea5f249", "record=76ce097b4412b61b95131c80ae36ddc1768a4fa119591e067f6e3de9d4519d8b", "rest=461e0f28bdde", "presentation=8b2fe86ea389")
 require_fragments("WIN-L-003", "226", "96")
 require_fragments("WIN-L-015", "physical Windows host", "installer_failure_matrix=[crash_before_commit,crash_after_commit,reboot_mid_operation,journal_replay,duplicate_start,owner_lease_replay]", "operation_journal_replay_idempotent=true", "singleton_owner_lease=one", "owner_replay_match_required=true", "last_good_on_failure=true")
@@ -535,7 +747,7 @@ require_fragments("WIN-M-014", "2125223e9996", "e3b0c44298fc", "a30afe326a99")
 require_fragments("WIN-M-014", "valid_selector.auto_reconnect=true", "old4_corrupt_invalid=Main_disconnected+Settings_recovery", "recovery_command_count=0", "Setup_confirmation_on_reconnect=0")
 require_fragments("WIN-M-007", "stage_boundary_count=4", "contract_hash_count=5", "stage_hashes=[native=d9bf9d1429ef", "owner=860d7ec45d6e53357b6f94201154d5a642fee9611bdb7bb410df5f712ea5f249", "record=76ce097b4412b61b95131c80ae36ddc1768a4fa119591e067f6e3de9d4519d8b", "rest=461e0f28bdde", "presentation=8b2fe86ea389", "record_policy_cases=[LIVE_OVERSIZE_PROVEN_TOOL_THEN_TERMINAL", "LOCAL_PARTIAL_LATER_SNAPSHOT", "local_model_column_order=[input_tokens,cached_input_tokens,output_tokens,input_dollars,cached_input_dollars,output_dollars]")
 require_fragments("WIN-M-010", "stage_boundary_count=4", "contract_hash_count=5", "stage_hashes=[native=d9bf9d1429ef", "owner=860d7ec45d6e53357b6f94201154d5a642fee9611bdb7bb410df5f712ea5f249", "record=76ce097b4412b61b95131c80ae36ddc1768a4fa119591e067f6e3de9d4519d8b", "rest=461e0f28bdde", "presentation=8b2fe86ea389", "record_policy_cases=[LIVE_OVERSIZE_PROVEN_TOOL_THEN_TERMINAL", "LOCAL_PARTIAL_LATER_SNAPSHOT", "local_model_column_order=[input_tokens,cached_input_tokens,output_tokens,input_dollars,cached_input_dollars,output_dollars]")
-require_fragments("WIN-M-015", "every ERROR-001 class=[API_UNREACHABLE,SSH_PROFILE_INVALID,SSH_LOCAL_PORT_IN_USE,SSH_INTERACTION_REQUIRED,SSH_PROCESS_START_OR_EXIT,SSH_HEALTH_UNAVAILABLE,AUTH_REQUIRED_OR_EXPIRED,AUTH_LAUNCH_FAILED,SETTINGS_CORRUPT,SETTINGS_SAVE_FAILED,STATUS_INVALID,DETAILS_INVALID,HISTORY_UNAVAILABLE,THREADS_UNAVAILABLE,DB_SERVER_ERROR,CLIPBOARD_WRITE_FAILED,INSTALL_OR_UPDATE_FAILED,UNINSTALL_FAILED,CLIENT_SHUTDOWN_TIMEOUT]", "SSH_PROFILE_INVALID", "SSH_PROCESS_START_OR_EXIT", "SSH_HEALTH_UNAVAILABLE", "UNINSTALL_FAILED", "CLIENT_SHUTDOWN_TIMEOUT", "gate=19 class mappings")
+require_fragments("WIN-M-015", "every ERROR-001 class=[API_UNREACHABLE,SSH_PROFILE_INVALID,SSH_LOCAL_PORT_IN_USE,SSH_INTERACTION_REQUIRED,SSH_PROCESS_START_OR_EXIT,SSH_HEALTH_UNAVAILABLE,AUTH_REQUIRED_OR_EXPIRED,AUTH_LAUNCH_FAILED,SETTINGS_CORRUPT,SETTINGS_SAVE_FAILED,STATUS_INVALID,DETAILS_INVALID,HISTORY_UNAVAILABLE,THREADS_UNAVAILABLE,DB_SERVER_ERROR,CLIPBOARD_WRITE_FAILED,INSTALL_OR_UPDATE_FAILED,UNINSTALL_FAILED,CLIENT_SHUTDOWN_TIMEOUT]", "SSH_PROFILE_INVALID", "SSH_LOCAL_PORT_IN_USE", "SSH_INTERACTION_REQUIRED", "SSH_PROCESS_START_OR_EXIT", "SSH_HEALTH_UNAVAILABLE", "SETTINGS_SAVE_FAILED", "action.settings.save.retry", "UNINSTALL_FAILED", "CLIENT_SHUTDOWN_TIMEOUT", "gate=19 class mappings")
 require_fragments("WIN-M-018", "saved_selector_auto_reconnect=true", "Setup_confirmation_on_reconnect=0", "same_generation_auto_retry_infinite=0", "app_wide_supervisor_single_tunnel=true")
 require_fragments("WIN-M-025", "UX-20260823-KEYBOARD-001", "keydown/keyup", "mouse")
 require_fragments("WIN-M-025", "help_caller_identity=(PID,HWND,WindowInstanceGeneration)", "destroy_or_reuse_fallback=Main_pre_Help_route_nav.Help", "ShuttingDown_restore=0", "idempotent_close_Back_Escape=true", "HelpScopeGeneration=monotonic", "HelpCloseToken=single_use", "caller_identity=(PID,starttime_ticks,HWND,WindowInstanceGeneration)", "Main_generation=monotonic", "restore_immediately_before_revalidation=true", "old_HWND_message_count=0", "first_caller_fixed=true", "setup_profile_step_projection=profile×step visible+enabled Tab projection", "SetupOperationGeneration=monotonic", "stale_completion_commit=0", "RC-121 profile_action_semantics")
@@ -590,8 +802,169 @@ require_fragments(
 require_fragments(
     "WIN-C-019",
     "floor(logical*dpi/96+0.5)",
-    "supported=logical threshold AND visible_frame fully contained in rcWork",
-    "topology_cases=[same_dpi_positive_origin,different_dpi,negative_origin,nonzero_origin,taskbar_shrink]",
+    "logical threshold AND visible_frame fully contained in current rcWork",
+    "topology sequence=[open on monitor B with negative origin",
+    "taskbar shrink invalidates rect",
+    "different-DPI remaining monitor",
+)
+require_fragments(
+    "WIN-C-006",
+    "reset_at=1780400000",
+    "delta=86401",
+    "delta=86400",
+    "delta=86399",
+    "ShuttingDown(UIなし)>AuthRequired>ErrorNoData",
+    "quota danger(<=2%)>quota warning(<=10%)>reset warning(<=86400s)>Normal",
+    "danger+resetはdanger",
+    "warning+resetはwarning",
+)
+require_fragments(
+    "WIN-C-012",
+    "locale resolution=[ja-JP→ja,xx-YY→en,C/POSIX→en]",
+    "catalog cases=[ja valid,en valid,en missing,en invalid UTF-8/key-set]",
+    "0s=`Resetting soon`",
+    "Remaining 1h 30m",
+    "Remaining 1d 2h",
+    "catalogのmissing/invalid UTF-8/required-key欠落はunknown locale fallbackと区別",
+    "0日0時間",
+)
+require_fragments(
+    "WIN-C-017",
+    "logical client=900x480",
+    "body left=30,width=840,right_exclusive=870",
+    "floor(logical*dpi/96+0.5)",
+    "左右差0",
+)
+require_fragments("WIN-A-019", "matrix=[quota valid+label valid", "quota null+label valid", "quota invalid+label valid", "quota valid+label invalid", "quota null+label validもroot/pairを受理", "quota未取得を表示してlabelだけ非表示", "invalid whole-candidate reject")
+require_fragments("WIN-D-004", "thread_count=[0,1,2,3,4,6,7,256]", "page_count=ceil(thread_count/3)", "各IDは全page合計exactly once", "current/total page、Prev、Next、Back、Close、Refresh", "refresh減少時はnew_page_count=0ならcurrent_page=0")
+require_fragments(
+    "WIN-C-018",
+    "exact 17 stateだけ",
+    "wire API `state=ready`は入力事実でありcanonical UI state IDではない",
+    "Graphは700x480",
+    "fixed surfaceは900x480",
+    "clip/overlap/root-or-inner-scroll/押し下げ0",
+    "N/Aはreason",
+)
+
+# Cross-row contradiction guards. These compare independently owned contracts
+# against their value authorities; they do not promote OPEN authority decisions
+# or product evidence to PASS.
+full_state_states = (
+    "`initializing`, `auth_required`, `normal`, `quota_warning`, `quota_danger`, `reset_warning`, `zero`,",
+    "`full`, `api_error`, `transport_error`, `status_invalid`, `details_invalid`, `history_error`,",
+    "`thread_error`, `db_error`, `stale`, `no_history`",
+)
+require_doc_fragments(Path("docs/UX_DECISION_ERROR_RECOVERY_2026-08-23.md"), "SETTINGS_SAVE_FAILED", "action.settings.save.retry", "action.cancel", "旧primary設定bytes", "DB/history", "connection process")
+require_doc_fragments(Path("docs/UX_DECISION_FULL_STATE_MATRIX_2026-08-23.md"), *full_state_states)
+require_doc_fragments(
+    Path("docs/WINDOWS_REQUIREMENTS_VALUE_AUTHORITIES_2026-08-22.md"),
+    "Main/Setup/Settings/Threads/Legal=logical `initial=min=max=900×480` fixed",
+    "Graph=`initial=940×640,min=700×480,max=unbounded,resizable`",
+    "Help=Main内900×480/additional HWND=0",
+    "`language`、`setupCompleted`、`connectionConfigured`、`timeZoneId`、`connectionProfile`、`connectionSelector`の6 keyだけ",
+    "profile enumは`none`、`wsl`、`sshConfigAlias`のいずれか",
+)
+for authority_path in (
+    Path("docs/REST_API_V1.md"),
+    Path("docs/DATA_PROTECTION_POLICY.md"),
+):
+    require_doc_fragments(
+        authority_path,
+        "application/json; charset=utf-8",
+        "charset欠落",
+    )
+require_doc_fragments(
+    Path("docs/REST_API_V1.md"),
+    "`ready=true` fieldを作らず",
+    "state == \"ready\" && authenticated == true",
+    "概念的なshell例であり、Windowsクライアントの実行argv順序を定義しない",
+    "Windowsのcanonical `ArgumentList`",
+    "auth_required`のsecurity visibility transitionはdata pairのcommitではない",
+    "status/details store、DB、pair generationは変更しない",
+)
+require_doc_fragments(
+    Path("docs/CUSTOMER_OPERATIONS_RUNBOOK.md"),
+    "状態: `EXTRACTION_CONTRACT / PRODUCT_PENDING`",
+    "./run.sh",
+    "CODEX_INFO_API_LISTEN=127.0.0.1:8787 ./run.sh",
+    "Slint component/window/event-loop生成=0",
+    "systemctl --user start codex-info-server.target",
+    "GET /v1/health",
+    "GET /v1/status",
+    "systemctl --user stop codex-info-server.target",
+    "systemctl --user restart codex-info-server.target",
+    "./codex-info-server-setup install",
+    "./codex-info-server-setup update",
+    "codex-info-server-setup rollback",
+    "codex-info-server-setup uninstall",
+    "失敗時はnewを成功表示せずpreviousへatomic rollback",
+    "通常uninstallはsettings、history DB、3 backup、source logsを削除しない",
+    "codex-info-server-setup restore --generation 1",
+    "codex-info-server-setup migrate --dry-run",
+    "codex-info-server-setup migrate --apply",
+    "失敗時は旧DB、旧memory、旧backupを保持",
+    "Cargo、repository、`run.sh`を要求しない",
+)
+require_doc_fragments(
+    Path("docs/REST_API_V1.md"),
+    "RecorderDaemon",
+    "独立writerであり、HTTP listenerを持たない",
+    "SnapshotPublisher",
+    "native UIとREST workerへ同じpairをread-onlyで渡す",
+    "REST専用workerは`SnapshotPublisher`のread-only consumer",
+    "UI/REST/`run.sh`はrecorderをspawnしない",
+    "UI/RESTの終了はrecorderを停止しない",
+    "daemonが単独で動く間に",
+    "HTTP listenerを暗黙生成せず",
+)
+require_doc_fragments(
+    Path("DESIGN.md"),
+    "### REST snapshot publisher・read-only境界",
+    "`record --interval 60` modeの`RecorderDaemon`はsource JSONLを検証して`UsageStore`へtransactional writeするだけでHTTP listenerを持たない",
+    "`SnapshotPublisher`はcommit済みの完全な`DataGeneration/DataHash`",
+    "native UIとREST workerは同じpairを読む",
+    "片側だけ新しくしない",
+)
+require_doc_fragments(
+    Path("docs/DATA_PROTECTION_POLICY.md"),
+    "auth_required+authenticated=false`のauth-clearはsecurity visibility transition",
+    "details/store/DB/pair bytesは不変",
+)
+require_doc_fragments(
+    Path("DESIGN.md"),
+    "保存の一意キーはlogical partitionを含む`(partition_id,reset_at,timestamp)`",
+    "同一partition内の同じ`(reset_at,timestamp)`へ複数の有効snapshot",
+    "wire projection内の表示列は`reset_at,timestamp`を保持するが、DB keyからpartitionを省略しない",
+)
+design_db_text = Path("DESIGN.md").read_text(encoding="utf-8")
+for obsolete_design_key in ("`(reset_at,timestamp)`が一意キーで",):
+    if obsolete_design_key in design_db_text:
+        fail(f"DESIGN.md: storage key still omits partition_id ({obsolete_design_key})")
+ssh_decision_path = Path("docs/UX_DECISION_SSH_CONNECTION_2026-08-23.md")
+require_doc_fragments(
+    ssh_decision_path,
+    "`state=auth_required,authenticated=false`",
+    "`state=ready,authenticated=true`",
+    "`state=ready AND authenticated=true`の場合だけMain readyとする",
+    "wireに`ready` booleanは存在しない",
+)
+ssh_decision_text = ssh_decision_path.read_text(encoding="utf-8")
+for forbidden_fragment in ("`auth_required,false`", "`ready,true`", "`ready,false`", "`auth_required,true`"):
+    if forbidden_fragment in ssh_decision_text:
+        fail(f"{ssh_decision_path}: retains obsolete wire-state shorthand {forbidden_fragment}")
+runbook_path = Path("docs/CUSTOMER_OPERATIONS_RUNBOOK.md")
+require_doc_fragments(
+    runbook_path,
+    "`state=ready AND authenticated=true`の導出順序",
+    "wire `ready` boolean field=0",
+)
+if "`ready=true`の順序" in runbook_path.read_text(encoding="utf-8"):
+    fail("CUSTOMER_OPERATIONS_RUNBOOK: ready=true is ambiguous wire-state wording")
+require_doc_fragments(
+    Path("docs/WINDOWS_REQUIREMENTS_VALUE_AUTHORITIES_2026-08-22.md"),
+    "wireの`state=ready`は入力事実であり、client canonical UI state IDではなく",
+    "17-state projection内の`normal`/`quota_warning`/`quota_danger`/`reset_warning`",
 )
 require_fragments("WIN-F-003", "persisted timeZoneId", "arbitrary IANA", "host IANA")
 require_fragments("WIN-G-010", "enum=[local,UTC]", "local_once_host_resolution=true", "arbitrary_IANA_rejected=true")
@@ -606,8 +979,9 @@ require_fragments(
 require_fragments("WIN-M-004", "setup_profile_step_projection=profile×step visible+enabled Tab projection", "SetupOperationGeneration=monotonic", "stale_completion_commit=0", "RC-121 profile_action_semantics", "action.StartForward is not a catch-all")
 for installer_row_id in ("WIN-H-001", "WIN-H-002", "WIN-H-003", "WIN-H-004", "WIN-H-005", "WIN-H-006", "WIN-H-007", "WIN-H-008", "WIN-H-009", "WIN-H-010", "WIN-H-011", "WIN-H-012"):
     require_fragments(installer_row_id, "installer_failure_matrix=[crash_before_commit,crash_after_commit,reboot_mid_operation,journal_replay,duplicate_start,owner_lease_replay]", "operation_journal_replay_idempotent=true", "singleton_owner_lease=one", "owner_replay_match_required=true", "last_good_on_failure=true")
-for lease_row_id in ("WIN-J-010", "WIN-J-013", "WIN-J-016"):
+for lease_row_id in ("WIN-J-010", "WIN-J-013"):
     require_fragments(lease_row_id, "listener_owner_typed_join=(WIN-J-010.daemon_lease,WIN-J-013.singleton_owner_lease,WIN-J-016.REST_publisher_bootstrap_generation_cycle_tuple)", "cycle_tuple=(ProfileScopeId,AccountScopeId,StorageEpoch,SupervisorLeaseIdentity,CollectorEpoch,CycleSeq)")
+require_fragments("WIN-J-016", "listener owner tuple=(ProfileScopeId,AccountScopeId,StorageEpoch,SupervisorLeaseIdentity,CollectorEpoch,CycleSeq)")
 require_fragments(
     "WIN-I-001",
     "client_mismatch_rejected_before_connect=true",
@@ -615,14 +989,16 @@ require_fragments(
     "health_status_auth_ready_separate=true",
     "installed_service_command=PRODUCT_PENDING",
 )
+require_fragments("WIN-I-001", "allowed_urls={health:http://127.0.0.1:8787/v1/health,status:http://127.0.0.1:8787/v1/status,details:http://127.0.0.1:8787/v1/details}", "editable=false", "external_destination_count=0", "redirect_follow=false")
 require_fragments("WIN-I-002", "automatic_remote=true", "ArgumentList_only=true", "automatic_remote_BatchMode=yes", "hidden_prompt=0", "PowerShell_process_count=0")
 require_fragments("WIN-I-015", "selector/profile are the only connection values persisted", "old4/corrupt/invalid selector recovery is Main_disconnected+Settings_recovery", "one-session raw is never durable completion")
 require_fragments(
     "WIN-J-001",
     "route_method_status_matrix exact",
-    "application/json;charset=utf-8",
+    "application/json; charset=utf-8",
     "cache_control=no-store",
 )
+require_fragments("WIN-J-001", "unknown_path=/v1/unknown", "case_altered_path=/v1/Status", "expected_status={GET:200,POST:405,PUT:405,DELETE:405}", "write_count=0", "DB fingerprint before=sha256:fixed", "DB/snapshot/memory/backup fingerprintは前後不変")
 require_fragments(
     "WIN-J-003",
     "floor(event_epoch/60)*60=1787402040",
@@ -700,6 +1076,21 @@ if "概算ドル" in rows_by_id["WIN-M-006"][4] or "概算ドル" in rows_by_id[
 ei_text = CONTRACTS[1].read_text(encoding="utf-8")
 if "200000" in ei_text or "200,000" in ei_text:
     fail("E-I concrete contract contains unauthorized 200,000 history-sample limit")
+setup_cancel_marker = "### WIN-M-004 / WIN-G-014 setup-cancel projection (RC-082)"
+if setup_cancel_marker not in ei_text:
+    fail(f"{CONTRACTS[1]}: RC-082 setup-cancel projection is missing")
+for setup_cancel_fragment in (
+    "visible_cancel=true,cancel_and_reap_product_process=true,user_confirmation_before_exit=true,setup_complete=false",
+    "visible_cancel=true,discard_unsaved_input=true,route=Settings",
+    "WIN-F-007",
+    "setup_complete=true,route=Settings,write_count=0",
+    "WIN-E-011 orphan/tunnel/reap",
+    "WIN-E-016 settings bytes/secret persistence",
+    "source_id=WIN-M-004:first-launch",
+    "source_id=WIN-M-004:reopen",
+):
+    if setup_cancel_fragment not in ei_text:
+        fail(f"{CONTRACTS[1]}: RC-082 projection lacks exact fragment: {setup_cancel_fragment}")
 
 trace_rows = table_rows(TRACE_MATRIX, re.compile(r"^\| WIN-[A-M]-\d{3} \|"))
 trace_ids = [row[0] for row in trace_rows]
@@ -723,8 +1114,8 @@ for fragment in (
         fail(f"traceability matrix lacks canonical-authority marker: {fragment}")
 trace_design_text = TRACE_DESIGN.read_text(encoding="utf-8")
 for fragment in (
-    "hard_prerequisite=409",
-    "related_validation_join=154",
+    "hard_prerequisite=412",
+    "related_validation_join=165",
     "consumer row -> target producer",
     "hard graphの非自明SCCは0",
     "layer 0: WIN-I / WIN-J",
@@ -1186,7 +1577,8 @@ if actual_b2b_document_kinds != expected_b2b_document_kinds:
     fail(f"B2B §14.4 document-kind set differs: actual={sorted(actual_b2b_document_kinds)}")
 for fragment in (
     "document_version=<product SemVer>+doc.<positive revision>",
-    "release packageとinstalled local customer-docsだけ",
+    "公開channelはrelease package",
+    "installed local customer-docsだけ",
     "SHA-256とUTF-8 byte数",
     "独立reviewer",
 ):
@@ -1381,8 +1773,13 @@ for contract_path, expected_fragment in zip(CONTRACTS, ("A-D target=10", "E-I ta
     contract_text = contract_path.read_text(encoding="utf-8")
     if str(LEGACY_GAP_PROJECTIONS) not in contract_text or expected_fragment not in contract_text:
         fail(f"{contract_path}: missing legacy-gap projection companion/count {expected_fragment}")
+legacy_gap_markers = (
+    str(LEGACY_GAP_PROJECTIONS),
+    str(LEGACY_GAP_PROJECTIONS).removeprefix("docs/"),
+    LEGACY_GAP_PROJECTIONS.name,
+)
 for path in (CANONICAL, ROW_CONTRACTS, TRACE_DESIGN, TRACE_MATRIX, FREEZE_CONTRACT, TRACKER):
-    if str(LEGACY_GAP_PROJECTIONS) not in path.read_text(encoding="utf-8"):
+    if not any(marker in path.read_text(encoding="utf-8") for marker in legacy_gap_markers):
         fail(f"{path}: missing legacy-gap companion join")
 
 concrete_text_by_id = {row[0]: " ".join(row[1:10]) for row in contract_rows}
@@ -1509,13 +1906,14 @@ for marker in (
     "PAR-2026-08-23-AUTHORITY-REPAIR",
     "PAR-2026-08-23-DEPENDENCY-DAG",
     "SEMANTIC_HOLD",
+    "MACHINE_STRUCTURE_PASS",
 ):
     if marker not in current_tracker_block:
         fail(f"current tracker block lacks fail-closed marker: {marker}")
-current_has_machine_pass = "MACHINE_PASS" in current_tracker_block
+current_has_machine_pass = "MACHINE_STRUCTURE_PASS" in current_tracker_block
 current_has_machine_fail = "MACHINE_FAIL" in current_tracker_block
 if current_has_machine_pass == current_has_machine_fail:
-    fail("current tracker block must contain exactly one of MACHINE_PASS or MACHINE_FAIL")
+    fail("current tracker block must contain exactly one of MACHINE_STRUCTURE_PASS or MACHINE_FAIL")
 
 print("id_structure=PASS current=226 legacy=96 baseline_titles=nonempty/unique")
 print(

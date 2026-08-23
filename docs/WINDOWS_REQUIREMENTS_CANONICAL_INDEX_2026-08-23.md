@@ -134,7 +134,7 @@ platform/API turn終了後のlivenessは主張せず、raw continuation eventが
 - invalid、失敗、部分結果、last-good、復旧、再入、終了時の保持条件
 - 該当する永続化、秘密情報、通信上限、周期、競合、負荷の境界
 - 実在する依存IDと、依存が必要な理由
-- `depends_on` は `hard_prerequisite=<comma-separated WIN IDs or —>; related_validation_join=<comma-separated WIN IDs or —>` を厳格に使い、既存参照を削除せず hard 409 / related 154 / total 563 とする。hardのみをcycle/layer検査し、relatedは非遮断joinだが不一致時はconsumer/targetの両行をFAILとする。
+- `depends_on` は `hard_prerequisite=<comma-separated WIN IDs or —>; related_validation_join=<comma-separated WIN IDs or —>` を厳格に使い、現行3冊を再計数した hard 412 / related 165 / total 577 を正本値とする。hardのみをcycle/layer検査し、relatedは非遮断joinだが不一致時はconsumer/targetの両行をFAILとする。
 - B2B対象79行とlegacy-gap対象53行は、各companionの同一ID/RC集合を追加入力にし、conflict rangeから再計算した集合と完全一致する
 - fixtureと製品固定値の区別
 - 実装後に取得する証拠種別、artifact固有SHA、独立oracle、三値判定式
@@ -167,7 +167,7 @@ SHAは後段release manifestが所有し、具体契約の作業途中SHAへ固�
 次のANDが成立した場合だけ、別変更で各正本文書を同時に `EXTRACTION_COMPLETE` へ更新できる。
 
 1. baselineと3具体契約のID集合が完全一致し、合計226、一意226、欠落/余剰0
-2. 各具体契約が10列で空欄0、depends_onが厳格parseされ、hard=409 / related=154 / total=563、依存は実在・非自己参照・型重複0、hard SCC=0・backward=0
+2. 各具体契約が10列で空欄0、depends_onが厳格parseされ、hard=412 / related=165 / total=577、依存は実在・非自己参照・型重複0、hard SCC=0・backward=0
 3. §4の意味条件を全226行について独立監査し、FAIL/OPEN/INCONCLUSIVEが0
 4. 旧96 source IDが完全一致し、target欠落0、存在しないtarget 0、意味欠落0。RC-164..171の8 source/53 current target projection、8件の10-field cross-row契約、3 concrete companion joinも完全一致
 5. 固定値正本との矛盾0、未記録supersession 0、`OPEN_AUTHORITY_CONFLICT` 0
