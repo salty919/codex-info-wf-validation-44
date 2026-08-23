@@ -130,6 +130,10 @@ series_press_count="$(rg -o --fixed-strings 'Classes="series-toggle" ClickMode="
 if [[ "$series_press_count" -ne 4 ]]; then
     fail 'all four graph series toggles must acknowledge pointer press immediately'
 fi
+selector_press_count="$(rg -o --fixed-strings 'ClickMode="Press"' windows-client/src/CodexInfo.WindowsClient/GraphWindow.axaml | wc -l)"
+if [[ "$selector_press_count" -ne 6 ]]; then
+    fail 'both graph selectors and all four series toggles must acknowledge pointer press immediately'
+fi
 if rg -q --fixed-strings 'mouse_event' windows-client/tools/Measure-WindowsGraphLatency.ps1; then
     fail 'graph latency probe must use checked SendInput rather than deprecated mouse_event'
 fi

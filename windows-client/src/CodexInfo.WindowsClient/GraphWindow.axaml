@@ -88,12 +88,14 @@
 
     <Grid Grid.Row="1" ColumnDefinitions="*,160" ColumnSpacing="10">
       <ToggleButton x:Name="PeriodSelector" Classes="selector"
+                    ClickMode="Press"
                     IsCheckedChanged="OnPeriodSelectorCheckedChanged" Content="{Binding SelectedPeriodText}"
                     IsEnabled="{Binding HasPeriods}" AutomationProperties.Name="{Binding Texts.ResetTime}"
                     AutomationProperties.AutomationId="Graph.PeriodSelector"
                     AutomationProperties.HelpText="{Binding SelectedPeriodText}"
                     ToolTip.Tip="{Binding SelectedPeriodText}" />
       <ToggleButton x:Name="MetricSelector" Grid.Column="1" Classes="selector"
+                    ClickMode="Press"
                     IsCheckedChanged="OnMetricSelectorCheckedChanged" Content="{Binding SelectedMetric}"
                     AutomationProperties.Name="{Binding Texts.ModelUsage}"
                     AutomationProperties.AutomationId="Graph.MetricSelector"
