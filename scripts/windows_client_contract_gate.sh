@@ -145,8 +145,9 @@ require_text windows-client/tools/Measure-WindowsGraphLatency.ps1 'P90Limit 75'
 require_text windows-client/tools/Measure-WindowsGraphLatency.ps1 'P95Limit 100'
 require_text windows-client/tools/Measure-WindowsGraphLatency.ps1 'P90Limit 100'
 require_text windows-client/tools/Measure-WindowsGraphLatency.ps1 'P95Limit 150'
-require_text .github/workflows/windows-client.yml 'Run installed Windows graph latency budget'
-require_text .github/workflows/windows-client.yml 'Measure-WindowsGraphLatency.ps1'
+if rg -q --fixed-strings 'Measure-WindowsGraphLatency.ps1' .github/workflows/windows-client.yml; then
+    fail 'hosted Windows runner must not be used as an absolute graph performance gate'
+fi
 if rg -q --fixed-strings 'Start-Sleep' windows-client/tools/Measure-WindowsGraphLatency.ps1; then
     fail 'graph latency probe must use polling, not fixed sleeps'
 fi

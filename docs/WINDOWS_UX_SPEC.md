@@ -243,6 +243,8 @@ component順や表示所有者を変更しない。
   user-visible paintまで、系列ON/OFFはP90 75 ms以下・P95 100 ms以下、期間/metricリストは
   P90 100 ms以下・P95 150 ms以下、いずれもcold max 250 ms以下とする。10,080点と契約最大1暦月
   44,640点の双方で30回以上測定し、一つでも未測定・超過ならUX FAILとする。
+- このP90/P95は固定Windows実機または専用self-hosted runnerで測る。負荷と画面capture速度が共有される
+  GitHub-hosted runnerは機能E2Eとハング検知にだけ使い、絶対性能の合否判定には使わない。
 - 系列ON/OFFはpointer pressで状態とボタン面を先に更新する。P90/P95はこのuser-visible acknowledgementを
   測り、同じ入力でplot画像も必ず変化したことを別のbounded postconditionとして確認する。
 - 期間/metricの各測定sampleは閉状態から1回の物理クリックで展開する同一操作とし、次sample用の

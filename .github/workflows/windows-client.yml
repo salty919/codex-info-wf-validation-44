@@ -260,35 +260,6 @@ jobs:
           name: windows-ui-e2e
           path: ${{ runner.temp }}/codex-info-windows-e2e
           if-no-files-found: warn
-      - name: Run installed Windows graph latency budget
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $setup = (Resolve-Path ./artifacts/windows-installer/CodexInfo.WindowsClient.Setup.exe).Path
-          $installProcess = Start-Process -FilePath $setup -ArgumentList @('/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART') -Wait -PassThru
-          if ($installProcess.ExitCode -ne 0) { throw "Graph latency fixture install failed with exit code $($installProcess.ExitCode)" }
-          $install = Join-Path $env:LOCALAPPDATA 'Programs\Codex Info Monitor'
-          $exe = Join-Path $install 'CodexInfo.WindowsClient.exe'
-          if (-not (Test-Path $exe -PathType Leaf)) { throw 'Installed client executable is missing for graph latency.' }
-          $latencyOutput = Join-Path $env:RUNNER_TEMP 'codex-info-windows-graph-latency'
-          try {
-            & ./windows-client/tools/Measure-WindowsGraphLatency.ps1 -ClientPath $exe -OutputDirectory $latencyOutput
-            if (-not $?) { throw 'Windows graph latency budget failed.' }
-          }
-          finally {
-            $uninstaller = Get-ChildItem -LiteralPath $install -Filter 'unins*.exe' -File -ErrorAction SilentlyContinue | Select-Object -First 1
-            if ($null -ne $uninstaller) {
-              $uninstallProcess = Start-Process -FilePath $uninstaller.FullName -ArgumentList @('/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART') -Wait -PassThru
-              if ($uninstallProcess.ExitCode -ne 0) { throw "Graph latency cleanup uninstall failed with exit code $($uninstallProcess.ExitCode)" }
-            }
-          }
-      - name: Upload Windows graph latency evidence
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: windows-graph-latency
-          path: ${{ runner.temp }}/codex-info-windows-graph-latency
-          if-no-files-found: warn
       - name: Upload CI installer artifact
         if: always()
         uses: actions/upload-artifact@v4
