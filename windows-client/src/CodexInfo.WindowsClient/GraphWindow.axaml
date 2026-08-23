@@ -103,16 +103,16 @@
 
     <!-- One four-column control group: label length never changes geometry. -->
     <Grid Grid.Row="2" ColumnDefinitions="*,*,*,*" ColumnSpacing="8">
-      <ToggleButton Classes="series-toggle" IsChecked="{Binding ShowRemaining}" AutomationProperties.Name="{Binding Texts.RemainingQuota}" AutomationProperties.AutomationId="Graph.Toggle.Remaining" ToolTip.Tip="{Binding Texts.RemainingQuota}">
+      <ToggleButton Classes="series-toggle" ClickMode="Press" IsChecked="{Binding ShowRemaining}" AutomationProperties.Name="{Binding Texts.RemainingQuota}" AutomationProperties.AutomationId="Graph.Toggle.Remaining" ToolTip.Tip="{Binding Texts.RemainingQuota}">
         <Grid ColumnDefinitions="18,*" ColumnSpacing="7"><Border Width="14" Height="4" CornerRadius="2" Background="#56B2F5" VerticalAlignment="Center" /><TextBlock Grid.Column="1" HorizontalAlignment="Center" VerticalAlignment="Center" Text="{Binding Texts.RemainingQuota}" /></Grid>
       </ToggleButton>
-      <ToggleButton Grid.Column="1" Classes="series-toggle" IsChecked="{Binding ShowLuna}" AutomationProperties.Name="LUNA" AutomationProperties.AutomationId="Graph.Toggle.LUNA" ToolTip.Tip="LUNA">
+      <ToggleButton Grid.Column="1" Classes="series-toggle" ClickMode="Press" IsChecked="{Binding ShowLuna}" AutomationProperties.Name="LUNA" AutomationProperties.AutomationId="Graph.Toggle.LUNA" ToolTip.Tip="LUNA">
         <Grid ColumnDefinitions="18,*" ColumnSpacing="7"><Border Width="14" Height="4" CornerRadius="2" Background="#E6A23C" VerticalAlignment="Center" /><TextBlock Grid.Column="1" HorizontalAlignment="Center" VerticalAlignment="Center" Text="LUNA" /></Grid>
       </ToggleButton>
-      <ToggleButton Grid.Column="2" Classes="series-toggle" IsChecked="{Binding ShowTerra}" AutomationProperties.Name="TERRA" AutomationProperties.AutomationId="Graph.Toggle.TERRA" ToolTip.Tip="TERRA">
+      <ToggleButton Grid.Column="2" Classes="series-toggle" ClickMode="Press" IsChecked="{Binding ShowTerra}" AutomationProperties.Name="TERRA" AutomationProperties.AutomationId="Graph.Toggle.TERRA" ToolTip.Tip="TERRA">
         <Grid ColumnDefinitions="18,*" ColumnSpacing="7"><Border Width="14" Height="4" CornerRadius="2" Background="#5DC98A" VerticalAlignment="Center" /><TextBlock Grid.Column="1" HorizontalAlignment="Center" VerticalAlignment="Center" Text="TERRA" /></Grid>
       </ToggleButton>
-      <ToggleButton Grid.Column="3" Classes="series-toggle" IsChecked="{Binding ShowSol}" AutomationProperties.Name="SOL" AutomationProperties.AutomationId="Graph.Toggle.SOL" ToolTip.Tip="SOL">
+      <ToggleButton Grid.Column="3" Classes="series-toggle" ClickMode="Press" IsChecked="{Binding ShowSol}" AutomationProperties.Name="SOL" AutomationProperties.AutomationId="Graph.Toggle.SOL" ToolTip.Tip="SOL">
         <Grid ColumnDefinitions="18,*" ColumnSpacing="7"><Border Width="14" Height="4" CornerRadius="2" Background="#A88CF5" VerticalAlignment="Center" /><TextBlock Grid.Column="1" HorizontalAlignment="Center" VerticalAlignment="Center" Text="SOL" /></Grid>
       </ToggleButton>
     </Grid>

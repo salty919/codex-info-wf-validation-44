@@ -126,6 +126,10 @@ require_text windows-client/tools/Measure-WindowsGraphLatency.ps1 'CopyFromScree
 require_text windows-client/tools/Measure-WindowsGraphLatency.ps1 'SendInput'
 require_text windows-client/tools/Run-WindowsClientE2E.ps1 'Assert-E2EQuotaGaugePalette'
 require_text windows-client/tools/Run-WindowsClientE2E.ps1 "main-quota-gauge: seven cells, two X-authority surface colors, and half-period boundary PASS"
+series_press_count="$(rg -o --fixed-strings 'Classes="series-toggle" ClickMode="Press"' windows-client/src/CodexInfo.WindowsClient/GraphWindow.axaml | wc -l)"
+if [[ "$series_press_count" -ne 4 ]]; then
+    fail 'all four graph series toggles must acknowledge pointer press immediately'
+fi
 if rg -q --fixed-strings 'mouse_event' windows-client/tools/Measure-WindowsGraphLatency.ps1; then
     fail 'graph latency probe must use checked SendInput rather than deprecated mouse_event'
 fi
