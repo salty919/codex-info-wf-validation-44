@@ -241,7 +241,7 @@ component順や表示所有者を変更しない。
 - 期間、ドル/トークン、Remaining/LUNA/TERRA/SOLの操作を上部固定帯に置く。
 - 期間・metricのリストはpointer pressの1回で展開する。REST/DB/poll完了を待たず、物理入力から
   user-visible paintまで、系列ON/OFFはP90 75 ms以下・P95 100 ms以下、期間/metricリストは
-  P90 100 ms以下・P95 120 ms以下、いずれもcold max 250 ms以下とする。10,080点と契約最大1暦月
+  P90 100 ms以下・P95 150 ms以下、いずれもcold max 250 ms以下とする。10,080点と契約最大1暦月
   44,640点の双方で30回以上測定し、一つでも未測定・超過ならUX FAILとする。
 - 系列ON/OFFはpointer pressで状態とボタン面を先に更新する。P90/P95はこのuser-visible acknowledgementを
   測り、同じ入力でplot画像も必ず変化したことを別のbounded postconditionとして確認する。

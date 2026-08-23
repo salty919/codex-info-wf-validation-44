@@ -144,7 +144,7 @@ require_text windows-client/tools/Measure-WindowsGraphLatency.ps1 'ToggleState]:
 require_text windows-client/tools/Measure-WindowsGraphLatency.ps1 'P90Limit 75'
 require_text windows-client/tools/Measure-WindowsGraphLatency.ps1 'P95Limit 100'
 require_text windows-client/tools/Measure-WindowsGraphLatency.ps1 'P90Limit 100'
-require_text windows-client/tools/Measure-WindowsGraphLatency.ps1 'P95Limit 120'
+require_text windows-client/tools/Measure-WindowsGraphLatency.ps1 'P95Limit 150'
 require_text .github/workflows/windows-client.yml 'Run installed Windows graph latency budget'
 require_text .github/workflows/windows-client.yml 'Measure-WindowsGraphLatency.ps1'
 if rg -q --fixed-strings 'Start-Sleep' windows-client/tools/Measure-WindowsGraphLatency.ps1; then

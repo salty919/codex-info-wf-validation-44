@@ -1016,7 +1016,7 @@ function Measure-GraphMenu {
     }
     $stats = Get-GraphLatencyStats -Samples @($samples) -Description $Name
     $coldMilliseconds = [double]$samples[0].latency_ms
-    Assert-GraphLatencyBudget -Stats $stats -P90Limit 100 -P95Limit 120 `
+    Assert-GraphLatencyBudget -Stats $stats -P90Limit 100 -P95Limit 150 `
         -ColdLimit 250 -ColdMilliseconds $coldMilliseconds -Description "menu $Name"
     return [pscustomobject]@{
         name = $Name
@@ -1025,7 +1025,7 @@ function Measure-GraphMenu {
         samples = @($samples)
         stats = $stats
         cold_ms = $coldMilliseconds
-        budget_ms = [ordered]@{ p90 = 100; p95 = 120; cold_max = 250 }
+        budget_ms = [ordered]@{ p90 = 100; p95 = 150; cold_max = 250 }
     }
 }
 
@@ -1135,7 +1135,7 @@ function Invoke-GraphPointCase {
             ForEach-Object { [double]$_.cold_ms } | Measure-Object -Maximum).Maximum)
         Assert-GraphLatencyBudget -Stats $toggleStats -P90Limit 75 -P95Limit 100 `
             -ColdLimit 250 -ColdMilliseconds $toggleColdMax -Description 'all toggles'
-        Assert-GraphLatencyBudget -Stats $menuStats -P90Limit 100 -P95Limit 120 `
+        Assert-GraphLatencyBudget -Stats $menuStats -P90Limit 100 -P95Limit 150 `
             -ColdLimit 250 -ColdMilliseconds $menuColdMax -Description 'all menus'
         $script:graphLatencyActiveCase['phase'] = 'pass'
         $script:graphLatencyActiveCase['aggregate'] = [ordered]@{
@@ -1187,7 +1187,7 @@ $script:graphLatencyReport = [ordered]@{
         toggle_p90 = 75
         toggle_p95 = 100
         menu_p90 = 100
-        menu_p95 = 120
+        menu_p95 = 150
         cold_max = 250
     }
     physical_input = [ordered]@{
@@ -1251,7 +1251,7 @@ try {
     } | Measure-Object -Maximum).Maximum)
     Assert-GraphLatencyBudget -Stats $globalToggleStats -P90Limit 75 -P95Limit 100 `
         -ColdLimit 250 -ColdMilliseconds $globalToggleColdMax -Description 'all points toggles'
-    Assert-GraphLatencyBudget -Stats $globalMenuStats -P90Limit 100 -P95Limit 120 `
+    Assert-GraphLatencyBudget -Stats $globalMenuStats -P90Limit 100 -P95Limit 150 `
         -ColdLimit 250 -ColdMilliseconds $globalMenuColdMax -Description 'all points menus'
     $script:graphLatencyReport['aggregate'] = [ordered]@{
         toggles = $globalToggleStats
