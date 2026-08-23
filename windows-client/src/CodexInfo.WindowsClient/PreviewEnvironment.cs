@@ -47,6 +47,12 @@ public static class PreviewEnvironment
         }
     }
 
+    public static int ThreadCount => ParseThreadCount(
+        Environment.GetEnvironmentVariable("CODEX_INFO_WINDOWS_PREVIEW_THREAD_COUNT"));
+
+    public static int ParseThreadCount(string? value) =>
+        int.TryParse(value, out var count) && count is >= 0 and <= 7 ? count : 6;
+
     public static bool TryGetSize(out double width, out double height)
     {
         var value = Environment.GetEnvironmentVariable("CODEX_INFO_WINDOWS_PREVIEW_SIZE");
@@ -161,7 +167,8 @@ public sealed class PreviewLoopbackClient : ILoopbackStatusClient, ILoopbackDeta
             new ApiThreadDetails("preview-second-root", "Windows installer verification", null, "gpt-preview-sol", "SOL", 9_200, 3_300, 16_000, now - 4_200, now - 420, false, 0, false),
             new ApiThreadDetails("preview-second-child", "REST boundary tests", "preview-second-root", "gpt-preview-terra", "TERRA", 5_600, 2_700, 16_000, now - 2_700, now - 240, true, 1, false),
             new ApiThreadDetails("preview-orphan", "Recovered worker", "missing-parent", "gpt-preview-sol", "SOL", 1_200, null, null, now - 1_800, null, true, null, true),
-        };
+            new ApiThreadDetails("preview-third-root", "Release smoke verification", null, "gpt-preview-luna", "LUNA", 2_400, 900, 16_000, now - 1_500, now - 180, false, 0, false),
+        }.Take(PreviewEnvironment.ThreadCount).ToArray();
 
         status = new ApiStatusSnapshot(
             previewState,

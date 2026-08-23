@@ -5,6 +5,7 @@ using System.Collections.Concurrent;
 using System.ComponentModel;
 using System.Diagnostics;
 using System.Globalization;
+using System.Xml.Linq;
 using CodexInfo.WindowsClient.Core;
 using CodexInfo.WindowsClient.Localization;
 using CodexInfo.WindowsClient.ViewModels;
@@ -143,6 +144,45 @@ public sealed class DetailsPresentationCoverageTests
     }
 
     [Fact]
+    public void ThreadsWindow_ViewportShowsSixCardsAndScrollsOnlyTheList()
+    {
+        var source = LoadRepositoryFile("windows-client", "src", "CodexInfo.WindowsClient", "ThreadsWindow.axaml");
+        var document = XDocument.Parse(source);
+
+        var window = document.Root;
+        Assert.NotNull(window);
+        Assert.Equal("900", window.Attribute("Width")?.Value);
+        Assert.Equal("480", window.Attribute("Height")?.Value);
+        Assert.Equal("900", window.Attribute("MinWidth")?.Value);
+        Assert.Equal("480", window.Attribute("MinHeight")?.Value);
+        Assert.Equal("900", window.Attribute("MaxWidth")?.Value);
+        Assert.Equal("480", window.Attribute("MaxHeight")?.Value);
+        Assert.Equal("False", window.Attribute("CanResize")?.Value);
+
+        var cardStyle = document.Descendants()
+            .Single(element => element.Name.LocalName == "Style" && element.Attribute("Selector")?.Value == "Border.thread-card");
+        var cardHeightSetter = cardStyle.Descendants()
+            .Single(element => element.Name.LocalName == "Setter" && element.Attribute("Property")?.Value == "Height");
+        Assert.Equal("56", cardHeightSetter.Attribute("Value")?.Value);
+
+        const int cardHeight = 56;
+        const int cardGap = 4;
+        const int visibleCardCount = 6;
+        const int viewportHeight = cardHeight * visibleCardCount + cardGap * visibleCardCount;
+
+        var listScrollViewer = Assert.Single(document.Descendants(), element => element.Name.LocalName == "ScrollViewer");
+        Assert.Equal("2", listScrollViewer.Attribute("Grid.Row")?.Value);
+        Assert.Equal(viewportHeight.ToString(CultureInfo.InvariantCulture), listScrollViewer.Attribute("Height")?.Value);
+        Assert.Equal("Top", listScrollViewer.Attribute("VerticalAlignment")?.Value);
+        Assert.Equal("Disabled", listScrollViewer.Attribute("HorizontalScrollBarVisibility")?.Value);
+        Assert.Equal("Auto", listScrollViewer.Attribute("VerticalScrollBarVisibility")?.Value);
+
+        var card = document.Descendants()
+            .Single(element => element.Name.LocalName == "Border" && element.Attribute("Classes")?.Value == "thread-card");
+        Assert.Equal("0,0,0,4", card.Attribute("Margin")?.Value);
+    }
+
+    [Fact]
     public async Task ThreadsWindow_CyclesMissingFieldsAndLocaleRebuildAreBounded()
     {
         var now = DateTimeOffset.UtcNow;
@@ -244,6 +284,20 @@ public sealed class DetailsPresentationCoverageTests
             periods.SelectMany(period => period.Samples).ToArray(),
             threads,
             "estimated");
+    }
+
+    private static string LoadRepositoryFile(params string[] segments)
+    {
+        for (var directory = new DirectoryInfo(AppContext.BaseDirectory); directory is not null; directory = directory.Parent)
+        {
+            var candidate = Path.Combine([directory.FullName, .. segments]);
+            if (File.Exists(candidate))
+            {
+                return File.ReadAllText(candidate);
+            }
+        }
+
+        throw new FileNotFoundException($"Could not locate repository file: {Path.Combine(segments)}");
     }
 
     private static ApiHistoryPeriod CreateSmallPeriod(

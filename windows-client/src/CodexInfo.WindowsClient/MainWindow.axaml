@@ -182,8 +182,8 @@
 
     <!-- RemainingQuota owns the current percentage and the current-period
          local cost estimate.  The bar is absent until a quota is validated. -->
-    <Border Grid.Row="1" Classes="section" Padding="14,6">
-      <Grid ColumnDefinitions="*,210" ColumnSpacing="14" IsVisible="{Binding IsAuthenticated}">
+    <Border Grid.Row="1" Classes="section" Padding="14,6" IsVisible="{Binding IsAuthenticated}">
+      <Grid ColumnDefinitions="*,210" ColumnSpacing="14">
         <StackPanel Spacing="2" VerticalAlignment="Center">
           <TextBlock Classes="label" Text="{Binding Texts.RemainingQuota}" />
           <TextBlock FontSize="36"
@@ -209,8 +209,8 @@
 
     <!-- WeekGauge owns the seven-cell weekly/monthly period gauge, the
          remaining countdown, and the exact reset/observation timestamps. -->
-    <Border Grid.Row="2" Classes="section" Padding="12,6">
-      <Grid RowDefinitions="24,20" RowSpacing="4" IsVisible="{Binding IsAuthenticated}">
+    <Border Grid.Row="2" Classes="section" Padding="12,6" IsVisible="{Binding IsAuthenticated}">
+      <Grid RowDefinitions="24,20" RowSpacing="4">
         <Grid ColumnDefinitions="Auto,*,Auto" ColumnSpacing="10">
           <TextBlock Classes="label"
                      VerticalAlignment="Center"
@@ -254,8 +254,8 @@
 
     <!-- AccountActivity owns only live activity: total count, model
          classification counts, and the one Details entry point. -->
-    <Border Grid.Row="3" Classes="section" Padding="12,5">
-      <Grid ColumnDefinitions="180,*,68" ColumnSpacing="8" IsVisible="{Binding IsAuthenticated}">
+    <Border Grid.Row="3" Classes="section" Padding="12,5" IsVisible="{Binding IsAuthenticated}">
+      <Grid ColumnDefinitions="180,*,68" ColumnSpacing="8">
         <StackPanel Spacing="1" VerticalAlignment="Center">
           <TextBlock Classes="metric-label" Text="{Binding Texts.RunningThreads}" />
           <TextBlock FontSize="22"
@@ -301,8 +301,8 @@
     <!-- ModelUsage is a compact table rather than one card per model.  The
          fixed row budget displays the expected three model rows without a
          nested scroll surface. -->
-    <Border Grid.Row="4" Classes="section" Padding="12,5">
-      <Grid RowDefinitions="22,20,*" IsVisible="{Binding IsAuthenticated}">
+    <Border Grid.Row="4" Classes="section" Padding="12,5" IsVisible="{Binding IsAuthenticated}">
+      <Grid RowDefinitions="22,20,*">
         <Grid ColumnDefinitions="Auto,*,Auto" ColumnSpacing="10">
           <TextBlock FontSize="17" FontWeight="SemiBold" Text="{Binding Texts.ModelUsage}" />
           <TextBlock Grid.Column="1"
@@ -391,9 +391,20 @@
                   ToolTip.Tip="{Binding Texts.AuthCheck}"
                   Content="{Binding Texts.AuthCheck}" />
         </StackPanel>
-        <StackPanel Grid.Column="2" Spacing="1" VerticalAlignment="Center" IsVisible="{Binding IsAuthenticated}">
+        <StackPanel Grid.Column="2" Orientation="Horizontal" Spacing="6" VerticalAlignment="Center" IsVisible="{Binding IsUpdateNotificationVisible}">
+          <TextBlock Classes="label" FontSize="11" VerticalAlignment="Center" Text="{Binding UpdateNotificationText}" TextWrapping="NoWrap" />
+          <Button Classes="refresh"
+                  MinWidth="92"
+                  Height="28"
+                  Padding="6,2"
+                  IsVisible="{Binding IsUpdateActionVisible}"
+                  Command="{Binding UpdateCommand}"
+                  AutomationProperties.Name="{Binding UpdateButtonText}"
+                  ToolTip.Tip="{Binding UpdateButtonText}"
+                  Content="{Binding UpdateButtonText}" />
+        </StackPanel>
+        <StackPanel Grid.Column="2" Spacing="1" VerticalAlignment="Center" IsVisible="{Binding ShowLastReceived}">
           <TextBlock Classes="label" FontSize="11" HorizontalAlignment="Right" Text="{Binding LastReceivedText}" TextWrapping="NoWrap" />
-          <TextBlock Classes="label" FontSize="11" HorizontalAlignment="Right" Text="{Binding ObservedAtText}" TextWrapping="NoWrap" ToolTip.Tip="{Binding Texts.ObservedAt}" />
         </StackPanel>
       </Grid>
     </Border>

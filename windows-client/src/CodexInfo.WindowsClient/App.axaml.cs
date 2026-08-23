@@ -4,8 +4,10 @@
 using Avalonia;
 using Avalonia.Controls.ApplicationLifetimes;
 using CodexInfo.WindowsClient.Core;
+using CodexInfo.WindowsClient.Infrastructure;
 using CodexInfo.WindowsClient.Localization;
 using CodexInfo.WindowsClient.Settings;
+using CodexInfo.WindowsClient.Updates;
 using CodexInfo.WindowsClient.ViewModels;
 
 namespace CodexInfo.WindowsClient;
@@ -41,7 +43,21 @@ public partial class App : Application
             LocalizationService.SetTimeZone(settings.TimeZoneId);
             ILoopbackStatusClient client = preview ? new PreviewLoopbackClient() : new LoopbackStatusClient();
             var supervisor = preview ? null : new ConnectionSupervisor();
-            var viewModel = new MainWindowViewModel(client, client as ILoopbackDetailsClient, supervisor);
+            IWindowsUpdateCoordinator updateCoordinator = preview
+                ? new PreviewUpdateCoordinator()
+                : new WindowsUpdateCoordinator(
+                    new WindowsUpdateClient(),
+                    new WindowsInstallerLauncher(),
+                    typeof(App).Assembly.GetName().Version ?? new Version(1, 0, 0),
+                    Path.Combine(
+                        Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                        "CodexInfo",
+                        "updates"));
+            var viewModel = new MainWindowViewModel(
+                client,
+                client as ILoopbackDetailsClient,
+                supervisor,
+                updateCoordinator);
             desktop.MainWindow = new MainWindow
             {
                 DataContext = viewModel,

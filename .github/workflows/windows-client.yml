@@ -46,7 +46,97 @@ on:
 permissions:
   contents: read
 
+# Main pushes are queued instead of cancelled so two version changes cannot
+# race between the existence check and the atomic tag creation.
+concurrency:
+  group: windows-client-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
+  version-policy:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      changed: ${{ steps.version.outputs.changed }}
+      upward: ${{ steps.version.outputs.upward }}
+      release: ${{ steps.version.outputs.release }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Run release decision fixtures
+        shell: pwsh
+        run: ./windows-client/tools/Test-WindowsReleaseDecision.ps1
+      - name: Validate stable version policy
+        id: version
+        shell: pwsh
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          EVENT_BEFORE: ${{ github.event.before }}
+          BASE_REF: ${{ github.base_ref }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $propsPath = 'windows-client/Directory.Build.props'
+          $baseCommit = $null
+          if ($env:EVENT_NAME -eq 'pull_request') {
+            $baseCommit = $env:BASE_SHA
+            if ([string]::IsNullOrWhiteSpace($baseCommit)) {
+              $baseCommit = (& git merge-base HEAD "origin/$env:BASE_REF").Trim()
+            }
+          }
+          else {
+            $baseCommit = $env:EVENT_BEFORE
+            if ([string]::IsNullOrWhiteSpace($baseCommit) -or $baseCommit -match '^0+$') {
+              $parent = & git rev-parse HEAD^ 2>$null
+              if ($LASTEXITCODE -eq 0) {
+                $baseCommit = $parent.Trim()
+              }
+              else {
+                $baseCommit = $null
+              }
+            }
+          }
+
+          $basePropsPath = $null
+          if (-not [string]::IsNullOrWhiteSpace($baseCommit)) {
+            & git cat-file -e "${baseCommit}^{commit}" 2>$null
+            if ($LASTEXITCODE -ne 0) {
+              throw "Version comparison base is not a readable commit: $baseCommit"
+            }
+
+            $baseEntries = @(& git ls-tree --name-only $baseCommit -- $propsPath 2>$null)
+            if ($LASTEXITCODE -ne 0) {
+              throw "Could not inspect version properties at base commit: $baseCommit"
+            }
+            if ($baseEntries.Count -gt 1 -or
+                ($baseEntries.Count -eq 1 -and $baseEntries[0] -ne $propsPath)) {
+              throw "Unexpected version properties tree entry at base commit: $baseCommit"
+            }
+            if ($baseEntries.Count -eq 1) {
+              $basePropsPath = Join-Path $env:RUNNER_TEMP 'codex-info-base-Directory.Build.props'
+              $xmlLines = & git show "${baseCommit}:$propsPath" 2>$null
+              if ($LASTEXITCODE -ne 0) {
+                throw "Could not read version properties at base commit: $baseCommit"
+              }
+              [IO.File]::WriteAllText(
+                $basePropsPath,
+                ($xmlLines -join "`n"),
+                [System.Text.UTF8Encoding]::new($false))
+            }
+            # An exact missing path is the sole first-authority case.
+          }
+
+          $decisionArguments = @{
+            CurrentPropsPath = $propsPath
+            EventName = $env:EVENT_NAME
+            OutputPath = $env:GITHUB_OUTPUT
+          }
+          if ($null -ne $basePropsPath) {
+            $decisionArguments.BasePropsPath = $basePropsPath
+          }
+          & ./windows-client/tools/Get-WindowsReleaseDecision.ps1 @decisionArguments
+
   core-tests:
     runs-on: ubuntu-latest
     steps:
@@ -78,15 +168,6 @@ jobs:
         run: dotnet build windows-client/CodexInfo.WindowsClient.sln --no-restore --configuration Release
       - name: Test REST client and presentation contract
         run: dotnet test windows-client/CodexInfo.WindowsClient.sln --no-restore --configuration Release
-      - name: Publish framework-dependent Windows client
-        run: dotnet publish windows-client/src/CodexInfo.WindowsClient --no-restore --configuration Release --runtime win-x64 --self-contained false --output artifacts/windows-client
-      - name: Collect third-party notices
-        shell: pwsh
-        run: |
-          ./windows-client/tools/Collect-ThirdPartyNotices.ps1 -Destination ./artifacts/windows-client
-          if (-not (Test-Path ./artifacts/windows-client/THIRD-PARTY-LICENSES/skiasharp.nativeassets.win32-3.119.4-THIRD-PARTY-NOTICES.txt -PathType Leaf)) {
-            throw 'Required SkiaSharp third-party notice was not copied.'
-          }
       - name: Install locked Inno Setup compiler
         shell: pwsh
         run: |
@@ -113,8 +194,10 @@ jobs:
           $start = Join-Path ([Environment]::GetFolderPath('Programs')) 'Codex Info\Codex Info Monitor.lnk'
           $desktop = Join-Path ([Environment]::GetFolderPath('Desktop')) 'Codex Info Monitor.lnk'
           $exe = Join-Path $install 'CodexInfo.WindowsClient.exe'
+          $nativeNotice = Join-Path $install 'THIRD-PARTY-LICENSES\skiasharp.nativeassets.win32-3.119.4-THIRD-PARTY-NOTICES.txt'
           $uninstaller = Get-ChildItem -LiteralPath $install -Filter 'unins*.exe' -File | Select-Object -First 1
           if (-not (Test-Path $exe -PathType Leaf)) { throw 'Installed client executable is missing.' }
+          if (-not (Test-Path $nativeNotice -PathType Leaf)) { throw 'Required SkiaSharp native notice is missing from the installed payload.' }
           if ($null -eq $uninstaller) { throw 'Installed uninstaller is missing.' }
           if (-not (Test-Path $start -PathType Leaf)) { throw 'Start-menu shortcut is missing.' }
           if (-not (Test-Path $desktop -PathType Leaf)) { throw 'Desktop shortcut is missing.' }
@@ -167,4 +250,190 @@ jobs:
               & $uninstaller.FullName /VERYSILENT /SUPPRESSMSGBOXES /NORESTART
               if ($LASTEXITCODE -ne 0) { throw "E2E cleanup uninstall failed with exit code $LASTEXITCODE" }
             }
+          }
+      - name: Run installed Windows graph latency budget
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $setup = (Resolve-Path ./artifacts/windows-installer/CodexInfo.WindowsClient.Setup.exe).Path
+          & $setup /VERYSILENT /SUPPRESSMSGBOXES /NORESTART
+          if ($LASTEXITCODE -ne 0) { throw "Graph latency fixture install failed with exit code $LASTEXITCODE" }
+          $install = Join-Path $env:LOCALAPPDATA 'Programs\Codex Info Monitor'
+          $exe = Join-Path $install 'CodexInfo.WindowsClient.exe'
+          if (-not (Test-Path $exe -PathType Leaf)) { throw 'Installed client executable is missing for graph latency.' }
+          $latencyOutput = Join-Path $env:RUNNER_TEMP 'codex-info-windows-graph-latency'
+          try {
+            & ./windows-client/tools/Measure-WindowsGraphLatency.ps1 -ClientPath $exe -OutputDirectory $latencyOutput
+            if (-not $?) { throw 'Windows graph latency budget failed.' }
+          }
+          finally {
+            $uninstaller = Get-ChildItem -LiteralPath $install -Filter 'unins*.exe' -File -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($null -ne $uninstaller) {
+              & $uninstaller.FullName /VERYSILENT /SUPPRESSMSGBOXES /NORESTART
+              if ($LASTEXITCODE -ne 0) { throw "Graph latency cleanup uninstall failed with exit code $LASTEXITCODE" }
+            }
+          }
+      - name: Upload CI installer artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-client-installer
+          path: artifacts/windows-installer/CodexInfo.WindowsClient.Setup.exe
+          if-no-files-found: warn
+
+  release:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.version-policy.outputs.release == 'true'
+    needs: [version-policy, core-tests, windows-build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download CI installer artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: windows-client-installer
+          path: artifacts/windows-installer
+      - name: Create deterministic update manifest
+        shell: pwsh
+        env:
+          VERSION: ${{ needs.version-policy.outputs.version }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          ./windows-client/tools/New-WindowsUpdateManifest.ps1 `
+            -Version $env:VERSION `
+            -InstallerPath ./artifacts/windows-installer/CodexInfo.WindowsClient.Setup.exe `
+            -OutputPath ./artifacts/windows-installer/CodexInfo.WindowsClient.update.json `
+            -Repository $env:REPOSITORY
+      - name: Create GitHub Release and upload Windows assets
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.version-policy.outputs.version }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $tag = "windows-v$env:VERSION"
+          $repository = $env:REPOSITORY
+          $setup = './artifacts/windows-installer/CodexInfo.WindowsClient.Setup.exe'
+          $manifest = './artifacts/windows-installer/CodexInfo.WindowsClient.update.json'
+
+          function Get-GitHubResourceStatus {
+            param([Parameter(Mandatory = $true)][string]$Endpoint)
+
+            # GitHub CLI writes its 404 explanation to stderr. Temporarily
+            # collect that native stream instead of letting the enclosing
+            # ErrorActionPreference=Stop obscure the HTTP status line.
+            $previousErrorActionPreference = $ErrorActionPreference
+            try {
+              $ErrorActionPreference = 'Continue'
+              $response = @(& gh api --include --silent `
+                -H 'Accept: application/vnd.github+json' `
+                -H 'X-GitHub-Api-Version: 2022-11-28' `
+                $Endpoint 2>&1)
+              $exitCode = $LASTEXITCODE
+            }
+            finally {
+              $ErrorActionPreference = $previousErrorActionPreference
+            }
+            $statusCodes = @()
+            foreach ($line in $response) {
+              if ([string]$line -match '^HTTP/(?:1\.1|2(?:\.0)?)\s+([0-9]{3})(?:\s|$)') {
+                $statusCodes += [int]$Matches[1]
+              }
+            }
+            if ($statusCodes.Count -ne 1) {
+              throw "GitHub did not return one unambiguous HTTP status for $Endpoint."
+            }
+
+            $statusCode = $statusCodes[0]
+            if ($statusCode -ge 200 -and $statusCode -le 299 -and $exitCode -eq 0) {
+              return $statusCode
+            }
+            if ($statusCode -eq 404 -and $exitCode -ne 0) {
+              return $statusCode
+            }
+            throw "GitHub resource check failed closed for $Endpoint (HTTP $statusCode, exit $exitCode)."
+          }
+
+          $releaseEndpoint = "repos/$repository/releases/tags/$tag"
+          $tagEndpoint = "repos/$repository/git/ref/tags/$tag"
+          if ((Get-GitHubResourceStatus $releaseEndpoint) -ne 404) {
+            throw "GitHub Release already exists: $tag"
+          }
+          if ((Get-GitHubResourceStatus $tagEndpoint) -ne 404) {
+            throw "Git tag already exists: $tag"
+          }
+
+          # Creating the ref is the atomic no-clobber boundary. A concurrent or
+          # pre-existing tag makes this request fail; the workflow never falls
+          # back to attaching a Release to somebody else's ref.
+          gh api --method POST "repos/$repository/git/refs" `
+            -f "ref=refs/tags/$tag" `
+            -f "sha=$env:GITHUB_SHA" *> $null
+          if ($LASTEXITCODE -ne 0) { throw "Atomic Git tag creation failed for $tag" }
+
+          # Keep the Release invisible until both exact assets have uploaded
+          # and their server-side names, byte sizes, and state are verified.
+          gh release create $tag `
+            --repo $repository `
+            --verify-tag `
+            --draft `
+            --title "Codex Info Monitor $env:VERSION" `
+            --notes "Windows client $env:VERSION"
+          if ($LASTEXITCODE -ne 0) { throw "Draft GitHub Release creation failed for $tag" }
+
+          gh release upload $tag $setup $manifest --repo $repository
+          if ($LASTEXITCODE -ne 0) { throw "Draft GitHub Release asset upload failed for $tag" }
+
+          $releaseJson = & gh api `
+            -H 'Accept: application/vnd.github+json' `
+            -H 'X-GitHub-Api-Version: 2022-11-28' `
+            $releaseEndpoint
+          if ($LASTEXITCODE -ne 0) { throw "Could not inspect the draft GitHub Release for $tag" }
+          $release = $releaseJson | ConvertFrom-Json
+          if ($release.tag_name -ne $tag -or -not $release.draft -or $release.prerelease) {
+            throw "Draft GitHub Release state is invalid for $tag"
+          }
+
+          $expectedAssets = @{
+            ([IO.Path]::GetFileName($setup)) = (Get-Item -LiteralPath $setup).Length
+            ([IO.Path]::GetFileName($manifest)) = (Get-Item -LiteralPath $manifest).Length
+          }
+          $assets = @($release.assets)
+          if ($assets.Count -ne $expectedAssets.Count) {
+            throw "Draft GitHub Release has an unexpected asset count for $tag"
+          }
+          foreach ($asset in $assets) {
+            if (-not $expectedAssets.ContainsKey([string]$asset.name) -or
+                [long]$asset.size -ne [long]$expectedAssets[[string]$asset.name] -or
+                [string]$asset.state -ne 'uploaded') {
+              throw "Draft GitHub Release asset verification failed for $tag"
+            }
+          }
+
+          $tagJson = & gh api `
+            -H 'Accept: application/vnd.github+json' `
+            -H 'X-GitHub-Api-Version: 2022-11-28' `
+            $tagEndpoint
+          if ($LASTEXITCODE -ne 0) { throw "Could not verify the created Git tag for $tag" }
+          $tagRef = $tagJson | ConvertFrom-Json
+          if ([string]$tagRef.object.type -ne 'commit' -or [string]$tagRef.object.sha -ne $env:GITHUB_SHA) {
+            throw "Created Git tag does not identify the gated commit for $tag"
+          }
+
+          gh api --method PATCH "repos/$repository/releases/$($release.id)" `
+            -F draft=false *> $null
+          if ($LASTEXITCODE -ne 0) { throw "Publishing the verified GitHub Release failed for $tag" }
+
+          $publishedJson = & gh api `
+            -H 'Accept: application/vnd.github+json' `
+            -H 'X-GitHub-Api-Version: 2022-11-28' `
+            $releaseEndpoint
+          if ($LASTEXITCODE -ne 0) { throw "Could not verify the published GitHub Release for $tag" }
+          $published = $publishedJson | ConvertFrom-Json
+          if ($published.tag_name -ne $tag -or $published.draft -or $published.prerelease -or
+              [string]::IsNullOrWhiteSpace([string]$published.published_at) -or
+              @($published.assets).Count -ne $expectedAssets.Count) {
+            throw "Published GitHub Release verification failed for $tag"
           }

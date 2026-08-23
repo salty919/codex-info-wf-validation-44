@@ -30,6 +30,19 @@ public sealed class PreviewEnvironmentTests
         Assert.False(CodexInfo.WindowsClient.PreviewEnvironment.TryParseSize(text, out _, out _));
     }
 
+    [Theory]
+    [InlineData(null, 6)]
+    [InlineData("", 6)]
+    [InlineData("0", 0)]
+    [InlineData("6", 6)]
+    [InlineData("7", 7)]
+    [InlineData("8", 6)]
+    [InlineData("not-a-number", 6)]
+    public void PreviewThreadCountIsBoundedToTheSixAndSevenRowAcceptanceFixtures(string? text, int expected)
+    {
+        Assert.Equal(expected, CodexInfo.WindowsClient.PreviewEnvironment.ParseThreadCount(text));
+    }
+
     [Fact]
     public async Task GraphThreadsAndLegalPreviewFixtureHasCompleteAuthenticatedData()
     {

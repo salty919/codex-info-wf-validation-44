@@ -29,6 +29,29 @@ public sealed class GraphPlotControlTests
     }
 
     [Fact]
+    public void ViewportReductionKeepsBothEdgesOfEveryMonotonicBucket()
+    {
+        var samples = Enumerable.Range(0, 12)
+            .Select(index => new ApiHistorySample(
+                index,
+                100,
+                100 - index,
+                index < 5 ? 0 : 10,
+                0,
+                0,
+                0,
+                0,
+                0))
+            .ToArray();
+
+        var reduced = GraphWindowViewModel.ReduceGraphSamples(samples, 6);
+
+        Assert.Equal([0L, 3L, 4L, 7L, 8L, 11L], reduced.Select(sample => sample.Timestamp));
+        Assert.Equal(0, reduced[2].SolDollars);
+        Assert.Equal(10, reduced[3].SolDollars);
+    }
+
+    [Fact]
     public void ScenePreservesAllIrregularSamplesAndExactEndpoints()
     {
         var source = Enumerable.Range(0, 2_048)
@@ -146,23 +169,51 @@ public sealed class GraphPlotControlTests
     }
 
     [Fact]
-    public void PlotProjectionHoldsSyntheticAnchorFlatThenChangesAtFirstObservation()
+    public void PlotProjectionCoalescesAdjacentSegmentsWithTheSameLineStyle()
+    {
+        var scene = Scene(
+            [
+                Point(1_000, 100, 0, 0, 0),
+                Point(1_060, 99, 0, 0, 1),
+                Point(1_120, 98, 0, 0, 2),
+                Point(1_180, 97, 0, 0, 3),
+            ]);
+
+        var lines = GraphPlotProjection.BuildModelLines(scene, scene.Luna);
+
+        Assert.Empty(lines.Flat.X);
+        Assert.Equal([1_000d, 1_060d, 1_120d, 1_180d], lines.Rising.X);
+        Assert.Equal([0d, 1d, 2d, 3d], lines.Rising.Y);
+    }
+
+    [Fact]
+    public void PlotProjectionStartsAtFirstObservationWithoutSyntheticVerticalJump()
     {
         var scene = Scene(
             [
                 Point(1_000, 100, 0, 0, 0),
                 Point(1_120, 90, 1, 0, 0),
+                Point(1_180, 80, 2, 0, 0),
             ]);
 
         var model = GraphPlotProjection.BuildModelLines(scene, scene.Sol);
         var remaining = GraphPlotProjection.BuildRemainingLine(scene);
 
-        Assert.Equal([1_000d, 1_120d], model.Flat.X);
-        Assert.Equal([0d, 0d], model.Flat.Y);
-        Assert.Equal([1_120d, 1_120d], model.Rising.X);
-        Assert.Equal([0d, 1d], model.Rising.Y);
-        Assert.Equal([1_000d, 1_120d, 1_120d], remaining.X);
-        Assert.Equal([100d, 100d, 90d], remaining.Y);
+        Assert.Empty(model.Flat.X);
+        Assert.Equal([1_120d, 1_180d], model.Rising.X);
+        Assert.Equal([1d, 2d], model.Rising.Y);
+        Assert.DoesNotContain(
+            model.Flat.X.Zip(model.Flat.X.Skip(1)),
+            pair => pair.First == pair.Second);
+        Assert.DoesNotContain(
+            model.Rising.X.Zip(model.Rising.X.Skip(1)),
+            pair => pair.First == pair.Second);
+        Assert.Equal([1_120d, 1_180d], remaining.X);
+        Assert.Equal([90d, 80d], remaining.Y);
+        Assert.DoesNotContain(
+            remaining.X.Zip(remaining.X.Skip(1)),
+            pair => pair.First == pair.Second);
+        Assert.True(Assert.Single(scene.IdleIntervals).PreserveBoundary);
     }
 
     [Fact]

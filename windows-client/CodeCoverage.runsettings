@@ -20,6 +20,7 @@
                 <Function>^CodexInfo\.WindowsClient\.Settings\..*</Function>
                 <Function>^CodexInfo\.WindowsClient\.Localization\..*</Function>
                 <Function>^CodexInfo\.WindowsClient\.Graphing\..*</Function>
+                <Function>^CodexInfo\.WindowsClient\.Infrastructure\.WindowsUpdateCoordinator\..*</Function>
                 <Function>^CodexInfo\.WindowsClient\.PreviewEnvironment\..*</Function>
                 <Function>^CodexInfo\.WindowsClient\.PreviewLoopbackClient\..*</Function>
                 <Function>^CodexInfo\.WindowsClient\.WindowDragGeometry\..*</Function>

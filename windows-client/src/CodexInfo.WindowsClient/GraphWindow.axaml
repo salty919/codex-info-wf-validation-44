@@ -91,11 +91,13 @@
                     Click="OnPeriodSelectorClick" Content="{Binding SelectedPeriodText}"
                     IsEnabled="{Binding HasPeriods}" AutomationProperties.Name="{Binding Texts.ResetTime}"
                     AutomationProperties.AutomationId="Graph.PeriodSelector"
+                    AutomationProperties.HelpText="{Binding SelectedPeriodText}"
                     ToolTip.Tip="{Binding SelectedPeriodText}" />
       <ToggleButton x:Name="MetricSelector" Grid.Column="1" Classes="selector"
                     Click="OnMetricSelectorClick" Content="{Binding SelectedMetric}"
                     AutomationProperties.Name="{Binding Texts.ModelUsage}"
                     AutomationProperties.AutomationId="Graph.MetricSelector"
+                    AutomationProperties.HelpText="{Binding SelectedMetric}"
                     ToolTip.Tip="{Binding Texts.ModelUsage}" />
     </Grid>
 
@@ -145,7 +147,9 @@
       <Border x:Name="PeriodMenu" HorizontalAlignment="Left" VerticalAlignment="Top" Margin="0,102,0,0"
               Opacity="0" IsEnabled="False" IsHitTestVisible="False" Width="560" MaxWidth="700" MaxHeight="320" Padding="4"
               Background="#1B2838" BorderBrush="#47769F" BorderThickness="1" CornerRadius="6">
-        <ListBox ItemsSource="{Binding Periods}" SelectedItem="{Binding SelectedPeriod}" SelectionChanged="OnPeriodSelectionChanged">
+        <ListBox ItemsSource="{Binding Periods}" SelectedItem="{Binding SelectedPeriod, Mode=TwoWay}"
+                 SelectionChanged="OnPeriodSelectionChanged"
+                 AutomationProperties.AutomationId="Graph.PeriodMenu">
           <ListBox.ItemTemplate>
             <DataTemplate x:DataType="core:ApiHistoryPeriod"><TextBlock Text="{Binding Label}" TextTrimming="CharacterEllipsis" /></DataTemplate>
           </ListBox.ItemTemplate>
@@ -154,7 +158,9 @@
       <Border x:Name="MetricMenu" HorizontalAlignment="Right" VerticalAlignment="Top" Margin="0,102,0,0"
               Opacity="0" IsEnabled="False" IsHitTestVisible="False" Width="160" MaxHeight="160" Padding="4"
               Background="#1B2838" BorderBrush="#47769F" BorderThickness="1" CornerRadius="6">
-        <ListBox ItemsSource="{Binding MetricOptions}" SelectedItem="{Binding SelectedMetric}" SelectionChanged="OnMetricSelectionChanged" />
+        <ListBox ItemsSource="{Binding MetricOptions}" SelectedItem="{Binding SelectedMetric, Mode=TwoWay}"
+                 SelectionChanged="OnMetricSelectionChanged"
+                 AutomationProperties.AutomationId="Graph.MetricMenu" />
       </Border>
     </Grid>
 

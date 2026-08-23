@@ -9,11 +9,44 @@ param(
 $ErrorActionPreference = 'Stop'
 $root = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path
 $clientProject = Join-Path $root 'windows-client\src\CodexInfo.WindowsClient\CodexInfo.WindowsClient.csproj'
+$versionProps = Join-Path $root 'windows-client\Directory.Build.props'
 $installerScript = Join-Path $root 'windows-client\installer\CodexInfo.WindowsClient.iss'
 $productIcon = Join-Path $root 'windows-client\src\CodexInfo.WindowsClient\Assets\CodexInfo.ico'
 $output = Join-Path $root $OutputDirectory
 $work = Join-Path ([IO.Path]::GetTempPath()) ("codex-info-installer-" + [Guid]::NewGuid().ToString('N'))
 $payload = Join-Path $work 'payload'
+
+function Get-AuthoritativeVersion {
+    param([Parameter(Mandatory = $true)][string]$Path)
+
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+        throw "Version properties file was not found: $Path"
+    }
+
+    try {
+        $document = [xml](Get-Content -LiteralPath $Path -Raw)
+    }
+    catch {
+        throw "Version properties file is not valid XML: $Path"
+    }
+    if ($null -eq $document) {
+        throw "Version properties file is not valid XML: $Path"
+    }
+
+    $versionNodes = $document.SelectNodes("/*[local-name()='Project']/*[local-name()='PropertyGroup']/*[local-name()='Version']")
+    if ($versionNodes.Count -ne 1) {
+        throw "Version properties file must contain exactly one Project/PropertyGroup/Version element: $Path"
+    }
+
+    $version = $versionNodes[0].InnerText.Trim()
+    if ($version -notmatch '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$') {
+        throw "Version must be a stable X.Y.Z value: $version"
+    }
+
+    return $version
+}
+
+$version = Get-AuthoritativeVersion -Path $versionProps
 
 $compilerCandidates = @(
     $env:INNO_SETUP_COMPILER,
@@ -40,7 +73,7 @@ try {
     }
     & (Join-Path $PSScriptRoot 'Collect-ThirdPartyNotices.ps1') -Destination $payload
     New-Item -ItemType Directory -Path $output -Force | Out-Null
-    & $compiler "/DPayloadDir=$payload" "/DOutputDir=$output" "/DProductIcon=$productIcon" "/DProductVersion=1.0.0" $installerScript
+    & $compiler "/DPayloadDir=$payload" "/DOutputDir=$output" "/DProductIcon=$productIcon" "/DProductVersion=$version" $installerScript
     if ($LASTEXITCODE -ne 0) {
         throw "Inno Setup compiler failed with exit code $LASTEXITCODE"
     }

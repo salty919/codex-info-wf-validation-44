@@ -7,6 +7,7 @@ param(
     [string]$ClientPath = '',
     [int]$GraphPoints = 3,
     [ValidateRange(0, 5000)][int]$GraphBuildDelayMilliseconds = 0,
+    [ValidateRange(0, 7)][int]$ThreadCount = 6,
     [switch]$OpenGraphPeriodMenu,
     [switch]$OpenGraphMetricMenu
 )
@@ -41,8 +42,9 @@ $env:CODEX_INFO_WINDOWS_PREVIEW = $Preview
 $env:CODEX_INFO_WINDOWS_PREVIEW_SIZE = $PreviewSize
 $env:CODEX_INFO_WINDOWS_PREVIEW_GRAPH_POINTS = $GraphPoints
 $env:CODEX_INFO_WINDOWS_PREVIEW_GRAPH_BUILD_DELAY_MS = $GraphBuildDelayMilliseconds
+$env:CODEX_INFO_WINDOWS_PREVIEW_THREAD_COUNT = $ThreadCount
 $expectedTitle = switch ($Preview) {
-    { $_ -in @('normal', 'auth', 'error', 'warning', 'danger', 'zero', 'full') } { 'Codex Info Monitor' }
+    { $_ -in @('normal', 'auth', 'error', 'warning', 'danger', 'zero', 'full', 'update') } { 'Codex Info Monitor' }
     'graph' { 'Codex Info Graph' }
     'threads' { 'Codex Info Threads' }
     'legal' { 'Codex Info Legal' }

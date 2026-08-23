@@ -57,7 +57,11 @@
       </StackPanel>
     </Grid>
     <TextBlock Grid.Row="1" Classes="label" Text="{Binding DetailsStatusText}" />
-    <ScrollViewer Grid.Row="2" VerticalScrollBarVisibility="Auto">
+    <ScrollViewer Grid.Row="2"
+                  Height="360"
+                  VerticalAlignment="Top"
+                  HorizontalScrollBarVisibility="Disabled"
+                  VerticalScrollBarVisibility="Auto">
       <Grid>
         <TextBlock Classes="label" HorizontalAlignment="Center" VerticalAlignment="Top" IsVisible="{Binding HasNoThreads}" Text="{Binding EmptyText}" />
         <ItemsControl IsVisible="{Binding HasThreads}" ItemsSource="{Binding Threads}">

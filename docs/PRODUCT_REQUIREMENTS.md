@@ -9,7 +9,9 @@
 - WindowsクライアントはLinux側の利用状況、残量、履歴、実行中threadを読み取り表示する。
 - 製品の通信は固定loopback API、利用者が選択したWSL、またはOpenSSH configのliteral `Host` aliasに限定する。
 - password、token、private key、展開済みSSH接続情報を保存しない。保存できるのは再接続に必要な非秘密selectorだけである。
-- telemetryは送信しない。未登録の外向き通信、暗黙のsupport upload、raw diagnostic uploadを行わない。
+- telemetryは送信しない。更新確認だけは固定GitHub repository
+  `salty919/codex_info_v2` の公開Release API/assetを読み取れる。これ以外の未登録の外向き通信、
+  暗黙のsupport upload、raw diagnostic uploadを行わない。
 
 ## 2. 状態と表示
 
@@ -37,14 +39,29 @@
 
 ## 5. Windows導入・更新・削除
 
+- アプリ起動後の更新確認は通知だけを生成し、download、Setup起動、既存payload変更を行わない。
+  新版がある場合だけ状態帯に更新操作を表示し、利用者がその操作を明示実行した後に限ってdownloadと
+  標準GUI Setupを開始する。常設の更新ボタン、silent install、unattended apply、自動再起動を行わない。
+- 更新候補は公開済み・非prereleaseの`windows-vX.Y.Z` Releaseだけから選び、同Releaseのexact-name
+  installerとmanifestについてversion、URL authority、byte size、SHA-256を完全検証する。不一致、
+  redirect逸脱、途中download、oversize、起動失敗は既存payloadを変更せず、部分fileを公開しない。
 - install、update、rollback、uninstallは別transactionとして扱い、stage中のfile、shortcut、HKCU、Apps登録を成功状態として公開しない。
 - update失敗時は旧payload、shortcut、registry、versionを起動可能な状態で保持する。初回install失敗時は未公開状態へ戻す。
 - uninstallは設定と履歴を保持する。途中失敗は完全復元または再開可能なjournal状態のどちらかにし、部分削除を成功と表示しない。
 - 同一install rootの同時操作は単一leaseで直列化する。PID再利用、foreign owner、reparse差替え、token変化を検出した操作はmutation 0とする。
-- interactive/silent等のmode、exit code、対応Windows、architecture、署名者、version policyはrelease authority inputで決める。未指定・未署名・不一致なら新規公開、更新、対応表明を行わず旧verified版を保持する。
+- interactive/silent等のmode、exit code、対応Windows、architecture、署名者、version policyはrelease authority inputで決める。
+  署名者authorityが未設定なら署名済みと表明せず、設定済みauthorityと不一致なら更新候補を拒否する。
+  利用者が開始するunsigned OSS buildは、exact GitHub repository、release tag、manifest、size、SHA-256の
+  検証を満たす場合だけ標準GUI Setupへ渡し、Windowsが示すpublisher警告を隠さない。
 
 ## 6. 配布・顧客向け表明
 
+- Windows製品版は単一の`X.Y.Z`を正本とする。PRでは現行`main`より上がる変更だけをrelease候補として
+  検証し、PRからReleaseを書き換えない。`main`へのmergeで同版が上がり、全Windows gateがPASSした時だけ
+  `windows-vX.Y.Z` tag、Setup、update manifestを同じGitHub Releaseへ公開する。版が不変または後退なら
+  Releaseを作らない。HTTP 404だけを不存在と認め、tagは原子的に新規作成する。Setupとmanifestは
+  非公開Draft上でexact 2資産の名前・size・状態・commit SHAを検証し終えてから公開し、既存tag/Release、
+  通信障害、5xx、部分uploadへ上書きして継続しない。
 - release artifactはsource、lockfile、実payload、license/notice、署名、version、対象platformを一つのrelease identityで追跡する。
 - publisher名、certificate、対応OS build、RPO/RTO、accessibility適合、support窓口を根拠なしに推測しない。
 - authority inputがないclaimは「保証なし」「未対応」とし、認証済み、対応済み、測定済みと表示しない。

@@ -228,6 +228,104 @@ public sealed record UiText(
     public string EstimatedUnavailable => LanguageCode == "ja" ? "概算 —" : $"{Dollars} —";
     public string LastReceivedPrefix => LanguageCode switch { "ja" => "前回受信", "zh-Hans" => "上次接收", "ko" => "마지막 수신", "es" => "Última recepción", "fr" => "Dernière réception", "de" => "Letzter Empfang", "pt" => "Último recebimento", "it" => "Ultima ricezione", "ru" => "Последнее получение", _ => "Last received" };
 
+    public string UpdateAvailableText(string version) => LanguageCode switch
+    {
+        "ja" => $"{version} を利用できます",
+        "zh-Hans" => $"可用版本：{version}",
+        "ko" => $"{version}을(를) 사용할 수 있습니다",
+        "es" => $"{version} está disponible",
+        "fr" => $"{version} est disponible",
+        "de" => $"{version} ist verfügbar",
+        "pt" => $"{version} está disponível",
+        "it" => $"{version} è disponibile",
+        "ru" => $"Доступна версия {version}",
+        _ => $"{version} is available",
+    };
+
+    public string UpdateButtonText => LanguageCode switch
+    {
+        "ja" => "更新する",
+        "zh-Hans" => "更新",
+        "ko" => "업데이트",
+        "es" => "Actualizar",
+        "fr" => "Mettre à jour",
+        "de" => "Aktualisieren",
+        "pt" => "Atualizar",
+        "it" => "Aggiorna",
+        "ru" => "Обновить",
+        _ => "Update",
+    };
+
+    public string UpdatePreparing => LanguageCode switch
+    {
+        "ja" => "更新を準備しています…",
+        "zh-Hans" => "正在准备更新…",
+        "ko" => "업데이트를 준비하는 중…",
+        "es" => "Preparando la actualización…",
+        "fr" => "Préparation de la mise à jour…",
+        "de" => "Update wird vorbereitet…",
+        "pt" => "Preparando a atualização…",
+        "it" => "Preparazione dell’aggiornamento…",
+        "ru" => "Подготовка обновления…",
+        _ => "Preparing update…",
+    };
+
+    public string UpdateStarted => LanguageCode switch
+    {
+        "ja" => "更新を開始しました",
+        "zh-Hans" => "更新已开始",
+        "ko" => "업데이트를 시작했습니다",
+        "es" => "La actualización ha comenzado",
+        "fr" => "La mise à jour a démarré",
+        "de" => "Update wurde gestartet",
+        "pt" => "A atualização foi iniciada",
+        "it" => "Aggiornamento avviato",
+        "ru" => "Обновление запущено",
+        _ => "Update started",
+    };
+
+    public string UpdateDownloadFailed => LanguageCode switch
+    {
+        "ja" => "更新のダウンロードに失敗しました",
+        "zh-Hans" => "更新下载失败",
+        "ko" => "업데이트 다운로드에 실패했습니다",
+        "es" => "No se pudo descargar la actualización",
+        "fr" => "Échec du téléchargement de la mise à jour",
+        "de" => "Update konnte nicht heruntergeladen werden",
+        "pt" => "Falha ao baixar a atualização",
+        "it" => "Download dell’aggiornamento non riuscito",
+        "ru" => "Не удалось скачать обновление",
+        _ => "Update download failed",
+    };
+
+    public string UpdateIntegrityFailed => LanguageCode switch
+    {
+        "ja" => "更新の整合性を確認できませんでした",
+        "zh-Hans" => "无法验证更新完整性",
+        "ko" => "업데이트 무결성을 확인하지 못했습니다",
+        "es" => "No se pudo verificar la integridad de la actualización",
+        "fr" => "Impossible de vérifier l’intégrité de la mise à jour",
+        "de" => "Integrität des Updates konnte nicht geprüft werden",
+        "pt" => "Não foi possível verificar a integridade da atualização",
+        "it" => "Impossibile verificare l’integrità dell’aggiornamento",
+        "ru" => "Не удалось проверить целостность обновления",
+        _ => "Update integrity check failed",
+    };
+
+    public string UpdateLaunchFailed => LanguageCode switch
+    {
+        "ja" => "更新を開始できませんでした",
+        "zh-Hans" => "无法启动更新",
+        "ko" => "업데이트를 시작하지 못했습니다",
+        "es" => "No se pudo iniciar la actualización",
+        "fr" => "Impossible de lancer la mise à jour",
+        "de" => "Update konnte nicht gestartet werden",
+        "pt" => "Não foi possível iniciar a atualização",
+        "it" => "Impossibile avviare l’aggiornamento",
+        "ru" => "Не удалось запустить обновление",
+        _ => "Update could not be started",
+    };
+
     public string StepConnection => LanguageCode switch { "ja" => "1. Linux API / SSH", "zh-Hans" => "1. Linux API / SSH", "ko" => "1. Linux API / SSH", _ => "1. Linux API / SSH" };
     public string StepAuth => LanguageCode switch { "ja" => "2. 認証", "zh-Hans" => "2. 认证", "ko" => "2. 인증", "es" => "2. Autenticación", "fr" => "2. Authentification", "de" => "2. Authentifizierung", "pt" => "2. Autenticação", "it" => "2. Autenticazione", "ru" => "2. Аутентификация", _ => "2. Authentication" };
     public string StepDone => LanguageCode switch { "ja" => "3. 完了", "zh-Hans" => "3. 完成", "ko" => "3. 완료", "es" => "3. Listo", "fr" => "3. Terminé", "de" => "3. Fertig", "pt" => "3. Concluído", "it" => "3. Fine", "ru" => "3. Готово", _ => "3. Done" };

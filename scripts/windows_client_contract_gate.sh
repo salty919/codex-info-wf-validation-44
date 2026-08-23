@@ -21,6 +21,9 @@ require_text windows-client/src/CodexInfo.WindowsClient/GraphWindow.axaml 'IsChe
 require_text windows-client/src/CodexInfo.WindowsClient/GraphWindow.axaml 'IsChecked="{Binding ShowSol}"'
 require_text windows-client/src/CodexInfo.WindowsClient/GraphWindow.axaml 'IsChecked="{Binding ShowTerra}"'
 require_text windows-client/src/CodexInfo.WindowsClient/GraphWindow.axaml 'IsChecked="{Binding ShowLuna}"'
+require_text windows-client/src/CodexInfo.WindowsClient/GraphWindow.axaml 'AutomationProperties.AutomationId="Graph.PeriodMenu"'
+require_text windows-client/src/CodexInfo.WindowsClient/GraphWindow.axaml 'AutomationProperties.AutomationId="Graph.MetricMenu"'
+require_text windows-client/src/CodexInfo.WindowsClient/ViewModels/DetailsWindowViewModels.cs 'MaxRenderedGraphPoints = 2_048'
 require_text windows-client/src/CodexInfo.WindowsClient/ThreadsWindow.axaml 'ThreadTreeControl'
 require_text windows-client/src/CodexInfo.WindowsClient/LegalNoticesWindow.axaml 'CurrentNoticeText'
 require_text windows-client/src/CodexInfo.WindowsClient/LegalNoticesWindow.axaml 'Command="{Binding BackCommand}"'
@@ -53,6 +56,21 @@ require_text windows-client/src/CodexInfo.WindowsClient/ViewModels/SettingsViewM
 require_text windows-client/src/CodexInfo.WindowsClient/SetupWindow.axaml.cs 'viewModel.Advance() == SetupAdvanceOutcome.CloseRequested'
 require_text windows-client/src/CodexInfo.WindowsClient/ViewModels/SettingsViewModel.cs 'if (IsAuthStep && !CanContinue)'
 require_text windows-client/src/CodexInfo.WindowsClient/MainWindow.axaml.cs 'SetupLaunchPolicy.ShouldOpen(App.CurrentSettings)'
+require_file windows-client/src/CodexInfo.WindowsClient.Core/WindowsUpdateClient.cs
+require_file windows-client/src/CodexInfo.WindowsClient/Infrastructure/WindowsUpdateCoordinator.cs
+require_text windows-client/src/CodexInfo.WindowsClient/MainWindow.axaml 'IsVisible="{Binding IsUpdateNotificationVisible}"'
+require_text windows-client/src/CodexInfo.WindowsClient/MainWindow.axaml 'Command="{Binding UpdateCommand}"'
+require_text windows-client/src/CodexInfo.WindowsClient/ViewModels/MainWindowViewModel.cs 'public bool IsUpdateNotificationVisible => !IsAuthRequired'
+require_text windows-client/src/CodexInfo.WindowsClient.Core/WindowsUpdateClient.cs 'https://api.github.com/repos/salty919/codex_info_v2/releases?per_page=20'
+require_text windows-client/src/CodexInfo.WindowsClient/Infrastructure/WindowsUpdateCoordinator.cs 'StartAvailableUpdateAsync'
+require_text windows-client/Directory.Build.props '<Version>'
+require_text .github/workflows/windows-client.yml 'needs: [version-policy, core-tests, windows-build]'
+require_text .github/workflows/windows-client.yml 'cancel-in-progress: false'
+require_text .github/workflows/windows-client.yml 'Get-GitHubResourceStatus'
+require_text .github/workflows/windows-client.yml 'gh api --method POST "repos/$repository/git/refs"'
+require_text .github/workflows/windows-client.yml 'gh release create $tag'
+require_text .github/workflows/windows-client.yml 'gh release upload $tag $setup $manifest'
+require_text .github/workflows/windows-client.yml '-F draft=false'
 require_file windows-client/src/CodexInfo.WindowsClient/Settings/ClientSettingsSession.cs
 require_file windows-client/src/CodexInfo.WindowsClient/Graphing/GraphPlotProjection.cs
 require_text windows-client/src/CodexInfo.WindowsClient/Controls/GraphPlotControl.cs 'GraphPlotProjection.BuildAxes('
@@ -87,6 +105,28 @@ require_text windows-client/tools/Build-WindowsInstaller.ps1 'Inno Setup 7\ISCC.
 require_text windows-client/tools/Build-WindowsInstaller.ps1 'CodexInfo.WindowsClient.iss'
 require_text windows-client/tools/Build-WindowsInstaller.ps1 'Collect-ThirdPartyNotices.ps1'
 require_text windows-client/tools/Build-WindowsInstaller.ps1 '--locked-mode'
+require_file windows-client/tools/Measure-WindowsGraphLatency.ps1
+require_text windows-client/tools/Measure-WindowsGraphLatency.ps1 "CODEX_INFO_WINDOWS_PREVIEW = 'graph'"
+require_text windows-client/tools/Measure-WindowsGraphLatency.ps1 "CODEX_INFO_WINDOWS_PREVIEW_SIZE = '940x640'"
+require_text windows-client/tools/Measure-WindowsGraphLatency.ps1 'CODEX_INFO_WINDOWS_PREVIEW_GRAPH_POINTS'
+require_text windows-client/tools/Measure-WindowsGraphLatency.ps1 'Graph.Toggle.Remaining'
+require_text windows-client/tools/Measure-WindowsGraphLatency.ps1 'Graph.Toggle.LUNA'
+require_text windows-client/tools/Measure-WindowsGraphLatency.ps1 'Graph.Toggle.TERRA'
+require_text windows-client/tools/Measure-WindowsGraphLatency.ps1 'Graph.Toggle.SOL'
+require_text windows-client/tools/Measure-WindowsGraphLatency.ps1 'Graph.PeriodSelector'
+require_text windows-client/tools/Measure-WindowsGraphLatency.ps1 'Graph.MetricSelector'
+require_text windows-client/tools/Measure-WindowsGraphLatency.ps1 'CopyFromScreen'
+require_text windows-client/tools/Measure-WindowsGraphLatency.ps1 'mouse_event'
+require_text windows-client/tools/Measure-WindowsGraphLatency.ps1 'Threading.Thread]::Yield'
+require_text windows-client/tools/Measure-WindowsGraphLatency.ps1 'P90Limit 75'
+require_text windows-client/tools/Measure-WindowsGraphLatency.ps1 'P95Limit 100'
+require_text windows-client/tools/Measure-WindowsGraphLatency.ps1 'P90Limit 100'
+require_text windows-client/tools/Measure-WindowsGraphLatency.ps1 'P95Limit 120'
+require_text .github/workflows/windows-client.yml 'Run installed Windows graph latency budget'
+require_text .github/workflows/windows-client.yml 'Measure-WindowsGraphLatency.ps1'
+if rg -q --fixed-strings 'Start-Sleep' windows-client/tools/Measure-WindowsGraphLatency.ps1; then
+    fail 'graph latency probe must use polling, not fixed sleeps'
+fi
 require_text docs/WINDOWS_CLIENT_REQUIREMENTS.md 'WIN-PAR-13'
 require_text docs/WINDOWS_CLIENT_REQUIREMENTS.md 'WIN-INSTALL-01'
 require_text docs/PRODUCT_REQUIREMENTS.md '# Codex Info 製品要件'

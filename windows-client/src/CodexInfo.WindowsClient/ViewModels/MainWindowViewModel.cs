@@ -12,6 +12,7 @@ using Avalonia.Media;
 using CodexInfo.WindowsClient.Core;
 using CodexInfo.WindowsClient.Localization;
 using CodexInfo.WindowsClient.Settings;
+using CodexInfo.WindowsClient.Updates;
 
 namespace CodexInfo.WindowsClient.ViewModels;
 
@@ -37,6 +38,7 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
     private readonly ILoopbackStatusClient client;
     private readonly ILoopbackDetailsClient? detailsClient;
     private readonly ConnectionSupervisor? connectionSupervisor;
+    private readonly UpdateViewModel? update;
     private readonly CancellationTokenSource lifetime = new();
     private readonly SemaphoreSlim refreshGate = new(1, 1);
     private readonly AsyncCommand refreshCommand;
@@ -57,11 +59,14 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
     public MainWindowViewModel(
         ILoopbackStatusClient client,
         ILoopbackDetailsClient? detailsClient = null,
-        ConnectionSupervisor? connectionSupervisor = null)
+        ConnectionSupervisor? connectionSupervisor = null,
+        IWindowsUpdateCoordinator? updateCoordinator = null)
     {
         this.client = client;
         this.detailsClient = detailsClient;
         this.connectionSupervisor = connectionSupervisor;
+        update = updateCoordinator is null ? null : new UpdateViewModel(updateCoordinator);
+        if (update is not null) update.PropertyChanged += OnUpdatePropertyChanged;
         refreshCommand = new AsyncCommand(RefreshManuallyAsync, () => CanRefresh);
         authCommand = new AsyncCommand(LaunchLinuxAuthenticationAsync, () => IsAuthRequired && !disposed);
         checkAuthCommand = new AsyncCommand(RefreshManuallyAsync, () => IsAuthRequired && CanRefresh);
@@ -79,6 +84,20 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
     public ICommand AuthCommand => authCommand;
 
     public ICommand CheckAuthCommand => checkAuthCommand;
+
+    public UpdateViewModel? Update => update;
+
+    public ICommand? UpdateCommand => update?.UpdateCommand;
+
+    public bool IsUpdateNotificationVisible => !IsAuthRequired && update?.IsNotificationVisible == true;
+
+    public bool IsUpdateActionVisible => !IsAuthRequired && update?.IsUpdateActionVisible == true;
+
+    public string UpdateNotificationText => update?.NotificationText ?? string.Empty;
+
+    public string UpdateButtonText => update?.ActionText ?? Texts.UpdateButtonText;
+
+    public bool ShowLastReceived => IsAuthenticated && !IsUpdateNotificationVisible;
 
     public ReadOnlyObservableCollection<ModelUsageViewModel> Models { get; }
 
@@ -278,6 +297,7 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
         }
 
         connectionSupervisor?.EnsureStarted(App.CurrentSettings);
+        update?.Start();
         _ = RunPollingAsync(lifetime.Token);
     }
 
@@ -291,6 +311,11 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
         disposed = true;
         LocalizationService.LanguageChanged -= OnLanguageChanged;
         lifetime.Cancel();
+        if (update is not null)
+        {
+            update.PropertyChanged -= OnUpdatePropertyChanged;
+            update.Dispose();
+        }
         if (client is IDisposable disposableClient)
         {
             disposableClient.Dispose();
@@ -365,6 +390,10 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
         Notify(nameof(RefreshButtonText));
         Notify(nameof(StatusTitle));
         Notify(nameof(StatusDetail));
+        Notify(nameof(UpdateNotificationText));
+        Notify(nameof(UpdateButtonText));
+        Notify(nameof(LastReceivedText));
+        Notify(nameof(ShowLastReceived));
         Notify(nameof(DetailsStatusText));
         Notify(nameof(QuotaWindowText));
         Notify(nameof(QuotaRemainingText));
@@ -774,6 +803,21 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
     private void Notify([CallerMemberName] string? propertyName = null)
     {
         PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(propertyName));
+        if (propertyName is nameof(IsAuthRequired) or nameof(IsAuthenticated))
+        {
+            Notify(nameof(IsUpdateNotificationVisible));
+            Notify(nameof(IsUpdateActionVisible));
+            Notify(nameof(ShowLastReceived));
+        }
+    }
+
+    private void OnUpdatePropertyChanged(object? sender, PropertyChangedEventArgs eventArgs)
+    {
+        Notify(nameof(IsUpdateNotificationVisible));
+        Notify(nameof(IsUpdateActionVisible));
+        Notify(nameof(UpdateNotificationText));
+        Notify(nameof(UpdateButtonText));
+        Notify(nameof(ShowLastReceived));
     }
 
     private enum ClientPresentationState

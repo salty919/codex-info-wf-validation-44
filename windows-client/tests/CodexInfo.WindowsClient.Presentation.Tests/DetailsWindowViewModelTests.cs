@@ -268,7 +268,7 @@ public sealed class DetailsWindowViewModelTests
         }
         Assert.False(graph.IsLoading);
         Assert.Equal(oldStart, graph.SelectedPeriodStartAt);
-        Assert.Equal(old.Samples.Count + 1, graph.Points.Count);
+        Assert.Equal(GraphWindowViewModel.MaxRenderedGraphPoints, graph.Points.Count);
         Assert.NotSame(previousPoints, graph.Points);
         Assert.False(graph.HasLoadError);
     }

@@ -11,7 +11,7 @@
   #error ProductIcon must identify CodexInfo.ico.
 #endif
 #ifndef ProductVersion
-  #define ProductVersion "1.0.0"
+  #error ProductVersion must come from windows-client/Directory.Build.props through the installer build.
 #endif
 
 #define ProductName "Codex Info Monitor"

@@ -497,9 +497,19 @@ function Get-E2ESelectedListItemLabel {
 function Get-E2ESelectorLabel {
     param([Parameter(Mandatory = $true)][System.Windows.Automation.AutomationElement]$Selector)
 
+    $helpText = [string]$Selector.Current.HelpText
+    if (-not [string]::IsNullOrWhiteSpace($helpText)) {
+        return $helpText.Trim()
+    }
+
     $values = @(Get-E2ETextValues $Selector)
+    # The selector's own accessible name is a localized field label
+    # (for example "Reset time"), while its child text is the selected
+    # value. Exclude the root name dynamically instead of maintaining an
+    # English-only list that makes a Japanese installed run time out.
+    $rootName = [string]$Selector.Current.Name
     $filtered = $values | Where-Object {
-        $_ -notin @(
+        $_ -ne $rootName -and $_ -notin @(
             'Reset time', 'Model usage', 'Remaining quota',
             'Reset period', 'Dollars', 'Tokens')
     }
@@ -515,12 +525,19 @@ function Wait-E2ESelectorLabel {
         [Parameter(Mandatory = $true)][string]$Expected
     )
 
-    Wait-E2E -Description "selector $AutomationId displays '$Expected'" -Probe {
-        $selector = Find-E2EElementByAutomationId $Root $AutomationId
-        if ($null -eq $selector) { return $false }
-        $label = Get-E2ESelectorLabel $selector
-        return $label -eq $Expected -or $label.Contains($Expected)
-    } | Out-Null
+    $script:e2eLastSelectorLabel = ''
+    try {
+        Wait-E2E -Description "selector $AutomationId displays '$Expected'" -Probe {
+            $selector = Find-E2EElementByAutomationId $Root $AutomationId
+            if ($null -eq $selector) { return $false }
+            $script:e2eLastSelectorLabel = Get-E2ESelectorLabel $selector
+            return $script:e2eLastSelectorLabel -eq $Expected -or $script:e2eLastSelectorLabel.Contains($Expected)
+        } | Out-Null
+    }
+    catch {
+        Write-E2E "selector: FAIL id=$AutomationId expected='$Expected' observed='$script:e2eLastSelectorLabel'"
+        throw
+    }
 }
 
 function Capture-E2EWindow {
@@ -759,12 +776,10 @@ try {
 
     Write-E2E 'case-2: period current -> past -> current and display-value assertions'
     Toggle-E2EElement $periodSelector
-    $graphBounds = Get-E2EWindowBounds $graph.Handle
-    $periodMenuRightBoundary = $graphBounds.Left + $graphBounds.Width - 200
     $periodItems = Wait-E2E -Description 'two Graph period options' -Probe {
-        $items = @(Get-E2EVisibleControlElements $graphRoot ([System.Windows.Automation.ControlType]::ListItem) | Where-Object {
-            $_.Current.BoundingRectangle.Left -lt $periodMenuRightBoundary
-        })
+        # Only the open in-window menu is enabled; the other pre-measured menu
+        # remains disabled.  Filtering by enabled UIA state is DPI-independent.
+        $items = @(Get-E2EVisibleControlElements $graphRoot ([System.Windows.Automation.ControlType]::ListItem))
         if ($items.Count -ge 2) { return $items }
         return $false
     }
@@ -793,11 +808,8 @@ try {
     $metricSelector = Find-E2EElementByAutomationId $graphRoot 'Graph.MetricSelector'
     $initialMetric = Get-E2ESelectorLabel $metricSelector
     Toggle-E2EElement $metricSelector
-    $metricMenuLeftBoundary = $graphBounds.Left + $graphBounds.Width - 200
     $metricItems = Wait-E2E -Description 'two Graph metric options' -Probe {
-        $items = @(Get-E2EVisibleControlElements $graphRoot ([System.Windows.Automation.ControlType]::ListItem) | Where-Object {
-            $_.Current.BoundingRectangle.Left -ge $metricMenuLeftBoundary
-        })
+        $items = @(Get-E2EVisibleControlElements $graphRoot ([System.Windows.Automation.ControlType]::ListItem))
         if ($items.Count -ge 2) { return $items }
         return $false
     }

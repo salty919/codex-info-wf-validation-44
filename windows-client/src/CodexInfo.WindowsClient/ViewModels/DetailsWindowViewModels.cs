@@ -72,7 +72,11 @@ public sealed class GraphPointViewModel
 
 public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
 {
-    internal const int MaxRenderedGraphPoints = 44_640;
+    // The transport keeps the complete one-month (44,640 minute) history, but
+    // a 940 logical-pixel graph cannot expose that many distinct x positions.
+    // Keep at least one sample per physical plot pixel at 200% DPI (and more
+    // at standard DPI) so paint cost is bounded without changing endpoints.
+    internal const int MaxRenderedGraphPoints = 2_048;
     private const int BackgroundBuildThreshold = 2_048;
     private readonly MainWindowViewModel main;
     private readonly Action<Action> postToUi;
@@ -293,19 +297,27 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
             return samples;
         }
 
-        // All graph series are cumulative and therefore monotonic. One
-        // endpoint per sub-pixel bucket preserves the first/last values and
-        // every visible trend while bounding paint work by viewport
-        // resolution instead of persisted history cardinality.
-        var reduced = new ApiHistorySample[maximum];
-        for (var index = 0; index < maximum; index++)
+        // All graph series are cumulative and therefore monotonic. Keep both
+        // edges of each display bucket so a short change is not lost or moved
+        // to a later bucket, while bounding paint work by viewport resolution.
+        var selected = new SortedSet<int> { 0, samples.Count - 1 };
+        var bucketCount = Math.Max(1, maximum / 2);
+        for (var bucket = 0; bucket < bucketCount; bucket++)
         {
-            var sourceIndex = (int)Math.Round(
-                index * (samples.Count - 1d) / (maximum - 1d),
-                MidpointRounding.AwayFromZero);
-            reduced[index] = samples[sourceIndex];
+            var start = (int)((long)bucket * samples.Count / bucketCount);
+            var endExclusive = (int)((long)(bucket + 1) * samples.Count / bucketCount);
+            selected.Add(start);
+            selected.Add(Math.Max(start, endExclusive - 1));
         }
-        return reduced;
+        // Odd/small caller-supplied maxima can leave one slot. Fill it with a
+        // uniformly located sample without disturbing the bucket edges.
+        for (var slot = 1; selected.Count < maximum && slot < maximum - 1; slot++)
+        {
+            selected.Add((int)Math.Round(
+                slot * (samples.Count - 1d) / (maximum - 1d),
+                MidpointRounding.AwayFromZero));
+        }
+        return selected.Take(maximum).Select(index => samples[index]).ToArray();
     }
 
     public string DetailsStatusText => main.DetailsStatusText;

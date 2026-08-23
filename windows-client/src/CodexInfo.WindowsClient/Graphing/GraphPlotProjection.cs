@@ -117,9 +117,9 @@ internal static class GraphPlotProjection
     }
 
     /// <summary>
-    /// Builds the remaining-quota path. A synthetic reset anchor is held flat
-    /// until the first observation and then changes at that timestamp, so an
-    /// unobserved interval is never rendered as gradual consumption.
+    /// Builds the remaining-quota path. The synthetic period-start anchor is
+    /// not an observation and therefore never becomes part of the path. The
+    /// boundary is still available to the idle-band projection.
     /// </summary>
     public static GraphLineProjection BuildRemainingLine(GraphScene scene)
     {
@@ -129,9 +129,10 @@ internal static class GraphPlotProjection
             return new GraphLineProjection([], []);
         }
 
-        var x = new List<double>(scene.Timestamps.Count + 1) { scene.Timestamps[0] };
-        var y = new List<double>(scene.Remaining.Count + 1) { scene.Remaining[0] };
-        for (var index = 1; index < scene.Timestamps.Count; index++)
+        var firstIndex = IsSyntheticFirstObservation(scene, 1) ? 1 : 0;
+        var x = new List<double>(scene.Timestamps.Count + 1) { scene.Timestamps[firstIndex] };
+        var y = new List<double>(scene.Remaining.Count + 1) { scene.Remaining[firstIndex] };
+        for (var index = firstIndex + 1; index < scene.Timestamps.Count; index++)
         {
             if (scene.IdleIntervals.Any(interval =>
                     interval.PreserveBoundary && interval.EndAt == (long)scene.Timestamps[index]))
@@ -175,12 +176,12 @@ internal static class GraphPlotProjection
 
             var startAt = scene.Timestamps[index - 1];
             var endAt = scene.Timestamps[index];
-            var syntheticFirstObservation = startAt == scene.PeriodStartAt &&
-                endAt - startAt > 60 && before <= 0 && after > 0;
-            if (syntheticFirstObservation)
+            if (IsSyntheticFirstObservation(scene, index))
             {
-                AppendSegment(flatX, flatY, startAt, before, endAt, before);
-                AppendSegment(risingX, risingY, endAt, before, endAt, after);
+                // The interval between the synthetic reset anchor and the
+                // first real observation is unknown. Do not render either a
+                // fabricated horizontal hold or an instantaneous jump.
+                continue;
             }
             else if (after == before)
             {
@@ -195,6 +196,25 @@ internal static class GraphPlotProjection
         return new GraphModelLineProjection(
             new GraphLineProjection(flatX, flatY),
             new GraphLineProjection(risingX, risingY));
+    }
+
+    private static bool IsSyntheticFirstObservation(GraphScene scene, int index)
+    {
+        if (index <= 0 || index >= scene.Timestamps.Count)
+        {
+            return false;
+        }
+
+        var startAt = scene.Timestamps[index - 1];
+        var endAt = scene.Timestamps[index];
+        return startAt == scene.PeriodStartAt &&
+            endAt - startAt > 60 &&
+            scene.Sol[index - 1] <= 0 &&
+            scene.Terra[index - 1] <= 0 &&
+            scene.Luna[index - 1] <= 0 &&
+            (scene.Sol[index] > scene.Sol[index - 1] ||
+             scene.Terra[index] > scene.Terra[index - 1] ||
+             scene.Luna[index] > scene.Luna[index - 1]);
     }
 
     /// <summary>
@@ -325,13 +345,25 @@ internal static class GraphPlotProjection
     }
 
     private static void AppendSegment(
-        ICollection<double> x,
-        ICollection<double> y,
+        List<double> x,
+        List<double> y,
         double x1,
         double y1,
         double x2,
         double y2)
     {
+        // Adjacent segments with the same visual role form one polyline. A
+        // NaN is needed only between runs separated by the other line style or
+        // invalid data; adding one after every minute triples ScottPlot work.
+        if (x.Count > 0 &&
+            !double.IsNaN(x[^1]) &&
+            x[^1] == x1 &&
+            y[^1] == y1)
+        {
+            x.Add(x2);
+            y.Add(y2);
+            return;
+        }
         if (x.Count > 0)
         {
             x.Add(double.NaN);

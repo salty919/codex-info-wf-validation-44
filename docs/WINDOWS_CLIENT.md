@@ -63,6 +63,19 @@ Windows側へ8787番ポートを公開するために、serverを`0.0.0.0`やLAN
 Setupは資格情報、SSH鍵、raw接続先を保存しない。Authenticode署名は外部のコード署名証明書があるrelease工程で
 のみ実施でき、証明書がないローカルbuildを署名済みと表明してはならない。
 
+GitHub配布版の更新確認は、固定repository `salty919/codex_info_v2` の公開済み
+`windows-vX.Y.Z` Releaseだけを対象とする。起動時は新版の有無を確認して状態帯へ通知するだけで、
+downloadもSetup起動も行わない。新版がある時だけ表示される「更新する」を利用者が押すと、exact-nameの
+manifestとSetupを取得し、version、許可済みHTTPS authority、size、SHA-256を検証してから通常のInno Setup
+GUIを起動する。silent install、unattended apply、自動再起動、常設Headerボタンは使用しない。
+
+Windows製品版は`windows-client/Directory.Build.props`のstable `X.Y.Z`を正本にする。PRは版番号の
+単調増加とbuild/test/installer/E2Eを検証するだけでReleaseへ書き込まない。`main`へmergeされた版番号が
+上がり、全Windows gateがPASSした時だけ`windows-vX.Y.Z`とSetup/update manifestを公開する。mainの
+release処理は同一refで直列化し、HTTP 404だけを不存在として受理する。tagを原子的に新規作成した後、
+非公開Draftへexact 2資産をuploadし、名前・byte size・upload状態・tagのcommit SHAを検証してから公開する。
+既存tag/Release、通信失敗、5xx、部分uploadへ上書き・追記して継続しない。
+
 ### 3. SSH 転送と初回セットアップ
 
 初回起動時は、画面の「初期設定」に従って次の順序で進む。
@@ -128,8 +141,10 @@ PRODUCT_PENDING/HOLDを維持し、読者が未確定のpathやcommandを推測�
 ## 表示と更新
 
 初回取得を直ちに行い、完了から 10 秒後に次の取得を行う。3 秒で応答がなければ失敗と
-する。手動の「更新」も同じ単一要求ゲートを使い、要求中のクリックは待ち行列に入れず
-無視する。Window を閉じると、タイマーと要求を cancellation token で停止する。
+する。Headerに手動の取得更新ボタンは置かない。周期取得は単一要求ゲートを使い、前の要求が
+残っている間に別要求を待ち行列へ積まない。Window を閉じると、タイマーと要求を
+cancellation token で停止する。ソフトウェア新版の「更新する」は、上記のとおり新版がある時だけ
+StatusBannerへ現れる別操作であり、利用者が押すまでdownloadもSetup起動も行わない。
 
 | 入力状態 | 状態帯 | 値の扱い |
 | --- | --- | --- |
@@ -205,9 +220,11 @@ single-file installerに固定する。clean supported Windowsで別途.NET Desk
 Visual Studio、payload folder、build操作を要求してはならない。Windowsでlocked restore後、
 repository既定のinstaller buildだけで最終setup executableを生成する。
 
-installer buildのexact commandはPRODUCT_PENDINGである。後段のrelease gateは、Avalonia/Skia/HarfBuzz/ANGLE、
-埋め込みフォント、rootの`THIRD_PARTY_NOTICES.md`と
-`LICENSES/`に加え、self-contained payloadへ実際に入った.NET runtimeのライセンス・通知を
-manifestから収集し、payloadへ同梱してからinstallerへ埋め込む。必要なruntime/packageの
-通知、version、hashが一つでも欠ける場合はbuildまたは配布gateをFAILとし、その成果物を
-顧客へ渡さない。ライセンス一覧と版は[第三者ライセンス通知](../THIRD_PARTY_NOTICES.md)を参照する。
+installer buildのexact commandはWindowsのrepository rootから
+`powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\windows-client\tools\Build-WindowsInstaller.ps1`
+とする。この一つのbuildが、
+locked restore、self-contained publish、Avalonia/Skia/HarfBuzz/ANGLE、埋め込みフォント、
+rootの`THIRD_PARTY_NOTICES.md`と`LICENSES/`、実payloadへ入った.NET runtimeの
+ライセンス・通知の収集、Inno Setupコンパイルを順に実行する。必要なruntime/packageの
+通知が一つでも欠ける場合はbuildまたは配布gateをFAILとし、その成果物を顧客へ渡さない。
+ライセンス一覧と版は[第三者ライセンス通知](../THIRD_PARTY_NOTICES.md)を参照する。

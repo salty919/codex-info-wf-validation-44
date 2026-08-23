@@ -3,6 +3,7 @@
 
 using System.Globalization;
 using Avalonia;
+using Avalonia.Automation.Peers;
 using CodexInfo.WindowsClient.Graphing;
 using CodexInfo.WindowsClient.Localization;
 using ScottPlot.Avalonia;
@@ -65,6 +66,9 @@ public sealed class GraphPlotControl : AvaPlot
     public bool ShowSol { get => GetValue(ShowSolProperty); set => SetValue(ShowSolProperty, value); }
     public bool ShowTerra { get => GetValue(ShowTerraProperty); set => SetValue(ShowTerraProperty, value); }
     public bool ShowLuna { get => GetValue(ShowLunaProperty); set => SetValue(ShowLunaProperty, value); }
+
+    protected override AutomationPeer OnCreateAutomationPeer() =>
+        new GraphPlotAutomationPeer(this);
 
     protected override void OnPropertyChanged(AvaloniaPropertyChangedEventArgs change)
     {
@@ -308,5 +312,24 @@ public sealed class GraphPlotControl : AvaPlot
     private sealed record ModelSeriesVisual(
         ScottPlot.Plottables.Scatter? Flat,
         ScottPlot.Plottables.Scatter? Rising);
+
+    private sealed class GraphPlotAutomationPeer : ControlAutomationPeer
+    {
+        public GraphPlotAutomationPeer(GraphPlotControl owner)
+            : base(owner)
+        {
+        }
+
+        protected override AutomationControlType GetAutomationControlTypeCore() =>
+            AutomationControlType.Pane;
+
+        protected override bool IsOffscreenCore()
+        {
+            var owner = (GraphPlotControl)Owner;
+            return !owner.IsEffectivelyVisible ||
+                owner.Bounds.Width <= 0 ||
+                owner.Bounds.Height <= 0;
+        }
+    }
 
 }
