@@ -42,7 +42,7 @@ public partial class GraphWindow : Window
         Close();
     }
 
-    private void OnPeriodSelectorClick(object? sender, RoutedEventArgs eventArgs)
+    private void OnPeriodSelectorCheckedChanged(object? sender, RoutedEventArgs eventArgs)
     {
         var open = PeriodSelector.IsChecked == true;
         SetMenuOpen(PeriodMenu, open);
@@ -53,7 +53,7 @@ public partial class GraphWindow : Window
         }
     }
 
-    private void OnMetricSelectorClick(object? sender, RoutedEventArgs eventArgs)
+    private void OnMetricSelectorCheckedChanged(object? sender, RoutedEventArgs eventArgs)
     {
         var open = MetricSelector.IsChecked == true;
         SetMenuOpen(MetricMenu, open);

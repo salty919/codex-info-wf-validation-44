@@ -243,6 +243,9 @@ component順や表示所有者を変更しない。
   user-visible paintまで、系列ON/OFFはP90 75 ms以下・P95 100 ms以下、期間/metricリストは
   P90 100 ms以下・P95 120 ms以下、いずれもcold max 250 ms以下とする。10,080点と契約最大1暦月
   44,640点の双方で30回以上測定し、一つでも未測定・超過ならUX FAILとする。
+- 期間/metricの各測定sampleは閉状態から1回の物理クリックで展開する同一操作とし、次sample用の
+  Escape閉鎖は測定区間へ混ぜない。物理入力、UI状態、実描画を別経路で確認し、同一点の機械的な
+  高速連打や開閉の異なる操作を一つのP90/P95へ合成しない。
 - 期間変更は`idle → loading → ready|failed`の有限状態遷移とする。選択表示は入力直後に更新し、
   DB/API/parse/reductionはUI thread外で行う。処理が次paintまでに終わらない場合は操作を塞がない
   indeterminate progressと「期間データを読み込み中…」を表示する。loading中は直前に完成したgraph・

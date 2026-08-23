@@ -23,6 +23,8 @@ require_text windows-client/src/CodexInfo.WindowsClient/GraphWindow.axaml 'IsChe
 require_text windows-client/src/CodexInfo.WindowsClient/GraphWindow.axaml 'IsChecked="{Binding ShowLuna}"'
 require_text windows-client/src/CodexInfo.WindowsClient/GraphWindow.axaml 'AutomationProperties.AutomationId="Graph.PeriodMenu"'
 require_text windows-client/src/CodexInfo.WindowsClient/GraphWindow.axaml 'AutomationProperties.AutomationId="Graph.MetricMenu"'
+require_text windows-client/src/CodexInfo.WindowsClient/GraphWindow.axaml 'IsCheckedChanged="OnPeriodSelectorCheckedChanged"'
+require_text windows-client/src/CodexInfo.WindowsClient/GraphWindow.axaml 'IsCheckedChanged="OnMetricSelectorCheckedChanged"'
 require_text windows-client/src/CodexInfo.WindowsClient/ViewModels/DetailsWindowViewModels.cs 'MaxRenderedGraphPoints = 2_048'
 require_text windows-client/src/CodexInfo.WindowsClient/ThreadsWindow.axaml 'ThreadTreeControl'
 require_text windows-client/src/CodexInfo.WindowsClient/LegalNoticesWindow.axaml 'CurrentNoticeText'
@@ -116,7 +118,10 @@ require_text windows-client/tools/Measure-WindowsGraphLatency.ps1 'Graph.Toggle.
 require_text windows-client/tools/Measure-WindowsGraphLatency.ps1 'Graph.PeriodSelector'
 require_text windows-client/tools/Measure-WindowsGraphLatency.ps1 'Graph.MetricSelector'
 require_text windows-client/tools/Measure-WindowsGraphLatency.ps1 'CopyFromScreen'
-require_text windows-client/tools/Measure-WindowsGraphLatency.ps1 'mouse_event'
+require_text windows-client/tools/Measure-WindowsGraphLatency.ps1 'SendInput'
+if rg -q --fixed-strings 'mouse_event' windows-client/tools/Measure-WindowsGraphLatency.ps1; then
+    fail 'graph latency probe must use checked SendInput rather than deprecated mouse_event'
+fi
 require_text windows-client/tools/Measure-WindowsGraphLatency.ps1 'Threading.Thread]::Yield'
 require_text windows-client/tools/Measure-WindowsGraphLatency.ps1 'P90Limit 75'
 require_text windows-client/tools/Measure-WindowsGraphLatency.ps1 'P95Limit 100'

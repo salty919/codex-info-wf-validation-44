@@ -52,6 +52,7 @@ $script:graphLatencyOutput = Resolve-GraphLatencyOutputDirectory $OutputDirector
 New-Item -ItemType Directory -Path $script:graphLatencyOutput -Force | Out-Null
 $script:graphLatencyLogPath = Join-Path $script:graphLatencyOutput 'windows-graph-latency.log'
 $script:graphLatencyReportPath = Join-Path $script:graphLatencyOutput 'windows-graph-latency.json'
+$script:graphPhysicalInputSequence = 0
 
 function Write-GraphLatencyLog {
     param([Parameter(Mandatory = $true)][string]$Message)
@@ -107,7 +108,9 @@ using System.Text;
 
 public static class CodexInfoWindowsGraphLatencyWin32 {
     [DllImport("user32.dll")] public static extern bool SetProcessDPIAware();
+    [DllImport("user32.dll")] public static extern uint GetDoubleClickTime();
     [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hWnd);
+    [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
     [DllImport("user32.dll")] public static extern bool BringWindowToTop(IntPtr hWnd);
     [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr hWnd, int command);
     [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr hWnd);
@@ -115,13 +118,45 @@ public static class CodexInfoWindowsGraphLatencyWin32 {
     [DllImport("user32.dll")] public static extern int GetWindowText(IntPtr hWnd, StringBuilder text, int count);
     [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr hWnd, out RECT rect);
     [DllImport("user32.dll")] public static extern bool SetCursorPos(int x, int y);
-    [DllImport("user32.dll")] public static extern void mouse_event(
-        uint flags, uint dx, uint dy, uint data, UIntPtr extraInfo);
+    [DllImport("user32.dll")] public static extern bool GetCursorPos(out POINT point);
+    [DllImport("user32.dll", SetLastError = true)] public static extern uint SendInput(
+        uint count, INPUT[] inputs, int size);
     [DllImport("user32.dll")] public static extern bool EnumWindows(EnumWindowsProc callback, IntPtr extra);
     [DllImport("user32.dll")] public static extern bool SetWindowPos(
         IntPtr hWnd, IntPtr insertAfter, int x, int y, int width, int height, uint flags);
 
     public delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr extra);
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct INPUT {
+        public uint Type;
+        public INPUTUNION Data;
+    }
+
+    [StructLayout(LayoutKind.Explicit)]
+    public struct INPUTUNION {
+        [FieldOffset(0)] public MOUSEINPUT Mouse;
+        [FieldOffset(0)] public KEYBDINPUT Keyboard;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct MOUSEINPUT {
+        public int X;
+        public int Y;
+        public uint MouseData;
+        public uint Flags;
+        public uint Time;
+        public UIntPtr ExtraInfo;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct KEYBDINPUT {
+        public ushort VirtualKey;
+        public ushort ScanCode;
+        public uint Flags;
+        public uint Time;
+        public UIntPtr ExtraInfo;
+    }
 
     [StructLayout(LayoutKind.Sequential)]
     public struct RECT {
@@ -131,11 +166,32 @@ public static class CodexInfoWindowsGraphLatencyWin32 {
         public int Bottom;
     }
 
+    [StructLayout(LayoutKind.Sequential)]
+    public struct POINT {
+        public int X;
+        public int Y;
+    }
+
     public sealed class ScreenFrame {
         public string Hash { get; set; }
         public bool HasVariation { get; set; }
         public int Width { get; set; }
         public int Height { get; set; }
+    }
+
+    public static bool SendMouseButton(uint flag) {
+        var inputs = new INPUT[1];
+        inputs[0].Type = 0;
+        inputs[0].Data.Mouse.Flags = flag;
+        return SendInput(1, inputs, Marshal.SizeOf(typeof(INPUT))) == 1;
+    }
+
+    public static bool SendKeyboardKey(ushort virtualKey, bool released) {
+        var inputs = new INPUT[1];
+        inputs[0].Type = 1;
+        inputs[0].Data.Keyboard.VirtualKey = virtualKey;
+        inputs[0].Data.Keyboard.Flags = released ? 0x0002u : 0u;
+        return SendInput(1, inputs, Marshal.SizeOf(typeof(INPUT))) == 1;
     }
 
     public static ScreenFrame CaptureScreenFrame(IntPtr hWnd) {
@@ -144,6 +200,20 @@ public static class CodexInfoWindowsGraphLatencyWin32 {
             throw new InvalidOperationException("GetWindowRect failed.");
         }
         return CaptureScreenFrame(hWnd, rect.Left, rect.Top, rect.Right - rect.Left, rect.Bottom - rect.Top);
+    }
+
+    public static void CaptureWindowPng(IntPtr hWnd, string path) {
+        RECT rect;
+        if (!GetWindowRect(hWnd, out rect)) {
+            throw new InvalidOperationException("GetWindowRect failed.");
+        }
+        var width = rect.Right - rect.Left;
+        var height = rect.Bottom - rect.Top;
+        using (var bitmap = new Bitmap(width, height, PixelFormat.Format32bppArgb))
+        using (var graphics = Graphics.FromImage(bitmap)) {
+            graphics.CopyFromScreen(rect.Left, rect.Top, 0, 0, new Size(width, height), CopyPixelOperation.SourceCopy);
+            bitmap.Save(path, ImageFormat.Png);
+        }
     }
 
     public static ScreenFrame CaptureScreenFrame(IntPtr hWnd, int left, int top, int width, int height) {
@@ -206,6 +276,15 @@ public static class CodexInfoWindowsGraphLatencyWin32 {
 }
 
 [CodexInfoWindowsGraphLatencyWin32]::SetProcessDPIAware() | Out-Null
+$script:graphPhysicalInputSettleMilliseconds =
+    [int][CodexInfoWindowsGraphLatencyWin32]::GetDoubleClickTime() + 50
+
+function Complete-GraphPhysicalClickCycle {
+    # P90/P95 stop at the first changed paint.  This interval is outside the
+    # measurement and prevents the following sample from being interpreted as
+    # the second half of the same Windows double-click gesture.
+    [Threading.Thread]::Sleep($script:graphPhysicalInputSettleMilliseconds)
+}
 
 function Find-GraphWindow {
     param(
@@ -253,6 +332,15 @@ function Bring-GraphWindowToFront {
     [CodexInfoWindowsGraphLatencyWin32]::BringWindowToTop($Handle) | Out-Null
     [CodexInfoWindowsGraphLatencyWin32]::SetForegroundWindow($Handle) | Out-Null
     [CodexInfoWindowsGraphLatencyWin32]::SetCursorPos(10, 10) | Out-Null
+}
+
+function Wait-GraphInputTarget {
+    param([Parameter(Mandatory = $true)][IntPtr]$Handle)
+
+    Bring-GraphWindowToFront $Handle
+    Wait-GraphLatencyPredicate -Description 'Graph foreground input target' -TimeoutMilliseconds 2000 -Probe {
+        return [CodexInfoWindowsGraphLatencyWin32]::GetForegroundWindow() -eq $Handle
+    } | Out-Null
 }
 
 function Get-GraphScreenFrame {
@@ -391,18 +479,45 @@ function Get-GraphToggleState {
 function Invoke-GraphToggle {
     param([Parameter(Mandatory = $true)][System.Windows.Automation.AutomationElement]$Element)
 
-    Position-GraphPointer $Element
-    [CodexInfoWindowsGraphLatencyWin32]::mouse_event(0x0002, 0, 0, 0, [UIntPtr]::Zero)
-    [CodexInfoWindowsGraphLatencyWin32]::mouse_event(0x0004, 0, 0, 0, [UIntPtr]::Zero)
+    $pressed = [CodexInfoWindowsGraphLatencyWin32]::SendMouseButton(0x0002)
+    Assert-GraphLatency $pressed 'SendInput did not enqueue physical left-button down.'
+    try {
+        # Keep the button down for one 60 Hz frame.  A zero-duration synthetic
+        # down/up batch can be consumed after Windows already reports the
+        # button released, which is not representative of a human click.
+        [Threading.Thread]::Sleep(16)
+    }
+    finally {
+        $released = [CodexInfoWindowsGraphLatencyWin32]::SendMouseButton(0x0004)
+    }
+    Assert-GraphLatency $released 'SendInput did not enqueue physical left-button up.'
+}
+
+function Invoke-GraphEscape {
+    param([Parameter(Mandatory = $true)][IntPtr]$Handle)
+
+    Wait-GraphInputTarget $Handle
+    Assert-GraphLatency ([CodexInfoWindowsGraphLatencyWin32]::SendKeyboardKey(0x1B, $false)) `
+        'SendInput did not enqueue Escape key down.'
+    try {
+        [Threading.Thread]::Sleep(16)
+    }
+    finally {
+        $released = [CodexInfoWindowsGraphLatencyWin32]::SendKeyboardKey(0x1B, $true)
+    }
+    Assert-GraphLatency $released 'SendInput did not enqueue Escape key up.'
 }
 
 function Position-GraphPointer {
-    param([Parameter(Mandatory = $true)][System.Windows.Automation.AutomationElement]$Element)
+    param(
+        [Parameter(Mandatory = $true)][System.Windows.Automation.AutomationElement]$Element,
+        [ValidateRange(0.1, 0.9)][double]$HorizontalFraction = 0.5
+    )
 
     $rectangle = $Element.Current.BoundingRectangle
     Assert-GraphLatency (-not $Element.Current.IsOffscreen -and
         $rectangle.Width -gt 0 -and $rectangle.Height -gt 0) 'Graph control has no clickable bounds.'
-    $x = [int][Math]::Round($rectangle.Left + $rectangle.Width / 2)
+    $x = [int][Math]::Round($rectangle.Left + $rectangle.Width * $HorizontalFraction)
     $y = [int][Math]::Round($rectangle.Top + $rectangle.Height / 2)
     Assert-GraphLatency ([CodexInfoWindowsGraphLatencyWin32]::SetCursorPos($x, $y)) 'SetCursorPos failed.'
 }
@@ -496,7 +611,10 @@ function Measure-GraphActionPaint {
 
     # Move before the measurement so hover paint is not mistaken for click
     # acknowledgement. Establish a stable baseline before the input timestamp.
-    Position-GraphPointer $Element
+    Wait-GraphInputTarget $Handle
+    $script:graphPhysicalInputSequence++
+    $horizontalFraction = if (($script:graphPhysicalInputSequence % 2) -eq 0) { 0.35 } else { 0.65 }
+    Position-GraphPointer -Element $Element -HorizontalFraction $horizontalFraction
     # Thus neither
     # baseline capture nor a fixed probe sleep is charged to the latency.
     # The control surface is the first user-visible acknowledgement. Avalonia
@@ -603,6 +721,7 @@ function Measure-GraphToggleSeries {
             paint_hash = $sample.paint_hash
         })
         $state = $expected
+        Complete-GraphPhysicalClickCycle
     }
     $stats = Get-GraphLatencyStats -Samples @($samples) -Description $Name
     $coldMilliseconds = [double]$samples[0].latency_ms
@@ -628,54 +747,67 @@ function Measure-GraphMenu {
         [int]$Count = 30
     )
 
-    # Menus must begin closed, and every open/close transition is measured as
-    # its own physical click. The menu root has a stable AutomationId, so its
-    # inherited enabled state is the open/close oracle without relying on
-    # virtualized descendant items or a cached selector ToggleState.
-    $initialSelector = Wait-GraphElementByAutomationId $Handle $AutomationId
+    # Every sample has the same finite meaning: a closed list is expanded by
+    # one physical click.  Closing is test setup for the next sample, not part
+    # of the expansion-latency distribution, and uses the physical Escape path
+    # after the measured paint and open postcondition have passed.
+    Wait-GraphElementByAutomationId $Handle $AutomationId | Out-Null
     $initialMenu = Find-GraphElementByAutomationId (Get-GraphUiaRoot $Handle) $MenuAutomationId
     Assert-GraphLatency ($null -ne $initialMenu) "$Name menu UIA root is missing."
     Assert-GraphLatency ((Get-GraphMenuItemCount $Handle) -eq 0) "$Name menu did not start closed."
 
     $samples = [System.Collections.Generic.List[object]]::new()
-    $isOpen = $false
     for ($index = 1; $index -le $Count; $index++) {
         $element = Wait-GraphElementByAutomationId $Handle $AutomationId
-        $expectedOpen = -not $isOpen
+        Assert-GraphLatency ((Get-GraphToggleState $element) -eq [System.Windows.Automation.ToggleState]::Off) `
+            "$Name selector did not start sample $index closed."
         $sample = Measure-GraphActionPaint -Handle $Handle -Element $element -Action toggle `
             -Description "$Name sample $index" -ObservationExtraHeight 480 `
             -TimeoutMilliseconds $PaintTimeoutMilliseconds
-        if ($expectedOpen) {
+        try {
             Wait-GraphMenuState -Handle $Handle -MenuAutomationId $MenuAutomationId -Open $true
         }
+        catch {
+            $selectorState = 'unavailable'
+            $menuEnabled = 'unavailable'
+            $menuOffscreen = 'unavailable'
+            $menuBounds = 'unavailable'
+            $cursor = New-Object CodexInfoWindowsGraphLatencyWin32+POINT
+            try {
+                $currentSelector = Find-GraphElementByAutomationId (Get-GraphUiaRoot $Handle) $AutomationId
+                if ($null -ne $currentSelector) { $selectorState = [string](Get-GraphToggleState $currentSelector) }
+                $currentMenu = Find-GraphElementByAutomationId (Get-GraphUiaRoot $Handle) $MenuAutomationId
+                if ($null -ne $currentMenu) {
+                    $menuEnabled = [string]$currentMenu.Current.IsEnabled
+                    $menuOffscreen = [string]$currentMenu.Current.IsOffscreen
+                    $bounds = $currentMenu.Current.BoundingRectangle
+                    $menuBounds = '{0}x{1}+{2}+{3}' -f $bounds.Width, $bounds.Height, $bounds.Left, $bounds.Top
+                }
+            }
+            catch { }
+            [CodexInfoWindowsGraphLatencyWin32]::GetCursorPos([ref]$cursor) | Out-Null
+            $foreground = [CodexInfoWindowsGraphLatencyWin32]::GetForegroundWindow()
+            $failureImage = Join-Path $script:graphLatencyOutput ("failure-{0}-{1}.png" -f $Name, $index)
+            try { [CodexInfoWindowsGraphLatencyWin32]::CaptureWindowPng($Handle, $failureImage) } catch { }
+            Write-GraphLatencyLog ("menu-transition-fail: name={0} index={1} expected_open=true selector_state={2} menu_enabled={3} menu_offscreen={4} menu_bounds={5} items={6} foreground=0x{7:X} expected_hwnd=0x{8:X} cursor={9},{10} image={11}" -f
+                $Name, $index, $selectorState, $menuEnabled, $menuOffscreen,
+                $menuBounds, (Get-GraphMenuItemCount $Handle), $foreground.ToInt64(), $Handle.ToInt64(),
+                $cursor.X, $cursor.Y, $failureImage)
+            throw
+        }
+        Complete-GraphPhysicalClickCycle
         $samples.Add([pscustomobject]@{
             index = $index
             latency_ms = $sample.latency_ms
-            open = $expectedOpen
+            open = $true
             baseline_hash = $sample.baseline_hash
             paint_hash = $sample.paint_hash
         })
-        $isOpen = $expectedOpen
+        Invoke-GraphEscape $Handle
+        Wait-GraphToggleState -Handle $Handle -AutomationId $AutomationId `
+            -Expected ([System.Windows.Automation.ToggleState]::Off)
+        Wait-GraphMenuState -Handle $Handle -MenuAutomationId $MenuAutomationId -Open $false
     }
-
-    if ($isOpen) {
-        $close = Wait-GraphElementByAutomationId $Handle $AutomationId
-        Measure-GraphActionPaint -Handle $Handle -Element $close -Action toggle `
-            -Description "$Name unmeasured close" -ObservationExtraHeight 480 `
-            -TimeoutMilliseconds $PaintTimeoutMilliseconds | Out-Null
-    }
-    # Every measured close except the final one is already followed by a
-    # measured open assertion. Exercise one additional open/close pair so the
-    # final measured close is also proven to have left a closed menu.
-    $verifyOpen = Wait-GraphElementByAutomationId $Handle $AutomationId
-    Measure-GraphActionPaint -Handle $Handle -Element $verifyOpen -Action toggle `
-        -Description "$Name close verification open" -ObservationExtraHeight 480 `
-        -TimeoutMilliseconds $PaintTimeoutMilliseconds | Out-Null
-    Wait-GraphMenuState -Handle $Handle -MenuAutomationId $MenuAutomationId -Open $true
-    $verifyClose = Wait-GraphElementByAutomationId $Handle $AutomationId
-    Measure-GraphActionPaint -Handle $Handle -Element $verifyClose -Action toggle `
-        -Description "$Name verification cleanup" -ObservationExtraHeight 480 `
-        -TimeoutMilliseconds $PaintTimeoutMilliseconds | Out-Null
     $stats = Get-GraphLatencyStats -Samples @($samples) -Description $Name
     $coldMilliseconds = [double]$samples[0].latency_ms
     Assert-GraphLatencyBudget -Stats $stats -P90Limit 100 -P95Limit 120 `
@@ -689,6 +821,28 @@ function Measure-GraphMenu {
         cold_ms = $coldMilliseconds
         budget_ms = [ordered]@{ p90 = 100; p95 = 120; cold_max = 250 }
     }
+}
+
+function Assert-GraphMenuRoundTripAfterToggles {
+    param(
+        [Parameter(Mandatory = $true)][IntPtr]$Handle,
+        [Parameter(Mandatory = $true)][string]$AutomationId,
+        [Parameter(Mandatory = $true)][string]$MenuAutomationId,
+        [Parameter(Mandatory = $true)][string]$Name
+    )
+
+    $open = Wait-GraphElementByAutomationId $Handle $AutomationId
+    Measure-GraphActionPaint -Handle $Handle -Element $open -Action toggle `
+        -Description "$Name post-toggle verification open" -ObservationExtraHeight 480 `
+        -TimeoutMilliseconds $PaintTimeoutMilliseconds | Out-Null
+    Wait-GraphMenuState -Handle $Handle -MenuAutomationId $MenuAutomationId -Open $true
+    Complete-GraphPhysicalClickCycle
+
+    Invoke-GraphEscape $Handle
+    Wait-GraphToggleState -Handle $Handle -AutomationId $AutomationId `
+        -Expected ([System.Windows.Automation.ToggleState]::Off)
+    Wait-GraphMenuState -Handle $Handle -MenuAutomationId $MenuAutomationId -Open $false
+    Write-GraphLatencyLog "post-toggle-menu-round-trip: name=$Name PASS"
 }
 
 function Invoke-GraphPointCase {
@@ -725,6 +879,10 @@ function Invoke-GraphPointCase {
             $plot.Current.BoundingRectangle.Height -gt 0) 'Graph plot has no rendered bounds.'
 
         $controls = [System.Collections.Generic.List[object]]::new()
+        $controls.Add((Measure-GraphMenu -Handle $window -AutomationId 'Graph.PeriodSelector' `
+            -MenuAutomationId 'Graph.PeriodMenu' -Name 'period' -Count $Iterations))
+        $controls.Add((Measure-GraphMenu -Handle $window -AutomationId 'Graph.MetricSelector' `
+            -MenuAutomationId 'Graph.MetricMenu' -Name 'metric' -Count $Iterations))
         $toggleCases = @(
             @{ Id = 'Graph.Toggle.Remaining'; Name = 'Remaining' },
             @{ Id = 'Graph.Toggle.LUNA'; Name = 'LUNA' },
@@ -735,10 +893,10 @@ function Invoke-GraphPointCase {
             $controls.Add((Measure-GraphToggleSeries -Handle $window -AutomationId $toggleCase.Id `
                 -Name $toggleCase.Name -Count $Iterations))
         }
-        $controls.Add((Measure-GraphMenu -Handle $window -AutomationId 'Graph.PeriodSelector' `
-            -MenuAutomationId 'Graph.PeriodMenu' -Name 'period' -Count $Iterations))
-        $controls.Add((Measure-GraphMenu -Handle $window -AutomationId 'Graph.MetricSelector' `
-            -MenuAutomationId 'Graph.MetricMenu' -Name 'metric' -Count $Iterations))
+        Assert-GraphMenuRoundTripAfterToggles -Handle $window -AutomationId 'Graph.PeriodSelector' `
+            -MenuAutomationId 'Graph.PeriodMenu' -Name 'period'
+        Assert-GraphMenuRoundTripAfterToggles -Handle $window -AutomationId 'Graph.MetricSelector' `
+            -MenuAutomationId 'Graph.MetricMenu' -Name 'metric'
 
         $toggleSamples = @($controls | Where-Object { $_.kind -eq 'toggle' } |
             ForEach-Object { $_.samples })
@@ -800,6 +958,10 @@ $script:graphLatencyReport = [ordered]@{
         menu_p90 = 100
         menu_p95 = 120
         cold_max = 250
+    }
+    physical_input = [ordered]@{
+        provider = 'SendInput'
+        independent_click_settle_ms = $script:graphPhysicalInputSettleMilliseconds
     }
     cases = @()
 }
