@@ -35,4 +35,4 @@ if [[ -z "$CODEX_INFO_CARGO" || ! -x "$CODEX_INFO_CARGO" ]]; then
     exit 127
 fi
 
-exec "$CODEX_INFO_CARGO" run --manifest-path "$BASE_DIR/Cargo.toml" --release --locked
+exec "$CODEX_INFO_CARGO" run --manifest-path "$BASE_DIR/Cargo.toml" --release --locked -- "$@"

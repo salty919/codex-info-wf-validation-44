@@ -3,9 +3,9 @@
 
 # Codex Info（Rust / X Window / WSLg）
 
-English quick start: [README.en.md](README.en.md) · 多言語化仕様: [docs/LOCALIZATION.md](docs/LOCALIZATION.md)
+English quick start: [README.en.md](README.en.md) · [製品要件](docs/PRODUCT_REQUIREMENTS.md) · [Windowsクライアント](docs/WINDOWS_CLIENT.md) · [REST API](docs/REST_API_V1.md) · [データ保護](docs/DATA_PROTECTION_POLICY.md) · [多言語化](docs/LOCALIZATION.md) · [顧客運用](docs/CUSTOMER_OPERATIONS_RUNBOOK.md)
 
-Codex App ServerからChatGPT/Codexアカウントのレート制限と週次または月間のリセット時刻を取得し、WSLのX Windowに表示します。WebサーバーやTkinterは使いません。UIはRustの宣言的GUIツールキットSlintで構成しています。
+Codex App ServerからChatGPT/Codexアカウントのレート制限と週次または月間のリセット時刻を取得し、WSLのX Windowに表示します。UIはRustの宣言的GUIツールキットSlintで構成しています。必要な場合だけ、SSHトンネル経由のWindows監視用にloopback限定の読み取り専用REST APIも開始できます。
 
 ## 起動
 
@@ -20,6 +20,8 @@ cd codex_info_v2
 ```bash
 CODEX_INFO_DATA_DIR="$PWD/data" ./run.sh
 ```
+
+起動モードは3つです。`./run.sh --service`は記録daemonとloopback RESTを1プロセスで起動し、`./run.sh --ui-only`は既存サービスへ追加するX UIだけを起動してdaemon/RESTを生成しません。通常の引数なし`./run.sh`または明示的な`./run.sh --all`は既存サービスを再利用し、なければdaemon+RESTを起動してからX UIを表示します。後方互換の`CODEX_INFO_API_LISTEN=127.0.0.1:8787 ./run.sh`だけはWindowを作らないservice起動であり、同じ環境変数を使ってUIも追加するときは`./run.sh --all`を明示します。サービスを自動起動するには`bash scripts/install_systemd_recorder.sh`、自動起動から外すには`bash scripts/install_systemd_recorder.sh --remove`を使います。解除してもSQLite履歴、バックアップ、reset hint、実行ファイルは削除しません。収集周期`CODEX_INFO_DAEMON_INTERVAL_SECS`は5〜3600秒へ制限されます。
 
 初回起動時の画面内タイトルは`Codex Info`です。ネイティブタイトルバーは使わず、アプリ内では認証パネルが接続状態を案内します。
 
@@ -64,6 +66,14 @@ codex app-server --help
 
 取得したトークンやパスワードはアプリのファイルへ保存しません。Codex側の認証ストアが管理します。
 
+## データ保護と変更ゲート
+
+履歴DBの一意性、複数collector、app-server停止時の復旧、3世代バックアップ、schema mismatch、migration、prune、障害時の保持境界は[データ保護規約](docs/DATA_PROTECTION_POLICY.md)を正本とします。変更時は`bash scripts/data_protection_gate.sh`で実装と回帰テストを確認します。
+
+## Windowsからのイントラネット監視
+
+Linux / WSL 側でネイティブ画面を維持したまま、Windows クライアントから監視する場合は、`windows-client/` の Avalonia クライアントと loopback 限定 API、SSH ローカルポート転送を使用します。Windows配布物はInno Setup 7.1.0の標準GUIウィザードを使う `CodexInfo.WindowsClient.Setup.exe` とし、非管理者のユーザー単位インストール、更新、Startメニュー、「インストールされているアプリ」登録、標準アンインストールを提供します。本体、Setup、shortcut、uninstallerには同じ製品アイコンを設定します。インターネット公開や HTTPS 証明書の設定は必要ありません。Visual Studio Communityでのbuild、インストーラー作成、SSH接続、API契約、Windows側の表示仕様は[Windows 監視クライアント](docs/WINDOWS_CLIENT.md)を参照してください。
+
 ## 表示と更新
 
 ### 言語・時刻・日本語表示
@@ -75,8 +85,8 @@ codex app-server --help
 - 残り時間は日・時・分で読みやすく表示
 - レート制限は1分ごとに再取得
 - ネイティブタイトルバーは使わず、各Windowの画面内タイトル領域に埋め込みフォントの見出しと自前の移動・最小化・閉じる操作を配置します。固定Windowには最大化操作を表示しません。
-- 認証済み画面の「グラフ」ボタンから1つのグラフウインドウを開きます。残り利用枠・LUNA/TERRA/SOLは凡例で個別に表示／非表示を切り替え、非表示系列は色とラベルのコントラストを下げて示します。初期状態は全系列表示です。各モデルの入力・キャッシュ・出力合計を独立した累積ラインで描き、表示中モデルの個別最大値をドル軸へ使います。全モデルの累積値が変化しない未使用区間は残量ラインを水平保持し、プロット下地の薄い帯で示します。モデルが進んでいるのに残量サンプルが同じ区間は欠測サンプルとして前後の残量変化から線形補完し、`1→1→3` は `1→中点→3` として折返しや瞬間的な消費を描きません。次の残量変化がまだ取得できない終端のactive区間は直前に確定したactive消費率で暫定補完し、残量は0%未満へ下げません。右端の値は系列色のリーダー線で終端へ結びます。リセット直後（0）から現在時刻まで表示します
-- グラフの1分サンプルはSQLite（`history/usage_history.sqlite3`）へ保存します。同一リセット期間・同一分は最大値を保持して再計測で減少しません。通常起動で削除されるのは3か月より古い行だけです。グラフ上部の「ドル／トークン」で、ドルは累積額、トークンは各モデルの時間帯別使用量へ切り替えられます（初期値はドル）。
+- 認証済み画面の「グラフ」ボタンから1つのグラフウインドウを開きます。残り利用枠・LUNA/TERRA/SOLは凡例で個別に表示／非表示を切り替え、非表示系列は色とラベルのコントラストを下げて示します。初期状態は全系列表示です。各モデルの入力・キャッシュ・出力合計を独立した累積ラインで描き、表示中モデルの個別最大値をドル軸へ使います。全モデルの累積値が変化しない未使用区間は残量ラインを水平保持し、プロット下地の薄い帯で示します。モデルが進んでいるのに残量サンプルが同じ区間は、前後を実測された残量低下値で挟める場合だけ欠測サンプルとして線形補間し、`1→1→3` は `1→中点→3` として折返しや瞬間的な消費を描きません。次の実測値がない終端は最後の実測残量を保持します。右端の値は系列色のリーダー線で終端へ結びます。リセット直後（0）から現在時刻まで表示します
+- グラフの1分サンプルはSQLite（`history/usage_history.sqlite3`）へ過去3暦月分保存します。同一リセット期間・同一分は最大値を保持して再計測で減少しません。通常起動で削除されるのは3暦月より古い行だけです。1回の取得・REST応答・グラフ表示はその保持データ中の最長1暦月（最大44,640分点）に限定し、DB全体を読みません。グラフ上部の「ドル／トークン」で、ドルは累積額、トークンは各モデルの時間帯別使用量へ切り替えられます（初期値はドル）。
 - `CODEX_INFO_DATA_DIR`を指定すると、そのディレクトリ配下へ履歴を保存します
 - 週次または月間の対象期間の残り時間は、端数も含めた7セルのゲージで表示
 - `~/.codex/sessions`に履歴がある場合は、週次または月間の対象期間を表示し、その期間内のSOL/TERRA/LUNAの入力（非キャッシュ）・キャッシュ入力・出力トークン数と、[OpenAI Developer Docsのモデル料金表](https://developers.openai.com/api/docs/models)に基づく予想ドル額（整数部のみ）を各カテゴリの独立したドル列に表示します。見出しはモデル・入力・キャッシュ・出力だけです。クレジット換算は行いません。連続する同一累積スナップショットは差分0として二重計上しません。その他のモデルは表示しません。
@@ -88,7 +98,7 @@ codex app-server --help
 
 ## Windowサイズとプレビュー
 
-ネイティブタイトルバーは全Windowで無効にし、ボタン以外の画面領域をドラッグして移動できます。Main/Threads/Legalはlogical client 900×480または720×520で固定し、物理サイズはOSのDPI／拡大率に連動します。最大化・リサイズ操作は表示しません。Graphはlogical client 940×640を初期値、700×480を最小値、上限なしとし、四隅の広い対角領域または辺からリサイズできます。Graphの最大化／復元は現在モニターの物理サイズ・位置へ適用し、仮想デスクトップ全体を描画しません。状態別の確認には`CODEX_INFO_PREVIEW=auth|normal|warning|reset-warning|error|zero|full|monthly|unlimited|idle|legal`を使い、グラフ表示は`CODEX_INFO_PREVIEW=graph|graph-old`で確認できます。`CODEX_INFO_PREVIEW_SIZE`はGraphの初期サイズを上書きするレイアウト検証用です。メイン画面の指定例は`CODEX_INFO_PREVIEW=normal ./run.sh`です。
+登録top-level surface inventoryはMain、Setup、Settings、Graph、Threads、Legalの正確な6個で、HelpはMain内surface（追加HWND=0）です。runtime open HWNDはMain=1＋open child subset 0..5、合計1..6で、各childはsingleton、5 childを全て開いた時だけ6となります。Main/Setup/Settings/Threads/Legalはlogical client `initial=min=max=900×480` fixed、Graphは`initial=940×640`、`min=700×480`、`max=unbounded`、resizableです。登録された6 surfaceはMinimize/Closeを持ち、native resize/maximize/restoreはGraphだけです。ネイティブタイトルバーは全Windowで無効にし、ボタン以外の画面領域をドラッグして移動できます。物理サイズはOSのDPI／拡大率に連動し、Graphの最大化／復元は現在モニターのwork areaへ適用します。状態別の確認には`CODEX_INFO_PREVIEW=initializing|auth|normal|warning|reset-warning|error|zero|full|monthly|unlimited|idle|legal`を使い、グラフ表示は`CODEX_INFO_PREVIEW=graph|graph-old`で確認できます。`CODEX_INFO_PREVIEW_SIZE`はGraphの初期サイズを上書きするレイアウト検証用です。メイン画面の指定例は`CODEX_INFO_PREVIEW=normal ./run.sh`です。
 
 ## UIを調整する場所
 
@@ -100,4 +110,4 @@ Copyright (C) 2026 salty919
 
 別途明記された第三者素材を除き、このリポジトリの独自コードと文書は[GNU General Public License version 3](LICENSE)（SPDX: `GPL-3.0-only`）で提供します。英語の[LICENSE](LICENSE)がGPLv3の正文であり、正式な条件・定義・免責を定めます。[LICENSE.ja.md](LICENSE.ja.md)は日本語案内です。著作権一覧は[COPYRIGHT](COPYRIGHT)を参照してください。
 
-同梱フォント、Codex CLIから生成したプロトコルスキーマ、Slint、およびRust依存クレートは各上流ライセンスで提供します。ソース・バイナリ配布物には[第三者ライセンス通知](THIRD_PARTY_NOTICES.md)、[assets/NOTICE.txt](assets/NOTICE.txt)、[LICENSES/](LICENSES/)を同梱します。
+同梱フォント、Codex CLIから生成したプロトコルスキーマ、Slint、Rust依存クレート、およびWindowsクライアントの Avalonia / NuGet 依存は各上流ライセンスで提供します。ソース・バイナリ配布物には[第三者ライセンス通知](THIRD_PARTY_NOTICES.md)、[assets/NOTICE.txt](assets/NOTICE.txt)、[LICENSES/](LICENSES/)を同梱します。Windows publish 時は[Windows 監視クライアント](docs/WINDOWS_CLIENT.md)の通知収集手順も実行してください。

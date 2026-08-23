@@ -1,0 +1,109 @@
+<!-- Copyright (C) 2026 salty919 -->
+<!-- SPDX-License-Identifier: GPL-3.0-only -->
+<Window xmlns="https://github.com/avaloniaui"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:vm="using:CodexInfo.WindowsClient.ViewModels"
+        xmlns:tree="using:CodexInfo.WindowsClient.Controls"
+        x:Class="CodexInfo.WindowsClient.ThreadsWindow"
+        x:DataType="vm:ThreadsWindowViewModel"
+        Width="900"
+        Height="480"
+        MinWidth="900"
+        MinHeight="480"
+        MaxWidth="900"
+        MaxHeight="480"
+        WindowStartupLocation="CenterOwner"
+        CanResize="False"
+        WindowDecorations="None"
+        ExtendClientAreaToDecorationsHint="True"
+        ExtendClientAreaTitleBarHeightHint="0"
+        Title="Codex Info Threads"
+        FontFamily="{StaticResource JapaneseFont}"
+        Background="#0E141E"
+        Foreground="#E9EFF8">
+  <Window.Styles>
+    <Style Selector="TextBlock.label">
+      <Setter Property="FontSize" Value="12" />
+      <Setter Property="Foreground" Value="#A8B7CA" />
+    </Style>
+    <Style Selector="Border.thread-card">
+      <Setter Property="Background" Value="#151F2D" />
+      <Setter Property="BorderBrush" Value="#263548" />
+      <Setter Property="BorderThickness" Value="1" />
+      <Setter Property="CornerRadius" Value="6" />
+      <Setter Property="Height" Value="56" />
+      <Setter Property="Padding" Value="8,4" />
+    </Style>
+    <Style Selector="Button.window-control">
+      <Setter Property="Width" Value="32" />
+      <Setter Property="Height" Value="30" />
+      <Setter Property="Padding" Value="0" />
+      <Setter Property="FontSize" Value="17" />
+      <Setter Property="Background" Value="Transparent" />
+      <Setter Property="BorderBrush" Value="Transparent" />
+      <Setter Property="Foreground" Value="#A8B7CA" />
+    </Style>
+    <Style Selector="Button.window-control:pointerover">
+      <Setter Property="Background" Value="#263548" />
+      <Setter Property="Foreground" Value="#F2F6FC" />
+    </Style>
+  </Window.Styles>
+  <Grid Margin="20" RowDefinitions="Auto,Auto,*" RowSpacing="6">
+    <Grid ColumnDefinitions="*,Auto" Background="Transparent" PointerPressed="OnTitlePointerPressed">
+      <TextBlock FontSize="22" FontWeight="SemiBold" VerticalAlignment="Center" Text="{Binding Texts.RunningThreads}" />
+      <StackPanel Grid.Column="1" Orientation="Horizontal" Spacing="2">
+        <Button Classes="window-control" Click="OnMinimizeWindow" AutomationProperties.Name="{Binding Texts.Minimize}" Content="—" ToolTip.Tip="{Binding Texts.Minimize}" />
+        <Button Classes="window-control" Click="OnCloseWindow" AutomationProperties.Name="{Binding Texts.Close}" Content="×" ToolTip.Tip="{Binding Texts.Close}" />
+      </StackPanel>
+    </Grid>
+    <TextBlock Grid.Row="1" Classes="label" Text="{Binding DetailsStatusText}" />
+    <ScrollViewer Grid.Row="2"
+                  Height="360"
+                  VerticalAlignment="Top"
+                  HorizontalScrollBarVisibility="Disabled"
+                  VerticalScrollBarVisibility="Auto">
+      <Grid>
+        <TextBlock Classes="label" HorizontalAlignment="Center" VerticalAlignment="Top" IsVisible="{Binding HasNoThreads}" Text="{Binding EmptyText}" />
+        <ItemsControl IsVisible="{Binding HasThreads}" ItemsSource="{Binding Threads}">
+          <ItemsControl.ItemTemplate>
+            <DataTemplate x:DataType="vm:ThreadItemViewModel">
+              <Border Classes="thread-card"
+                      Margin="0,0,0,4"
+                      AutomationProperties.Name="{Binding Title}">
+                <Grid>
+                  <tree:ThreadTreeControl Width="64" HorizontalAlignment="Left" IsHitTestVisible="False"
+                    TreeDepth="{Binding TreeDepth}" ConnectedToParent="{Binding ConnectedToParent}"
+                    HasChildren="{Binding HasChildren}" HasNextSibling="{Binding HasNextSibling}"
+                    AncestorGuide1="{Binding AncestorGuide1}" AncestorGuide2="{Binding AncestorGuide2}" AncestorGuide3="{Binding AncestorGuide3}" />
+                  <Grid Margin="72,0,0,0"
+                        ColumnDefinitions="*,128,170,140"
+                        RowDefinitions="20,18"
+                        ColumnSpacing="10">
+                    <TextBlock FontSize="14"
+                               FontWeight="SemiBold"
+                               VerticalAlignment="Center"
+                               AutomationProperties.AutomationId="{Binding Id}"
+                               Text="{Binding Title}"
+                               TextTrimming="CharacterEllipsis"
+                               ToolTip.Tip="{Binding Id}" />
+                    <TextBlock Grid.Column="1" Classes="label" VerticalAlignment="Center" Text="{Binding ModelText}" TextTrimming="CharacterEllipsis" />
+                    <TextBlock Grid.Column="2" Classes="label" VerticalAlignment="Center" Text="{Binding ContextText}" TextTrimming="CharacterEllipsis" />
+                    <TextBlock Grid.Column="3" Classes="label" HorizontalAlignment="Right" VerticalAlignment="Center" Text="{Binding AgeText}" TextTrimming="CharacterEllipsis" />
+
+                    <TextBlock Grid.Row="1" Classes="label" VerticalAlignment="Center" Text="{Binding ParentText}" TextTrimming="CharacterEllipsis" />
+                    <StackPanel Grid.Row="1" Grid.Column="1" Orientation="Horizontal" Spacing="8" VerticalAlignment="Center">
+                      <TextBlock Classes="label" Text="{Binding RoleText}" TextTrimming="CharacterEllipsis" />
+                      <TextBlock Classes="label" Text="{Binding DepthText}" TextTrimming="CharacterEllipsis" />
+                    </StackPanel>
+                    <TextBlock Grid.Row="1" Grid.Column="2" Classes="label" VerticalAlignment="Center" Text="{Binding TokenText}" TextTrimming="CharacterEllipsis" />
+                    <TextBlock Grid.Row="1" Grid.Column="3" Classes="label" HorizontalAlignment="Right" VerticalAlignment="Center" Text="{Binding InstructionAgeText}" TextTrimming="CharacterEllipsis" />
+                  </Grid>
+                </Grid>
+              </Border>
+            </DataTemplate>
+          </ItemsControl.ItemTemplate>
+        </ItemsControl>
+      </Grid>
+    </ScrollViewer>
+  </Grid>
+</Window>

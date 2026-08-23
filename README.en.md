@@ -50,18 +50,30 @@ The graph offers individual visibility controls for remaining quota and
 LUNA/TERRA/SOL; all series start visible, and hidden series use muted color and
 labels. Intervals where no model's cumulative usage changes appear as faint
 background bands, and right-edge values use series-colored leader lines to the
-corresponding endpoints. Native title bars are disabled; each window provides
-its own embedded-font title area with move, minimize, and close controls.
-All frameless windows can be moved by dragging any non-button surface. Graph is
-resizable from 700x480 pixels with no upper bound; its enlarged corner hit
-areas and directional cursors make diagonal resizing easier. Main, Threads,
-and Legal remain fixed-size and do not expose maximize or resize controls.
+corresponding endpoints. The registered top-level surface inventory is exactly
+Main, Setup, Settings, Graph, Threads, and Legal (six); Help is Main-internal
+with 0 additional HWND. Runtime open HWND is Main=1 plus an open child subset
+of 0..5, total 1..6, with singleton children; all five children produce six
+only when open together. Main, Setup, Settings, Threads, and Legal use fixed
+logical client `initial=min=max=900x480`; Graph uses `initial=940x640`,
+`min=700x480`, `max=unbounded`, and is resizable. All six registered surfaces
+provide Minimize/Close, while only Graph provides native resize and
+Maximize/Restore. Native title bars are disabled; each surface provides its
+own embedded-font title area, and any non-button surface can be dragged to move
+it. Graph Maximize/Restore uses the current monitor work area.
 
 ## Licensing
 
 Original source and documentation are GPL-3.0-only. The authoritative GPLv3
 text is [LICENSE](LICENSE), and [LICENSE.ja.md](LICENSE.ja.md) provides a
-Japanese guide. Noto fonts, generated protocol schemas, Slint, and Cargo
-dependencies retain their upstream licenses. Source and binary distributions
-include [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md),
-[assets/NOTICE.txt](assets/NOTICE.txt), and [LICENSES/](LICENSES/).
+Japanese guide. Noto fonts, generated protocol schemas, Slint, Cargo
+dependencies, and the Windows client's Avalonia/NuGet dependencies retain
+their upstream licenses. Source and binary distributions include
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md),
+[assets/NOTICE.txt](assets/NOTICE.txt), and [LICENSES/](LICENSES/). A Windows
+publish must also run the notice collection procedure in
+[WINDOWS_CLIENT.md](docs/WINDOWS_CLIENT.md).
+The Windows distribution is installed with the generated
+`CodexInfo.WindowsClient.Setup.exe`; it creates the Start-menu and per-user
+uninstall registration, and the uninstaller removes the client without
+deleting server history.

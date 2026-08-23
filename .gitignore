@@ -1,6 +1,18 @@
 # Rust build artifacts
 /target/
 
+# .NET / Visual Studio build artifacts for the Windows monitor
+/windows-client/**/bin/
+/windows-client/**/obj/
+/windows-client/.vs/
+/windows-client/TestResults/
+/windows-client/dist/
+/artifacts/
+
+# Temporary local installer/font-probe workspaces
+/.installer-build.*/
+/.tmp-font-probe/
+
 # Local runtime data
 /data/
 /history/
@@ -45,6 +57,8 @@
 !assets/**/*.jpeg
 !assets/**/*.gif
 !assets/**/*.webp
+/docs/evidence/**/*.xwd
+/docs/evidence/**/captures.tsv
 
 # Local agent metadata
 /.agents/

@@ -3,13 +3,16 @@
 
 use chrono::{DateTime, Months, Utc};
 use rusqlite::types::Value;
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, DatabaseName, OptionalExtension};
+use std::collections::BTreeSet;
 use std::fmt;
 use std::fs;
 use std::fs::OpenOptions;
 use std::path::Path;
 #[cfg(test)]
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS usage_history (
@@ -26,6 +29,8 @@ CREATE TABLE IF NOT EXISTS usage_history (
 );
 CREATE INDEX IF NOT EXISTS usage_history_timestamp_idx
     ON usage_history (timestamp);
+CREATE INDEX IF NOT EXISTS usage_history_timestamp_reset_idx
+    ON usage_history (timestamp, reset_at);
 
 CREATE TABLE IF NOT EXISTS durable_state (
     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
@@ -36,6 +41,11 @@ CREATE TABLE IF NOT EXISTS durable_state (
 "#;
 
 const RESET_GROUP_TOLERANCE_SECONDS: i128 = 60;
+/// Maximum minute buckets materialized by a single one-month history read.
+/// Persistent retention is independently three calendar months; callers must
+/// never materialize that whole retention window merely to serve one request.
+pub const MAX_RECENT_HISTORY_SAMPLES: usize = 31 * 24 * 60;
+static BACKUP_TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 const UPSERT_SAMPLE: &str = r#"
 INSERT INTO usage_history (
@@ -68,6 +78,15 @@ ON CONFLICT (reset_at, timestamp) DO UPDATE SET
 fn three_months_before(now: DateTime<Utc>) -> DateTime<Utc> {
     now.checked_sub_months(Months::new(3))
         .expect("subtracting three calendar months from UTC now must be representable")
+}
+
+/// Returns the UTC instant one calendar month before `now`.
+///
+/// History reads use the half-open interval `(cutoff, now]`: a 31-day month
+/// therefore contains at most exactly 44,640 one-minute buckets, not 44,641.
+fn one_month_before(now: DateTime<Utc>) -> DateTime<Utc> {
+    now.checked_sub_months(Months::new(1))
+        .expect("subtracting one calendar month from UTC now must be representable")
 }
 
 /// Upper bound for the serialized durable snapshot kept in SQLite.
@@ -110,6 +129,16 @@ pub struct DurableRecord {
     pub snapshot_json: String,
 }
 
+/// Result of a verified, candidate-database migration.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MigrationReport {
+    pub source_rows: usize,
+    pub candidate_rows: usize,
+    pub source_fingerprint: String,
+    pub candidate_fingerprint: String,
+    pub preserved_backup: std::path::PathBuf,
+}
+
 /// Errors returned while opening or using a usage history database.
 #[derive(Debug)]
 pub enum UsageStoreError {
@@ -121,6 +150,7 @@ pub enum UsageStoreError {
     NonFiniteValue { field: &'static str },
     GenerationConflict { expected: u64, actual: u64 },
     GenerationOverflow,
+    HistoryCapacityExceeded { maximum: usize },
 }
 
 pub type Result<T> = std::result::Result<T, UsageStoreError>;
@@ -146,6 +176,12 @@ impl fmt::Display for UsageStoreError {
                 "durable generation conflict: expected {expected}, found {actual}"
             ),
             Self::GenerationOverflow => write!(formatter, "durable generation overflow"),
+            Self::HistoryCapacityExceeded { maximum } => {
+                write!(
+                    formatter,
+                    "recent history exceeds the {maximum}-row capacity"
+                )
+            }
         }
     }
 }
@@ -160,7 +196,8 @@ impl std::error::Error for UsageStoreError {
             | Self::InvalidTimestamp { .. }
             | Self::NonFiniteValue { .. }
             | Self::GenerationConflict { .. }
-            | Self::GenerationOverflow => None,
+            | Self::GenerationOverflow
+            | Self::HistoryCapacityExceeded { .. } => None,
         }
     }
 }
@@ -310,6 +347,61 @@ fn valid_sample_from_row(row: &rusqlite::Row<'_>) -> Result<Option<UsageHistoryS
         return Ok(None);
     }
     Ok(Some(sample))
+}
+
+fn samples_fingerprint(samples: &[UsageHistorySample]) -> String {
+    // A deterministic, dependency-free fingerprint is sufficient for the
+    // migration gate: it detects any row/value/order change between the
+    // source and candidate snapshots without persisting credentials or data.
+    let mut hash = 0xcbf29ce484222325_u64;
+    let mut feed = |bytes: &[u8]| {
+        for byte in bytes {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(0x100000001b3);
+        }
+    };
+    for sample in samples {
+        feed(&sample.timestamp.to_le_bytes());
+        feed(&sample.reset_at.to_le_bytes());
+        feed(
+            &sample
+                .remaining_percent
+                .unwrap_or(f64::NAN)
+                .to_bits()
+                .to_le_bytes(),
+        );
+        feed(&sample.sol_dollars.to_bits().to_le_bytes());
+        feed(&sample.terra_dollars.to_bits().to_le_bytes());
+        feed(&sample.luna_dollars.to_bits().to_le_bytes());
+        feed(&sample.sol_tokens.to_le_bytes());
+        feed(&sample.terra_tokens.to_le_bytes());
+        feed(&sample.luna_tokens.to_le_bytes());
+    }
+    format!("{hash:016x}")
+}
+
+fn validate_migration_samples(samples: &[UsageHistorySample]) -> Result<()> {
+    let mut keys = BTreeSet::new();
+    for sample in samples {
+        sample.validate()?;
+        if !keys.insert((sample.reset_at, sample.timestamp)) {
+            return Err(UsageStoreError::InvalidImport(
+                "migration candidate contains duplicate history keys".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn quick_check_database(path: &Path) -> Result<()> {
+    let connection = Connection::open(path)?;
+    let result: String = connection.query_row("PRAGMA quick_check", [], |row| row.get(0))?;
+    if result != "ok" {
+        return Err(UsageStoreError::InvalidImport(format!(
+            "migration candidate quick_check failed: {result}"
+        )));
+    }
+    Ok(())
 }
 
 fn validate_data_hash(data_hash: &str) -> Result<()> {
@@ -489,6 +581,11 @@ impl UsageStore {
         }
 
         let mut connection = Connection::open(path)?;
+        // Multiple Codex Info instances are allowed to observe the same
+        // history DB. SQLite remains the serialization authority; a bounded
+        // busy timeout prevents a transient writer collision from discarding
+        // an otherwise valid batch.
+        connection.busy_timeout(Duration::from_secs(2))?;
         let transaction = connection.transaction()?;
         transaction.execute_batch(SCHEMA)?;
         // A database must already have the current schema. Older formats are
@@ -514,6 +611,302 @@ impl UsageStore {
         Self::open(path)
     }
 
+    /// Create bounded, SQLite-consistent backup generations before a
+    /// destructive maintenance operation. The source is never replaced; a
+    /// failed backup leaves all existing generations untouched. Rotation is
+    /// staged inside the same directory and rolled back if any rename fails;
+    /// this matters because a backup failure must not silently consume the
+    /// only older generation that could be used for manual recovery.
+    pub fn backup_generations<P: AsRef<Path>>(path: P, generations: usize) -> Result<()> {
+        let path = path.as_ref();
+        if generations == 0 {
+            return Ok(());
+        }
+        if !path.is_absolute() {
+            return Err(UsageStoreError::InvalidImport(
+                "database backup path must be absolute".into(),
+            ));
+        }
+        let parent = path.parent().ok_or_else(|| {
+            UsageStoreError::InvalidImport("database backup parent is missing".into())
+        })?;
+        let file_name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| UsageStoreError::InvalidImport("database filename is invalid".into()))?;
+
+        // Validate the source without changing it before creating any
+        // temporary or generation file. This rejects corrupt/old-schema input
+        // at the read boundary and leaves every existing generation intact.
+        let source_store = Self::open(path)?;
+        drop(source_store);
+        let source = Connection::open(path)?;
+        source.busy_timeout(Duration::from_secs(2))?;
+        let source_check: String = source.query_row("PRAGMA quick_check", [], |row| row.get(0))?;
+        if source_check != "ok" {
+            return Err(UsageStoreError::InvalidImport(format!(
+                "source database quick_check failed: {source_check}"
+            )));
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::create_dir_all(parent)?;
+            fs::set_permissions(parent, fs::Permissions::from_mode(0o700))?;
+        }
+
+        let counter = BACKUP_TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let temporary = parent.join(format!(
+            ".{file_name}.backup.tmp-{}-{counter}",
+            std::process::id(),
+        ));
+        if fs::symlink_metadata(&temporary).is_ok() {
+            return Err(UsageStoreError::InvalidImport(
+                "stale backup temporary exists; inspect before retry".into(),
+            ));
+        }
+        let backup_result = source.backup(DatabaseName::Main, &temporary, None);
+        if let Err(error) = backup_result {
+            let _ = fs::remove_file(&temporary);
+            return Err(error.into());
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if let Err(error) = fs::set_permissions(&temporary, fs::Permissions::from_mode(0o600)) {
+                let _ = fs::remove_file(&temporary);
+                return Err(error.into());
+            }
+        }
+        if let Err(error) = quick_check_database(&temporary) {
+            let _ = fs::remove_file(&temporary);
+            return Err(error);
+        }
+        drop(source);
+
+        let stage_prefix = format!(
+            ".{file_name}.backup-rotate-{}-{counter}",
+            std::process::id()
+        );
+        let mut staged = Vec::with_capacity(generations);
+        for generation in 1..=generations {
+            let final_path = path.with_extension(format!("sqlite3.bak.{generation}"));
+            let stage_path = parent.join(format!("{stage_prefix}-{generation}"));
+            if fs::symlink_metadata(&stage_path).is_ok() {
+                let _ = fs::remove_file(&temporary);
+                return Err(UsageStoreError::InvalidImport(
+                    "stale backup rotation file exists; inspect before retry".into(),
+                ));
+            }
+            if let Ok(metadata) = fs::symlink_metadata(&final_path) {
+                if metadata.file_type().is_symlink() || !metadata.is_file() {
+                    let _ = fs::remove_file(&temporary);
+                    return Err(UsageStoreError::InvalidImport(
+                        "backup generation is not a regular file".into(),
+                    ));
+                }
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    if metadata.permissions().mode() & 0o077 != 0 {
+                        let _ = fs::remove_file(&temporary);
+                        return Err(UsageStoreError::InvalidImport(
+                            "backup generation is not private".into(),
+                        ));
+                    }
+                }
+                staged.push((final_path, stage_path));
+            }
+        }
+
+        // Move every existing generation out of the way first. Since each
+        // destination is now empty, a later failure can restore the exact
+        // original names without overwriting a racing file.
+        let mut moved = Vec::new();
+        let rotation_result = (|| -> Result<()> {
+            for (final_path, stage_path) in &staged {
+                fs::rename(final_path, stage_path)?;
+                moved.push((final_path.clone(), stage_path.clone()));
+            }
+            let first = path.with_extension("sqlite3.bak.1");
+            fs::rename(&temporary, &first)?;
+            for generation in (2..=generations).rev() {
+                let source_stage = parent.join(format!("{stage_prefix}-{}", generation - 1));
+                if fs::symlink_metadata(&source_stage).is_ok() {
+                    let destination = path.with_extension(format!("sqlite3.bak.{generation}"));
+                    fs::rename(&source_stage, destination)?;
+                }
+            }
+            // The oldest generation is intentionally discarded only after
+            // every retained generation has been installed. Failure to remove
+            // this private staging file is non-fatal; it is not an advertised
+            // generation and can be inspected/cleaned on the next run.
+            let oldest_stage = parent.join(format!("{stage_prefix}-{generations}"));
+            let _ = fs::remove_file(oldest_stage);
+            Ok(())
+        })();
+
+        if let Err(error) = rotation_result {
+            // Restore installed generations to their staging names. The new
+            // generation is moved back to its temporary name so the caller
+            // never observes a partially rotated set on a failed operation.
+            let first = path.with_extension("sqlite3.bak.1");
+            if fs::symlink_metadata(&first).is_ok() {
+                let _ = fs::rename(&first, &temporary);
+            }
+            for generation in 2..=generations {
+                let destination = path.with_extension(format!("sqlite3.bak.{generation}"));
+                let source_stage = parent.join(format!("{stage_prefix}-{}", generation - 1));
+                if fs::symlink_metadata(&destination).is_ok() {
+                    let _ = fs::rename(destination, source_stage);
+                }
+            }
+            for (final_path, stage_path) in moved.into_iter().rev() {
+                if fs::symlink_metadata(&stage_path).is_ok() {
+                    let _ = fs::rename(stage_path, final_path);
+                }
+            }
+            let _ = fs::remove_file(&temporary);
+            for (_, stage_path) in staged {
+                let _ = fs::remove_file(stage_path);
+            }
+            return Err(error);
+        }
+
+        Ok(())
+    }
+
+    /// Migrate through a separately validated candidate database.
+    ///
+    /// The caller supplies an explicit transformation, so no schema or row
+    /// value is guessed implicitly. The source remains untouched until the
+    /// candidate has passed validation, quick_check, row/fingerprint equality
+    /// and reset-period boundary comparison. The old file is retained beside
+    /// the new file for manual rollback; a failure restores the source.
+    pub fn migrate_verified<P, F>(path: P, transform: F) -> Result<MigrationReport>
+    where
+        P: AsRef<Path>,
+        F: FnOnce(&[UsageHistorySample]) -> Result<Vec<UsageHistorySample>>,
+    {
+        let path = path.as_ref();
+        if !path.is_absolute() {
+            return Err(UsageStoreError::InvalidImport(
+                "database path must be absolute".into(),
+            ));
+        }
+        let parent = path.parent().ok_or_else(|| {
+            UsageStoreError::InvalidImport("database migration parent is missing".into())
+        })?;
+        fs::create_dir_all(parent)?;
+        let file_name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| UsageStoreError::InvalidImport("database filename is invalid".into()))?;
+        let pid = std::process::id();
+        let candidate = parent.join(format!(".{file_name}.migration-{pid}.candidate"));
+        let rollback = parent.join(format!(".{file_name}.migration-{pid}.original"));
+        let lock_path = parent.join(format!(".{file_name}.migration.lock"));
+
+        let mut lock_options = OpenOptions::new();
+        lock_options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            lock_options.mode(0o600);
+        }
+        let _lock = lock_options.open(&lock_path).map_err(|error| {
+            UsageStoreError::Io(std::io::Error::new(
+                error.kind(),
+                format!("database migration is already running: {error}"),
+            ))
+        })?;
+
+        let result = (|| {
+            if candidate.exists() || rollback.exists() {
+                return Err(UsageStoreError::InvalidImport(
+                    "stale migration candidate/original exists; inspect before retry".into(),
+                ));
+            }
+            let source_store = Self::open(path)?;
+            let source_samples = source_store.load_all()?;
+            let source_periods = build_reset_periods(&source_samples);
+            let source_fingerprint = samples_fingerprint(&source_samples);
+            let candidate_samples = transform(&source_samples)?;
+            validate_migration_samples(&candidate_samples)?;
+            let mut candidate_store = Self::open(&candidate)?;
+            candidate_store.upsert_samples(&candidate_samples)?;
+            drop(candidate_store);
+            quick_check_database(&candidate)?;
+            let candidate_store = Self::open(&candidate)?;
+            let verified_samples = candidate_store.load_all()?;
+            let candidate_periods = build_reset_periods(&verified_samples);
+            let candidate_fingerprint = samples_fingerprint(&verified_samples);
+            if verified_samples.len() != source_samples.len()
+                || verified_samples.len() != candidate_samples.len()
+                || candidate_fingerprint != samples_fingerprint(&candidate_samples)
+                || source_periods != candidate_periods
+            {
+                return Err(UsageStoreError::InvalidImport(
+                    "migration candidate row/fingerprint/period validation failed".into(),
+                ));
+            }
+            drop(candidate_store);
+            drop(source_store);
+
+            // Preserve the current database before the atomic path switch.
+            Self::backup_generations(path, 3)?;
+            // Keep a separately named old generation for manual rollback.
+            // The source is closed and validated above, so a byte copy here
+            // cannot observe an in-flight transaction. On Unix, replacing the
+            // path with one same-directory rename is the atomic publication
+            // boundary; the old DB remains available at `rollback` and in the
+            // online backup generations. Windows cannot replace an open file
+            // through `rename`, so it uses the conservative two-rename path.
+            let preserve_result = (|| -> Result<()> {
+                fs::copy(path, &rollback)?;
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    fs::set_permissions(&rollback, fs::Permissions::from_mode(0o600))?;
+                }
+                quick_check_database(&rollback)
+            })();
+            if let Err(error) = preserve_result {
+                let _ = fs::remove_file(&rollback);
+                return Err(error);
+            }
+            #[cfg(unix)]
+            {
+                if let Err(error) = fs::rename(&candidate, path) {
+                    let _ = fs::remove_file(&rollback);
+                    return Err(UsageStoreError::Io(error));
+                }
+            }
+            #[cfg(not(unix))]
+            {
+                fs::rename(path, &rollback)?;
+                if let Err(error) = fs::rename(&candidate, path) {
+                    let _ = fs::rename(&rollback, path);
+                    return Err(UsageStoreError::Io(error));
+                }
+            }
+
+            Ok(MigrationReport {
+                source_rows: source_samples.len(),
+                candidate_rows: verified_samples.len(),
+                source_fingerprint,
+                candidate_fingerprint,
+                preserved_backup: rollback,
+            })
+        })();
+
+        if result.is_err() {
+            let _ = fs::remove_file(&candidate);
+        }
+        let _ = fs::remove_file(&lock_path);
+        result
+    }
+
     /// Loads all samples in reset-window and timestamp order.
     pub fn load_all(&self) -> Result<Vec<UsageHistorySample>> {
         let mut statement = self.connection.prepare(
@@ -535,38 +928,45 @@ impl UsageStore {
     }
 
     fn load_recent_history_impl(&self, now: DateTime<Utc>) -> Result<Vec<UsageHistorySample>> {
-        let cutoff = three_months_before(now).timestamp();
+        let cutoff = one_month_before(now).timestamp();
         let now_timestamp = now.timestamp();
         let mut statement = self.connection.prepare(
             "SELECT timestamp, reset_at, remaining_percent, sol_dollars, \
                     terra_dollars, luna_dollars, sol_tokens, terra_tokens, luna_tokens \
              FROM usage_history \
-             WHERE timestamp >= ?1 AND timestamp <= ?2 \
-             ORDER BY reset_at ASC, timestamp ASC",
+             WHERE timestamp > ?1 AND timestamp <= ?2 \
+             ORDER BY timestamp DESC, reset_at DESC \
+             LIMIT ?3",
         )?;
-        let mut rows = statement.query(params![cutoff, now_timestamp])?;
-        let mut samples = Vec::new();
+        let mut rows = statement.query(params![
+            cutoff,
+            now_timestamp,
+            MAX_RECENT_HISTORY_SAMPLES as i64 + 1
+        ])?;
+        let mut samples = Vec::with_capacity(MAX_RECENT_HISTORY_SAMPLES);
         while let Some(row) = rows.next()? {
             if let Some(sample) = valid_sample_from_row(row)? {
                 samples.push(sample);
             }
         }
+        if samples.len() > MAX_RECENT_HISTORY_SAMPLES {
+            return Err(UsageStoreError::HistoryCapacityExceeded {
+                maximum: MAX_RECENT_HISTORY_SAMPLES,
+            });
+        }
+        samples.sort_by_key(|sample| (sample.reset_at, sample.timestamp));
         Ok(samples)
     }
 
-    /// Loads valid, non-pruned samples in the inclusive three-calendar-month
-    /// UTC interval ending at the explicit `now` instant.
-    pub fn load_recent_three_months(&self, now: DateTime<Utc>) -> Result<Vec<UsageHistorySample>> {
+    /// Loads valid samples from `(one calendar month before now, now]`.
+    ///
+    /// The database retains three months independently of this bounded read.
+    pub fn load_recent_one_month(&self, now: DateTime<Utc>) -> Result<Vec<UsageHistorySample>> {
         self.load_recent_history_impl(now)
     }
 
     /// Alias for the same bounded read, retaining the history terminology.
     pub fn load_recent_history(&self, now: DateTime<Utc>) -> Result<Vec<UsageHistorySample>> {
-        self.load_recent_history_impl(now)
-    }
-
-    /// Alias for callers that name the interval by its calendar length.
-    pub fn load_three_month_history(&self, now: DateTime<Utc>) -> Result<Vec<UsageHistorySample>> {
         self.load_recent_history_impl(now)
     }
 
@@ -581,7 +981,12 @@ impl UsageStore {
     /// A missing remaining-quota value never erases an already stored value.
     pub fn upsert_sample(&self, sample: &UsageHistorySample) -> Result<()> {
         sample.validate()?;
-        self.connection.execute(
+        // Even the one-row convenience path uses an explicit transaction, so
+        // every history mutation has the same all-or-nothing boundary as a
+        // batch write. `unchecked_transaction` is the rusqlite variant that
+        // preserves this method's shared-reference API.
+        let transaction = self.connection.unchecked_transaction()?;
+        transaction.execute(
             UPSERT_SAMPLE,
             params![
                 sample.timestamp,
@@ -595,6 +1000,7 @@ impl UsageStore {
                 sample.luna_tokens as i64,
             ],
         )?;
+        transaction.commit()?;
         Ok(())
     }
 
@@ -802,6 +1208,8 @@ mod tests {
     use super::*;
     use chrono::TimeZone;
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Arc, Barrier};
+    use std::time::Instant;
 
     fn database_path(test_name: &str) -> PathBuf {
         static NEXT_ID: AtomicU64 = AtomicU64::new(0);
@@ -839,6 +1247,150 @@ mod tests {
             terra_tokens: 22,
             luna_tokens: 33,
         }
+    }
+
+    #[test]
+    #[ignore = "explicit host SQLite latency SLO gate"]
+    fn recent_history_query_is_indexed_bounded_and_meets_capacity_slo() {
+        let path = database_path("history-slo");
+        let now = Utc.timestamp_opt(1_800_000_000, 0).single().unwrap();
+        let mut store = UsageStore::open(&path).unwrap();
+        {
+            let transaction = store.connection.transaction().unwrap();
+            {
+                let mut insert = transaction
+                    .prepare(
+                        "INSERT INTO usage_history (timestamp, reset_at, remaining_percent, \
+                         sol_dollars, terra_dollars, luna_dollars, sol_tokens, terra_tokens, luna_tokens) \
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                    )
+                    .unwrap();
+                for index in 0..MAX_RECENT_HISTORY_SAMPLES {
+                    let timestamp =
+                        now.timestamp() - (MAX_RECENT_HISTORY_SAMPLES - 1 - index) as i64 * 60;
+                    insert
+                        .execute(params![
+                            timestamp,
+                            now.timestamp() + 604_800,
+                            48.0,
+                            index as f64,
+                            index as f64,
+                            index as f64,
+                            index as i64,
+                            index as i64,
+                            index as i64,
+                        ])
+                        .unwrap();
+                }
+                // A full additional month remains in the retained three-month
+                // database but is outside the one-month acquisition window.
+                // Its presence must not change query cardinality or force a
+                // scan of the retained table.
+                let cutoff = one_month_before(now).timestamp();
+                for index in 0..MAX_RECENT_HISTORY_SAMPLES {
+                    let timestamp = cutoff - 1 - index as i64 * 60;
+                    insert
+                        .execute(params![
+                            timestamp,
+                            now.timestamp() - 604_800,
+                            48.0,
+                            index as f64,
+                            index as f64,
+                            index as f64,
+                            index as i64,
+                            index as i64,
+                            index as i64,
+                        ])
+                        .unwrap();
+                }
+            }
+            transaction.commit().unwrap();
+        }
+
+        let cutoff = one_month_before(now).timestamp();
+        let plan = store
+            .connection
+            .prepare(
+                "EXPLAIN QUERY PLAN SELECT timestamp, reset_at, remaining_percent, sol_dollars, \
+                 terra_dollars, luna_dollars, sol_tokens, terra_tokens, luna_tokens \
+                 FROM usage_history WHERE timestamp > ?1 AND timestamp <= ?2 \
+                 ORDER BY timestamp DESC, reset_at DESC LIMIT ?3",
+            )
+            .unwrap()
+            .query_map(
+                params![cutoff, now.timestamp(), MAX_RECENT_HISTORY_SAMPLES as i64],
+                |row| row.get::<_, String>(3),
+            )
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+            .join(" | ");
+        assert!(
+            plan.contains("usage_history_timestamp_reset_idx"),
+            "unexpected query plan: {plan}"
+        );
+        assert!(!plan.contains("SCAN usage_history"), "full scan: {plan}");
+
+        let mut elapsed = Vec::with_capacity(20);
+        for _ in 0..20 {
+            let started = Instant::now();
+            let rows = store.load_recent_one_month(now).unwrap();
+            elapsed.push(started.elapsed().as_secs_f64() * 1_000.0);
+            assert_eq!(rows.len(), MAX_RECENT_HISTORY_SAMPLES);
+            assert!(rows.windows(2).all(|pair| {
+                (pair[0].reset_at, pair[0].timestamp) <= (pair[1].reset_at, pair[1].timestamp)
+            }));
+        }
+        elapsed.sort_by(f64::total_cmp);
+        let p90 = elapsed[17];
+        let p95 = elapsed[18];
+        let maximum = elapsed[19];
+        eprintln!(
+            "SLO db=recent_history rows={} n=20 p90={p90:.3}ms p95={p95:.3}ms max={maximum:.3}ms plan={plan}",
+            MAX_RECENT_HISTORY_SAMPLES
+        );
+        assert!(p90 <= 100.0, "DB p90 {p90:.3}ms exceeds 100ms");
+        assert!(p95 <= 150.0, "DB p95 {p95:.3}ms exceeds 150ms");
+
+        // More than 44,640 rows in the one-month candidate is malformed
+        // cardinality (for example overlapping reset windows), not permission
+        // to silently truncate the response. The retained database is intact.
+        let before_count: i64 = store
+            .connection
+            .query_row("SELECT COUNT(*) FROM usage_history", [], |row| row.get(0))
+            .unwrap();
+        store
+            .connection
+            .execute(
+                "INSERT INTO usage_history (timestamp, reset_at, remaining_percent, \
+                 sol_dollars, terra_dollars, luna_dollars, sol_tokens, terra_tokens, luna_tokens) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                params![
+                    now.timestamp(),
+                    now.timestamp() + 1_209_600,
+                    48.0,
+                    1.0,
+                    1.0,
+                    1.0,
+                    1_i64,
+                    1_i64,
+                    1_i64,
+                ],
+            )
+            .unwrap();
+        assert!(matches!(
+            store.load_recent_one_month(now),
+            Err(UsageStoreError::HistoryCapacityExceeded {
+                maximum: MAX_RECENT_HISTORY_SAMPLES
+            })
+        ));
+        let after_count: i64 = store
+            .connection
+            .query_row("SELECT COUNT(*) FROM usage_history", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(after_count, before_count + 1);
+        drop(store);
+        remove_database(&path);
     }
 
     #[test]
@@ -972,6 +1524,168 @@ mod tests {
     }
 
     #[test]
+    fn concurrent_collectors_merge_one_minute_without_duplicate_rows() {
+        let path = database_path("concurrent-merge");
+        drop(UsageStore::open(&path).unwrap());
+        let barrier = Arc::new(Barrier::new(2));
+        let first = sample(1_700_000_060, 1_700_604_800, Some(75.0), 1.25);
+        let mut second = first.clone();
+        second.sol_dollars = 4.5;
+        second.sol_tokens = 900;
+        let left_path = path.clone();
+        let left_barrier = Arc::clone(&barrier);
+        let left = std::thread::spawn(move || {
+            let store = UsageStore::open(left_path).unwrap();
+            left_barrier.wait();
+            store.upsert_sample(&first).unwrap();
+        });
+        let right_path = path.clone();
+        let right_barrier = Arc::clone(&barrier);
+        let right = std::thread::spawn(move || {
+            let store = UsageStore::open(right_path).unwrap();
+            right_barrier.wait();
+            store.upsert_sample(&second).unwrap();
+        });
+        left.join().unwrap();
+        right.join().unwrap();
+        let rows = UsageStore::open(&path).unwrap().load_all().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].sol_dollars, 4.5);
+        assert_eq!(rows[0].sol_tokens, 900);
+        remove_database(&path);
+    }
+
+    #[test]
+    fn backup_generations_are_sqlite_consistent_and_bounded() {
+        let path = database_path("backup-generations");
+        let first = sample(1_700_000_060, 1_700_604_800, Some(75.0), 1.25);
+        let store = UsageStore::open(&path).unwrap();
+        store.upsert_sample(&first).unwrap();
+        drop(store);
+        for _ in 0..4 {
+            UsageStore::backup_generations(&path, 3).unwrap();
+        }
+        for generation in 1..=3 {
+            let backup = path.with_extension(format!("sqlite3.bak.{generation}"));
+            assert!(backup.is_file(), "missing backup generation {generation}");
+            let connection = Connection::open(&backup).unwrap();
+            let quick_check: String = connection
+                .query_row("PRAGMA quick_check", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(quick_check, "ok");
+            assert_eq!(
+                UsageStore::open(&backup).unwrap().load_all().unwrap(),
+                vec![first.clone()]
+            );
+        }
+        assert!(!path.with_extension("sqlite3.bak.4").exists());
+        remove_database(&path);
+    }
+
+    #[test]
+    fn failed_backup_rotation_keeps_existing_generation_untouched() {
+        let path = database_path("backup-rotation-failure");
+        let original = sample(1_700_000_060, 1_700_604_800, Some(75.0), 1.25);
+        let store = UsageStore::open(&path).unwrap();
+        store.upsert_sample(&original).unwrap();
+        drop(store);
+        UsageStore::backup_generations(&path, 3).unwrap();
+        let first = path.with_extension("sqlite3.bak.1");
+        let before = fs::read(&first).unwrap();
+
+        // A non-regular generation is rejected before rotation starts. The
+        // current DB and the already usable generation must remain intact.
+        let blocked = path.with_extension("sqlite3.bak.2");
+        fs::create_dir(&blocked).unwrap();
+        assert!(UsageStore::backup_generations(&path, 3).is_err());
+        assert_eq!(fs::read(&first).unwrap(), before);
+        assert_eq!(
+            UsageStore::open(&path).unwrap().load_all().unwrap(),
+            vec![original]
+        );
+        fs::remove_dir(&blocked).unwrap();
+        remove_database(&path);
+    }
+
+    #[test]
+    fn verified_migration_switches_only_after_candidate_validation() {
+        let path = database_path("verified-migration");
+        let original = sample(1_700_000_060, 1_700_604_800, Some(75.0), 1.25);
+        let store = UsageStore::open(&path).unwrap();
+        store.upsert_sample(&original).unwrap();
+        drop(store);
+
+        let report = UsageStore::migrate_verified(&path, |samples| {
+            let mut migrated = samples.to_vec();
+            migrated[0].sol_dollars = 2.5;
+            Ok(migrated)
+        })
+        .unwrap();
+
+        assert_eq!(report.source_rows, 1);
+        assert_eq!(report.candidate_rows, 1);
+        assert!(report.preserved_backup.is_file());
+        let migrated = UsageStore::open(&path).unwrap().load_all().unwrap();
+        assert_eq!(migrated[0].sol_dollars, 2.5);
+        let preserved = UsageStore::open(&report.preserved_backup)
+            .unwrap()
+            .load_all()
+            .unwrap();
+        assert_eq!(preserved, vec![original]);
+        remove_database(&path);
+        let _ = fs::remove_file(report.preserved_backup);
+    }
+
+    #[test]
+    fn invalid_migration_candidate_leaves_source_untouched() {
+        let path = database_path("invalid-migration");
+        let original = sample(1_700_000_060, 1_700_604_800, Some(75.0), 1.25);
+        let store = UsageStore::open(&path).unwrap();
+        store.upsert_sample(&original).unwrap();
+        drop(store);
+
+        let result = UsageStore::migrate_verified(&path, |samples| {
+            let mut migrated = samples.to_vec();
+            migrated[0].remaining_percent = Some(101.0);
+            Ok(migrated)
+        });
+        assert!(result.is_err());
+        assert_eq!(
+            UsageStore::open(&path).unwrap().load_all().unwrap(),
+            vec![original]
+        );
+        assert!(!path
+            .parent()
+            .unwrap()
+            .join(format!(
+                ".{}.migration.lock",
+                path.file_name().unwrap().to_string_lossy()
+            ))
+            .exists());
+        remove_database(&path);
+    }
+
+    #[test]
+    fn migration_that_drops_a_valid_row_is_rejected_before_switch() {
+        let path = database_path("migration-row-drop");
+        let first = sample(1_700_000_060, 1_700_604_800, Some(75.0), 1.25);
+        let second = sample(1_700_000_120, 1_700_604_800, Some(70.0), 2.5);
+        let mut store = UsageStore::open(&path).unwrap();
+        store
+            .upsert_samples(&[first.clone(), second.clone()])
+            .unwrap();
+        drop(store);
+
+        let result = UsageStore::migrate_verified(&path, |samples| Ok(vec![samples[0].clone()]));
+        assert!(result.is_err());
+        assert_eq!(
+            UsageStore::open(&path).unwrap().load_all().unwrap(),
+            vec![first, second]
+        );
+        remove_database(&path);
+    }
+
+    #[test]
     fn usage_store_missing_remaining_does_not_erase_existing_value() {
         let path = database_path("nullable-update");
         let observed = sample(1_700_000_060, 1_700_604_800, Some(75.0), 1.25);
@@ -1055,6 +1769,14 @@ mod tests {
         let expected = Utc.with_ymd_and_hms(2024, 2, 29, 12, 34, 56).unwrap();
 
         assert_eq!(three_months_before(now), expected);
+    }
+
+    #[test]
+    fn one_month_cutoff_clamps_end_of_month_by_calendar_rule() {
+        let now = Utc.with_ymd_and_hms(2024, 5, 31, 12, 34, 56).unwrap();
+        let expected = Utc.with_ymd_and_hms(2024, 4, 30, 12, 34, 56).unwrap();
+
+        assert_eq!(one_month_before(now), expected);
     }
 
     #[test]
@@ -1299,12 +2021,12 @@ mod wave_b_correction_tests {
     }
 
     #[test]
-    fn recent_read_uses_independent_closed_interval_epochs_for_leap_and_non_leap_month_ends() {
+    fn recent_read_uses_one_month_half_open_interval_at_month_ends() {
         let cases = [
-            // 2024-05-31T12:00:00Z -> 2024-02-29T12:00:00Z.
-            (1_717_156_800_i64, 1_709_208_000_i64),
-            // 2023-05-31T12:00:00Z -> 2023-02-28T12:00:00Z.
-            (1_685_534_400_i64, 1_677_585_600_i64),
+            // 2024-05-31T12:00:00Z -> 2024-04-30T12:00:00Z.
+            (1_717_156_800_i64, 1_714_478_400_i64),
+            // 2023-05-31T12:00:00Z -> 2023-04-30T12:00:00Z.
+            (1_685_534_400_i64, 1_682_856_000_i64),
         ];
         for (case_number, (now_epoch, cutoff_epoch)) in cases.into_iter().enumerate() {
             let path = database_path(&format!("recent-{case_number}"));
@@ -1322,15 +2044,12 @@ mod wave_b_correction_tests {
                 ])
                 .unwrap();
             let timestamps = store
-                .load_recent_three_months(now)
+                .load_recent_one_month(now)
                 .unwrap()
                 .into_iter()
                 .map(|row| row.timestamp)
                 .collect::<Vec<_>>();
-            assert_eq!(
-                timestamps,
-                vec![cutoff_epoch, cutoff_epoch + 1, now_epoch - 1, now_epoch]
-            );
+            assert_eq!(timestamps, vec![cutoff_epoch + 1, now_epoch - 1, now_epoch]);
             assert_eq!(history_rows(&path).len(), 6);
             drop(store);
             cleanup(&path);
@@ -1341,7 +2060,7 @@ mod wave_b_correction_tests {
     fn recent_read_filters_invalid_values_without_deleting_rows() {
         let path = database_path("recent-invalid");
         let now_epoch = 1_717_156_800_i64;
-        let cutoff_epoch = 1_709_208_000_i64;
+        let cutoff_epoch = 1_714_478_400_i64;
         let now = Utc.timestamp_opt(now_epoch, 0).single().unwrap();
         let store = UsageStore::open(&path).unwrap();
         store
@@ -1383,12 +2102,12 @@ mod wave_b_correction_tests {
         drop(connection);
         assert_eq!(
             store
-                .load_recent_three_months(now)
+                .load_recent_one_month(now)
                 .unwrap()
                 .into_iter()
                 .map(|row| row.timestamp)
                 .collect::<Vec<_>>(),
-            vec![cutoff_epoch]
+            Vec::<i64>::new()
         );
         assert_eq!(history_rows(&path).len(), 5);
         drop(store);
@@ -1910,7 +2629,7 @@ mod wave_b_correction_tests {
         let old = sample(1_600_000_000, 1_600_000_100, Some(10.0), 1.0);
         store.upsert_sample(&old).unwrap();
         let before = history_rows(&path);
-        assert!(store.load_recent_three_months(now).unwrap().is_empty());
+        assert!(store.load_recent_one_month(now).unwrap().is_empty());
         store
             .upsert_sample(&sample(1_715_156_700, 1_715_156_000, Some(20.0), 2.0))
             .unwrap();
@@ -2325,7 +3044,7 @@ mod wave_b_correction_tests {
         assert_eq!(count_rows(&path), 2);
         assert!(old_is_present(&path));
         assert_eq!(
-            store.load_recent_three_months(now).unwrap(),
+            store.load_recent_one_month(now).unwrap(),
             vec![recent.clone()]
         );
         assert_eq!(count_rows(&path), 2);

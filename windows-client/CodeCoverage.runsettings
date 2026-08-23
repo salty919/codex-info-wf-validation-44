@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="utf-8"?>
+<RunSettings>
+  <DataCollectionRunSettings>
+    <DataCollectors>
+      <DataCollector friendlyName="Code Coverage">
+        <Configuration>
+          <Format>Cobertura</Format>
+          <IncludeTestAssembly>False</IncludeTestAssembly>
+          <CodeCoverage>
+            <ModulePaths>
+              <Include>
+                <ModulePath>.*CodexInfo\.WindowsClient\.Core\.dll$</ModulePath>
+                <ModulePath>.*CodexInfo\.WindowsClient\.dll$</ModulePath>
+              </Include>
+            </ModulePaths>
+            <Functions>
+              <Include>
+                <Function>^CodexInfo\.WindowsClient\.Core\..*</Function>
+                <Function>^CodexInfo\.WindowsClient\.ViewModels\..*</Function>
+                <Function>^CodexInfo\.WindowsClient\.Settings\..*</Function>
+                <Function>^CodexInfo\.WindowsClient\.Localization\..*</Function>
+                <Function>^CodexInfo\.WindowsClient\.Graphing\..*</Function>
+                <Function>^CodexInfo\.WindowsClient\.Infrastructure\.WindowsUpdateCoordinator\..*</Function>
+                <Function>^CodexInfo\.WindowsClient\.PreviewEnvironment\..*</Function>
+                <Function>^CodexInfo\.WindowsClient\.PreviewLoopbackClient\..*</Function>
+                <Function>^CodexInfo\.WindowsClient\.WindowDragGeometry\..*</Function>
+              </Include>
+            </Functions>
+          </CodeCoverage>
+        </Configuration>
+      </DataCollector>
+    </DataCollectors>
+  </DataCollectionRunSettings>
+</RunSettings>

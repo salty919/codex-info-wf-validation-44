@@ -3,10 +3,17 @@
 
 #![deny(unsafe_code)]
 
+mod daemon;
+
 use chrono::{DateTime, Months, Utc};
 use codex_info::i18n::{I18n, PeriodKind, TextKey};
 use codex_info::protocol_contract;
 use codex_info::security;
+use codex_info::server::{
+    ApiServer, ApiServerConfig, PublicDetailedModelUsage, PublicDetails, PublicHistoryPeriod,
+    PublicHistorySample, PublicModelUsage, PublicQuota, PublicSnapshot, PublicState, PublicThread,
+    MAX_PUBLIC_THREADS,
+};
 use codex_info::thread_contract::{
     self, PageAcceptance, ThreadCycleAccumulator, ThreadCycleOutcome, ValidatedThreadCandidate,
 };
@@ -18,10 +25,12 @@ use slint::winit_030::{winit, EventResult, WinitWindowAccessor};
 use slint::{CloseRequestResponse, ComponentHandle, Timer, TimerMode};
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::OsString;
 use std::fs::{self, File};
-use std::io::{BufReader, Read, Seek, SeekFrom, Write};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
+use std::net::{SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::rc::Rc;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Mutex, OnceLock};
@@ -1013,6 +1022,18 @@ enum ActiveThreadUpdate {
     Failed,
 }
 
+/// Opt-in runtime diagnostics for investigating live update regressions.
+///
+/// The normal client remains silent and never writes account/session data to
+/// logs.  Setting `CODEX_INFO_DEBUG=1` emits only bounded counters and state
+/// transitions, which makes a broken worker/update boundary observable without
+/// exposing email addresses, URLs, paths, prompts, or token contents.
+fn debug_runtime(message: impl AsRef<str>) {
+    if std::env::var_os("CODEX_INFO_DEBUG").is_some_and(|value| value == "1") {
+        eprintln!("[codex-info] {}", message.as_ref());
+    }
+}
+
 fn plan_type_label(plan_type: Option<&str>) -> String {
     protocol_contract::plan_label(plan_type)
 }
@@ -1126,7 +1147,8 @@ fn read_thread_rollout_path(
     file.seek(SeekFrom::Start(0)).map_err(|_| ())?;
     let rollout = {
         let mut reader = BufReader::new((&mut file).take(complete_len));
-        thread_contract::parse_rollout_reader(&mut reader, complete_len).map_err(|_| ())?
+        thread_contract::parse_rollout_reader_recoverable(&mut reader, complete_len)
+            .map_err(|_| ())?
     };
 
     let after_file = file.metadata().map_err(|_| ())?;
@@ -1227,29 +1249,27 @@ fn open_codex_session_paths(
     Ok(open_files)
 }
 
+fn active_thread_paths(codex_root: &Path) -> Result<(PathBuf, BTreeSet<PathBuf>), ()> {
+    let sessions_root = codex_root.join("sessions");
+    let active_paths = open_codex_session_paths(Path::new("/proc"), &sessions_root)?;
+    debug_runtime(format!("thread active paths={}", active_paths.len()));
+    Ok((sessions_root, active_paths))
+}
+
 fn fetch_active_thread_update(
     input: &mut impl Write,
     output: &Receiver<RpcReadEvent>,
     next_id: &mut u64,
-    codex_root: Option<&Path>,
+    sessions_root: &Path,
+    active_paths: &BTreeSet<PathBuf>,
+    codex_root: &Path,
 ) -> ActiveThreadUpdate {
-    let Some(codex_root) = codex_root else {
-        return ActiveThreadUpdate::Failed;
-    };
-    let sessions_root = codex_root.join("sessions");
-    let active_paths = match open_codex_session_paths(Path::new("/proc"), &sessions_root) {
-        Ok(paths) => paths,
-        Err(_) => return ActiveThreadUpdate::Failed,
-    };
-    if active_paths.is_empty() {
-        return ActiveThreadUpdate::NoThread;
-    }
     fetch_active_thread_update_for_paths_and_state(
         input,
         output,
         next_id,
-        &sessions_root,
-        &active_paths,
+        sessions_root,
+        active_paths,
         Some(codex_root),
     )
 }
@@ -1285,7 +1305,10 @@ fn fetch_active_thread_update_for_paths_and_state(
     loop {
         let params = match thread_contract::thread_list_request(cursor.as_deref()) {
             Ok(params) => params,
-            Err(_) => return ActiveThreadUpdate::Failed,
+            Err(_) => {
+                debug_runtime("thread list request construction failed");
+                return ActiveThreadUpdate::Failed;
+            }
         };
         let request_id = *next_id;
         let Some(following_id) = next_id.checked_add(1) else {
@@ -1294,12 +1317,18 @@ fn fetch_active_thread_update_for_paths_and_state(
         *next_id = following_id;
         let page = match request(input, output, request_id, "thread/list", params) {
             Ok(page) => page,
-            Err(_) => return ActiveThreadUpdate::Failed,
+            Err(_) => {
+                debug_runtime("thread list RPC failed");
+                return ActiveThreadUpdate::Failed;
+            }
         };
         match accumulator.accept_page(&page) {
             Ok(PageAcceptance::NeedNextPage { cursor: next }) => cursor = Some(next),
             Ok(PageAcceptance::Terminal) => break,
-            Err(_) => return ActiveThreadUpdate::Failed,
+            Err(_) => {
+                debug_runtime("thread list page rejected");
+                return ActiveThreadUpdate::Failed;
+            }
         }
     }
 
@@ -1316,8 +1345,15 @@ fn fetch_active_thread_update_for_paths_and_state(
             })
             .map(|candidate| candidate.id().to_owned())
             .collect::<BTreeSet<_>>(),
-        Err(_) => return ActiveThreadUpdate::Failed,
+        Err(_) => {
+            debug_runtime("thread candidate ordering failed");
+            return ActiveThreadUpdate::Failed;
+        }
     };
+    debug_runtime(format!(
+        "thread active owner roots={}",
+        owner_root_ids.len()
+    ));
 
     let root_outcome = thread_contract::select_active_threads_parsed_where(
         accumulator,
@@ -1329,13 +1365,26 @@ fn fetch_active_thread_update_for_paths_and_state(
                 })
                 .is_some_and(|path| active_paths.contains(&path))
         },
-        |candidate| read_thread_rollout(sessions_root, candidate),
+        |candidate| {
+            let result = read_thread_rollout(sessions_root, candidate);
+            if result.is_err() {
+                debug_runtime(format!(
+                    "thread rollout rejected candidate={}",
+                    candidate.id()
+                ));
+            }
+            result
+        },
     );
     let root_snapshots = match root_outcome {
         ThreadCycleOutcome::Snapshots(snapshots) => snapshots,
         ThreadCycleOutcome::NoThread => Vec::new(),
-        ThreadCycleOutcome::CycleError => return ActiveThreadUpdate::Failed,
+        ThreadCycleOutcome::CycleError => {
+            debug_runtime("thread active candidate selection failed");
+            return ActiveThreadUpdate::Failed;
+        }
     };
+    debug_runtime(format!("thread root snapshots={}", root_snapshots.len()));
 
     let mut threads = root_snapshots
         .into_iter()
@@ -1361,16 +1410,35 @@ fn fetch_active_thread_update_for_paths_and_state(
             match thread_state::load_native_descendants(codex_root, sessions_root, &owner_root_ids)
             {
                 Ok(descendants) => descendants,
-                Err(_) => return ActiveThreadUpdate::Failed,
+                Err(_) => {
+                    debug_runtime("thread descendant load failed");
+                    return ActiveThreadUpdate::Failed;
+                }
             };
+        let mut descendant_snapshots = 0usize;
+        let mut skipped_inactive_descendants = 0usize;
         for descendant in descendants {
+            // The native state database is historical and keeps completed or
+            // abandoned child rows.  A rollout parser can only tell us that
+            // an old file ended after `task_started`; it cannot prove that
+            // the child is still owned by a live app-server.  Require the
+            // child rollout to be one of the files currently held by a
+            // running Codex process, just as root candidates are filtered.
+            if !active_paths.contains(&descendant.rollout_path) {
+                skipped_inactive_descendants = skipped_inactive_descendants.saturating_add(1);
+                continue;
+            }
             let rollout = match read_thread_rollout_path(sessions_root, &descendant.rollout_path) {
                 Ok(rollout) => rollout,
-                Err(_) => return ActiveThreadUpdate::Failed,
+                Err(_) => {
+                    debug_runtime("thread descendant rollout parse failed");
+                    return ActiveThreadUpdate::Failed;
+                }
             };
             if !rollout.is_running() {
                 continue;
             }
+            descendant_snapshots = descendant_snapshots.saturating_add(1);
             threads.push(ActiveThread {
                 id: descendant.id,
                 created_at: descendant.created_at,
@@ -1387,6 +1455,14 @@ fn fetch_active_thread_update_for_paths_and_state(
                 depth: Some(descendant.depth),
             });
         }
+        debug_runtime(format!(
+            "thread descendant snapshots={}",
+            descendant_snapshots
+        ));
+        debug_runtime(format!(
+            "thread descendants skipped inactive={}",
+            skipped_inactive_descendants
+        ));
     }
 
     let mut by_id = BTreeMap::new();
@@ -1727,16 +1803,25 @@ struct UsageHistory {
 
 impl UsageHistory {
     fn load() -> Self {
-        let mut history = Self::load_from_db_path(usage_history_db_path());
-        history.startup_maintenance(Utc::now());
+        let now = Utc::now();
+        let mut history = Self::load_from_db_path_at(usage_history_db_path(), now);
+        history.startup_maintenance(now);
         history
     }
 
+    #[cfg(test)]
     fn load_from_db_path(db_path: Option<PathBuf>) -> Self {
+        Self::load_from_db_path_at(db_path, Utc::now())
+    }
+
+    fn load_from_db_path_at(db_path: Option<PathBuf>, now: DateTime<Utc>) -> Self {
         let samples = db_path
             .as_ref()
             .and_then(|path| UsageStore::open(path).ok())
-            .and_then(|store| store.load_all().ok())
+            // Startup must never materialize an unbounded database. The
+            // bounded recent read uses the timestamp/reset index and the same
+            // cardinality ceiling as the public details contract.
+            .and_then(|store| store.load_recent_one_month(now).ok())
             .unwrap_or_default();
 
         let samples = samples
@@ -1750,6 +1835,18 @@ impl UsageHistory {
         };
         history.normalize();
         history
+    }
+
+    /// Return a bounded period hint for a startup backfill when the account
+    /// bridge is unavailable. The persisted reset timestamp is evidence from
+    /// the local log/DB, not a substitute for a fresh quota snapshot.
+    fn latest_period_hint(&self) -> Option<(i64, i64)> {
+        daemon::load_reset_hint().or_else(|| {
+            self.samples
+                .iter()
+                .max_by_key(|sample| sample.timestamp)
+                .map(|sample| (sample.reset_at, WEEK_SECONDS))
+        })
     }
 
     fn preview(now: i64, reset_at: i64, costs: ModelDollarTotals) -> Self {
@@ -1827,8 +1924,13 @@ impl UsageHistory {
         self.startup_maintenance_done = true;
 
         if let Some(path) = self.db_path.as_ref() {
-            if let Ok(mut store) = UsageStore::open(path) {
-                let _ = store.prune_older_than_three_months(now);
+            // Pruning is the only normal destructive operation. A consistent
+            // three-generation SQLite backup must succeed first; otherwise
+            // leave every historical row untouched and continue read-only.
+            if UsageStore::backup_generations(path, 3).is_ok() {
+                if let Ok(mut store) = UsageStore::open(path) {
+                    let _ = store.prune_older_than_three_months(now);
+                }
             }
         }
 
@@ -1843,9 +1945,11 @@ impl UsageHistory {
             return;
         }
         let mut sample = sample;
+        let acquisition_end = sample.timestamp;
         sample.reset_at = self.canonical_reset_at(sample.reset_at);
         merge_exact_sample(&mut self.samples, sample);
         self.normalize();
+        self.retain_acquisition_window(acquisition_end);
         self.save();
     }
 
@@ -1853,6 +1957,11 @@ impl UsageHistory {
         if samples.is_empty() {
             return;
         }
+        let acquisition_end = samples
+            .iter()
+            .filter(|sample| sample.is_valid())
+            .map(|sample| sample.timestamp)
+            .max();
         let storage_reset_at = self.canonical_reset_at(reset_at);
         for mut sample in samples {
             if !sample.is_valid() {
@@ -1862,6 +1971,9 @@ impl UsageHistory {
             merge_exact_sample(&mut self.samples, sample);
         }
         self.normalize();
+        if let Some(acquisition_end) = acquisition_end {
+            self.retain_acquisition_window(acquisition_end);
+        }
         self.save();
     }
 
@@ -1985,6 +2097,18 @@ impl UsageHistory {
         self.samples = normalized;
     }
 
+    /// Bounds the in-memory/API/graph working set without deleting SQLite
+    /// retention rows. Persistent deletion remains exclusively the three-month
+    /// startup prune.
+    fn retain_acquisition_window(&mut self, end_timestamp: i64) {
+        let Some(end) = DateTime::<Utc>::from_timestamp(end_timestamp, 0) else {
+            return;
+        };
+        let cutoff = one_month_before_utc(end);
+        self.samples
+            .retain(|sample| sample.timestamp > cutoff && sample.timestamp <= end_timestamp);
+    }
+
     fn save(&self) {
         let Some(path) = &self.db_path else {
             return;
@@ -2046,6 +2170,12 @@ fn usage_data_root() -> Option<PathBuf> {
 fn three_months_before_utc(now: DateTime<Utc>) -> i64 {
     now.checked_sub_months(Months::new(3))
         .expect("subtracting three calendar months from UTC now must be representable")
+        .timestamp()
+}
+
+fn one_month_before_utc(now: DateTime<Utc>) -> i64 {
+    now.checked_sub_months(Months::new(1))
+        .expect("subtracting one calendar month from UTC now must be representable")
         .timestamp()
 }
 
@@ -3097,21 +3227,12 @@ fn smooth_remaining_points_with_activity(
             })
             .sum::<f64>()
     };
-    let latest_active_drop_rate = |before: usize| {
-        (1..=before).rev().find_map(|end| {
-            let drop = points[end - 1].1 - points[end].1;
-            if drop <= 0.0 {
-                return None;
-            }
-            let duration = active_duration_between(end - 1, end);
-            (duration > f64::EPSILON).then_some(drop / duration)
-        })
-    };
-
     // A model can advance through several minute buckets while the quota
     // endpoint is still the previous reread. Treat a repeated value as a
-    // missed sample and fill it from the nearest surrounding lower endpoint.
-    // For example, `1 -> 1 -> 3` becomes `1 -> 2 -> 3`.
+    // missed sample only when it is bounded by a later, observed lower value.
+    // For example, `1 -> 1 -> 3` becomes `1 -> 2 -> 3`. A terminal plateau
+    // remains at the latest observation: model activity is not evidence that
+    // the service's quota reading has fallen.
     //
     // The search deliberately crosses short idle intervals. The line must not
     // slope while every model is idle, but an idle interval between two active
@@ -3133,9 +3254,10 @@ fn smooth_remaining_points_with_activity(
         while right_index < points.len() && points[right_index].1 >= left_value {
             right_index += 1;
         }
-        let terminal_extrapolation = right_index >= points.len();
-        if terminal_extrapolation {
-            right_index = points.len() - 1;
+        if right_index >= points.len() {
+            // There is no later observed lower quota value. Do not turn the
+            // latest real reading into a consumption-rate estimate.
+            continue;
         }
         if right_index <= left_index || points[right_index].0 <= points[left_index].0 {
             continue;
@@ -3145,17 +3267,9 @@ fn smooth_remaining_points_with_activity(
         if active_duration <= f64::EPSILON {
             continue;
         }
-        let right_value = if terminal_extrapolation {
-            let Some(rate) = latest_active_drop_rate(left_index) else {
-                continue;
-            };
-            (left_value - rate * active_duration).max(0.0)
-        } else {
-            let value = points[right_index].1;
-            if value >= left_value {
-                continue;
-            }
-            value
+        let right_value = points[right_index].1;
+        if right_value >= left_value {
+            continue;
         };
 
         let mut active_elapsed = 0.0;
@@ -3175,19 +3289,9 @@ fn smooth_remaining_points_with_activity(
             smoothed[point_index].1 = left_value + (right_value - left_value) * fraction;
             interpolated[point_index] = true;
         }
-        if terminal_extrapolation {
-            // There is no future quota endpoint yet, but an active terminal
-            // plateau is still a missing sample. Carry forward the most recent
-            // measured active drop rate so the line does not pretend that
-            // consumption stopped at the final reread. Clamp at zero because
-            // the quota cannot become negative.
-            smoothed[right_index].1 = right_value;
-            interpolated[right_index] = true;
-        }
         // For a measured lower endpoint the loop above stops before
         // right_index, so a later pass can use it as the next anchor without
-        // accumulating floating-point error. A terminal extrapolation writes
-        // its synthetic endpoint explicitly above.
+        // accumulating floating-point error.
     }
 
     for index in 1..points.len() - 1 {
@@ -3431,8 +3535,16 @@ fn collect_local_model_usage(
     let mut totals = ModelUsageTotals::default();
     let window_start = reset_at.saturating_sub(window_seconds.max(0));
     if let Some(root) = local_sessions_root() {
-        for path in session_jsonl_files(&root)? {
-            collect_session_file(&path, &mut totals, window_start)?;
+        let paths = session_jsonl_files(&root)?;
+        debug_runtime(format!("local session files={}", paths.len()));
+        for path in paths {
+            if let Err(error) = collect_session_file(&path, &mut totals, window_start) {
+                debug_runtime(format!(
+                    "local session parse failed kind={:?}",
+                    error.kind()
+                ));
+                return Err(error);
+            }
         }
     }
     let window_end = reset_at;
@@ -3494,7 +3606,7 @@ fn read_recovery_entries(
     let mut entries = Vec::new();
     let mut reader = BufReader::new(file);
     loop {
-        let line = match security::read_bounded_jsonl_line(&mut reader) {
+        let line = match read_recoverable_session_line(&mut reader) {
             Ok(Some(line)) => line,
             Ok(None) => break,
             Err(_) => return Vec::new(),
@@ -3535,6 +3647,41 @@ struct TimedModelUsage {
     timestamp: i64,
     model: String,
     delta: TokenSnapshot,
+}
+
+/// Read one session record while isolating a malformed/oversized line.
+///
+/// Codex rollout files are append-only and may contain a very large tool
+/// payload.  One such payload must not make every valid token snapshot in the
+/// same file disappear from the graph.  The bounded reader consumes the bad
+/// record before returning the error, so skipping only `LimitExceeded` and
+/// `Parse` is both recoverable and bounded; I/O failures remain fatal.
+fn read_recoverable_session_line<R: BufRead>(
+    reader: &mut R,
+) -> Result<Option<String>, security::SecurityError> {
+    loop {
+        match security::read_bounded_jsonl_record(reader) {
+            Ok(Some((line, true))) => return Ok(Some(line)),
+            Ok(Some((_line, false))) => {
+                return Err(security::SecurityError::new(
+                    security::SecurityErrorKind::Unterminated,
+                ));
+            }
+            Ok(None) => return Ok(None),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    security::SecurityErrorKind::LimitExceeded | security::SecurityErrorKind::Parse
+                ) =>
+            {
+                debug_runtime(format!(
+                    "skipped malformed session record kind={:?}",
+                    error.kind()
+                ));
+            }
+            Err(error) => return Err(error),
+        }
+    }
 }
 
 fn session_event_type(value: &Value) -> Option<&str> {
@@ -3663,8 +3810,17 @@ fn collect_local_model_usage_timeline(
     let now = Utc::now().timestamp().min(reset_at);
     let mut events = Vec::new();
     if let Some(root) = local_sessions_root() {
-        for path in session_jsonl_files(&root)? {
-            collect_session_timeline_file(&path, window_start, now, &mut events)?;
+        let paths = session_jsonl_files(&root)?;
+        debug_runtime(format!("local timeline files={}", paths.len()));
+        for path in paths {
+            if let Err(error) = collect_session_timeline_file(&path, window_start, now, &mut events)
+            {
+                debug_runtime(format!(
+                    "local timeline parse failed kind={:?}",
+                    error.kind()
+                ));
+                return Err(error);
+            }
         }
     }
     if let Some(path) = delegation_usage_recovery_path() {
@@ -3686,7 +3842,7 @@ fn collect_session_timeline_file(
     let mut previous = TokenSnapshot::default();
     let mut reader = BufReader::new(file);
     loop {
-        let line = match security::read_bounded_jsonl_line(&mut reader) {
+        let line = match read_recoverable_session_line(&mut reader) {
             Ok(Some(line)) => line,
             Ok(None) => break,
             Err(error) => {
@@ -3743,7 +3899,7 @@ fn collect_session_file(
     let mut previous = TokenSnapshot::default();
     let mut reader = BufReader::new(file);
     loop {
-        let line = match security::read_bounded_jsonl_line(&mut reader) {
+        let line = match read_recoverable_session_line(&mut reader) {
             Ok(Some(line)) => line,
             Ok(None) => break,
             Err(error) => {
@@ -3884,6 +4040,7 @@ impl LocalUsageBridge {
 }
 
 fn account_server_worker(commands: Receiver<AccountCommand>, events: Sender<Event>) {
+    debug_runtime("account worker starting");
     let Some(codex) = resolved_executable("CODEX_INFO_CODEX_BIN", "codex") else {
         let _ = events.send(Event::Error(
             "Codex app-serverの安全な実行ファイルを確認できません。".into(),
@@ -3930,6 +4087,7 @@ fn account_server_worker(commands: Receiver<AccountCommand>, events: Sender<Even
         return;
     }
     let _ = events.send(Event::Ready);
+    debug_runtime("account worker ready");
     let mut id = 2u64;
     while let Ok(command) = commands.recv() {
         match command {
@@ -3970,6 +4128,7 @@ fn account_server_worker(commands: Receiver<AccountCommand>, events: Sender<Even
                 id += 1;
             }
             AccountCommand::Read => {
+                debug_runtime("account read requested");
                 let account = request(&mut input, &output, id, "account/read", json!({}));
                 id += 1;
                 match account {
@@ -3996,6 +4155,7 @@ fn account_server_worker(commands: Receiver<AccountCommand>, events: Sender<Even
                             authenticated,
                             plan_type: plan_type.clone(),
                         });
+                        debug_runtime(format!("account read authenticated={authenticated}"));
                         if authenticated {
                             let rate_request_id = id;
                             id = id.saturating_add(1);
@@ -4097,6 +4257,9 @@ fn account_server_worker(commands: Receiver<AccountCommand>, events: Sender<Even
                                                     quota_title,
                                                     monthly,
                                                 })));
+                                            debug_runtime(format!(
+                                                "usage received reset_at={reset_at} window_seconds={window_seconds}"
+                                            ));
                                         }
                                         Err(()) => {
                                             let _ = events.send(Event::Error(
@@ -4160,10 +4323,12 @@ fn start_app_server() -> Result<RunningAppServer, String> {
 }
 
 fn thread_server_worker(commands: Receiver<ThreadCommand>, events: Sender<ThreadEvent>) {
+    debug_runtime("thread worker starting");
     // The thread bridge is lazy: construction of CodexInfoState does not issue
     // thread/list before account authentication succeeds. Once started, this
     // worker owns its own child, stdin/stdout, reader and request-id sequence.
     let mut server: Option<RunningAppServer> = None;
+    let mut server_active_paths = BTreeSet::new();
     let mut next_id = 2u64;
     while let Ok(command) = commands.recv() {
         match command {
@@ -4174,10 +4339,56 @@ fn thread_server_worker(commands: Receiver<ThreadCommand>, events: Sender<Thread
                 break;
             }
             ThreadCommand::Read { auth_epoch } => {
+                debug_runtime(format!("thread read requested epoch={auth_epoch}"));
+                let Some(codex_root) = codex_home_root() else {
+                    let _ = events.send(ThreadEvent::Error {
+                        auth_epoch,
+                        message: "スレッド情報を安全に取得できませんでした。".into(),
+                    });
+                    continue;
+                };
+                let (sessions_root, active_paths) = match active_thread_paths(&codex_root) {
+                    Ok(paths) => paths,
+                    Err(()) => {
+                        debug_runtime("thread active path scan failed");
+                        let _ = events.send(ThreadEvent::Error {
+                            auth_epoch,
+                            message: "スレッド情報を安全に取得できませんでした。".into(),
+                        });
+                        continue;
+                    }
+                };
+                if active_paths.is_empty() {
+                    if let Some(mut idle) = server.take() {
+                        let _ = idle.child.kill_and_reap();
+                    }
+                    server_active_paths.clear();
+                    next_id = 2;
+                    let _ = events.send(ThreadEvent::Update {
+                        auth_epoch,
+                        update: ActiveThreadUpdate::NoThread,
+                    });
+                    continue;
+                }
+
+                // Codex app-server snapshots its thread index when it starts.
+                // Reusing that process after the live rollout set changes can
+                // therefore publish a false zero to REST while the X client,
+                // started later, sees the running thread. Refresh exactly on
+                // the process-owned session-set boundary; steady-state polls
+                // keep the same child and do not create process churn.
+                if server.is_some() && server_active_paths != active_paths {
+                    if let Some(mut stale) = server.take() {
+                        let _ = stale.child.kill_and_reap();
+                    }
+                    server_active_paths.clear();
+                    next_id = 2;
+                }
                 if server.is_none() {
                     match start_app_server() {
                         Ok(started) => {
                             server = Some(started);
+                            server_active_paths = active_paths.clone();
                             let _ = events.send(ThreadEvent::Ready);
                         }
                         Err(message) => {
@@ -4192,14 +4403,16 @@ fn thread_server_worker(commands: Receiver<ThreadCommand>, events: Sender<Thread
                 let Some(server_ref) = server.as_mut() else {
                     continue;
                 };
-                let codex_root = codex_home_root();
                 let update = fetch_active_thread_update(
                     &mut server_ref.input,
                     &server_ref.output,
                     &mut next_id,
-                    codex_root.as_deref(),
+                    &sessions_root,
+                    &active_paths,
+                    &codex_root,
                 );
                 if update == ActiveThreadUpdate::Failed {
+                    debug_runtime("thread read failed");
                     let _ = events.send(ThreadEvent::Error {
                         auth_epoch,
                         message: "スレッド情報を安全に取得できませんでした。".into(),
@@ -4210,8 +4423,16 @@ fn thread_server_worker(commands: Receiver<ThreadCommand>, events: Sender<Thread
                     if let Some(mut failed) = server.take() {
                         let _ = failed.child.kill_and_reap();
                     }
+                    server_active_paths.clear();
                     next_id = 2;
                 } else {
+                    debug_runtime(match &update {
+                        ActiveThreadUpdate::Snapshot(rows) => {
+                            format!("thread snapshot rows={}", rows.len())
+                        }
+                        ActiveThreadUpdate::NoThread => "thread snapshot rows=0".to_owned(),
+                        ActiveThreadUpdate::Failed => "thread snapshot failed".to_owned(),
+                    });
                     let _ = events.send(ThreadEvent::Update { auth_epoch, update });
                 }
             }
@@ -4220,6 +4441,7 @@ fn thread_server_worker(commands: Receiver<ThreadCommand>, events: Sender<Thread
 }
 
 fn local_usage_worker(commands: Receiver<LocalCommand>, events: Sender<LocalEvent>) {
+    debug_runtime("local usage worker starting");
     while let Ok(command) = commands.recv() {
         match command {
             LocalCommand::Stop => break,
@@ -4228,6 +4450,9 @@ fn local_usage_worker(commands: Receiver<LocalCommand>, events: Sender<LocalEven
                 reset_at,
                 window_seconds,
             } => {
+                debug_runtime(format!(
+                    "local collect requested epoch={auth_epoch} reset_at={reset_at} window_seconds={window_seconds}"
+                ));
                 let result = (|| {
                     let model_usage = collect_local_model_usage(reset_at, window_seconds)?;
                     let history_samples =
@@ -4236,6 +4461,11 @@ fn local_usage_worker(commands: Receiver<LocalCommand>, events: Sender<LocalEven
                 })();
                 match result {
                     Ok((model_usage, history_samples)) => {
+                        debug_runtime(format!(
+                            "local collect succeeded rows={} samples={}",
+                            model_usage.clone().rows().len(),
+                            history_samples.len()
+                        ));
                         let _ = events.send(LocalEvent::Usage(LocalUsageResult {
                             auth_epoch,
                             reset_at,
@@ -4245,6 +4475,7 @@ fn local_usage_worker(commands: Receiver<LocalCommand>, events: Sender<LocalEven
                         }));
                     }
                     Err(_) => {
+                        debug_runtime("local collect failed");
                         let _ = events.send(LocalEvent::Error {
                             auth_epoch,
                             reset_at,
@@ -4366,9 +4597,222 @@ struct CodexInfoState {
     thread_error: bool,
     local_usage_error: bool,
     last_thread_poll: Instant,
+    /// The last persisted reset period is enough to backfill local session
+    /// usage while app-server/REST is unavailable. It is never exposed until
+    /// a fresh authenticated quota snapshot is committed.
+    recovery_period: Option<(i64, i64)>,
+    recovery_requested: bool,
 }
 
 impl CodexInfoState {
+    /// Build the only data shape allowed to cross into the loopback API.
+    ///
+    /// This intentionally does not include email, auth URL, local paths,
+    /// session content, or detailed backend errors. The HTTP worker cannot
+    /// access this state directly; it receives only this immutable copy.
+    fn public_snapshot(&self) -> PublicSnapshot {
+        let state = if self.error.is_some() || self.account_error.is_some() {
+            PublicState::Error
+        } else if !self.authenticated {
+            if self.checking {
+                PublicState::Initializing
+            } else {
+                PublicState::AuthRequired
+            }
+        } else if self.has_usage {
+            PublicState::Ready
+        } else {
+            PublicState::Initializing
+        };
+        let quota = self
+            .has_quota_percent
+            .then_some(())
+            .and_then(|_| self.remaining_percent.zip(self.reset_at))
+            .map(|(remaining_percent, reset_at)| PublicQuota {
+                remaining_percent: remaining_percent.clamp(0.0, 100.0),
+                reset_at,
+                window_seconds: self.window_seconds.max(1),
+                monthly: self.monthly,
+            });
+        let models = self
+            .authenticated
+            .then_some(())
+            .filter(|_| self.has_usage)
+            .map(|_| {
+                self.model_usage
+                    .iter()
+                    .filter(|row| matches!(row.name.as_str(), "SOL" | "TERRA" | "LUNA"))
+                    .map(|row| PublicModelUsage {
+                        name: row.name.clone(),
+                        input_tokens: row.input_tokens.saturating_sub(row.cached_input_tokens),
+                        cached_input_tokens: row.cached_input_tokens,
+                        output_tokens: row.output_tokens,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        PublicSnapshot {
+            state,
+            observed_at: if self.authenticated && self.has_usage {
+                self.last_success_at.filter(|timestamp| *timestamp > 0)
+            } else {
+                None
+            },
+            authenticated: self.authenticated,
+            plan_label: self
+                .authenticated
+                .then(|| self.plan_label.trim())
+                .filter(|label| !label.is_empty())
+                .map(str::to_owned),
+            quota,
+            models,
+            active_thread_count: if self.authenticated {
+                u64::try_from(self.active_threads.len()).unwrap_or(u64::MAX)
+            } else {
+                0
+            },
+        }
+    }
+
+    /// Build the additive read-only document consumed by the Windows client.
+    /// This is deliberately derived from the same state as `public_snapshot`
+    /// so status and details are published atomically as one generation.
+    fn public_details(&self) -> PublicDetails {
+        let mut snapshot = self.public_snapshot();
+        let models = if self.authenticated && self.has_usage {
+            self.model_usage
+                .iter()
+                .filter(|row| matches!(row.name.as_str(), "SOL" | "TERRA" | "LUNA"))
+                .map(|row| {
+                    let (input_dollars, cached_input_dollars, output_dollars) = row.dollar_costs();
+                    PublicDetailedModelUsage {
+                        name: row.name.clone(),
+                        input_tokens: row.input_tokens.saturating_sub(row.cached_input_tokens),
+                        cached_input_tokens: row.cached_input_tokens,
+                        output_tokens: row.output_tokens,
+                        input_dollars,
+                        cached_input_dollars,
+                        output_dollars,
+                    }
+                })
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+
+        let now = Utc::now().timestamp();
+        let history_cutoff = DateTime::<Utc>::from_timestamp(now, 0)
+            .map(one_month_before_utc)
+            .unwrap_or(now);
+        let history_periods = if self.authenticated {
+            self.history_periods()
+                .into_iter()
+                .map(|period| {
+                    let current = self.reset_at.is_some_and(|reset_at| {
+                        reset_at.abs_diff(period.canonical_reset_at)
+                            <= RESET_AT_TOLERANCE_SECONDS as u64
+                            && now < period.canonical_reset_at
+                    });
+                    PublicHistoryPeriod {
+                        id: period.canonical_reset_at.to_string(),
+                        start_at: period.start,
+                        // `HistoryPeriod::end` is clipped to now for graph
+                        // rendering. The API describes the actual period
+                        // boundary so clients can render a complete window.
+                        end_at: if current {
+                            period.canonical_reset_at
+                        } else {
+                            period.end
+                        },
+                        reset_at: period.canonical_reset_at,
+                        label: period.label,
+                        current,
+                    }
+                })
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+
+        let mut history_samples = if self.authenticated {
+            display_history_samples(&self.history.samples)
+                .into_iter()
+                // SQLite retains three calendar months, but one REST
+                // document materializes only `(one month before now, now]`.
+                // Enforce the boundary here as well as at the store/working-
+                // set boundary so a malformed or synthetic in-memory state
+                // cannot freeze publication with old or future rows.
+                .filter(|sample| sample.timestamp > history_cutoff && sample.timestamp <= now)
+                .map(|sample| PublicHistorySample {
+                    timestamp: sample.timestamp,
+                    reset_at: sample.reset_at,
+                    remaining_percent: (sample.remaining_percent >= 0.0)
+                        .then_some(sample.remaining_percent),
+                    sol_dollars: sample.sol_dollars,
+                    terra_dollars: sample.terra_dollars,
+                    luna_dollars: sample.luna_dollars,
+                    sol_tokens: sample.sol_tokens,
+                    terra_tokens: sample.terra_tokens,
+                    luna_tokens: sample.luna_tokens,
+                })
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+        history_samples.sort_by_key(|sample| (sample.reset_at, sample.timestamp));
+        // Do not silently truncate an over-capacity candidate. The REST
+        // publisher validates the complete candidate and keeps the previous
+        // atomic status/details generation when the public limit is exceeded.
+
+        let mut threads = if self.authenticated {
+            self.active_threads
+                .iter()
+                .take(MAX_PUBLIC_THREADS)
+                .map(|thread| PublicThread {
+                    id: thread.id.clone(),
+                    title: thread.title.clone(),
+                    parent_thread_id: thread.parent_thread_id.clone(),
+                    model: thread.model.clone(),
+                    model_label: thread.model_label.clone(),
+                    total_tokens: thread.total_tokens,
+                    context_usage_tokens: thread.context_usage_tokens,
+                    context_window_tokens: thread.context_window_tokens,
+                    created_at: thread.created_at,
+                    last_user_message_at: thread.last_user_message_at,
+                    is_subagent: thread.is_subagent,
+                    depth: thread.depth,
+                })
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+        if threads.len() != self.active_threads.len() {
+            // Keep the public count consistent with the bounded rows. This
+            // branch is only reachable for a pathological process with more
+            // than the API's maximum active-thread budget.
+            snapshot.active_thread_count = threads.len() as u64;
+        }
+
+        // Ensure no stale unauthenticated rows survive if an auxiliary worker
+        // completed just as the account state changed.
+        if !snapshot.authenticated {
+            threads.clear();
+        }
+        PublicDetails {
+            state: snapshot.state,
+            observed_at: snapshot.observed_at,
+            authenticated: snapshot.authenticated,
+            plan_label: snapshot.plan_label,
+            quota: snapshot.quota,
+            models,
+            active_thread_count: snapshot.active_thread_count,
+            history_periods,
+            history_samples,
+            threads,
+            estimated_cost_label: self.estimated_cost_label.clone(),
+        }
+    }
+
     #[allow(clippy::needless_return)]
     fn window_title(&self) -> String {
         #[cfg(test)]
@@ -4392,6 +4836,8 @@ impl CodexInfoState {
         let i18n = I18n::detect();
         let bridge = AppServerBridge::<AccountCommand, Event>::start();
         bridge.send(AccountCommand::Read);
+        let history = UsageHistory::load();
+        let recovery_period = history.latest_period_hint();
         Self {
             i18n,
             bridge,
@@ -4419,7 +4865,7 @@ impl CodexInfoState {
             model_usage: Vec::new(),
             active_threads: Vec::new(),
             estimated_cost_label: "概算 —".into(),
-            history: UsageHistory::load(),
+            history,
             selected_reset_at: None,
             selected_history_period: "履歴なし".into(),
             selected_metric: "ドル".into(),
@@ -4429,6 +4875,8 @@ impl CodexInfoState {
             thread_error: false,
             local_usage_error: false,
             last_thread_poll: Instant::now(),
+            recovery_period,
+            recovery_requested: false,
         }
     }
 
@@ -4494,8 +4942,35 @@ impl CodexInfoState {
             thread_error: false,
             local_usage_error: false,
             last_thread_poll: Instant::now(),
+            recovery_period: None,
+            recovery_requested: false,
         };
         match kind {
+            "initializing" => {
+                // Match the first safe public snapshot: the native application
+                // has started its read but has not established either identity
+                // or usage data yet. This gives the REST client a deterministic
+                // visual fixture without changing live authentication state.
+                state.authenticated = false;
+                state.email = None;
+                state.plan_label.clear();
+                state.remaining_percent = None;
+                state.has_quota_percent = false;
+                state.has_usage = false;
+                state.reset_at = None;
+                state.last_success_at = None;
+                state.model_usage.clear();
+                state.active_threads.clear();
+                state.estimated_cost_label = "概算 —".into();
+                state.history = UsageHistory::default();
+                state.selected_reset_at = None;
+                state.selected_history_period = "履歴なし".into();
+                state.checking = true;
+                // Keep the canonical internal status string so `display_status`
+                // resolves it through the startup-pinned catalog just like a
+                // live first request does.
+                state.status = "Codex app-serverへ接続しています…".into();
+            }
             "auth" => {
                 state.authenticated = false;
                 state.email = None;
@@ -4734,7 +5209,7 @@ impl CodexInfoState {
             }
             "error" => {
                 state.error = Some("preview".into());
-                state.status = "最新情報を取得できません。表示は12:34時点の値です。".into();
+                state.status = state.i18n.format_stale_status(state.last_success_at);
             }
             _ => {
                 state.status = state.normal_status();
@@ -4807,7 +5282,7 @@ impl CodexInfoState {
     }
 
     fn request_local_usage(&mut self, reset_at: i64, window_seconds: i64) {
-        if !self.preview && self.authenticated {
+        if !self.preview && reset_at > 0 {
             let command = LocalCommand::Collect {
                 auth_epoch: self.auth_epoch,
                 reset_at,
@@ -4817,6 +5292,7 @@ impl CodexInfoState {
                 self.local_bridge = LocalUsageBridge::start();
                 if !self.local_bridge.send(command) {
                     self.apply_local_usage_error(self.auth_epoch, reset_at, window_seconds);
+                    return;
                 }
             }
         }
@@ -4846,6 +5322,7 @@ impl CodexInfoState {
         self.thread_checking = false;
         self.thread_error = false;
         self.local_usage_error = false;
+        self.recovery_requested = false;
         self.history = UsageHistory::default();
         self.selected_reset_at = None;
         self.selected_history_period = "履歴なし".into();
@@ -4855,7 +5332,13 @@ impl CodexInfoState {
         match update {
             ActiveThreadUpdate::Snapshot(threads) => self.active_threads = threads,
             ActiveThreadUpdate::NoThread => self.active_threads.clear(),
-            ActiveThreadUpdate::Failed => return true,
+            // A failed read is not evidence that the previous rows are still
+            // running. Fail closed so a stopped thread cannot remain visible
+            // merely because the latest live-state check was unavailable.
+            ActiveThreadUpdate::Failed => {
+                self.active_threads.clear();
+                return true;
+            }
         }
         false
     }
@@ -4877,6 +5360,15 @@ impl CodexInfoState {
         self.remaining_percent = remaining_percent.map(|value| value.clamp(0.0, 100.0));
         self.reset_at = (reset_at > 0).then_some(reset_at);
         self.window_seconds = window_seconds;
+        self.recovery_period = (reset_at > 0).then_some((reset_at, window_seconds));
+        if !self.preview && reset_at > 0 {
+            // The daemon and the one-shot app-server recovery share this
+            // bounded hint, but neither path ever reconstructs quota from
+            // local logs.  A failed metadata write leaves the previous hint
+            // untouched and does not invalidate the authenticated snapshot.
+            let _ = daemon::persist_reset_hint(reset_at, window_seconds);
+        }
+        self.recovery_requested = false;
         self.limit_name = limit_name;
         self.quota_title = quota_title;
         self.monthly = monthly;
@@ -4890,6 +5382,10 @@ impl CodexInfoState {
         }
         self.checking = false;
         self.last_success_at = Some(Utc::now().timestamp());
+        debug_runtime(format!(
+            "state usage applied authenticated={} reset_at={} window_seconds={} auth_epoch={}",
+            self.authenticated, reset_at, window_seconds, self.auth_epoch
+        ));
         // Quota is committed before the independent local worker is asked to
         // collect usage. The request carries the exact auth/period tuple.
         self.request_local_usage(reset_at, window_seconds);
@@ -4909,6 +5405,15 @@ impl CodexInfoState {
         self.error = Some(error);
         self.status =
             "利用状況を取得できません。Codex app-serverへの接続を確認してください。".into();
+        // Keep this latch set for the entire account outage. The account
+        // bridge may respawn and report several errors before authentication
+        // succeeds again; those retries must not rescan every JSONL file.
+        if !self.recovery_requested {
+            if let Some((reset_at, window_seconds)) = self.recovery_period {
+                self.recovery_requested = true;
+                self.request_local_usage(reset_at, window_seconds);
+            }
+        }
     }
 
     fn apply_account_event(
@@ -4963,27 +5468,53 @@ impl CodexInfoState {
     }
 
     fn current_local_period_matches(&self, reset_at: i64, window_seconds: i64) -> bool {
-        if !self.authenticated || self.window_seconds != window_seconds {
-            return false;
+        if self.authenticated {
+            return self.window_seconds == window_seconds
+                && if reset_at > 0 {
+                    self.reset_at == Some(reset_at)
+                } else {
+                    self.reset_at.is_none()
+                };
         }
-        if reset_at > 0 {
-            self.reset_at == Some(reset_at)
-        } else {
-            self.reset_at.is_none()
-        }
+        self.recovery_period == Some((reset_at, window_seconds))
     }
 
     fn apply_local_usage_success(&mut self, result: LocalUsageResult) {
-        if result.auth_epoch != self.auth_epoch
+        let period_matches = self.recovery_period == Some((result.reset_at, result.window_seconds));
+        let unauthenticated_recovery = !self.authenticated && period_matches;
+        let recovery_result = self.recovery_requested && period_matches;
+        if (!unauthenticated_recovery && result.auth_epoch != self.auth_epoch)
             || !self.current_local_period_matches(result.reset_at, result.window_seconds)
         {
+            debug_runtime(format!(
+                "local result discarded epoch={} current_epoch={} period_match={}",
+                result.auth_epoch,
+                self.auth_epoch,
+                self.current_local_period_matches(result.reset_at, result.window_seconds)
+            ));
             return;
         }
         let model_costs = result.model_usage.dollar_totals();
         let model_tokens = result.model_usage.token_totals();
+        let history_sample_count = result.history_samples.len();
         self.local_usage_error = false;
-        self.model_usage = result.model_usage.rows();
-        self.estimated_cost_label = format_estimated_cost(model_costs);
+        // A recovery result closes the one-shot backfill, but it must remain
+        // marked as attempted until a fresh authenticated quota event arrives.
+        // Otherwise an app-server restart loop would launch the same full
+        // session scan once per failed account worker instead of once per
+        // outage period.
+        if !recovery_result {
+            self.recovery_requested = false;
+        }
+        if unauthenticated_recovery && self.history.db_path.is_none() {
+            // Reattach the durable store only at the recovery commit boundary;
+            // an unauthenticated clear still keeps all visible history empty.
+            self.history = UsageHistory::load();
+        }
+        if self.authenticated {
+            self.model_usage = result.model_usage.rows();
+            self.estimated_cost_label = format_estimated_cost(model_costs);
+        }
         if !self.preview {
             self.history
                 .apply_backfill_samples(result.reset_at, result.history_samples);
@@ -4998,15 +5529,23 @@ impl CodexInfoState {
             ));
         }
         self.refresh_partial_failure_status();
+        debug_runtime(format!(
+            "state local usage applied rows={} history_samples={} history_total={}",
+            self.model_usage.len(),
+            history_sample_count,
+            self.history.samples.len()
+        ));
     }
 
     fn apply_local_usage_error(&mut self, auth_epoch: u64, reset_at: i64, window_seconds: i64) {
-        if auth_epoch != self.auth_epoch
+        if !self.authenticated
+            || auth_epoch != self.auth_epoch
             || !self.current_local_period_matches(reset_at, window_seconds)
         {
             return;
         }
         self.local_usage_error = true;
+        self.recovery_requested = false;
         self.refresh_partial_failure_status();
     }
 
@@ -5018,6 +5557,10 @@ impl CodexInfoState {
         self.thread_checking = false;
         self.thread_error = failed;
         self.last_thread_poll = Instant::now();
+        debug_runtime(format!(
+            "state thread result rows={}",
+            self.active_threads.len()
+        ));
         self.refresh_partial_failure_status();
     }
 
@@ -5026,6 +5569,9 @@ impl CodexInfoState {
             return;
         }
         self.thread_checking = false;
+        // The worker could not establish a fresh live snapshot. Do not expose
+        // rows from the previous successful poll as if they were running.
+        self.active_threads.clear();
         self.thread_error = true;
         let _ = message;
         self.refresh_partial_failure_status();
@@ -5042,8 +5588,8 @@ impl CodexInfoState {
             (true, true) => {
                 self.error =
                     Some("ローカル履歴とスレッド情報を安全に取得できませんでした。".into());
-                self.status =
-                    "利用枠は更新しました。履歴とスレッドは前回値を保持しています。".into();
+                self.status = "利用枠は更新しました。履歴とスレッド情報の取得に失敗し、実行中の状態は未確認です。"
+                    .into();
             }
             (true, false) => {
                 self.error = Some("ローカル利用履歴を安全に集計できませんでした。".into());
@@ -5051,7 +5597,9 @@ impl CodexInfoState {
             }
             (false, true) => {
                 self.error = Some("スレッド情報を安全に取得できませんでした。".into());
-                self.status = "利用枠は更新しました。スレッド表示は前回値を保持しています。".into();
+                self.status =
+                    "利用枠は更新しました。スレッド情報の取得に失敗し、実行中の状態は未確認です。"
+                        .into();
             }
             (false, false) => {
                 self.error = None;
@@ -5104,11 +5652,12 @@ impl CodexInfoState {
             account_events.push(event);
         }
         if self.apply_account_event_batch(account_events) {
-            // Do not retry in this callback. Replace only the failed
-            // connection; the explicit retry or scheduled refresh sends the
-            // next request through the fresh bridge.
+            // Do not respawn immediately on every initialize/protocol error.
+            // The failed worker's channel is left as the retry sentinel;
+            // the next scheduled/explicit read observes send failure and
+            // creates one replacement. This bounds process churn while the
+            // app-server is unavailable and keeps recovery one-shot.
             let _ = self.bridge.send(AccountCommand::Stop);
-            self.bridge = AppServerBridge::<AccountCommand, Event>::start();
         }
 
         let mut thread_events = Vec::new();
@@ -6007,6 +6556,22 @@ fn automatic_refresh_interval(authenticated: bool, auth_polling: bool) -> Durati
     }
 }
 
+/// Decide whether the account bridge may receive its next periodic read.
+/// Keeping this predicate independent from the timer callback makes the
+/// transient-worker-failure boundary testable: a failed worker clears
+/// `checking`, and the next bounded interval is still admitted without an
+/// immediate respawn loop.
+fn account_refresh_due(
+    now: Instant,
+    last_poll: Instant,
+    checking: bool,
+    authenticated: bool,
+    auth_polling: bool,
+) -> bool {
+    !checking
+        && now.duration_since(last_poll) >= automatic_refresh_interval(authenticated, auth_polling)
+}
+
 fn open_validated_auth_url(value: &str) -> bool {
     let Ok(url) = security::validate_auth_url(value) else {
         return false;
@@ -6096,14 +6661,14 @@ impl CodexInfoState {
             "利用状況を取得できません。Codex app-serverへの接続を確認してください。" => {
                 self.i18n.text(TextKey::CannotFetchUsage).into()
             }
-            "利用枠は更新しました。履歴とスレッドは前回値を保持しています。" => {
-                self.i18n.text(TextKey::PartialHistoryThreads).into()
+            "利用枠は更新しました。履歴とスレッド情報の取得に失敗し、実行中の状態は未確認です。" => {
+                self.status.clone()
             }
             "利用枠は更新しました。履歴は前回値を保持しています。" => {
                 self.i18n.text(TextKey::PartialHistory).into()
             }
-            "利用枠は更新しました。スレッド表示は前回値を保持しています。" => {
-                self.i18n.text(TextKey::PartialThreads).into()
+            "利用枠は更新しました。スレッド情報の取得に失敗し、実行中の状態は未確認です。" => {
+                self.status.clone()
             }
             "状態を表示できません。" => {
                 self.i18n.text(TextKey::CannotDisplayStatus).into()
@@ -6760,7 +7325,332 @@ fn clamp_graph_preview_size((width, height): (u32, u32)) -> (u32, u32) {
     (width.max(700), height.max(480))
 }
 
-fn main() -> Result<(), slint::PlatformError> {
+const DEFAULT_SERVICE_ADDRESS: &str = "127.0.0.1:8787";
+const BACKGROUND_SERVICE_START_TIMEOUT: Duration = Duration::from_secs(5);
+const BACKGROUND_CHILD_CLEANUP_TIMEOUT: Duration = Duration::from_secs(2);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LaunchMode {
+    /// Mode 1: one resident owner containing recorder + REST.
+    Service(ApiServerConfig),
+    /// Mode 2: X only. It never starts or owns a resident service.
+    UiOnly,
+    /// Mode 3: ensure mode 1 exists at this address, then add the X UI.
+    All(ApiServerConfig),
+    /// Backward-compatible diagnostic recorder command.
+    RecordOnly { once: bool },
+}
+
+fn default_service_config() -> Result<ApiServerConfig, String> {
+    DEFAULT_SERVICE_ADDRESS
+        .parse::<SocketAddr>()
+        .map_err(|_| "default service address is invalid".to_owned())
+        .and_then(|address| ApiServerConfig::new(address).map_err(|error| error.to_string()))
+}
+
+fn parse_launch_mode<I>(arguments: I) -> Result<LaunchMode, String>
+where
+    I: IntoIterator<Item = OsString>,
+{
+    let arguments = arguments.into_iter().collect::<Vec<_>>();
+    match arguments.as_slice() {
+        [] => default_service_config().map(LaunchMode::All),
+        [value] if value == "--all" => default_service_config().map(LaunchMode::All),
+        [value] if value == "--ui-only" => Ok(LaunchMode::UiOnly),
+        [value] if value == "--service" => default_service_config().map(LaunchMode::Service),
+        [service, listen, address] if service == "--service" && listen == "--listen" => {
+            let address = address
+                .to_str()
+                .ok_or_else(|| "--listen requires a numeric loopback address".to_owned())?
+                .parse::<SocketAddr>()
+                .map_err(|_| "--listen requires a numeric loopback address".to_owned())?;
+            ApiServerConfig::new(address)
+                .map(LaunchMode::Service)
+                .map_err(|error| error.to_string())
+        }
+        [record] if record == "--record-daemon" => Ok(LaunchMode::RecordOnly {
+            once: std::env::var_os("CODEX_INFO_DAEMON_ONESHOT").is_some_and(|value| value == "1"),
+        }),
+        [record, once] if record == "--record-daemon" && once == "--once" => {
+            Ok(LaunchMode::RecordOnly { once: true })
+        }
+        _ => Err("usage: codex_info [--all|--ui-only|--service [--listen 127.0.0.1:PORT]|--record-daemon [--once]]".to_owned()),
+    }
+}
+
+fn apply_launch_environment(
+    mode: LaunchMode,
+    arguments_were_explicit: bool,
+    environment_config: Option<ApiServerConfig>,
+) -> LaunchMode {
+    match (mode, arguments_were_explicit, environment_config) {
+        // Preserve the legacy environment-only service entry point only when
+        // no CLI mode was supplied.
+        (LaunchMode::All(_), false, Some(config)) => LaunchMode::Service(config),
+        // An explicit --all keeps its UI and uses the requested loopback
+        // address for the background daemon+REST service it ensures.
+        (LaunchMode::All(_), true, Some(config)) => LaunchMode::All(config),
+        (mode, _, _) => mode,
+    }
+}
+
+fn is_service_health_response(response: &[u8]) -> bool {
+    if !response.starts_with(b"HTTP/1.1 200 ") {
+        return false;
+    }
+    let Some(header_end) = response.windows(4).position(|window| window == b"\r\n\r\n") else {
+        return false;
+    };
+    let body = &response[header_end + 4..];
+    serde_json::from_slice::<Value>(body).is_ok_and(|value| {
+        value.get("api_version").and_then(Value::as_str) == Some("v1")
+            && value.get("service").and_then(Value::as_str) == Some("codex-info")
+    })
+}
+
+fn service_is_healthy(address: SocketAddr) -> bool {
+    let timeout = Duration::from_millis(150);
+    let Ok(mut stream) = TcpStream::connect_timeout(&address, timeout) else {
+        return false;
+    };
+    let request =
+        format!("GET /v1/health HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\n\r\n");
+    if stream.set_read_timeout(Some(timeout)).is_err()
+        || stream.set_write_timeout(Some(timeout)).is_err()
+        || stream.write_all(request.as_bytes()).is_err()
+    {
+        return false;
+    }
+    let mut response = Vec::with_capacity(512);
+    let mut buffer = [0_u8; 512];
+    while response.len() < 4096 {
+        let remaining = 4096 - response.len();
+        let read_limit = remaining.min(buffer.len());
+        match stream.read(&mut buffer[..read_limit]) {
+            Ok(0) => break,
+            Ok(read) => {
+                response.extend_from_slice(&buffer[..read]);
+                // The server supplies Content-Length and may keep the socket
+                // open. A complete, validated body is success; EOF is not a
+                // health requirement.
+                if is_service_health_response(&response) {
+                    return true;
+                }
+            }
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                break;
+            }
+            Err(_) => return false,
+        }
+    }
+    is_service_health_response(&response)
+}
+
+fn healthy_combined_service_owner(address: SocketAddr) -> Option<u32> {
+    service_is_healthy(address)
+        .then(daemon::current_daemon_owner_pid)
+        .flatten()
+}
+
+fn terminate_and_reap_owned_child(child: &mut Child) -> bool {
+    if matches!(child.try_wait(), Ok(Some(_))) {
+        return true;
+    }
+    // Never block indefinitely in `wait`: after requesting termination,
+    // `try_wait` both observes and reaps the child within a fixed deadline.
+    let _ = child.kill();
+    let deadline = Instant::now() + BACKGROUND_CHILD_CLEANUP_TIMEOUT;
+    loop {
+        if matches!(child.try_wait(), Ok(Some(_))) {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn ensure_background_service(config: ApiServerConfig) -> Result<(), String> {
+    let address = config.listen_addr();
+    if healthy_combined_service_owner(address).is_some() {
+        return Ok(());
+    }
+    let executable = std::env::current_exe()
+        .map_err(|_| "combined service executable is unavailable".to_owned())?;
+    let address_text = address.to_string();
+    let child = Command::new(executable)
+        .args(["--service", "--listen", address_text.as_str()])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|_| "combined daemon+REST service could not start".to_owned())?;
+    let child_pid = child.id();
+    let mut owned_child = Some(child);
+    let deadline = Instant::now() + BACKGROUND_SERVICE_START_TIMEOUT;
+    loop {
+        let healthy_owner = healthy_combined_service_owner(address);
+        if healthy_owner == Some(child_pid) {
+            // This is the resident child this --all invocation intentionally
+            // created. Dropping the process handle detaches it; it must remain
+            // alive after the X UI closes.
+            return Ok(());
+        }
+        if healthy_owner.is_some() {
+            // A concurrent --all/--service won recorder ownership and became
+            // healthy. This invocation must reap only the child it spawned
+            // before attaching its UI to that winner.
+            if let Some(child) = owned_child.as_mut() {
+                if !terminate_and_reap_owned_child(child) {
+                    return Err("losing combined service child could not be reaped".to_owned());
+                }
+            }
+            return Ok(());
+        }
+
+        if let Some(child) = owned_child.as_mut() {
+            match child.try_wait() {
+                Ok(Some(_)) => owned_child = None,
+                Ok(None) => {}
+                Err(_) => {
+                    let reaped = terminate_and_reap_owned_child(child);
+                    return Err(if reaped {
+                        "combined daemon+REST service state is unavailable".to_owned()
+                    } else {
+                        "combined daemon+REST service state is unavailable and its child could not be reaped".to_owned()
+                    });
+                }
+            }
+        }
+        if owned_child.is_none() && daemon::current_daemon_owner_pid().is_none() {
+            return Err("combined daemon+REST service exited before becoming healthy".to_owned());
+        }
+        if Instant::now() >= deadline {
+            let reaped = owned_child
+                .as_mut()
+                .is_none_or(terminate_and_reap_owned_child);
+            return Err(if reaped {
+                "combined daemon+REST service did not become healthy".to_owned()
+            } else {
+                "combined daemon+REST service did not become healthy and its child could not be reaped".to_owned()
+            });
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn poll_service_state(state: &mut CodexInfoState) {
+    state.poll();
+    if account_refresh_due(
+        Instant::now(),
+        state.last_poll,
+        state.checking,
+        state.authenticated,
+        state.auth_polling,
+    ) {
+        let status = if state.auth_polling && !state.authenticated {
+            "認証完了を確認しています…"
+        } else {
+            "利用状況を更新しています…"
+        };
+        state.request_read(status);
+        state.last_poll = Instant::now();
+    }
+    if state.authenticated
+        && !state.thread_checking
+        && state.last_thread_poll.elapsed() >= Duration::from_secs(5)
+    {
+        state.request_thread_update();
+    }
+}
+
+async fn service_shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        let ctrl_c = tokio::signal::ctrl_c();
+        if let Ok(mut terminate) = signal(SignalKind::terminate()) {
+            tokio::select! {
+                _ = ctrl_c => {}
+                _ = terminate.recv() => {}
+            }
+        } else {
+            let _ = ctrl_c.await;
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
+}
+
+fn run_combined_service(config: ApiServerConfig) -> Result<(), Box<dyn std::error::Error>> {
+    let mut recorder = daemon::RecorderWorker::start().map_err(std::io::Error::other)?;
+    if !recorder.is_active() {
+        recorder.shutdown();
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "combined daemon+REST service is already owned by another process",
+        )
+        .into());
+    }
+    // Bind REST only after this process owns the recorder. Concurrent service
+    // children therefore exit before publishing a listener, and an API bind
+    // failure drops the worker and releases its exact lock identity.
+    let mut api_server = ApiServer::start(config)?;
+    let publisher = api_server.publisher();
+    let mut state = CodexInfoState::new();
+    publisher.publish_details(state.public_details())?;
+    let mut last_publish_error = None;
+    eprintln!(
+        "codex-info: daemon+REST listening on {} recorder_owner={}",
+        api_server.local_addr(),
+        recorder.is_active()
+    );
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_io()
+        .enable_time()
+        .build()?;
+    runtime.block_on(async {
+        let mut ticker = tokio::time::interval(Duration::from_secs(1));
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let shutdown = service_shutdown_signal();
+        tokio::pin!(shutdown);
+        loop {
+            tokio::select! {
+                _ = &mut shutdown => break,
+                _ = ticker.tick() => {
+                    poll_service_state(&mut state);
+                    match publisher.publish_details(state.public_details()) {
+                        Ok(()) => {
+                            if last_publish_error.take().is_some() {
+                                eprintln!("codex-info: REST snapshot publication recovered");
+                            }
+                        }
+                        Err(error) => {
+                            if last_publish_error != Some(error) {
+                                eprintln!("codex-info: REST snapshot publication rejected: {error}");
+                                last_publish_error = Some(error);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    });
+    recorder.shutdown();
+    api_server.shutdown();
+    Ok(())
+}
+
+fn run_ui() -> Result<(), Box<dyn std::error::Error>> {
     let ui = MainWindow::new()?;
     install_fixed_window_guard(ui.window());
     let preview_size = std::env::var("CODEX_INFO_PREVIEW_SIZE")
@@ -7151,24 +8041,7 @@ fn main() -> Result<(), slint::PlatformError> {
         timer.start(TimerMode::Repeated, Duration::from_secs(1), move || {
             if let Some(ui) = weak_ui.upgrade() {
                 let mut state = state.borrow_mut();
-                state.poll();
-                let refresh_interval =
-                    automatic_refresh_interval(state.authenticated, state.auth_polling);
-                if !state.checking && state.last_poll.elapsed() >= refresh_interval {
-                    let status = if state.auth_polling && !state.authenticated {
-                        "認証完了を確認しています…"
-                    } else {
-                        "利用状況を更新しています…"
-                    };
-                    state.request_read(status);
-                    state.last_poll = Instant::now();
-                }
-                if state.authenticated
-                    && !state.thread_checking
-                    && state.last_thread_poll.elapsed() >= Duration::from_secs(5)
-                {
-                    state.request_thread_update();
-                }
+                poll_service_state(&mut state);
                 state.sync_ui(&ui);
                 if let Some(graph) = graph_window_for_timer.borrow().as_ref() {
                     if graph.window().is_visible() {
@@ -7183,45 +8056,78 @@ fn main() -> Result<(), slint::PlatformError> {
             }
         });
     }
-    ui.run()
+    ui.run()?;
+    Ok(())
+}
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let arguments = std::env::args_os().skip(1).collect::<Vec<_>>();
+    let arguments_were_explicit = !arguments.is_empty();
+    let parsed_mode = parse_launch_mode(arguments).map_err(std::io::Error::other)?;
+    // Only modes that may own a service inspect the legacy listen variable;
+    // --ui-only remains unable to create any listener through inheritance.
+    let environment_config = if matches!(parsed_mode, LaunchMode::All(_)) {
+        ApiServerConfig::from_environment()?
+    } else {
+        None
+    };
+    let mode = apply_launch_environment(parsed_mode, arguments_were_explicit, environment_config);
+    match mode {
+        LaunchMode::Service(config) => run_combined_service(config),
+        LaunchMode::UiOnly => run_ui(),
+        LaunchMode::All(config) => {
+            ensure_background_service(config).map_err(std::io::Error::other)?;
+            run_ui()
+        }
+        LaunchMode::RecordOnly { once } => {
+            daemon::run_record_daemon(once).map_err(std::io::Error::other)?;
+            Ok(())
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::winit;
     use super::{
-        account_window_title, active_thread_model_counts, active_thread_rows_at,
-        add_recovery_usage, automatic_refresh_interval, clamp_graph_preview_size,
-        collapse_remaining_change_points, collect_session_file, complete_rollout_prefix_len,
-        current_label_connector_path, detail_window_title, fetch_active_thread_update_for_paths,
+        account_refresh_due, account_window_title, active_thread_model_counts,
+        active_thread_rows_at, add_recovery_usage, apply_launch_environment,
+        automatic_refresh_interval, clamp_graph_preview_size, collapse_remaining_change_points,
+        collect_session_file, complete_rollout_prefix_len, current_label_connector_path,
+        detail_window_title, fetch_active_thread_update_for_paths,
         fetch_active_thread_update_for_paths_and_state, fixed_resize_decision,
         fixed_resize_decision_for_scale, format_elapsed, format_estimated_cost,
         format_model_usage_columns, format_percent, format_period_label, graph_paths,
         graph_paths_for_selection, graph_period_end, graph_points, graph_time_endpoints,
-        minute_model_spend, minute_model_spend_for_metric, model_usage_timeline_from_events,
-        monthly_window_seconds, native_account_window_title, normal_status_text,
-        open_codex_session_paths, parse_preview_size, parse_rate_limits, parse_resize_direction,
-        period_remaining_text, physical_size_for_logical, plan_type_label, preview_model_row,
-        read_recovery_entries, recovery_timed_usage, remaining_graph_points, remaining_graph_y,
-        remaining_marker_positions, remaining_marker_positions_on_points, request_with_timeout,
-        same_rollout_identity, separate_current_label_positions, session_event_model,
+        is_service_health_response, minute_model_spend, minute_model_spend_for_metric,
+        model_usage_timeline_from_events, monthly_window_seconds, native_account_window_title,
+        normal_status_text, one_month_before_utc, open_codex_session_paths, parse_launch_mode,
+        parse_preview_size, parse_rate_limits, parse_resize_direction, period_remaining_text,
+        physical_size_for_logical, plan_type_label, preview_model_row, read_recovery_entries,
+        read_thread_rollout_path, recovery_timed_usage, remaining_graph_points,
+        remaining_graph_points_for_metric, remaining_graph_y, remaining_marker_positions,
+        remaining_marker_positions_on_points, request_with_timeout, same_rollout_identity,
+        separate_current_label_positions, service_is_healthy, session_event_model,
         session_event_type, session_jsonl_files, session_token_snapshot, smooth_model_spend,
         smooth_remaining_points, split_metric_line_paths, stacked_area_path,
-        thread_presentation_rows, three_months_before_utc, unused_interval_positions,
-        week_remaining_text, ActiveThread, ActiveThreadUpdate, CodexInfoState, Event,
-        FixedResizeDecision, GraphPaths, GraphWindow, HourlyModelSpend, LocalUsageResult,
-        ManualX11Geometry, ManualX11WindowAction, ModelDollarTotals, ModelTokenTotals,
-        ModelUsageRow, ModelUsageTotals, RpcReadEvent, SessionTraversalBudget, TokenSnapshot,
+        terminate_and_reap_owned_child, thread_presentation_rows, three_months_before_utc,
+        unused_interval_positions, week_remaining_text, ActiveThread, ActiveThreadUpdate,
+        ApiServer, ApiServerConfig, CodexInfoState, Event, FixedResizeDecision, GraphPaths,
+        GraphWindow, HourlyModelSpend, LaunchMode, LocalUsageResult, ManualX11Geometry,
+        ManualX11WindowAction, ModelDollarTotals, ModelTokenTotals, ModelUsageRow,
+        ModelUsageTotals, RpcReadEvent, SessionTraversalBudget, TokenSnapshot,
         UnusedIntervalPosition, UsageEvent, UsageHistory, UsageHistorySample, UsageStore,
-        FIXED_WINDOW_HEIGHT, FIXED_WINDOW_WIDTH, GRAPH_METRIC_OPTIONS, GRAPH_WINDOW_PURPOSE,
-        LOCAL_ESTIMATE_PRICE_VERSION, THREADS_WINDOW_PURPOSE, UNAUTHENTICATED_WINDOW_TITLE,
-        WEEK_SECONDS,
+        DEFAULT_SERVICE_ADDRESS, FIXED_WINDOW_HEIGHT, FIXED_WINDOW_WIDTH, GRAPH_METRIC_OPTIONS,
+        GRAPH_WINDOW_PURPOSE, LOCAL_ESTIMATE_PRICE_VERSION, THREADS_WINDOW_PURPOSE,
+        UNAUTHENTICATED_WINDOW_TITLE, WEEK_SECONDS,
     };
     use super::{
         claim_manual_x11_action, forbidden_x11_states, manual_resize_geometry,
         manual_window_geometry, motif_wm_functions, motif_wm_resizable_functions, X11StateAtoms,
     };
     use chrono::{TimeZone, Utc};
+    use codex_info::security;
+    use codex_info::server::PublicState;
     use codex_info::thread_contract;
     use rusqlite::Connection;
     use serde_json::{json, Value};
@@ -7231,7 +8137,188 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::mpsc;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
+
+    fn launch_args(values: &[&str]) -> Vec<std::ffi::OsString> {
+        values.iter().map(std::ffi::OsString::from).collect()
+    }
+
+    #[test]
+    fn launch_modes_are_explicit_and_ui_only_never_maps_to_service() {
+        let default_address = DEFAULT_SERVICE_ADDRESS.parse().unwrap();
+        let LaunchMode::All(default_config) = parse_launch_mode(launch_args(&[])).unwrap() else {
+            panic!("default mode was not all");
+        };
+        assert_eq!(default_config.listen_addr(), default_address);
+        assert_eq!(
+            parse_launch_mode(launch_args(&["--ui-only"])).unwrap(),
+            LaunchMode::UiOnly
+        );
+        let LaunchMode::All(explicit_all_config) =
+            parse_launch_mode(launch_args(&["--all"])).unwrap()
+        else {
+            panic!("explicit --all mode was not selected");
+        };
+        assert_eq!(explicit_all_config.listen_addr(), default_address);
+        let LaunchMode::Service(config) =
+            parse_launch_mode(launch_args(&["--service", "--listen", "127.0.0.1:9876"])).unwrap()
+        else {
+            panic!("service mode was not selected");
+        };
+        assert_eq!(config.listen_addr(), "127.0.0.1:9876".parse().unwrap());
+        assert!(
+            parse_launch_mode(launch_args(&["--service", "--listen", "0.0.0.0:9876"])).is_err()
+        );
+        assert!(parse_launch_mode(launch_args(&["--ui-only", "--service"])).is_err());
+    }
+
+    #[test]
+    fn explicit_all_keeps_ui_while_implicit_environment_mode_stays_compatible() {
+        let environment_config = ApiServerConfig::new("127.0.0.1:9877".parse().unwrap()).unwrap();
+        let parsed_all = parse_launch_mode(launch_args(&["--all"])).unwrap();
+        assert_eq!(
+            apply_launch_environment(parsed_all, true, Some(environment_config)),
+            LaunchMode::All(environment_config)
+        );
+
+        let implicit = parse_launch_mode(launch_args(&[])).unwrap();
+        assert_eq!(
+            apply_launch_environment(implicit, false, Some(environment_config)),
+            LaunchMode::Service(environment_config)
+        );
+
+        assert_eq!(
+            apply_launch_environment(LaunchMode::UiOnly, true, Some(environment_config)),
+            LaunchMode::UiOnly
+        );
+    }
+
+    #[test]
+    fn service_health_requires_a_complete_success_json_body_without_waiting_for_eof() {
+        let valid = b"HTTP/1.1 200 OK\r\nContent-Length: 43\r\nConnection: keep-alive\r\n\r\n{\"api_version\":\"v1\",\"service\":\"codex-info\"}";
+        assert!(is_service_health_response(valid));
+        assert!(!is_service_health_response(
+            b"HTTP/1.1 200 OK\r\nX-Service: codex-info\r\n\r\n{}"
+        ));
+        assert!(!is_service_health_response(
+            b"HTTP/1.1 500 Error\r\n\r\n{\"api_version\":\"v1\",\"service\":\"codex-info\"}"
+        ));
+        assert!(!is_service_health_response(
+            b"HTTP/1.1 200 OK\r\n\r\n{\"api_version\":\"v1\",\"service\":\"codex-info\""
+        ));
+    }
+
+    #[test]
+    fn service_health_accepts_the_live_loopback_server_response() {
+        let server =
+            ApiServer::start(ApiServerConfig::new("127.0.0.1:0".parse().unwrap()).unwrap())
+                .unwrap();
+        assert!(service_is_healthy(server.local_addr()));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn owned_background_child_cleanup_is_bounded_and_reaps() {
+        let mut child = std::process::Command::new("sh")
+            .args(["-c", "exec sleep 60"])
+            .spawn()
+            .unwrap();
+        let started = Instant::now();
+        assert!(terminate_and_reap_owned_child(&mut child));
+        assert!(started.elapsed() < Duration::from_secs(3));
+        assert!(child.try_wait().unwrap().is_some());
+    }
+
+    #[test]
+    fn public_snapshot_is_whitelisted_and_tracks_auth_state() {
+        let normal = CodexInfoState::preview("normal");
+        let snapshot = normal.public_snapshot();
+        assert_eq!(snapshot.state, PublicState::Ready);
+        assert!(snapshot.authenticated);
+        assert_eq!(snapshot.plan_label.as_deref(), Some("Pro"));
+        assert_eq!(
+            snapshot.quota.as_ref().map(|quota| quota.remaining_percent),
+            Some(14.0)
+        );
+        assert_eq!(snapshot.models.len(), 3);
+        assert_eq!(snapshot.models[0].name, "SOL");
+        assert_eq!(snapshot.models[0].input_tokens, 80_000_000);
+        assert_eq!(snapshot.models[0].cached_input_tokens, 30_000_000);
+        assert_eq!(snapshot.active_thread_count, 1);
+        let json = serde_json::to_value(snapshot).expect("public snapshot serializes");
+        assert!(json.get("email").is_none());
+        assert!(json.get("auth_url").is_none());
+        assert!(json.get("error").is_none());
+        assert!(json.get("history").is_none());
+        assert!(json.get("session_path").is_none());
+
+        let details = normal.public_details();
+        assert_eq!(details.models.len(), 3);
+        assert!(details.models[0].input_dollars.is_finite());
+        assert!(details.models[0].input_dollars > 0.0);
+        assert!(!details.history_periods.is_empty());
+        assert!(!details.history_samples.is_empty());
+        assert_eq!(details.threads.len(), 1);
+        assert_eq!(details.threads[0].model_label, "gpt-5.6-sol");
+        let details_json = serde_json::to_value(details).expect("public details serializes");
+        assert!(details_json.get("email").is_none());
+        assert!(details_json.get("auth_url").is_none());
+        assert!(details_json.get("session_path").is_none());
+
+        let auth = CodexInfoState::preview("auth").public_snapshot();
+        assert_eq!(auth.state, PublicState::AuthRequired);
+        assert!(!auth.authenticated);
+        assert!(auth.plan_label.is_none());
+        assert!(auth.observed_at.is_none());
+        assert!(auth.quota.is_none());
+        assert!(auth.models.is_empty());
+        assert_eq!(auth.active_thread_count, 0);
+
+        let initializing = CodexInfoState::preview("initializing").public_snapshot();
+        assert_eq!(initializing.state, PublicState::Initializing);
+        assert!(!initializing.authenticated);
+        assert!(initializing.plan_label.is_none());
+        assert!(initializing.observed_at.is_none());
+        assert!(initializing.quota.is_none());
+        assert!(initializing.models.is_empty());
+        assert_eq!(initializing.active_thread_count, 0);
+
+        let unlimited = CodexInfoState::preview("unlimited").public_snapshot();
+        assert_eq!(unlimited.state, PublicState::Ready);
+        assert!(unlimited.quota.is_none());
+    }
+
+    #[test]
+    fn public_details_materializes_exactly_one_calendar_month() {
+        let mut state = CodexInfoState::preview("normal");
+        let now = Utc::now();
+        let now_timestamp = now.timestamp();
+        let cutoff = one_month_before_utc(now);
+        let reset_at = now_timestamp + WEEK_SECONDS;
+        state.history.samples = [cutoff, cutoff + 1, now_timestamp, now_timestamp + 60]
+            .into_iter()
+            .map(|timestamp| UsageHistorySample {
+                timestamp,
+                reset_at,
+                remaining_percent: 80.0,
+                sol_dollars: 0.0,
+                terra_dollars: 0.0,
+                luna_dollars: 0.0,
+                sol_tokens: 0,
+                terra_tokens: 0,
+                luna_tokens: 0,
+            })
+            .collect();
+
+        let timestamps = state
+            .public_details()
+            .history_samples
+            .into_iter()
+            .map(|sample| sample.timestamp)
+            .collect::<Vec<_>>();
+
+        assert_eq!(timestamps, vec![cutoff + 1, now_timestamp]);
+    }
 
     #[test]
     fn enterprise_individual_limit_wins_and_uses_calendar_month() {
@@ -7569,9 +8656,13 @@ mod tests {
 
         state.apply_thread_result(state.auth_epoch, ActiveThreadUpdate::Failed);
         assert!(state.thread_error);
+        assert!(state.active_threads.is_empty());
+        assert_eq!(state.public_snapshot().active_thread_count, 0);
+        assert!(state.public_details().threads.is_empty());
+        assert!(active_thread_rows_at(&state.active_threads, 0).is_empty());
         assert_eq!(
             state.status,
-            "利用枠は更新しました。スレッド表示は前回値を保持しています。"
+            "利用枠は更新しました。スレッド情報の取得に失敗し、実行中の状態は未確認です。"
         );
 
         let replacement = ActiveThread {
@@ -7648,6 +8739,84 @@ mod tests {
     }
 
     #[test]
+    fn persisted_period_backfill_is_admitted_before_auth_without_publishing_usage() {
+        let mut state = CodexInfoState::preview("normal");
+        let reset_at = state.reset_at.expect("preview quota has reset");
+        state.authenticated = false;
+        state.auth_epoch = 7;
+        state.recovery_period = Some((reset_at, WEEK_SECONDS));
+        let db_path = std::env::temp_dir().join(format!(
+            "codex-info-recovery-test-{}.sqlite3",
+            std::process::id()
+        ));
+        let _ = fs::remove_file(&db_path);
+        state.history = UsageHistory::load_from_db_path(Some(db_path.clone()));
+        state.model_usage.clear();
+        let sample = UsageHistorySample::new_with_usage(
+            Utc::now().timestamp(),
+            reset_at,
+            -1.0,
+            ModelDollarTotals {
+                sol: 1.0,
+                terra: 0.0,
+                luna: 0.0,
+            },
+            ModelTokenTotals {
+                sol: 100,
+                terra: 0,
+                luna: 0,
+            },
+        );
+        state.apply_local_usage_success(LocalUsageResult {
+            auth_epoch: 0,
+            reset_at,
+            window_seconds: WEEK_SECONDS,
+            model_usage: ModelUsageTotals::default(),
+            history_samples: vec![sample],
+        });
+        assert_eq!(state.history.samples.len(), 1);
+        assert!(state.model_usage.is_empty());
+        assert!(!state.public_snapshot().authenticated);
+        assert!(state.public_details().history_samples.is_empty());
+        let _ = fs::remove_file(db_path);
+    }
+
+    #[test]
+    fn recovery_backfill_is_one_shot_until_authenticated_quota_returns() {
+        let mut state = CodexInfoState::preview("normal");
+        let reset_at = state.reset_at.expect("preview quota has reset");
+        state.authenticated = false;
+        state.auth_epoch = 7;
+        state.recovery_period = Some((reset_at, WEEK_SECONDS));
+        let db_path = std::env::temp_dir().join(format!(
+            "codex-info-recovery-latch-{}.sqlite3",
+            std::process::id()
+        ));
+        state.history = UsageHistory {
+            db_path: Some(db_path.clone()),
+            samples: Vec::new(),
+            startup_maintenance_done: true,
+        };
+
+        state.apply_account_error("account bridge unavailable".into());
+        assert!(state.recovery_requested);
+        state.apply_local_usage_success(LocalUsageResult {
+            auth_epoch: 0,
+            reset_at,
+            window_seconds: WEEK_SECONDS,
+            model_usage: ModelUsageTotals::default(),
+            history_samples: Vec::new(),
+        });
+        assert!(state.recovery_requested);
+        state.apply_account_error("account bridge retry failed".into());
+        assert!(state.recovery_requested);
+
+        state.apply_usage_event(usage_event(Some(80.0), reset_at));
+        assert!(!state.recovery_requested);
+        let _ = fs::remove_file(db_path);
+    }
+
+    #[test]
     fn quota_event_is_pure_and_account_read_branch_has_no_thread_or_local_calls() {
         let source = include_str!("main.rs");
         let usage_definition = source
@@ -7679,6 +8848,29 @@ mod tests {
     }
 
     #[test]
+    fn periodic_ui_timer_only_polls_account_and_threads_not_session_files() {
+        let source = include_str!("main.rs");
+        let timer = source
+            .split_once("let timer = Timer::default();")
+            .and_then(|(_, rest)| rest.split_once("    ui.run()?;"))
+            .map(|(body, _)| body)
+            .expect("account timer boundary must remain explicit");
+        assert!(!timer.contains("collect_local_model_usage"));
+        assert!(!timer.contains("session_jsonl_files"));
+        assert!(timer.contains("poll_service_state"));
+
+        let poll = source
+            .split_once("fn poll_service_state")
+            .and_then(|(_, rest)| rest.split_once("async fn service_shutdown_signal"))
+            .map(|(body, _)| body)
+            .expect("shared poll boundary must remain explicit");
+        assert!(!poll.contains("collect_local_model_usage"));
+        assert!(!poll.contains("session_jsonl_files"));
+        assert!(poll.contains("request_thread_update"));
+        assert!(poll.contains("account_refresh_due"));
+    }
+
+    #[test]
     fn thread_failure_preserves_quota_plan_reset_and_history() {
         let mut state = CodexInfoState::preview("normal");
         let reset_at = state.reset_at.expect("preview reset");
@@ -7693,6 +8885,47 @@ mod tests {
         assert_eq!(state.plan_label, plan);
         assert_eq!(state.history.samples, history);
         assert!(state.thread_error);
+        assert!(!state.thread_checking);
+        assert!(state.active_threads.is_empty());
+        assert_eq!(
+            state.status,
+            "利用枠は更新しました。スレッド情報の取得に失敗し、実行中の状態は未確認です。"
+        );
+    }
+
+    #[test]
+    fn thread_failure_recovery_requires_a_new_complete_snapshot() {
+        let mut state = CodexInfoState::preview("normal");
+        state.active_threads = vec![ActiveThread {
+            id: "old-running".into(),
+            ..ActiveThread::default()
+        }];
+        state.thread_checking = true;
+
+        // A failed cycle must not leave the previous running row visible.
+        state.apply_thread_result(state.auth_epoch, ActiveThreadUpdate::Failed);
+        assert!(state.active_threads.is_empty());
+        assert!(state.thread_error);
+        assert!(!state.thread_checking);
+
+        // Recovery is only allowed through a subsequent complete snapshot;
+        // an arbitrary partial row is never merged with the cleared state.
+        state.apply_thread_result(
+            state.auth_epoch,
+            ActiveThreadUpdate::Snapshot(vec![ActiveThread {
+                id: "new-running".into(),
+                ..ActiveThread::default()
+            }]),
+        );
+        assert_eq!(
+            state
+                .active_threads
+                .iter()
+                .map(|thread| thread.id.as_str())
+                .collect::<Vec<_>>(),
+            ["new-running"]
+        );
+        assert!(!state.thread_error);
         assert!(!state.thread_checking);
     }
 
@@ -7737,6 +8970,7 @@ mod tests {
                 ..ActiveThread::default()
             }]),
         );
+        state.apply_thread_result(8, ActiveThreadUpdate::Failed);
         state.apply_thread_error(8, "stale thread error".into());
         state.apply_local_usage_success(LocalUsageResult {
             auth_epoch: 8,
@@ -8441,7 +9675,7 @@ mod tests {
     }
 
     #[test]
-    fn active_thread_adapter_paginates_and_falls_back_to_the_next_valid_rollout() {
+    fn active_thread_adapter_rejects_partial_rollout_fallback() {
         static NEXT_ROOT: AtomicU64 = AtomicU64::new(0);
         let root = std::env::temp_dir().join(format!(
             "codex-info-thread-adapter-{}-{}",
@@ -8507,24 +9741,7 @@ mod tests {
             &root,
             &active_paths,
         );
-        assert_eq!(
-            update,
-            ActiveThreadUpdate::Snapshot(vec![ActiveThread {
-                id: "fallback".into(),
-                created_at: Some(1),
-                updated_at: 10,
-                title: "title-fallback".into(),
-                model: "gpt-5.6-sol".into(),
-                model_label: "gpt-5.6-sol".into(),
-                total_tokens: Some(12_345),
-                context_usage_tokens: None,
-                context_window_tokens: None,
-                last_user_message_at: None,
-                is_subagent: false,
-                parent_thread_id: None,
-                depth: None,
-            }])
-        );
+        assert_eq!(update, ActiveThreadUpdate::Failed);
         assert_eq!(next_id, 52);
 
         let requests = String::from_utf8(input)
@@ -8781,7 +9998,10 @@ mod tests {
                 .unwrap(),
             ))
             .unwrap();
-        let active_paths = BTreeSet::from([fs::canonicalize(&root_rollout).unwrap()]);
+        let active_paths = BTreeSet::from([
+            fs::canonicalize(&root_rollout).unwrap(),
+            fs::canonicalize(&completed_rollout).unwrap(),
+        ]);
         let mut input = Vec::new();
         let mut next_id = 80;
         let update = fetch_active_thread_update_for_paths_and_state(
@@ -8814,6 +10034,199 @@ mod tests {
     }
 
     #[test]
+    fn native_stale_running_descendant_not_held_open_is_excluded() {
+        static NEXT_ROOT: AtomicU64 = AtomicU64::new(0);
+        let root = std::env::temp_dir().join(format!(
+            "codex-info-native-stale-descendant-{}-{}",
+            std::process::id(),
+            NEXT_ROOT.fetch_add(1, Ordering::Relaxed)
+        ));
+        create_native_state_schema(&root);
+        let sessions = root.join("sessions");
+        let root_rollout = sessions.join("root.jsonl");
+        let stale_child_rollout = sessions.join("stale-child.jsonl");
+        write_native_rollout(&root_rollout, false);
+        // The child has no terminal event, so rollout parsing alone would
+        // call it running. It is deliberately absent from active_paths: the
+        // native DB row is historical, not proof of a live app-server handle.
+        write_native_rollout(&stale_child_rollout, false);
+        add_native_state_thread(&root, "stale-child", &stale_child_rollout);
+        add_native_state_edge(&root, "root", "stale-child");
+
+        let (sender, receiver) = mpsc::channel();
+        sender
+            .send(RpcReadEvent::Line(
+                super::security::RpcLine::new(
+                    json!({
+                        "id": 82,
+                        "result": {"data": [thread_list_item("root", 10, &root_rollout)]}
+                    })
+                    .to_string(),
+                )
+                .unwrap(),
+            ))
+            .unwrap();
+        let active_paths = BTreeSet::from([fs::canonicalize(&root_rollout).unwrap()]);
+        let mut input = Vec::new();
+        let mut next_id = 82;
+        let update = fetch_active_thread_update_for_paths_and_state(
+            &mut input,
+            &receiver,
+            &mut next_id,
+            &sessions,
+            &active_paths,
+            Some(&root),
+        );
+        assert!(
+            matches!(update, ActiveThreadUpdate::Snapshot(rows) if rows.len() == 1 && rows[0].id == "root")
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn native_live_state_matrix_is_fail_closed_across_path_and_rollout_states() {
+        #[derive(Clone, Copy)]
+        enum ChildFixture {
+            Running,
+            Completed,
+            Invalid,
+            Missing,
+        }
+
+        let cases = [
+            ("running-active", ChildFixture::Running, true, "two"),
+            ("running-inactive", ChildFixture::Running, false, "root"),
+            ("completed-active", ChildFixture::Completed, true, "root"),
+            ("invalid-inactive", ChildFixture::Invalid, false, "root"),
+            ("invalid-active", ChildFixture::Invalid, true, "failed"),
+            ("missing-row", ChildFixture::Missing, true, "failed"),
+        ];
+
+        for (index, (label, fixture, child_active, expected)) in cases.into_iter().enumerate() {
+            let root = std::env::temp_dir().join(format!(
+                "codex-info-live-state-matrix-{}-{index}",
+                std::process::id()
+            ));
+            create_native_state_schema(&root);
+            let sessions = root.join("sessions");
+            let root_rollout = sessions.join("root.jsonl");
+            let child_rollout = sessions.join("child.jsonl");
+            write_native_rollout(&root_rollout, false);
+            match fixture {
+                ChildFixture::Running => write_native_rollout(&child_rollout, false),
+                ChildFixture::Completed => write_native_rollout(&child_rollout, true),
+                ChildFixture::Invalid => fs::write(&child_rollout, b"{not-json}\n").unwrap(),
+                ChildFixture::Missing => write_native_rollout(&child_rollout, false),
+            }
+            if !matches!(fixture, ChildFixture::Missing) {
+                add_native_state_thread(&root, "child", &child_rollout);
+            }
+            add_native_state_edge(&root, "root", "child");
+
+            let (sender, receiver) = mpsc::channel();
+            sender
+                .send(RpcReadEvent::Line(
+                    super::security::RpcLine::new(
+                        json!({
+                            "id": 90,
+                            "result": {"data": [thread_list_item("root", 10, &root_rollout)]}
+                        })
+                        .to_string(),
+                    )
+                    .unwrap(),
+                ))
+                .unwrap();
+            let mut active_paths = BTreeSet::from([fs::canonicalize(&root_rollout).unwrap()]);
+            if child_active {
+                active_paths.insert(fs::canonicalize(&child_rollout).unwrap());
+            }
+            let mut input = Vec::new();
+            let mut next_id = 90;
+            let update = fetch_active_thread_update_for_paths_and_state(
+                &mut input,
+                &receiver,
+                &mut next_id,
+                &sessions,
+                &active_paths,
+                Some(&root),
+            );
+            match expected {
+                "two" => assert!(
+                    matches!(update, ActiveThreadUpdate::Snapshot(rows) if rows.len() == 2),
+                    "{label}"
+                ),
+                "root" => assert!(
+                    matches!(update, ActiveThreadUpdate::Snapshot(rows) if rows.len() == 1 && rows[0].id == "root"),
+                    "{label}"
+                ),
+                "failed" => assert_eq!(update, ActiveThreadUpdate::Failed, "{label}"),
+                _ => unreachable!(),
+            }
+            let _ = fs::remove_dir_all(root);
+        }
+
+        let root_cases = [
+            ("root-running-active", false, true, "one"),
+            ("root-running-inactive", false, false, "empty"),
+            ("root-terminal-active", true, true, "empty"),
+            ("root-invalid-active", false, true, "failed"),
+        ];
+        for (index, (label, completed, root_active, expected)) in root_cases.into_iter().enumerate()
+        {
+            let root = std::env::temp_dir().join(format!(
+                "codex-info-live-state-root-matrix-{}-{index}",
+                std::process::id()
+            ));
+            create_native_state_schema(&root);
+            let sessions = root.join("sessions");
+            let root_rollout = sessions.join("root.jsonl");
+            if label == "root-invalid-active" {
+                fs::write(&root_rollout, b"{not-json}\n").unwrap();
+            } else {
+                write_native_rollout(&root_rollout, completed);
+            }
+            let (sender, receiver) = mpsc::channel();
+            sender
+                .send(RpcReadEvent::Line(
+                    super::security::RpcLine::new(
+                        json!({
+                            "id": 100,
+                            "result": {"data": [thread_list_item("root", 10, &root_rollout)]}
+                        })
+                        .to_string(),
+                    )
+                    .unwrap(),
+                ))
+                .unwrap();
+            let active_paths = if root_active {
+                BTreeSet::from([fs::canonicalize(&root_rollout).unwrap()])
+            } else {
+                BTreeSet::new()
+            };
+            let mut input = Vec::new();
+            let mut next_id = 100;
+            let update = fetch_active_thread_update_for_paths_and_state(
+                &mut input,
+                &receiver,
+                &mut next_id,
+                &sessions,
+                &active_paths,
+                Some(&root),
+            );
+            match expected {
+                "one" => assert!(
+                    matches!(update, ActiveThreadUpdate::Snapshot(rows) if rows.len() == 1),
+                    "{label}"
+                ),
+                "empty" => assert_eq!(update, ActiveThreadUpdate::NoThread, "{label}"),
+                "failed" => assert_eq!(update, ActiveThreadUpdate::Failed, "{label}"),
+                _ => unreachable!(),
+            }
+            let _ = fs::remove_dir_all(root);
+        }
+    }
+
+    #[test]
     fn native_descendant_failure_rejects_root_snapshot_atomically() {
         static NEXT_ROOT: AtomicU64 = AtomicU64::new(0);
         let root = std::env::temp_dir().join(format!(
@@ -8843,7 +10256,10 @@ mod tests {
                 .unwrap(),
             ))
             .unwrap();
-        let active_paths = BTreeSet::from([fs::canonicalize(&root_rollout).unwrap()]);
+        let active_paths = BTreeSet::from([
+            fs::canonicalize(&root_rollout).unwrap(),
+            fs::canonicalize(&invalid_rollout).unwrap(),
+        ]);
         let mut input = Vec::new();
         let mut next_id = 81;
         let update = fetch_active_thread_update_for_paths_and_state(
@@ -8971,6 +10387,69 @@ mod tests {
     }
 
     #[test]
+    fn production_rollout_reader_separates_record_recovery_from_candidate_failure() {
+        let root = std::env::temp_dir().join(format!(
+            "codex-info-rollout-boundaries-{}-{}",
+            std::process::id(),
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        fs::create_dir(&root).unwrap();
+
+        let recoverable = root.join("recoverable.jsonl");
+        let prefix = concat!(
+            "{\"type\":\"thread_context\",\"model\":\"gpt-5.6-sol\"}\n",
+            "{\"type\":\"task_started\"}\n"
+        );
+        let oversized = format!(
+            "{{\"type\":\"response_item\",\"payload\":\"{}\"}}\n",
+            "x".repeat(security::MAX_JSONL_LINE_BYTES + 128)
+        );
+        let suffix = concat!(
+            "{\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",",
+            "\"info\":{\"total_token_usage\":{\"total_tokens\":321}}}}\n"
+        );
+        let mut bytes = prefix.as_bytes().to_vec();
+        bytes.extend_from_slice(oversized.as_bytes());
+        bytes.extend_from_slice(&[b'{', 0xff, b'}', b'\n']);
+        bytes.extend_from_slice(suffix.as_bytes());
+        fs::write(&recoverable, bytes).unwrap();
+        let rollout = read_thread_rollout_path(&root, &recoverable)
+            .expect("oversized/invalid-UTF8 records are isolated by the production reader");
+        assert!(rollout.is_running());
+        assert_eq!(rollout.total_tokens(), Some(321));
+
+        let malformed = root.join("malformed.jsonl");
+        fs::write(
+            &malformed,
+            concat!(
+                "{\"type\":\"thread_context\",\"model\":\"gpt-5.6-sol\"}\n",
+                "{not-json}\n",
+                "{\"type\":\"task_started\"}\n"
+            ),
+        )
+        .unwrap();
+        assert!(read_thread_rollout_path(&root, &malformed).is_err());
+
+        let known_event_error = root.join("known-event-error.jsonl");
+        fs::write(
+            &known_event_error,
+            concat!(
+                "{\"type\":\"thread_context\",\"model\":\"gpt-5.6-sol\"}\n",
+                "{\"type\":\"event_msg\",\"payload\":{}}\n"
+            ),
+        )
+        .unwrap();
+        assert!(read_thread_rollout_path(&root, &known_event_error).is_err());
+
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&malformed, root.join("symlink.jsonl")).unwrap();
+            assert!(read_thread_rollout_path(&root, &root.join("symlink.jsonl")).is_err());
+        }
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn rpc_request_enforces_mismatch_timeout_and_error_redaction() {
         let (tx, rx) = mpsc::channel();
         for _ in 0..super::security::MAX_RPC_IGNORED_MESSAGES {
@@ -9071,6 +10550,37 @@ mod tests {
             automatic_refresh_interval(true, true),
             Duration::from_secs(60)
         );
+    }
+
+    #[test]
+    fn transient_account_worker_failure_still_admits_the_next_periodic_read() {
+        let mut state = CodexInfoState::preview("normal");
+        state.checking = true;
+        state.authenticated = true;
+        state.last_poll = Instant::now() - Duration::from_secs(61);
+
+        // A failed worker is a publication error, not a permanent polling
+        // disable. It clears the in-flight marker while retaining last-good
+        // quota/history state.
+        state.apply_account_error("transient worker failure".into());
+        assert!(!state.checking);
+        assert!(account_refresh_due(
+            Instant::now(),
+            state.last_poll,
+            state.checking,
+            state.authenticated,
+            state.auth_polling,
+        ));
+
+        // The timer owns one read at a time; once a read is in flight it must
+        // not schedule a second request until the worker reports or fails.
+        assert!(!account_refresh_due(
+            Instant::now(),
+            state.last_poll,
+            true,
+            state.authenticated,
+            state.auth_polling,
+        ));
     }
 
     #[test]
@@ -9985,6 +11495,166 @@ mod tests {
     }
 
     #[test]
+    fn oversized_tool_records_do_not_hide_following_usage_samples() {
+        let path = std::env::temp_dir().join(format!(
+            "codex-info-oversized-session-{}.jsonl",
+            std::process::id()
+        ));
+        let context = json!({
+            "timestamp": "2026-08-11T10:00:00Z",
+            "type": "turn_context",
+            "model": "gpt-5.6-luna"
+        });
+        let token_count = json!({
+            "timestamp": "2026-08-11T10:00:02Z",
+            "type": "event_msg",
+            "payload": {"type": "token_count", "info": {"total_token_usage": {
+                "total_tokens": 120, "input_tokens": 100,
+                "cached_input_tokens": 80, "output_tokens": 20
+            }}}
+        });
+        let oversized = format!(
+            "{{\"type\":\"response_item\",\"payload\":\"{}\"}}",
+            "x".repeat(security::MAX_JSONL_LINE_BYTES + 128)
+        );
+        fs::write(
+            &path,
+            format!(
+                "{}\n{}\n{}\n",
+                serde_json::to_string(&context).unwrap(),
+                oversized,
+                serde_json::to_string(&token_count).unwrap()
+            ),
+        )
+        .unwrap();
+        let mut totals = ModelUsageTotals::default();
+        collect_session_file(&path, &mut totals, 0).unwrap();
+        assert_eq!(totals.luna.tokens, 120);
+        assert_eq!(totals.luna.output_tokens, 20);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn malformed_tool_records_do_not_hide_following_usage_samples() {
+        let path = std::env::temp_dir().join(format!(
+            "codex-info-malformed-session-{}.jsonl",
+            std::process::id()
+        ));
+        let context = json!({
+            "timestamp": "2026-08-11T10:00:00Z",
+            "type": "turn_context",
+            "model": "gpt-5.6-luna"
+        });
+        let token_count = json!({
+            "timestamp": "2026-08-11T10:00:02Z",
+            "type": "event_msg",
+            "payload": {"type": "token_count", "info": {"total_token_usage": {
+                "total_tokens": 120, "input_tokens": 100,
+                "cached_input_tokens": 80, "output_tokens": 20
+            }}}
+        });
+        fs::write(
+            &path,
+            format!(
+                "{}\n{{\"type\":\"response_item\",\"payload\":\n{}\n",
+                serde_json::to_string(&context).unwrap(),
+                serde_json::to_string(&token_count).unwrap()
+            ),
+        )
+        .unwrap();
+        let mut totals = ModelUsageTotals::default();
+        collect_session_file(&path, &mut totals, 0).unwrap();
+        assert_eq!(totals.luna.tokens, 120);
+        assert_eq!(totals.luna.output_tokens, 20);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn unterminated_session_record_rolls_back_the_whole_local_input() {
+        let path = std::env::temp_dir().join(format!(
+            "codex-info-unterminated-session-{}.jsonl",
+            std::process::id()
+        ));
+        let valid = json!({
+            "timestamp": "2026-08-11T10:00:00Z",
+            "type": "event_msg",
+            "payload": {"type": "token_count", "info": {"total_token_usage": {
+                "total_tokens": 120, "input_tokens": 100,
+                "cached_input_tokens": 80, "output_tokens": 20
+            }}}
+        });
+        let mut bytes = serde_json::to_vec(&valid).unwrap();
+        bytes.extend_from_slice(b"\n{\xff");
+        fs::write(&path, bytes).unwrap();
+        let mut totals = ModelUsageTotals::default();
+        totals.luna.tokens = 7;
+        let before = totals.clone();
+        let error = collect_session_file(&path, &mut totals, 0)
+            .expect_err("EOF-incomplete local record must fail closed");
+        assert_eq!(error.kind(), security::SecurityErrorKind::Unterminated);
+        assert_eq!(totals.luna.tokens, before.luna.tokens);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn valid_json_unterminated_session_record_rolls_back_the_whole_local_input() {
+        let path = std::env::temp_dir().join(format!(
+            "codex-info-valid-unterminated-session-{}.jsonl",
+            std::process::id()
+        ));
+        let valid = json!({
+            "timestamp": "2026-08-11T10:00:00Z",
+            "type": "event_msg",
+            "payload": {"type": "token_count", "info": {"total_token_usage": {
+                "total_tokens": 120, "input_tokens": 100,
+                "cached_input_tokens": 80, "output_tokens": 20
+            }}}
+        });
+        let mut bytes = serde_json::to_vec(&valid).unwrap();
+        bytes.extend_from_slice(b"\n{}");
+        fs::write(&path, bytes).unwrap();
+        let mut totals = ModelUsageTotals::default();
+        totals.luna.tokens = 7;
+        let before = totals.clone();
+        let error = collect_session_file(&path, &mut totals, 0)
+            .expect_err("valid EOF-incomplete local record must fail closed");
+        assert_eq!(error.kind(), security::SecurityErrorKind::Unterminated);
+        assert_eq!(totals.luna.tokens, before.luna.tokens);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn oversized_unterminated_session_record_rolls_back_the_whole_local_input() {
+        let path = std::env::temp_dir().join(format!(
+            "codex-info-oversized-unterminated-session-{}.jsonl",
+            std::process::id()
+        ));
+        let prefix = json!({
+            "timestamp": "2026-08-11T10:00:00Z",
+            "type": "event_msg",
+            "payload": {"type": "token_count", "info": {"total_token_usage": {
+                "total_tokens": 120, "input_tokens": 100,
+                "cached_input_tokens": 80, "output_tokens": 20
+            }}}
+        });
+        let mut bytes = serde_json::to_vec(&prefix).unwrap();
+        bytes.extend_from_slice(b"\n");
+        bytes.extend(std::iter::repeat_n(
+            b'x',
+            security::MAX_JSONL_LINE_BYTES + 1,
+        ));
+        fs::write(&path, bytes).unwrap();
+        let mut totals = ModelUsageTotals::default();
+        totals.luna.tokens = 7;
+        let before = totals.clone();
+        let error = collect_session_file(&path, &mut totals, 0)
+            .expect_err("oversized EOF-incomplete local record must fail closed");
+        assert_eq!(error.kind(), security::SecurityErrorKind::Unterminated);
+        assert_eq!(totals.luna.tokens, before.luna.tokens);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
     fn session_collector_counts_sol_when_model_context_is_nested() {
         let path = std::env::temp_dir().join(format!(
             "codex-info-sol-session-{}.jsonl",
@@ -10019,7 +11689,8 @@ mod tests {
                 .iter()
                 .map(|line| serde_json::to_string(line).unwrap())
                 .collect::<Vec<_>>()
-                .join("\n"),
+                .join("\n")
+                + "\n",
         )
         .unwrap();
         let mut totals = ModelUsageTotals::default();
@@ -10083,7 +11754,8 @@ mod tests {
                 .iter()
                 .map(|line| serde_json::to_string(line).unwrap())
                 .collect::<Vec<_>>()
-                .join("\n"),
+                .join("\n")
+                + "\n",
         )
         .unwrap();
         let mut totals = ModelUsageTotals::default();
@@ -10285,7 +11957,7 @@ mod tests {
             .unwrap();
         drop(store);
 
-        let mut history = UsageHistory::load_from_db_path(Some(db_path.clone()));
+        let mut history = UsageHistory::load_from_db_path_at(Some(db_path.clone()), now);
         history.startup_maintenance(now);
 
         assert_eq!(
@@ -10294,7 +11966,7 @@ mod tests {
                 .iter()
                 .map(|sample| sample.timestamp)
                 .collect::<Vec<_>>(),
-            vec![cutoff]
+            Vec::<i64>::new()
         );
         let persisted = UsageStore::open(&db_path).unwrap().load_all().unwrap();
         assert_eq!(persisted.len(), 1);
@@ -10353,7 +12025,8 @@ mod tests {
             .iter()
             .map(ToString::to_string)
             .collect::<Vec<_>>()
-            .join("\n");
+            .join("\n")
+            + "\n";
         fs::write(&path, contents).unwrap();
         path
     }
@@ -10520,7 +12193,7 @@ mod tests {
             .unwrap();
         drop(store);
 
-        let mut history = UsageHistory::load_from_db_path(Some(db_path.clone()));
+        let mut history = UsageHistory::load_from_db_path_at(Some(db_path.clone()), now);
         history.startup_maintenance(now);
         assert_eq!(
             history
@@ -10528,11 +12201,11 @@ mod tests {
                 .iter()
                 .map(|sample| sample.timestamp)
                 .collect::<Vec<_>>(),
-            vec![cutoff, now.timestamp()]
+            vec![now.timestamp()]
         );
         let periods = history.periods(now.timestamp(), Some(now.timestamp() + 30_000));
-        assert_eq!(periods.len(), 2);
-        assert_eq!(history.period_options(now.timestamp(), None).len(), 2);
+        assert_eq!(periods.len(), 1);
+        assert_eq!(history.period_options(now.timestamp(), None).len(), 1);
         for period in periods {
             assert_eq!(
                 history.period_id_for_label(
@@ -10576,7 +12249,8 @@ mod tests {
         store.upsert_sample(&sqlite_sample.to_store()).unwrap();
         drop(store);
 
-        let mut history = UsageHistory::load_from_db_path(Some(db_path.clone()));
+        let load_at = chrono::DateTime::<Utc>::from_timestamp(1_700_000_180, 0).unwrap();
+        let mut history = UsageHistory::load_from_db_path_at(Some(db_path.clone()), load_at);
         assert_eq!(history.samples, vec![sqlite_sample]);
         history.record(UsageHistorySample::new(
             1_700_000_180,
@@ -10605,7 +12279,8 @@ mod tests {
             )
             .unwrap();
         drop(store);
-        let history = UsageHistory::load_from_db_path(Some(db_path.clone()));
+        let load_at = chrono::DateTime::<Utc>::from_timestamp(100, 0).unwrap();
+        let history = UsageHistory::load_from_db_path_at(Some(db_path.clone()), load_at);
 
         let periods = history.periods(2_000, None);
         assert_eq!(
@@ -10682,7 +12357,8 @@ mod tests {
             .unwrap();
         drop(store);
 
-        let history = UsageHistory::load_from_db_path(Some(db_path.clone()));
+        let load_at = chrono::DateTime::<Utc>::from_timestamp(real_singleton_timestamp, 0).unwrap();
+        let history = UsageHistory::load_from_db_path_at(Some(db_path.clone()), load_at);
         let period_ids = history
             .periods(base + 300, None)
             .into_iter()
@@ -11147,54 +12823,64 @@ mod tests {
                 (60, 90.0),
                 (120, 85.0),
                 (180, 80.0),
-                (240, 70.0)
+                (240, 80.0)
             ]
         );
         assert_eq!(
             graph_paths(&references, 0, 240).remaining,
-            "M0.00 1.00 L25.00 10.80 L50.00 15.70 L75.00 20.60 L100.00 30.40"
+            "M0.00 1.00 L25.00 10.80 L50.00 15.70 L75.00 20.60 L100.00 20.60"
         );
     }
 
     #[test]
-    fn remaining_graph_terminal_extrapolation_never_goes_below_zero() {
+    fn remaining_graph_token_mode_keeps_the_latest_terminal_observation() {
         let samples = [
-            UsageHistorySample::new(0, 1_000, 100.0, ModelDollarTotals::default()),
-            UsageHistorySample::new(
+            UsageHistorySample::new_with_usage(
+                0,
+                1_000,
+                100.0,
+                ModelDollarTotals::default(),
+                ModelTokenTotals::default(),
+            ),
+            UsageHistorySample::new_with_usage(
                 60,
                 1_000,
-                10.0,
-                ModelDollarTotals {
-                    sol: 1.0,
-                    ..ModelDollarTotals::default()
+                99.0,
+                ModelDollarTotals::default(),
+                ModelTokenTotals {
+                    luna: 1,
+                    ..ModelTokenTotals::default()
                 },
             ),
-            UsageHistorySample::new(
+            UsageHistorySample::new_with_usage(
                 120,
                 1_000,
-                0.0,
-                ModelDollarTotals {
-                    sol: 2.0,
-                    ..ModelDollarTotals::default()
+                99.0,
+                ModelDollarTotals::default(),
+                ModelTokenTotals {
+                    luna: 2,
+                    ..ModelTokenTotals::default()
                 },
             ),
-            // An active terminal plateau would extrapolate below zero without
-            // the quota floor. Zero is the lower bound even while usage moves.
-            UsageHistorySample::new(
+            UsageHistorySample::new_with_usage(
                 180,
                 1_000,
-                0.0,
-                ModelDollarTotals {
-                    sol: 3.0,
-                    ..ModelDollarTotals::default()
+                99.0,
+                ModelDollarTotals::default(),
+                ModelTokenTotals {
+                    luna: 3,
+                    ..ModelTokenTotals::default()
                 },
             ),
         ];
         let references = samples.iter().collect::<Vec<_>>();
 
-        let points = remaining_graph_points(&references, 0, 180);
-        assert!(points.iter().all(|(_, value)| *value >= 0.0));
-        assert_eq!(points.last(), Some(&(180, 0.0)));
+        let points = remaining_graph_points_for_metric(&references, 0, 180, true);
+        assert_eq!(points.last(), Some(&(180, 99.0)));
+        assert!(points.iter().all(|(_, remaining)| *remaining >= 99.0));
+        let graph = graph_paths_for_selection(&references, 0, 180, true, true, true, true);
+        assert_eq!(graph.current_remaining_label, "99%");
+        assert!(graph.remaining.ends_with("L100.00 1.98"));
     }
 
     #[test]

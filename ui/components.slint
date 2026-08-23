@@ -426,7 +426,6 @@ export component RemainingQuota inherits Rectangle {
     in property <float> remaining-percent;
     in property <bool> has-quota-percent: true;
     height: 96px;
-    border-radius: DesignTokens.radius-surface;
     background: DesignTokens.raised;
 
     Text {
@@ -470,30 +469,33 @@ export component RemainingQuota inherits Rectangle {
         y: 81px;
         width: parent.width - 40px;
         height: 8px;
-        border-radius: 5px;
+        // Avoid a rounded clip here. Slint's X11 software renderer leaks this
+        // specific dynamic full-width clip into later rows at 100%. The fill
+        // stays a simple left-to-right bar in every boundary state.
         background: DesignTokens.accent-muted;
-        clip: true;
-        Rectangle {
-            x: 0px;
-            width: parent.width * min(100, max(0, root.remaining-percent)) / 100;
-            height: parent.height;
-            border-radius: 5px;
-            background: DesignTokens.accent-primary;
-        }
+    }
+    if root.has-quota-percent && root.remaining-percent > 0 : Rectangle {
+        x: 20px;
+        y: 81px;
+        // Keep the software renderer away from its exact parent-width clip
+        // edge. 0.01px is sub-pixel at the supported scale and renders as a
+        // visually full 100% bar without corrupting subsequent rows.
+        width: min(
+            parent.width - 40.01px,
+            (parent.width - 40px) * min(100, max(0, root.remaining-percent)) / 100
+        );
+        height: 8px;
+        background: DesignTokens.accent-primary;
     }
 }
 
 component DaySegment inherits Rectangle {
     in property <float> fill;
-    border-radius: DesignTokens.radius-control;
     background: DesignTokens.accent-muted;
-    clip: true;
-    Rectangle {
-        x: 0px;
-        width: parent.width * min(1, max(0, root.fill));
-        height: parent.height;
-        background: DesignTokens.accent-primary;
-    }
+}
+
+component DayFill inherits Rectangle {
+    background: DesignTokens.accent-primary;
 }
 
 component ActionButton inherits Rectangle {
@@ -552,8 +554,8 @@ component ActionButton inherits Rectangle {
 export component WeekGauge inherits Rectangle {
     in property <float> remaining-days;
     in property <string> remaining-label;
+    property <length> segment-width: (root.width - 64px) / 7;
     height: 56px;
-    border-radius: DesignTokens.radius-surface;
     background: DesignTokens.raised;
 
     Text {
@@ -617,6 +619,13 @@ export component WeekGauge inherits Rectangle {
         height: 20px;
         fill: root.remaining-days - 6;
     }
+    if root.remaining-days > 0 : DayFill { x: 20px; y: 29px; width: min(root.segment-width - 1px, root.segment-width * min(1, root.remaining-days)); height: 20px; }
+    if root.remaining-days - 1 > 0 : DayFill { x: 20px + root.segment-width + 4px; y: 29px; width: min(root.segment-width - 1px, root.segment-width * min(1, root.remaining-days - 1)); height: 20px; }
+    if root.remaining-days - 2 > 0 : DayFill { x: 20px + 2 * (root.segment-width + 4px); y: 29px; width: min(root.segment-width - 1px, root.segment-width * min(1, root.remaining-days - 2)); height: 20px; }
+    if root.remaining-days - 3 > 0 : DayFill { x: 20px + 3 * (root.segment-width + 4px); y: 29px; width: min(root.segment-width - 1px, root.segment-width * min(1, root.remaining-days - 3)); height: 20px; }
+    if root.remaining-days - 4 > 0 : DayFill { x: 20px + 4 * (root.segment-width + 4px); y: 29px; width: min(root.segment-width - 1px, root.segment-width * min(1, root.remaining-days - 4)); height: 20px; }
+    if root.remaining-days - 5 > 0 : DayFill { x: 20px + 5 * (root.segment-width + 4px); y: 29px; width: min(root.segment-width - 1px, root.segment-width * min(1, root.remaining-days - 5)); height: 20px; }
+    if root.remaining-days - 6 > 0 : DayFill { x: 20px + 6 * (root.segment-width + 4px); y: 29px; width: min(root.segment-width - 1px, root.segment-width * min(1, root.remaining-days - 6)); height: 20px; }
 }
 
 component ThreadModelStat inherits Rectangle {
@@ -1474,7 +1483,6 @@ export component StatusBanner inherits Rectangle {
         y: 14px;
         width: 7px;
         height: 7px;
-        border-radius: 4px;
         background: level == "error" ? DesignTokens.danger :
             level == "warning" ? DesignTokens.warning : DesignTokens.success;
     }

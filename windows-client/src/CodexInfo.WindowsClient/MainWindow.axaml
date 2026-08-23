@@ -1,0 +1,429 @@
+<!-- Copyright (C) 2026 salty919 -->
+<!-- SPDX-License-Identifier: GPL-3.0-only -->
+<Window xmlns="https://github.com/avaloniaui"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:vm="using:CodexInfo.WindowsClient.ViewModels"
+        x:Class="CodexInfo.WindowsClient.MainWindow"
+        x:DataType="vm:MainWindowViewModel"
+        Width="900"
+        Height="480"
+        MinWidth="900"
+        MinHeight="480"
+        MaxWidth="900"
+        MaxHeight="480"
+        WindowStartupLocation="CenterScreen"
+        CanResize="False"
+        WindowDecorations="None"
+        ExtendClientAreaToDecorationsHint="True"
+        ExtendClientAreaTitleBarHeightHint="0"
+        Title="Codex Info Monitor"
+        FontFamily="{StaticResource JapaneseFont}"
+        Background="#0E141E"
+        Foreground="#E9EFF8">
+  <Window.Styles>
+    <!-- Main uses a single compact surface per component.  The fixed rows
+         below are the viewport contract; no component relies on a hidden
+         overflow path. -->
+    <Style Selector="Border.section">
+      <Setter Property="Background" Value="#151F2D" />
+      <Setter Property="BorderBrush" Value="#263548" />
+      <Setter Property="BorderThickness" Value="1" />
+      <Setter Property="CornerRadius" Value="8" />
+    </Style>
+    <Style Selector="TextBlock.label">
+      <Setter Property="FontSize" Value="12" />
+      <Setter Property="Foreground" Value="#A8B7CA" />
+    </Style>
+    <Style Selector="TextBlock.value">
+      <Setter Property="FontSize" Value="15" />
+      <Setter Property="Foreground" Value="#F2F6FC" />
+      <Setter Property="TextWrapping" Value="NoWrap" />
+    </Style>
+    <Style Selector="TextBlock.metric-label">
+      <Setter Property="FontSize" Value="11" />
+      <Setter Property="Foreground" Value="#A8B7CA" />
+      <Setter Property="TextWrapping" Value="NoWrap" />
+    </Style>
+    <Style Selector="TextBlock.metric-value">
+      <Setter Property="FontSize" Value="13" />
+      <Setter Property="Foreground" Value="#F2F6FC" />
+      <Setter Property="HorizontalAlignment" Value="Right" />
+      <Setter Property="TextWrapping" Value="NoWrap" />
+    </Style>
+    <Style Selector="Button.refresh">
+      <Setter Property="Padding" Value="8,4" />
+      <Setter Property="MinWidth" Value="64" />
+      <Setter Property="FontSize" Value="12" />
+      <Setter Property="HorizontalContentAlignment" Value="Center" />
+      <Setter Property="VerticalContentAlignment" Value="Center" />
+      <Setter Property="Background" Value="#294968" />
+      <Setter Property="BorderBrush" Value="#47769F" />
+      <Setter Property="Foreground" Value="#F2F6FC" />
+    </Style>
+    <Style Selector="Button.refresh:pointerover">
+      <Setter Property="Background" Value="#356087" />
+    </Style>
+    <Style Selector="Button.refresh:disabled">
+      <Setter Property="Background" Value="#1D2A38" />
+      <Setter Property="BorderBrush" Value="#2A3A4B" />
+      <Setter Property="Foreground" Value="#8EA1B5" />
+    </Style>
+    <Style Selector="Button.command">
+      <Setter Property="Padding" Value="8,5" />
+      <Setter Property="MinWidth" Value="70" />
+      <Setter Property="FontSize" Value="12" />
+      <Setter Property="HorizontalContentAlignment" Value="Center" />
+      <Setter Property="VerticalContentAlignment" Value="Center" />
+      <Setter Property="Background" Value="#18283A" />
+      <Setter Property="BorderBrush" Value="#304A63" />
+      <Setter Property="Foreground" Value="#EAF2FB" />
+    </Style>
+    <Style Selector="Button.command:pointerover">
+      <Setter Property="Background" Value="#24415E" />
+      <Setter Property="BorderBrush" Value="#5EA7E5" />
+    </Style>
+    <!-- WeekGauge cells use a fixed two-surface template instead of a themed
+         progress control.  This keeps the gauge free of hover, animation, and
+         indeterminate layers. -->
+    <Style Selector="Border.quota-segment">
+      <Setter Property="Background" Value="#326799" />
+      <Setter Property="Height" Value="12" />
+      <Setter Property="Margin" Value="0,0,4,0" />
+    </Style>
+    <Style Selector="Border.app-mark">
+      <Setter Property="Width" Value="36" />
+      <Setter Property="Height" Value="36" />
+      <Setter Property="CornerRadius" Value="10" />
+      <Setter Property="Background" Value="#1C5D91" />
+      <Setter Property="BorderBrush" Value="#5EA7E5" />
+      <Setter Property="BorderThickness" Value="1" />
+    </Style>
+    <Style Selector="Button.window-control">
+      <Setter Property="Width" Value="30" />
+      <Setter Property="Height" Value="28" />
+      <Setter Property="Padding" Value="0" />
+      <Setter Property="FontSize" Value="16" />
+      <Setter Property="Background" Value="Transparent" />
+      <Setter Property="BorderBrush" Value="Transparent" />
+      <Setter Property="Foreground" Value="#A8B7CA" />
+    </Style>
+    <Style Selector="Button.window-control:pointerover">
+      <Setter Property="Background" Value="#263548" />
+      <Setter Property="Foreground" Value="#F2F6FC" />
+    </Style>
+  </Window.Styles>
+
+  <!-- The six rows keep the complete overview on one surface without
+       compressing labels or table rows below the product typography scale. -->
+  <Grid Margin="22,14"
+        RowDefinitions="52,82,62,56,118,42"
+        RowSpacing="8">
+    <!-- Header owns the application heading, endpoint, and navigation. -->
+    <Grid Grid.Row="0"
+          ColumnDefinitions="210,*"
+          ColumnSpacing="10"
+          Panel.ZIndex="10"
+          Background="Transparent"
+          PointerPressed="OnTitlePointerPressed">
+      <StackPanel Orientation="Horizontal" Spacing="10" VerticalAlignment="Center">
+        <Border Classes="app-mark">
+          <TextBlock FontSize="20"
+                     Foreground="#F2F6FC"
+                     HorizontalAlignment="Center"
+                     VerticalAlignment="Center"
+                     Text="◈" />
+        </Border>
+        <StackPanel VerticalAlignment="Center">
+          <TextBlock FontSize="22"
+                     FontWeight="SemiBold"
+                     Foreground="#E9EFF8"
+                     Text="{Binding Texts.UsageStatus}" />
+        </StackPanel>
+      </StackPanel>
+      <StackPanel Grid.Column="1"
+                  Orientation="Horizontal"
+                  Spacing="4"
+                  HorizontalAlignment="Right"
+                  VerticalAlignment="Center">
+        <Button Classes="command"
+                IsVisible="{Binding IsAuthenticated}"
+                Click="OnOpenGraph"
+                AutomationProperties.Name="{Binding Texts.Graph}"
+                AutomationProperties.AutomationId="Main.OpenGraph"
+                ToolTip.Tip="{Binding Texts.Graph}">
+          <StackPanel Orientation="Horizontal" Spacing="4"><TextBlock Text="▥" /><TextBlock Text="{Binding Texts.Graph}" /></StackPanel>
+        </Button>
+        <Button Classes="command"
+                IsVisible="{Binding IsAuthenticated}"
+                Click="OnOpenThreads"
+                AutomationProperties.Name="{Binding Texts.Threads}"
+                AutomationProperties.AutomationId="Main.OpenThreads"
+                ToolTip.Tip="{Binding Texts.Threads}">
+          <StackPanel Orientation="Horizontal" Spacing="4"><TextBlock Text="☷" /><TextBlock Text="{Binding Texts.Threads}" /></StackPanel>
+        </Button>
+        <Button Classes="command"
+                Click="OnOpenLegal"
+                AutomationProperties.Name="{Binding Texts.Legal}"
+                AutomationProperties.AutomationId="Main.OpenLegal"
+                ToolTip.Tip="{Binding Texts.Legal}">
+          <StackPanel Orientation="Horizontal" Spacing="4"><TextBlock Text="ⓘ" /><TextBlock Text="{Binding Texts.Legal}" /></StackPanel>
+        </Button>
+        <Button Classes="command"
+                Click="OnOpenSettings"
+                AutomationProperties.Name="{Binding Texts.Settings}"
+                AutomationProperties.AutomationId="Main.OpenSettings"
+                ToolTip.Tip="{Binding Texts.Settings}">
+          <StackPanel Orientation="Horizontal" Spacing="4"><TextBlock Text="⚙" /><TextBlock Text="{Binding Texts.Settings}" /></StackPanel>
+        </Button>
+        <Button Classes="window-control"
+                Click="OnMinimizeWindow"
+                AutomationProperties.Name="{Binding Texts.Minimize}"
+                Content="—"
+                ToolTip.Tip="{Binding Texts.Minimize}" />
+        <Button Classes="window-control"
+                Click="OnCloseWindow"
+                AutomationProperties.Name="{Binding Texts.Close}"
+                Content="×"
+                ToolTip.Tip="{Binding Texts.Close}" />
+      </StackPanel>
+    </Grid>
+
+    <!-- RemainingQuota owns the current percentage and the current-period
+         local cost estimate.  The bar is absent until a quota is validated. -->
+    <Border Grid.Row="1" Classes="section" Padding="14,6" IsVisible="{Binding IsAuthenticated}">
+      <Grid ColumnDefinitions="*,210" ColumnSpacing="14">
+        <StackPanel Spacing="2" VerticalAlignment="Center">
+          <TextBlock Classes="label" Text="{Binding Texts.RemainingQuota}" />
+          <TextBlock FontSize="36"
+                     FontWeight="SemiBold"
+                     Foreground="#F2F6FC"
+                     Text="{Binding RemainingPercentText}"
+                     TextWrapping="NoWrap" />
+          <ProgressBar Minimum="0"
+                       Maximum="100"
+                       Value="{Binding RemainingPercentValue}"
+                       Height="6"
+                       IsVisible="{Binding HasQuota}" />
+        </StackPanel>
+        <StackPanel Grid.Column="1" HorizontalAlignment="Right" VerticalAlignment="Center">
+          <TextBlock FontSize="20"
+                     Foreground="#E6B85C"
+                     HorizontalAlignment="Right"
+                     Text="{Binding EstimatedCostText}"
+                     TextWrapping="NoWrap" />
+        </StackPanel>
+      </Grid>
+    </Border>
+
+    <!-- WeekGauge owns the seven-cell weekly/monthly period gauge, the
+         remaining countdown, and the exact reset/observation timestamps. -->
+    <Border Grid.Row="2" Classes="section" Padding="12,6" IsVisible="{Binding IsAuthenticated}">
+      <Grid RowDefinitions="24,20" RowSpacing="4">
+        <Grid ColumnDefinitions="Auto,*,Auto" ColumnSpacing="10">
+          <TextBlock Classes="label"
+                     VerticalAlignment="Center"
+                     Text="{Binding QuotaWindowText}"
+                     TextWrapping="NoWrap" />
+          <ItemsControl Grid.Column="1"
+                        VerticalAlignment="Center"
+                        ItemsSource="{Binding QuotaSegments}"
+                        IsVisible="{Binding HasQuota}"
+                        AutomationProperties.AutomationId="Main.QuotaPeriodGauge"
+                        AutomationProperties.Name="{Binding QuotaWindowText}"
+                        AutomationProperties.HelpText="{Binding QuotaRemainingText}">
+            <ItemsControl.ItemsPanel>
+              <ItemsPanelTemplate>
+                <UniformGrid Rows="1" Columns="7" />
+              </ItemsPanelTemplate>
+            </ItemsControl.ItemsPanel>
+            <ItemsControl.ItemTemplate>
+              <DataTemplate x:DataType="vm:QuotaSegmentViewModel">
+                <Border x:Name="QuotaSegmentCell" Classes="quota-segment" ClipToBounds="True">
+                  <Border Background="#56B2F5"
+                          HorizontalAlignment="Stretch"
+                          VerticalAlignment="Stretch"
+                          RenderTransformOrigin="0%,50%">
+                    <Border.RenderTransform>
+                      <ScaleTransform x:CompileBindings="False"
+                                      ScaleX="{Binding DataContext.Fill, ElementName=QuotaSegmentCell}" />
+                    </Border.RenderTransform>
+                  </Border>
+                </Border>
+              </DataTemplate>
+            </ItemsControl.ItemTemplate>
+          </ItemsControl>
+          <TextBlock Grid.Column="2"
+                     Classes="value"
+                     FontSize="13"
+                     HorizontalAlignment="Right"
+                     VerticalAlignment="Center"
+                     Text="{Binding QuotaRemainingText}"
+                     TextWrapping="NoWrap" />
+        </Grid>
+        <Grid Grid.Row="1" ColumnDefinitions="Auto,Auto,Auto,Auto" ColumnSpacing="8">
+          <TextBlock Classes="metric-label" VerticalAlignment="Center" Text="{Binding Texts.ResetTime}" />
+          <TextBlock Grid.Column="1" Classes="metric-value" VerticalAlignment="Center" Text="{Binding ResetAtText}" />
+          <TextBlock Grid.Column="2" Classes="metric-label" Margin="12,0,0,0" VerticalAlignment="Center" Text="{Binding Texts.ObservedAt}" />
+          <TextBlock Grid.Column="3" Classes="metric-value" VerticalAlignment="Center" Text="{Binding ObservedAtText}" />
+        </Grid>
+      </Grid>
+    </Border>
+
+    <!-- AccountActivity owns only live activity: total count, model
+         classification counts, and the one Details entry point. -->
+    <Border Grid.Row="3" Classes="section" Padding="12,5" IsVisible="{Binding IsAuthenticated}">
+      <Grid ColumnDefinitions="180,*,68" ColumnSpacing="8">
+        <StackPanel Spacing="1" VerticalAlignment="Center">
+          <TextBlock Classes="metric-label" Text="{Binding Texts.RunningThreads}" />
+          <TextBlock FontSize="22"
+                     FontWeight="SemiBold"
+                     IsVisible="{Binding HasActiveThreads}"
+                     Text="{Binding ActiveThreadCountLabel}"
+                     TextWrapping="NoWrap" />
+          <TextBlock Classes="label"
+                     IsVisible="{Binding HasNoActiveThreads}"
+                     Text="{Binding Texts.NoRunningThreads}"
+                     TextWrapping="NoWrap" />
+        </StackPanel>
+        <UniformGrid Grid.Column="1" Columns="4" HorizontalAlignment="Stretch" VerticalAlignment="Center" IsVisible="{Binding HasActiveThreads}">
+          <StackPanel Spacing="1" HorizontalAlignment="Center">
+            <TextBlock Classes="metric-label" Foreground="#B79BFF" HorizontalAlignment="Center" Text="SOL" />
+            <TextBlock Classes="metric-value" Foreground="#B79BFF" HorizontalAlignment="Center" Text="{Binding ActiveSolCount}" />
+          </StackPanel>
+          <StackPanel Spacing="1" HorizontalAlignment="Center">
+            <TextBlock Classes="metric-label" Foreground="#71D39A" HorizontalAlignment="Center" Text="TERRA" />
+            <TextBlock Classes="metric-value" Foreground="#71D39A" HorizontalAlignment="Center" Text="{Binding ActiveTerraCount}" />
+          </StackPanel>
+          <StackPanel Spacing="1" HorizontalAlignment="Center">
+            <TextBlock Classes="metric-label" Foreground="#F1B35A" HorizontalAlignment="Center" Text="LUNA" />
+            <TextBlock Classes="metric-value" Foreground="#F1B35A" HorizontalAlignment="Center" Text="{Binding ActiveLunaCount}" />
+          </StackPanel>
+          <StackPanel Spacing="1" HorizontalAlignment="Center">
+            <TextBlock Classes="metric-label" HorizontalAlignment="Center" Text="{Binding Texts.Other}" />
+            <TextBlock Classes="metric-value" HorizontalAlignment="Center" Text="{Binding ActiveOtherCount}" />
+          </StackPanel>
+        </UniformGrid>
+        <Button Grid.Column="2"
+                Classes="refresh"
+                Width="68"
+                Height="30"
+                Padding="5,2"
+                Click="OnOpenThreads"
+                AutomationProperties.Name="{Binding Texts.Details}"
+                ToolTip.Tip="{Binding Texts.Details}"
+                Content="{Binding Texts.Details}" />
+      </Grid>
+    </Border>
+
+    <!-- ModelUsage is a compact table rather than one card per model.  The
+         fixed row budget displays the expected three model rows without a
+         nested scroll surface. -->
+    <Border Grid.Row="4" Classes="section" Padding="12,5" IsVisible="{Binding IsAuthenticated}">
+      <Grid RowDefinitions="22,20,*">
+        <Grid ColumnDefinitions="Auto,*,Auto" ColumnSpacing="10">
+          <TextBlock FontSize="17" FontWeight="SemiBold" Text="{Binding Texts.ModelUsage}" />
+          <TextBlock Grid.Column="1"
+                     Classes="metric-label"
+                     VerticalAlignment="Center"
+                     Text="{Binding Texts.ModelUsageDescription}"
+                     TextWrapping="NoWrap" />
+          <TextBlock Grid.Column="2"
+                     Classes="metric-label"
+                     HorizontalAlignment="Right"
+                     Text="{Binding DetailsStatusText}"
+                     TextWrapping="NoWrap" />
+        </Grid>
+        <Grid Grid.Row="1"
+              ColumnDefinitions="2.4*,*,*,*,*,*,*"
+              ColumnSpacing="6">
+          <TextBlock Classes="metric-label" VerticalAlignment="Center" Text="Model" />
+          <TextBlock Grid.Column="1" Grid.ColumnSpan="2" Classes="metric-label" HorizontalAlignment="Center" Text="{Binding Texts.Input}" />
+          <TextBlock Grid.Column="3" Grid.ColumnSpan="2" Classes="metric-label" HorizontalAlignment="Center" Text="{Binding Texts.CachedInput}" />
+          <TextBlock Grid.Column="5" Grid.ColumnSpan="2" Classes="metric-label" HorizontalAlignment="Center" Text="{Binding Texts.Output}" />
+        </Grid>
+        <TextBlock Grid.Row="2"
+                   Classes="label"
+                   VerticalAlignment="Center"
+                   IsVisible="{Binding HasNoModels}"
+                   Text="{Binding ModelUsageUnavailableText}" />
+        <ItemsControl Grid.Row="2"
+                      IsVisible="{Binding HasModels}"
+                      ItemsSource="{Binding Models}">
+          <ItemsControl.ItemsPanel>
+            <ItemsPanelTemplate>
+              <StackPanel Orientation="Vertical" />
+            </ItemsPanelTemplate>
+          </ItemsControl.ItemsPanel>
+          <ItemsControl.ItemTemplate>
+            <DataTemplate x:DataType="vm:ModelUsageViewModel">
+              <Grid Height="22"
+                    ColumnDefinitions="2.4*,*,*,*,*,*,*"
+                    ColumnSpacing="6">
+                <TextBlock FontSize="13" VerticalAlignment="Center" Text="{Binding Name}" TextWrapping="NoWrap" />
+                <TextBlock Grid.Column="1" Classes="metric-value" VerticalAlignment="Center" Text="{Binding InputTokensText}" />
+                <TextBlock Grid.Column="2" Classes="metric-value" Foreground="#B8C6D7" VerticalAlignment="Center" Text="{Binding InputDollarsText}" />
+                <TextBlock Grid.Column="3" Classes="metric-value" VerticalAlignment="Center" Text="{Binding CachedInputTokensText}" />
+                <TextBlock Grid.Column="4" Classes="metric-value" Foreground="#B8C6D7" VerticalAlignment="Center" Text="{Binding CachedInputDollarsText}" />
+                <TextBlock Grid.Column="5" Classes="metric-value" VerticalAlignment="Center" Text="{Binding OutputTokensText}" />
+                <TextBlock Grid.Column="6" Classes="metric-value" Foreground="#B8C6D7" VerticalAlignment="Center" Text="{Binding OutputDollarsText}" />
+              </Grid>
+            </DataTemplate>
+          </ItemsControl.ItemTemplate>
+        </ItemsControl>
+      </Grid>
+    </Border>
+
+    <!-- StatusBanner is the sole owner of refresh/backend state and stays in
+         the final viewport row.  Authentication recovery actions live here
+         as well, so a failed/auth-required state never hides its CTA. -->
+    <Border Grid.Row="5"
+            Background="{Binding StatusBackground}"
+            BorderBrush="{Binding StatusBorder}"
+            BorderThickness="1"
+            CornerRadius="8"
+            Padding="10,4">
+      <Grid ColumnDefinitions="Auto,*,Auto" ColumnSpacing="8">
+        <Border Width="8" Height="8" CornerRadius="4" Background="{Binding StatusAccent}" VerticalAlignment="Top" Margin="0,5,0,0" />
+        <StackPanel Grid.Column="1" Spacing="1" VerticalAlignment="Center">
+          <TextBlock FontSize="13" FontWeight="SemiBold" Text="{Binding StatusTitle}" TextWrapping="NoWrap" />
+          <TextBlock Classes="label" FontSize="11" Text="{Binding StatusDetail}" TextWrapping="NoWrap" />
+        </StackPanel>
+        <StackPanel Grid.Column="2" Orientation="Horizontal" Spacing="6" VerticalAlignment="Center" IsVisible="{Binding IsAuthRequired}">
+          <Button Classes="refresh"
+                  MinWidth="112"
+                  Height="28"
+                  Padding="6,2"
+                  IsVisible="{Binding IsAuthRequired}"
+                  Command="{Binding AuthCommand}"
+                  AutomationProperties.Name="{Binding Texts.AuthStart}"
+                  ToolTip.Tip="{Binding Texts.AuthStart}"
+                  Content="{Binding Texts.AuthStart}" />
+          <Button Classes="refresh"
+                  MinWidth="112"
+                  Height="28"
+                  Padding="6,2"
+                  IsVisible="{Binding IsAuthRequired}"
+                  Command="{Binding CheckAuthCommand}"
+                  AutomationProperties.Name="{Binding Texts.AuthCheck}"
+                  ToolTip.Tip="{Binding Texts.AuthCheck}"
+                  Content="{Binding Texts.AuthCheck}" />
+        </StackPanel>
+        <StackPanel Grid.Column="2" Orientation="Horizontal" Spacing="6" VerticalAlignment="Center" IsVisible="{Binding IsUpdateNotificationVisible}">
+          <TextBlock Classes="label" FontSize="11" VerticalAlignment="Center" Text="{Binding UpdateNotificationText}" TextWrapping="NoWrap" />
+          <Button Classes="refresh"
+                  MinWidth="92"
+                  Height="28"
+                  Padding="6,2"
+                  IsVisible="{Binding IsUpdateActionVisible}"
+                  Command="{Binding UpdateCommand}"
+                  AutomationProperties.Name="{Binding UpdateButtonText}"
+                  ToolTip.Tip="{Binding UpdateButtonText}"
+                  Content="{Binding UpdateButtonText}" />
+        </StackPanel>
+        <StackPanel Grid.Column="2" Spacing="1" VerticalAlignment="Center" IsVisible="{Binding ShowLastReceived}">
+          <TextBlock Classes="label" FontSize="11" HorizontalAlignment="Right" Text="{Binding LastReceivedText}" TextWrapping="NoWrap" />
+        </StackPanel>
+      </Grid>
+    </Border>
+  </Grid>
+</Window>

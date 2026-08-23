@@ -1,0 +1,33 @@
+<!-- Copyright (C) 2026 salty919 -->
+<!-- SPDX-License-Identifier: GPL-3.0-only -->
+<Application xmlns="https://github.com/avaloniaui"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             x:Class="CodexInfo.WindowsClient.App">
+  <Application.Styles>
+    <FluentTheme />
+    <!--
+      NotoSansJP.ttf is a variable font whose only face exposed by
+      Avalonia 12.1.1 is Thin.  Use the statically-instantiated Medium face
+      for inherited body/control text; per-control SemiBold/Bold declarations
+      remain the heading hierarchy.
+    -->
+    <Style Selector="Window">
+      <Setter Property="FontWeight" Value="Medium" />
+    </Style>
+    <Style Selector="Button:focus">
+      <Setter Property="BorderBrush" Value="#8BD4FF" />
+      <Setter Property="BorderThickness" Value="2" />
+    </Style>
+    <Style Selector="ComboBox:focus">
+      <Setter Property="BorderBrush" Value="#8BD4FF" />
+      <Setter Property="BorderThickness" Value="2" />
+    </Style>
+    <Style Selector="CheckBox:focus">
+      <Setter Property="BorderBrush" Value="#8BD4FF" />
+      <Setter Property="BorderThickness" Value="2" />
+    </Style>
+  </Application.Styles>
+  <Application.Resources>
+    <FontFamily x:Key="JapaneseFont">avares://CodexInfo.WindowsClient/Assets/#Noto Sans JP Medium</FontFamily>
+  </Application.Resources>
+</Application>

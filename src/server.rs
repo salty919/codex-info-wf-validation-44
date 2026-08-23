@@ -1,0 +1,1906 @@
+// Copyright (C) 2026 salty919
+// SPDX-License-Identifier: GPL-3.0-only
+
+//! Loopback-only, read-only REST API for an already running Codex Info UI.
+//!
+//! This module deliberately knows nothing about Slint, Codex app-server,
+//! SQLite, or local session files. The UI thread copies a whitelisted immutable
+//! snapshot into [`ApiSnapshotPublisher`]; HTTP handlers only read that copy.
+
+use crate::security;
+use serde::Serialize;
+use std::collections::HashSet;
+use std::env;
+use std::fmt;
+use std::io::{self, Read, Write};
+use std::net::{IpAddr, Shutdown, SocketAddr, TcpListener, TcpStream};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{mpsc, Arc, RwLock};
+use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
+use tokio::net::TcpListener as TokioTcpListener;
+use tokio::sync::oneshot;
+
+/// Environment variable that opt-ins to the local REST listener.
+pub const API_LISTEN_ENV: &str = "CODEX_INFO_API_LISTEN";
+pub const API_VERSION: &str = "v1";
+/// Maximum number of model rows accepted at the public boundary.
+pub const MAX_PUBLIC_MODELS: usize = 3;
+/// SQLite retains three calendar months, while one REST details snapshot is
+/// limited to one calendar month of minute buckets.
+pub const MAX_PUBLIC_HISTORY_PERIODS: usize = 128;
+pub const MAX_PUBLIC_HISTORY_SAMPLES: usize = 31 * 24 * 60;
+pub const MAX_PUBLIC_THREADS: usize = 256;
+const API_START_TIMEOUT: Duration = Duration::from_secs(1);
+const MAX_PUBLIC_UNIX_SECONDS: i64 = 253_402_300_799; // 9999-12-31T23:59:59Z
+const MAX_PUBLIC_ID_SCALARS: usize = 512;
+const MAX_PUBLIC_HISTORY_LABEL_SCALARS: usize = 512;
+
+// These limits are the finite wire boundary from docs/REST_API_V1.md. The
+// parser closes every connection after one request, so no unbounded body or
+// pipeline is ever handed to the snapshot handlers.
+const MAX_REQUEST_LINE_BYTES: usize = 2_048;
+const MAX_METHOD_BYTES: usize = 8;
+const MAX_REQUEST_HEADERS: usize = 32;
+const MAX_HEADER_NAME_BYTES: usize = 64;
+const MAX_HEADER_VALUE_BYTES: usize = 1_024;
+const MAX_HEADER_AGGREGATE_BYTES: usize = 8 * 1_024;
+const MAX_ACTIVE_CONNECTIONS: usize = 16;
+const REQUEST_HEADER_DEADLINE: Duration = Duration::from_secs(3);
+const REQUEST_READ_POLL: Duration = Duration::from_millis(100);
+
+/// The public availability of the monitor data. No error detail is exported.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PublicState {
+    #[default]
+    Initializing,
+    Ready,
+    AuthRequired,
+    Error,
+}
+
+/// Quota values safe for the intranet monitoring client.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct PublicQuota {
+    pub remaining_percent: f64,
+    pub reset_at: i64,
+    pub window_seconds: i64,
+    pub monthly: bool,
+}
+
+/// Per-model usage values. `input_tokens` excludes cached input tokens.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct PublicModelUsage {
+    pub name: String,
+    pub input_tokens: u64,
+    pub cached_input_tokens: u64,
+    pub output_tokens: u64,
+}
+
+/// Detailed per-model usage for `/v1/details`. The legacy `/v1/status`
+/// response intentionally continues to use [`PublicModelUsage`] so adding
+/// pricing fields cannot change its strict schema.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct PublicDetailedModelUsage {
+    pub name: String,
+    pub input_tokens: u64,
+    pub cached_input_tokens: u64,
+    pub output_tokens: u64,
+    pub input_dollars: f64,
+    pub cached_input_dollars: f64,
+    pub output_dollars: f64,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct PublicHistoryPeriod {
+    pub id: String,
+    pub start_at: i64,
+    pub end_at: i64,
+    /// Canonical quota-reset boundary. `end_at` may be clipped when a newer
+    /// reset period begins before this boundary, so clients must not infer
+    /// sample ownership from the graph end.
+    pub reset_at: i64,
+    pub label: String,
+    pub current: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct PublicHistorySample {
+    pub timestamp: i64,
+    pub reset_at: i64,
+    /// `null` means the local session backfill had no quota observation.
+    pub remaining_percent: Option<f64>,
+    pub sol_dollars: f64,
+    pub terra_dollars: f64,
+    pub luna_dollars: f64,
+    pub sol_tokens: u64,
+    pub terra_tokens: u64,
+    pub luna_tokens: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct PublicThread {
+    pub id: String,
+    pub title: String,
+    pub parent_thread_id: Option<String>,
+    pub model: String,
+    pub model_label: String,
+    pub total_tokens: Option<u64>,
+    pub context_usage_tokens: Option<u64>,
+    pub context_window_tokens: Option<u64>,
+    pub created_at: Option<i64>,
+    pub last_user_message_at: Option<i64>,
+    pub is_subagent: bool,
+    pub depth: Option<i32>,
+}
+
+/// Immutable data that may cross the REST trust boundary.
+///
+/// Do not add account email, authentication URLs, filesystem locations, raw
+/// backend errors, or secrets to this type.
+#[derive(Clone, Debug, Default, PartialEq, Serialize)]
+pub struct PublicSnapshot {
+    pub state: PublicState,
+    pub observed_at: Option<i64>,
+    pub authenticated: bool,
+    pub plan_label: Option<String>,
+    pub quota: Option<PublicQuota>,
+    pub models: Vec<PublicModelUsage>,
+    pub active_thread_count: u64,
+}
+
+/// The additive `/v1/details` document. The scalar fields intentionally mirror
+/// the legacy status document while model rows carry the additional pricing
+/// columns needed by the Windows client.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct PublicDetails {
+    pub state: PublicState,
+    pub observed_at: Option<i64>,
+    pub authenticated: bool,
+    pub plan_label: Option<String>,
+    pub quota: Option<PublicQuota>,
+    pub models: Vec<PublicDetailedModelUsage>,
+    pub active_thread_count: u64,
+    pub history_periods: Vec<PublicHistoryPeriod>,
+    pub history_samples: Vec<PublicHistorySample>,
+    pub threads: Vec<PublicThread>,
+    pub estimated_cost_label: String,
+}
+
+impl Default for PublicDetails {
+    fn default() -> Self {
+        Self {
+            state: PublicState::Initializing,
+            observed_at: None,
+            authenticated: false,
+            plan_label: None,
+            quota: None,
+            models: Vec::new(),
+            active_thread_count: 0,
+            history_periods: Vec::new(),
+            history_samples: Vec::new(),
+            threads: Vec::new(),
+            estimated_cost_label: "概算 —".to_owned(),
+        }
+    }
+}
+
+impl PublicDetails {
+    /// Build an additive document from a legacy snapshot for callers that have
+    /// not opted into detailed publication yet. The resulting detail rows are
+    /// still schema-valid; pricing is zero because it was not supplied.
+    fn from_snapshot(snapshot: &PublicSnapshot) -> Self {
+        Self {
+            state: snapshot.state,
+            observed_at: snapshot.observed_at,
+            authenticated: snapshot.authenticated,
+            plan_label: snapshot.plan_label.clone(),
+            quota: snapshot.quota.clone(),
+            models: snapshot
+                .models
+                .iter()
+                .map(|model| PublicDetailedModelUsage {
+                    name: model.name.clone(),
+                    input_tokens: model.input_tokens,
+                    cached_input_tokens: model.cached_input_tokens,
+                    output_tokens: model.output_tokens,
+                    input_dollars: 0.0,
+                    cached_input_dollars: 0.0,
+                    output_dollars: 0.0,
+                })
+                .collect(),
+            active_thread_count: snapshot.active_thread_count,
+            estimated_cost_label: "概算 —".to_owned(),
+            ..Self::default()
+        }
+    }
+
+    fn status_snapshot(&self) -> PublicSnapshot {
+        PublicSnapshot {
+            state: self.state,
+            observed_at: self.observed_at,
+            authenticated: self.authenticated,
+            plan_label: self.plan_label.clone(),
+            quota: self.quota.clone(),
+            models: self
+                .models
+                .iter()
+                .map(|model| PublicModelUsage {
+                    name: model.name.clone(),
+                    input_tokens: model.input_tokens,
+                    cached_input_tokens: model.cached_input_tokens,
+                    output_tokens: model.output_tokens,
+                })
+                .collect(),
+            active_thread_count: self.active_thread_count,
+        }
+    }
+
+    fn validate(&self) -> Result<(), ApiSnapshotError> {
+        self.status_snapshot().validate()?;
+        if self.history_periods.len() > MAX_PUBLIC_HISTORY_PERIODS {
+            return Err(ApiSnapshotError::ListTooLong);
+        }
+        if self.history_samples.len() > MAX_PUBLIC_HISTORY_SAMPLES {
+            return Err(ApiSnapshotError::ListTooLong);
+        }
+        if self.threads.len() > MAX_PUBLIC_THREADS {
+            return Err(ApiSnapshotError::ListTooLong);
+        }
+        if self.models.len() > MAX_PUBLIC_MODELS {
+            return Err(ApiSnapshotError::ListTooLong);
+        }
+
+        for model in &self.models {
+            if !valid_non_negative_rate(model.input_dollars)
+                || !valid_non_negative_rate(model.cached_input_dollars)
+                || !valid_non_negative_rate(model.output_dollars)
+            {
+                return Err(ApiSnapshotError::InvalidModel);
+            }
+        }
+
+        let mut period_ids = HashSet::with_capacity(self.history_periods.len());
+        let mut current_periods = 0usize;
+        for period in &self.history_periods {
+            if !valid_text(&period.id, MAX_PUBLIC_ID_SCALARS)
+                || !period_ids.insert(period.id.as_str())
+                || !valid_timestamp(period.start_at)
+                || !valid_timestamp(period.end_at)
+                || !valid_timestamp(period.reset_at)
+                || period.end_at < period.start_at
+                || period.reset_at < period.end_at
+                || !valid_text(&period.label, MAX_PUBLIC_HISTORY_LABEL_SCALARS)
+                || period.label.is_empty()
+            {
+                return Err(ApiSnapshotError::InvalidHistoryPeriod);
+            }
+            if period.current {
+                current_periods = current_periods.saturating_add(1);
+            }
+        }
+        if current_periods > 1 {
+            return Err(ApiSnapshotError::InvalidHistoryPeriod);
+        }
+
+        for sample in &self.history_samples {
+            if !valid_timestamp(sample.timestamp)
+                || !valid_timestamp(sample.reset_at)
+                || sample
+                    .remaining_percent
+                    .is_some_and(|value| !value.is_finite() || !(0.0..=100.0).contains(&value))
+                || !valid_non_negative_rate(sample.sol_dollars)
+                || !valid_non_negative_rate(sample.terra_dollars)
+                || !valid_non_negative_rate(sample.luna_dollars)
+            {
+                return Err(ApiSnapshotError::InvalidHistorySample);
+            }
+        }
+
+        let mut thread_ids = HashSet::with_capacity(self.threads.len());
+        for thread in &self.threads {
+            if !valid_text(&thread.id, MAX_PUBLIC_ID_SCALARS)
+                || !thread_ids.insert(thread.id.as_str())
+                || !valid_text(&thread.title, security::MAX_THREAD_TITLE_SCALARS)
+                || thread.title.is_empty()
+                || !valid_text(&thread.model, security::MAX_MODEL_SCALARS)
+                || thread.model.is_empty()
+                || !valid_text(
+                    &thread.model_label,
+                    security::MAX_ACCOUNT_ACTIVITY_LABEL_SCALARS,
+                )
+                || thread.model_label.is_empty()
+                || !thread
+                    .parent_thread_id
+                    .as_deref()
+                    .is_none_or(|id| valid_text(id, MAX_PUBLIC_ID_SCALARS) && !id.is_empty())
+                || !thread.created_at.is_none_or(valid_timestamp)
+                || !thread.last_user_message_at.is_none_or(valid_timestamp)
+                || !thread.depth.is_none_or(|depth| (0..=1024).contains(&depth))
+            {
+                return Err(ApiSnapshotError::InvalidThread);
+            }
+        }
+        if !valid_text(&self.estimated_cost_label, security::MAX_STATUS_SCALARS)
+            || self.estimated_cost_label.is_empty()
+        {
+            return Err(ApiSnapshotError::InvalidLabel);
+        }
+        Ok(())
+    }
+}
+
+fn valid_timestamp(value: i64) -> bool {
+    (1..=MAX_PUBLIC_UNIX_SECONDS).contains(&value)
+}
+
+fn valid_non_negative_rate(value: f64) -> bool {
+    value.is_finite() && value >= 0.0
+}
+
+fn valid_text(value: &str, max_scalars: usize) -> bool {
+    !value.is_empty()
+        && value.chars().count() <= max_scalars
+        && !value.chars().any(char::is_control)
+}
+
+impl PublicSnapshot {
+    fn validate(&self) -> Result<(), ApiSnapshotError> {
+        if self
+            .observed_at
+            .is_some_and(|timestamp| !valid_timestamp(timestamp))
+        {
+            return Err(ApiSnapshotError::InvalidObservedAt);
+        }
+        if let Some(quota) = self.quota.as_ref() {
+            if !quota.remaining_percent.is_finite()
+                || !(0.0..=100.0).contains(&quota.remaining_percent)
+                || !valid_timestamp(quota.reset_at)
+                || quota.window_seconds <= 0
+            {
+                return Err(ApiSnapshotError::InvalidQuota);
+            }
+        }
+        if self.models.len() > MAX_PUBLIC_MODELS {
+            return Err(ApiSnapshotError::ListTooLong);
+        }
+        let mut model_names = HashSet::with_capacity(self.models.len());
+        if self.models.iter().any(|model| {
+            !matches!(model.name.as_str(), "SOL" | "TERRA" | "LUNA")
+                || !model_names.insert(model.name.as_str())
+        }) {
+            return Err(ApiSnapshotError::InvalidModel);
+        }
+        if self
+            .plan_label
+            .as_deref()
+            .is_some_and(|label| !valid_text(label, security::MAX_PLAN_SCALARS))
+        {
+            return Err(ApiSnapshotError::InvalidLabel);
+        }
+        Ok(())
+    }
+}
+
+/// A redacted validation error for data that would leave the process.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ApiSnapshotError {
+    InvalidObservedAt,
+    InvalidQuota,
+    InvalidModel,
+    InvalidLabel,
+    InvalidHistoryPeriod,
+    InvalidHistorySample,
+    InvalidThread,
+    ListTooLong,
+    Serialization,
+}
+
+impl fmt::Display for ApiSnapshotError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let message = match self {
+            Self::InvalidObservedAt => "public snapshot has an invalid observation time",
+            Self::InvalidQuota => "public snapshot has an invalid quota",
+            Self::InvalidModel => "public snapshot has an invalid model",
+            Self::InvalidLabel => "public snapshot has an invalid label",
+            Self::InvalidHistoryPeriod => "public snapshot has an invalid history period",
+            Self::InvalidHistorySample => "public snapshot has an invalid history sample",
+            Self::InvalidThread => "public snapshot has an invalid thread",
+            Self::ListTooLong => "public snapshot has too many rows",
+            Self::Serialization => "public snapshot could not be serialized",
+        };
+        formatter.write_str(message)
+    }
+}
+
+impl std::error::Error for ApiSnapshotError {}
+
+#[derive(Serialize)]
+struct StatusResponse<'a> {
+    api_version: &'static str,
+    #[serde(flatten)]
+    snapshot: &'a PublicSnapshot,
+}
+
+#[derive(Serialize)]
+struct DetailsResponse<'a> {
+    api_version: &'static str,
+    #[serde(flatten)]
+    details: &'a PublicDetails,
+}
+
+fn serialize_status(snapshot: &PublicSnapshot) -> Result<Vec<u8>, ApiSnapshotError> {
+    serde_json::to_vec(&StatusResponse {
+        api_version: API_VERSION,
+        snapshot,
+    })
+    .map_err(|_| ApiSnapshotError::Serialization)
+}
+
+fn serialize_details(details: &PublicDetails) -> Result<Vec<u8>, ApiSnapshotError> {
+    serde_json::to_vec(&DetailsResponse {
+        api_version: API_VERSION,
+        details,
+    })
+    .map_err(|_| ApiSnapshotError::Serialization)
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct PublishedSnapshot {
+    status_body: Vec<u8>,
+    details_body: Vec<u8>,
+}
+
+impl Default for PublishedSnapshot {
+    fn default() -> Self {
+        let status = PublicSnapshot::default();
+        let details = PublicDetails::default();
+        Self {
+            status_body: serialize_status(&status).expect("default status must serialize"),
+            details_body: serialize_details(&details).expect("default details must serialize"),
+        }
+    }
+}
+
+type SharedSnapshot = Arc<RwLock<PublishedSnapshot>>;
+
+/// Cloneable one-way publication handle held by the UI thread.
+#[derive(Clone)]
+pub struct ApiSnapshotPublisher {
+    snapshot: SharedSnapshot,
+}
+
+impl ApiSnapshotPublisher {
+    /// Replaces the entire public snapshot only after its finite whitelist has
+    /// been validated. The previous snapshot remains available on failure.
+    pub fn publish(&self, snapshot: PublicSnapshot) -> Result<(), ApiSnapshotError> {
+        snapshot.validate()?;
+        let details = PublicDetails::from_snapshot(&snapshot);
+        details.validate()?;
+        let status_body = serialize_status(&snapshot)?;
+        let details_body = serialize_details(&details)?;
+        let mut current = self
+            .snapshot
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *current = PublishedSnapshot {
+            status_body,
+            details_body,
+        };
+        Ok(())
+    }
+
+    /// Atomically publishes the status and all additive details. The status
+    /// projection is derived from the same document, so `/status` and
+    /// `/details` can never observe different account/quota generations.
+    pub fn publish_details(&self, details: PublicDetails) -> Result<(), ApiSnapshotError> {
+        details.validate()?;
+        let status = details.status_snapshot();
+        let status_body = serialize_status(&status)?;
+        let details_body = serialize_details(&details)?;
+        let mut current = self
+            .snapshot
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *current = PublishedSnapshot {
+            status_body,
+            details_body,
+        };
+        Ok(())
+    }
+}
+
+/// A listener configuration that can never represent a LAN or public bind.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ApiServerConfig {
+    listen_addr: SocketAddr,
+}
+
+impl ApiServerConfig {
+    pub fn new(listen_addr: SocketAddr) -> Result<Self, ApiServerError> {
+        if !is_loopback(listen_addr.ip()) {
+            return Err(ApiServerError::NonLoopbackAddress);
+        }
+        Ok(Self { listen_addr })
+    }
+
+    /// Parses the opt-in listener. An unset variable keeps the API disabled.
+    pub fn from_environment() -> Result<Option<Self>, ApiServerError> {
+        let Some(value) = env::var_os(API_LISTEN_ENV) else {
+            return Ok(None);
+        };
+        let value = value
+            .to_str()
+            .ok_or(ApiServerError::InvalidListenConfiguration)?;
+        let address = value
+            .parse::<SocketAddr>()
+            .map_err(|_| ApiServerError::InvalidListenConfiguration)?;
+        Self::new(address).map(Some)
+    }
+
+    pub const fn listen_addr(self) -> SocketAddr {
+        self.listen_addr
+    }
+}
+
+fn is_loopback(address: IpAddr) -> bool {
+    address.is_loopback()
+}
+
+/// Redacted errors for starting the optional API listener.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ApiServerError {
+    InvalidListenConfiguration,
+    NonLoopbackAddress,
+    BindFailed,
+    RuntimeFailed,
+    WorkerStartFailed,
+}
+
+impl fmt::Display for ApiServerError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let message = match self {
+            Self::InvalidListenConfiguration => "API listen configuration is invalid",
+            Self::NonLoopbackAddress => "API listener must use a loopback address",
+            Self::BindFailed => "API listener could not bind safely",
+            Self::RuntimeFailed => "API runtime could not start",
+            Self::WorkerStartFailed => "API worker could not start",
+        };
+        formatter.write_str(message)
+    }
+}
+
+impl std::error::Error for ApiServerError {}
+
+/// An optional API worker. Dropping it closes the listener and joins its
+/// thread; it owns no Codex child process and never accesses UI state.
+pub struct ApiServer {
+    publisher: ApiSnapshotPublisher,
+    local_addr: SocketAddr,
+    shutdown: Option<oneshot::Sender<()>>,
+    worker: Option<JoinHandle<()>>,
+}
+
+impl ApiServer {
+    pub fn from_environment() -> Result<Option<Self>, ApiServerError> {
+        ApiServerConfig::from_environment()?
+            .map(Self::start)
+            .transpose()
+    }
+
+    pub fn start(config: ApiServerConfig) -> Result<Self, ApiServerError> {
+        let listener =
+            TcpListener::bind(config.listen_addr).map_err(|_| ApiServerError::BindFailed)?;
+        listener
+            .set_nonblocking(true)
+            .map_err(|_| ApiServerError::BindFailed)?;
+        let local_addr = listener
+            .local_addr()
+            .map_err(|_| ApiServerError::BindFailed)?;
+        let publisher = ApiSnapshotPublisher {
+            snapshot: Arc::new(RwLock::new(PublishedSnapshot::default())),
+        };
+        let snapshot = Arc::clone(&publisher.snapshot);
+        let (shutdown, shutdown_receiver) = oneshot::channel();
+        let (started, started_receiver) = mpsc::sync_channel(1);
+        let worker = thread::Builder::new()
+            .name("codex-info-api".into())
+            .spawn(move || {
+                let runtime = match tokio::runtime::Builder::new_current_thread()
+                    .enable_io()
+                    .build()
+                {
+                    Ok(runtime) => runtime,
+                    Err(_) => {
+                        let _ = started.send(Err(ApiServerError::RuntimeFailed));
+                        return;
+                    }
+                };
+                runtime.block_on(async move {
+                    let listener = match TokioTcpListener::from_std(listener) {
+                        Ok(listener) => listener,
+                        Err(_) => {
+                            let _ = started.send(Err(ApiServerError::RuntimeFailed));
+                            return;
+                        }
+                    };
+                    if started.send(Ok(())).is_err() {
+                        return;
+                    }
+                    serve_listener(
+                        listener,
+                        snapshot,
+                        authority_for(local_addr),
+                        shutdown_receiver,
+                    )
+                    .await;
+                });
+            })
+            .map_err(|_| ApiServerError::WorkerStartFailed)?;
+
+        match started_receiver.recv_timeout(API_START_TIMEOUT) {
+            Ok(Ok(())) => Ok(Self {
+                publisher,
+                local_addr,
+                shutdown: Some(shutdown),
+                worker: Some(worker),
+            }),
+            Ok(Err(error)) => {
+                let _ = shutdown.send(());
+                let _ = worker.join();
+                Err(error)
+            }
+            Err(_) => {
+                let _ = shutdown.send(());
+                let _ = worker.join();
+                Err(ApiServerError::WorkerStartFailed)
+            }
+        }
+    }
+
+    pub fn publisher(&self) -> ApiSnapshotPublisher {
+        self.publisher.clone()
+    }
+
+    pub const fn local_addr(&self) -> SocketAddr {
+        self.local_addr
+    }
+
+    /// Stops the worker and releases the loopback port. Calling it more than
+    /// once is harmless.
+    pub fn shutdown(&mut self) {
+        if let Some(shutdown) = self.shutdown.take() {
+            let _ = shutdown.send(());
+        }
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
+}
+
+impl Drop for ApiServer {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+
+#[derive(Serialize)]
+struct HealthResponse {
+    api_version: &'static str,
+    service: &'static str,
+}
+
+#[derive(Serialize)]
+struct ErrorResponse {
+    api_version: &'static str,
+    error: &'static str,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ApiRoute {
+    Health,
+    Status,
+    Details,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ParseFailure {
+    BadRequest,
+    HeadersTooLarge,
+}
+
+#[derive(Debug)]
+enum HeaderRead {
+    Complete {
+        data: Vec<u8>,
+        line_end: usize,
+        terminator: usize,
+        trailing_data: bool,
+    },
+    Timeout,
+    BadRequest,
+    HeadersTooLarge,
+    Closed,
+}
+
+#[derive(Debug)]
+struct ParsedRequest {
+    route: Option<ApiRoute>,
+    is_get: bool,
+    body_not_allowed: bool,
+}
+
+fn authority_for(address: SocketAddr) -> String {
+    match address {
+        SocketAddr::V4(address) => format!("{}:{}", address.ip(), address.port()),
+        SocketAddr::V6(address) => format!("[{}]:{}", address.ip(), address.port()),
+    }
+}
+
+/// Accept at most one bounded HTTP/1.1 request on each socket. A small
+/// blocking worker per admitted socket keeps the parser independent from
+/// axum/hyper's permissive connection lifecycle while the listener itself
+/// remains asynchronous and shutdown-aware.
+async fn serve_listener(
+    listener: TokioTcpListener,
+    snapshot: SharedSnapshot,
+    authority: String,
+    mut shutdown_receiver: oneshot::Receiver<()>,
+) {
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let active = Arc::new(AtomicUsize::new(0));
+    let mut workers: Vec<JoinHandle<()>> = Vec::new();
+
+    loop {
+        tokio::select! {
+            _ = &mut shutdown_receiver => break,
+            accepted = listener.accept() => {
+                let Ok((stream, _peer)) = accepted else {
+                    continue;
+                };
+                let Ok(stream) = stream.into_std() else {
+                    continue;
+                };
+                let _ = stream.set_nonblocking(false);
+
+                if !try_admit_connection(&active) {
+                    let mut stream = stream;
+                    let _ = stream.set_write_timeout(Some(Duration::from_secs(1)));
+                    write_error_response(&mut stream, 429, "too_many_requests");
+                    let _ = stream.shutdown(Shutdown::Both);
+                    continue;
+                }
+
+                // Completed joins are reaped before retaining another handle,
+                // preventing a sequential client from growing this vector.
+                let mut worker_index = 0;
+                while worker_index < workers.len() {
+                    if workers[worker_index].is_finished() {
+                        let worker = workers.swap_remove(worker_index);
+                        let _ = worker.join();
+                    } else {
+                        worker_index += 1;
+                    }
+                }
+
+                let worker_shutdown = Arc::clone(&shutdown);
+                let worker_active = Arc::clone(&active);
+                let worker_snapshot = Arc::clone(&snapshot);
+                let worker_authority = authority.clone();
+                workers.push(thread::spawn(move || {
+                    handle_connection(
+                        stream,
+                        worker_snapshot,
+                        worker_authority,
+                        worker_shutdown,
+                    );
+                    worker_active.fetch_sub(1, Ordering::AcqRel);
+                }));
+            }
+        }
+    }
+
+    // Stop new admissions first, then give already accepted sockets the
+    // documented finite drain window. Their read deadline is also bounded by
+    // three seconds, so joining does not leave an orphaned listener worker.
+    shutdown.store(true, Ordering::Release);
+    for worker in workers {
+        let _ = worker.join();
+    }
+}
+
+fn try_admit_connection(active: &AtomicUsize) -> bool {
+    let mut current = active.load(Ordering::Acquire);
+    loop {
+        if current >= MAX_ACTIVE_CONNECTIONS {
+            return false;
+        }
+        match active.compare_exchange_weak(
+            current,
+            current + 1,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => return true,
+            Err(next) => current = next,
+        }
+    }
+}
+
+fn handle_connection(
+    mut stream: TcpStream,
+    snapshot: SharedSnapshot,
+    authority: String,
+    shutdown: Arc<AtomicBool>,
+) {
+    let _ = stream.set_read_timeout(Some(REQUEST_READ_POLL));
+    let _ = stream.set_write_timeout(Some(Duration::from_secs(3)));
+
+    if shutdown.load(Ordering::Acquire) {
+        let _ = stream.shutdown(Shutdown::Both);
+        return;
+    }
+
+    let response = match read_request_headers(&mut stream, &shutdown) {
+        HeaderRead::Complete {
+            data,
+            line_end,
+            terminator,
+            trailing_data,
+        } => match parse_request(&data, line_end, terminator, trailing_data, &authority) {
+            Ok(request) => match request.route {
+                None => (404, error_body("not_found")),
+                Some(_) if !request.is_get => (405, error_body("method_not_allowed")),
+                Some(_) if request.body_not_allowed => {
+                    (413, error_body("request_body_not_allowed"))
+                }
+                Some(ApiRoute::Health) => (200, health_body()),
+                Some(ApiRoute::Status) => {
+                    let body = snapshot
+                        .read()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .status_body
+                        .clone();
+                    (200, body)
+                }
+                Some(ApiRoute::Details) => {
+                    let body = snapshot
+                        .read()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .details_body
+                        .clone();
+                    (200, body)
+                }
+            },
+            Err(ParseFailure::BadRequest) => (400, error_body("bad_request")),
+            Err(ParseFailure::HeadersTooLarge) => (431, error_body("request_headers_too_large")),
+        },
+        HeaderRead::Timeout => (408, error_body("request_timeout")),
+        HeaderRead::BadRequest => (400, error_body("bad_request")),
+        HeaderRead::HeadersTooLarge => (431, error_body("request_headers_too_large")),
+        HeaderRead::Closed => {
+            let _ = stream.shutdown(Shutdown::Both);
+            return;
+        }
+    };
+
+    write_json_response(&mut stream, response.0, &response.1);
+    let _ = stream.shutdown(Shutdown::Both);
+}
+
+fn read_request_headers(stream: &mut TcpStream, shutdown: &AtomicBool) -> HeaderRead {
+    let started = Instant::now();
+    let mut data = Vec::with_capacity(4 * 1_024);
+
+    loop {
+        if shutdown.load(Ordering::Acquire) {
+            return HeaderRead::Closed;
+        }
+        if started.elapsed() >= REQUEST_HEADER_DEADLINE {
+            return HeaderRead::Timeout;
+        }
+
+        let mut chunk = [0_u8; 1_024];
+        match stream.read(&mut chunk) {
+            Ok(0) => return HeaderRead::Closed,
+            Ok(count) => {
+                data.extend_from_slice(&chunk[..count]);
+                if let Some(terminator) = find_bytes(&data, b"\r\n\r\n") {
+                    let Some(line_end) = find_bytes(&data, b"\r\n") else {
+                        return HeaderRead::BadRequest;
+                    };
+                    if line_end.saturating_add(2) > MAX_REQUEST_LINE_BYTES {
+                        return HeaderRead::BadRequest;
+                    }
+                    let header_start = line_end + 2;
+                    let header_aggregate =
+                        terminator.saturating_add(2).saturating_sub(header_start);
+                    if header_aggregate > MAX_HEADER_AGGREGATE_BYTES {
+                        return HeaderRead::HeadersTooLarge;
+                    }
+                    let header_end = terminator + 4;
+                    if invalid_header_line_endings(&data[..header_end]) {
+                        return HeaderRead::BadRequest;
+                    }
+                    return HeaderRead::Complete {
+                        trailing_data: data.len() > header_end,
+                        data,
+                        line_end,
+                        terminator,
+                    };
+                }
+
+                if find_bytes(&data, b"\r\n").is_none() {
+                    if data.len() > MAX_REQUEST_LINE_BYTES {
+                        return HeaderRead::BadRequest;
+                    }
+                } else if data.len() > MAX_REQUEST_LINE_BYTES + MAX_HEADER_AGGREGATE_BYTES + 4 {
+                    return HeaderRead::HeadersTooLarge;
+                }
+                if data
+                    .windows(2)
+                    .any(|window| window[1] == b'\n' && window[0] != b'\r')
+                    || data.first() == Some(&b'\n')
+                {
+                    return HeaderRead::BadRequest;
+                }
+            }
+            Err(error) if error.kind() == io::ErrorKind::TimedOut => continue,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(_) => return HeaderRead::Closed,
+        }
+    }
+}
+
+fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
+}
+
+fn invalid_header_line_endings(data: &[u8]) -> bool {
+    data.iter().enumerate().any(|(index, byte)| {
+        (*byte == b'\n' && (index == 0 || data[index - 1] != b'\r'))
+            || (*byte == b'\r' && data.get(index + 1) != Some(&b'\n'))
+    })
+}
+
+fn parse_request(
+    data: &[u8],
+    line_end: usize,
+    terminator: usize,
+    trailing_data: bool,
+    authority: &str,
+) -> Result<ParsedRequest, ParseFailure> {
+    let request_line = &data[..line_end];
+    let mut fields = request_line.split(|byte| *byte == b' ');
+    let method = fields.next().ok_or(ParseFailure::BadRequest)?;
+    let target = fields.next().ok_or(ParseFailure::BadRequest)?;
+    let version = fields.next().ok_or(ParseFailure::BadRequest)?;
+    if fields.next().is_some()
+        || method.is_empty()
+        || method.len() > MAX_METHOD_BYTES
+        || !is_http_token(method)
+        || version != b"HTTP/1.1"
+        || target.is_empty()
+        || target.iter().any(|byte| !(0x21..=0x7e).contains(byte))
+    {
+        return Err(ParseFailure::BadRequest);
+    }
+
+    let route = classify_target(target)?;
+    let mut seen = HashSet::new();
+    let mut host = None;
+    let mut content_length = None;
+    let mut transfer_encoding = false;
+    let mut disallowed_header = false;
+    let header_section = &data[line_end + 2..terminator];
+    let mut cursor = 0;
+    let mut header_count = 0usize;
+    while cursor < header_section.len() {
+        let line = match find_bytes(&header_section[cursor..], b"\r\n") {
+            Some(offset) => {
+                let line = &header_section[cursor..cursor + offset];
+                cursor += offset + 2;
+                line
+            }
+            None => {
+                let line = &header_section[cursor..];
+                cursor = header_section.len();
+                line
+            }
+        };
+        if line.is_empty() || matches!(line.first(), Some(b' ' | b'\t')) {
+            return Err(ParseFailure::BadRequest);
+        }
+        header_count += 1;
+        if header_count > MAX_REQUEST_HEADERS {
+            return Err(ParseFailure::HeadersTooLarge);
+        }
+        let colon = line
+            .iter()
+            .position(|byte| *byte == b':')
+            .ok_or(ParseFailure::BadRequest)?;
+        let name = &line[..colon];
+        let raw_value = &line[colon + 1..];
+        if name.len() > MAX_HEADER_NAME_BYTES || raw_value.len() > MAX_HEADER_VALUE_BYTES {
+            return Err(ParseFailure::HeadersTooLarge);
+        }
+        if !is_http_token(name) {
+            return Err(ParseFailure::BadRequest);
+        }
+        let name = std::str::from_utf8(name)
+            .map_err(|_| ParseFailure::BadRequest)?
+            .to_ascii_lowercase();
+        if !seen.insert(name.clone()) {
+            return Err(ParseFailure::BadRequest);
+        }
+        let value = trim_ows(raw_value);
+        let value = std::str::from_utf8(value).map_err(|_| ParseFailure::BadRequest)?;
+        if value.chars().any(char::is_control) {
+            return Err(ParseFailure::BadRequest);
+        }
+
+        match name.as_str() {
+            "host" => host = Some(value.to_owned()),
+            "accept" | "user-agent" => {}
+            "connection" => {
+                if value
+                    .split(',')
+                    .any(|token| token.trim().eq_ignore_ascii_case("upgrade"))
+                {
+                    return Err(ParseFailure::BadRequest);
+                }
+            }
+            "content-length" => {
+                if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+                    return Err(ParseFailure::BadRequest);
+                }
+                let length = value.parse::<u64>().map_err(|_| ParseFailure::BadRequest)?;
+                content_length = Some(length);
+            }
+            "transfer-encoding" => transfer_encoding = true,
+            _ => disallowed_header = true,
+        }
+    }
+
+    if host.as_deref() != Some(authority) {
+        return Err(ParseFailure::BadRequest);
+    }
+    if disallowed_header {
+        return Err(ParseFailure::BadRequest);
+    }
+
+    Ok(ParsedRequest {
+        route,
+        is_get: method == b"GET",
+        body_not_allowed: trailing_data
+            || transfer_encoding
+            || content_length.is_some_and(|length| length != 0),
+    })
+}
+
+fn classify_target(target: &[u8]) -> Result<Option<ApiRoute>, ParseFailure> {
+    if !target.starts_with(b"/") || target.starts_with(b"//") {
+        return Err(ParseFailure::BadRequest);
+    }
+    Ok(match target {
+        b"/v1/health" => Some(ApiRoute::Health),
+        b"/v1/status" => Some(ApiRoute::Status),
+        b"/v1/details" => Some(ApiRoute::Details),
+        _ => None,
+    })
+}
+
+fn is_http_token(value: &[u8]) -> bool {
+    !value.is_empty()
+        && value.iter().all(|byte| {
+            byte.is_ascii_alphanumeric()
+                || matches!(
+                    byte,
+                    b'!' | b'#'
+                        | b'$'
+                        | b'%'
+                        | b'&'
+                        | b'\''
+                        | b'*'
+                        | b'+'
+                        | b'-'
+                        | b'.'
+                        | b'^'
+                        | b'_'
+                        | b'`'
+                        | b'|'
+                        | b'~'
+                )
+        })
+}
+
+fn trim_ows(value: &[u8]) -> &[u8] {
+    let start = value
+        .iter()
+        .position(|byte| !matches!(byte, b' ' | b'\t'))
+        .unwrap_or(value.len());
+    let end = value
+        .iter()
+        .rposition(|byte| !matches!(byte, b' ' | b'\t'))
+        .map_or(start, |index| index + 1);
+    &value[start..end]
+}
+
+fn health_body() -> Vec<u8> {
+    serde_json::to_vec(&HealthResponse {
+        api_version: API_VERSION,
+        service: "codex-info",
+    })
+    .expect("fixed health response must serialize")
+}
+
+fn error_body(error: &'static str) -> Vec<u8> {
+    serde_json::to_vec(&ErrorResponse {
+        api_version: API_VERSION,
+        error,
+    })
+    .expect("fixed error response must serialize")
+}
+
+fn write_error_response(stream: &mut TcpStream, status: u16, error: &'static str) {
+    let body = error_body(error);
+    write_json_response(stream, status, &body);
+}
+
+fn write_json_response(stream: &mut TcpStream, status: u16, body: &[u8]) {
+    let reason = match status {
+        200 => "OK",
+        400 => "Bad Request",
+        404 => "Not Found",
+        405 => "Method Not Allowed",
+        408 => "Request Timeout",
+        413 => "Content Too Large",
+        429 => "Too Many Requests",
+        431 => "Request Header Fields Too Large",
+        500 => "Internal Server Error",
+        503 => "Service Unavailable",
+        _ => "Error",
+    };
+    let header = format!(
+        "HTTP/1.1 {status} {reason}\r\ncontent-type: application/json; charset=utf-8\r\ncache-control: no-store\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+        body.len()
+    );
+    let _ = stream.write_all(header.as_bytes());
+    let _ = stream.write_all(body);
+    let _ = stream.flush();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::Value;
+    use std::io::{Read, Write};
+    use std::net::TcpStream;
+    use std::sync::{Mutex, OnceLock};
+    use std::time::Instant;
+
+    fn environment_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    fn api_server_test_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    fn loopback_config() -> ApiServerConfig {
+        ApiServerConfig::new(SocketAddr::from(([127, 0, 0, 1], 0))).unwrap()
+    }
+
+    fn wire_request(address: SocketAddr, request: &str) -> String {
+        // Existing fixtures use a human-readable localhost Host. Wire it to
+        // the ephemeral listener authority so production parsing remains
+        // exact while the tests exercise the same origin-form contract.
+        let authority = authority_for(address);
+        let host_rewritten = request.replace("Host: localhost", &format!("Host: {authority}"));
+        wire_request_raw(address, host_rewritten.as_bytes())
+    }
+
+    fn wire_request_raw(address: SocketAddr, request: &[u8]) -> String {
+        let mut stream = TcpStream::connect(address).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        stream.write_all(request).unwrap();
+        stream.flush().unwrap();
+        let mut response = String::new();
+        stream.read_to_string(&mut response).unwrap();
+        response
+    }
+
+    fn body(response: &str) -> Value {
+        let (_, body) = response.split_once("\r\n\r\n").unwrap();
+        serde_json::from_str(body).unwrap()
+    }
+
+    fn detailed_fixture() -> PublicDetails {
+        PublicDetails {
+            state: PublicState::Ready,
+            observed_at: Some(1_780_000_000),
+            authenticated: true,
+            plan_label: Some("Pro".into()),
+            quota: Some(PublicQuota {
+                remaining_percent: 98.0,
+                reset_at: 1_780_400_000,
+                window_seconds: 604_800,
+                monthly: false,
+            }),
+            models: vec![PublicDetailedModelUsage {
+                name: "SOL".into(),
+                input_tokens: 900,
+                cached_input_tokens: 300,
+                output_tokens: 400,
+                input_dollars: 0.0045,
+                cached_input_dollars: 0.00015,
+                output_dollars: 0.012,
+            }],
+            active_thread_count: 1,
+            history_periods: vec![PublicHistoryPeriod {
+                id: "1780400000".into(),
+                start_at: 1_779_395_200,
+                end_at: 1_780_400_000,
+                reset_at: 1_780_400_000,
+                label: "2026/06/01 — 2026/06/08".into(),
+                current: true,
+            }],
+            history_samples: vec![PublicHistorySample {
+                timestamp: 1_780_000_000,
+                reset_at: 1_780_400_000,
+                remaining_percent: None,
+                sol_dollars: 0.01665,
+                terra_dollars: 0.0,
+                luna_dollars: 0.0,
+                sol_tokens: 1_600,
+                terra_tokens: 0,
+                luna_tokens: 0,
+            }],
+            threads: vec![PublicThread {
+                id: "thread-1".into(),
+                title: "安全な読み取り確認".into(),
+                parent_thread_id: None,
+                model: "gpt-5.6-sol".into(),
+                model_label: "gpt-5.6-sol".into(),
+                total_tokens: Some(1_600),
+                context_usage_tokens: Some(1_200),
+                context_window_tokens: Some(258_400),
+                created_at: Some(1_779_999_000),
+                last_user_message_at: Some(1_779_999_900),
+                is_subagent: false,
+                depth: None,
+            }],
+            estimated_cost_label: "概算 $1".into(),
+        }
+    }
+
+    fn history_fixture(sample_count: usize) -> PublicDetails {
+        let mut details = detailed_fixture();
+        let end = 1_800_000_000_i64;
+        let start = end - sample_count as i64 * 60;
+        details.observed_at = Some(end);
+        details.quota = Some(PublicQuota {
+            remaining_percent: 48.0,
+            reset_at: end + 604_800,
+            window_seconds: 604_800,
+            monthly: false,
+        });
+        details.history_periods = vec![PublicHistoryPeriod {
+            id: "slo-period".into(),
+            start_at: start,
+            end_at: end + 604_800,
+            reset_at: end + 604_800,
+            label: "SLO fixture".into(),
+            current: true,
+        }];
+        details.history_samples = (0..sample_count)
+            .map(|index| {
+                let fraction = index as f64 / sample_count.max(1) as f64;
+                PublicHistorySample {
+                    timestamp: start + index as i64 * 60,
+                    reset_at: end + 604_800,
+                    remaining_percent: Some(100.0 - 52.0 * fraction),
+                    sol_dollars: 8.75 * fraction,
+                    terra_dollars: 4.5 * fraction,
+                    luna_dollars: 2.75 * fraction,
+                    sol_tokens: (8_400.0 * fraction) as u64,
+                    terra_tokens: (4_200.0 * fraction) as u64,
+                    luna_tokens: (2_100.0 * fraction) as u64,
+                }
+            })
+            .collect();
+        details
+    }
+
+    fn latency_percentiles(address: SocketAddr, route: &str, runs: usize) -> (f64, f64, f64) {
+        let request =
+            format!("GET {route} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+        for _ in 0..5 {
+            let _ = wire_request(address, &request);
+        }
+        let mut elapsed = Vec::with_capacity(runs);
+        for _ in 0..runs {
+            let started = Instant::now();
+            let response = wire_request(address, &request);
+            assert!(response.starts_with("HTTP/1.1"));
+            elapsed.push(started.elapsed().as_secs_f64() * 1_000.0);
+        }
+        elapsed.sort_by(f64::total_cmp);
+        let percentile = |percent: usize| elapsed[(runs * percent).div_ceil(100) - 1];
+        (percentile(90), percentile(95), elapsed[runs - 1])
+    }
+
+    #[test]
+    #[ignore = "explicit host loopback latency SLO gate"]
+    fn all_rest_routes_meet_latency_slo_at_supported_capacity() {
+        let _guard = api_server_test_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut server = ApiServer::start(loopback_config()).unwrap();
+        let address = server.local_addr();
+
+        for route in ["/v1/health", "/v1/status", "/v1/missing"] {
+            let (p90, p95, maximum) = latency_percentiles(address, route, 100);
+            eprintln!("SLO route={route} n=100 p90={p90:.3}ms p95={p95:.3}ms max={maximum:.3}ms");
+            assert!(p90 <= 25.0, "{route} p90 {p90:.3}ms exceeds 25ms");
+            assert!(p95 <= 50.0, "{route} p95 {p95:.3}ms exceeds 50ms");
+        }
+
+        for (sample_count, p90_limit, p95_limit) in [
+            (10_080, 50.0, 100.0),
+            (MAX_PUBLIC_HISTORY_SAMPLES, 100.0, 150.0),
+        ] {
+            server
+                .publisher()
+                .publish_details(history_fixture(sample_count))
+                .unwrap();
+            let (p90, p95, maximum) = latency_percentiles(address, "/v1/details", 30);
+            eprintln!(
+                "SLO route=/v1/details samples={sample_count} n=30 p90={p90:.3}ms p95={p95:.3}ms max={maximum:.3}ms"
+            );
+            assert!(
+                p90 <= p90_limit,
+                "details({sample_count}) p90 {p90:.3}ms exceeds {p90_limit}ms"
+            );
+            assert!(
+                p95 <= p95_limit,
+                "details({sample_count}) p95 {p95:.3}ms exceeds {p95_limit}ms"
+            );
+        }
+        server.shutdown();
+    }
+
+    #[test]
+    fn environment_is_disabled_when_listen_is_unset() {
+        let _guard = environment_lock().lock().unwrap();
+        let previous = env::var_os(API_LISTEN_ENV);
+        env::remove_var(API_LISTEN_ENV);
+        assert_eq!(ApiServerConfig::from_environment().unwrap(), None);
+        match previous {
+            Some(value) => env::set_var(API_LISTEN_ENV, value),
+            None => env::remove_var(API_LISTEN_ENV),
+        }
+    }
+
+    #[test]
+    fn configuration_rejects_non_loopback_or_non_numeric_addresses() {
+        assert_eq!(
+            ApiServerConfig::new("0.0.0.0:8787".parse().unwrap()),
+            Err(ApiServerError::NonLoopbackAddress)
+        );
+        assert_eq!(
+            ApiServerConfig::new("192.168.1.7:8787".parse().unwrap()),
+            Err(ApiServerError::NonLoopbackAddress)
+        );
+        assert_eq!(
+            ApiServerConfig::new("[::]:8787".parse().unwrap()),
+            Err(ApiServerError::NonLoopbackAddress)
+        );
+        assert!(ApiServerConfig::new("[::1]:8787".parse().unwrap()).is_ok());
+        let _guard = environment_lock().lock().unwrap();
+        let previous = env::var_os(API_LISTEN_ENV);
+        env::set_var(API_LISTEN_ENV, "localhost:8787");
+        assert_eq!(
+            ApiServerConfig::from_environment(),
+            Err(ApiServerError::InvalidListenConfiguration)
+        );
+        match previous {
+            Some(value) => env::set_var(API_LISTEN_ENV, value),
+            None => env::remove_var(API_LISTEN_ENV),
+        }
+    }
+
+    #[test]
+    fn health_status_errors_and_snapshot_are_json_no_store() {
+        // All API tests use an ephemeral loopback port. Serialize their server
+        // lifetimes so another test cannot claim this test's just-released
+        // port between shutdown and the explicit rebind assertion.
+        let _guard = api_server_test_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut server = ApiServer::start(loopback_config()).unwrap();
+        let publisher = server.publisher();
+        publisher
+            .publish(PublicSnapshot {
+                state: PublicState::Ready,
+                observed_at: Some(1_780_000_000),
+                authenticated: true,
+                plan_label: Some("Pro".into()),
+                quota: Some(PublicQuota {
+                    remaining_percent: 98.0,
+                    reset_at: 1_780_400_000,
+                    window_seconds: 604_800,
+                    monthly: false,
+                }),
+                models: vec![PublicModelUsage {
+                    name: "SOL".into(),
+                    input_tokens: 1_200,
+                    cached_input_tokens: 300,
+                    output_tokens: 400,
+                }],
+                active_thread_count: 1,
+            })
+            .unwrap();
+
+        let health = wire_request(
+            server.local_addr(),
+            "GET /v1/health HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        );
+        assert!(health.starts_with("HTTP/1.1 200"), "response: {health:?}");
+        assert!(health.contains("cache-control: no-store"));
+        assert_eq!(body(&health)["api_version"], "v1");
+
+        let status = wire_request(
+            server.local_addr(),
+            "GET /v1/status HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        );
+        assert!(status.starts_with("HTTP/1.1 200"));
+        assert!(status.contains("cache-control: no-store"));
+        let status_body = body(&status);
+        assert_eq!(status_body["state"], "ready");
+        assert_eq!(status_body["quota"]["remaining_percent"], 98.0);
+        assert_eq!(status_body["models"][0]["input_tokens"], 1200);
+        let status_keys = status_body.as_object().unwrap().keys().collect::<Vec<_>>();
+        assert_eq!(
+            status_keys,
+            vec![
+                "active_thread_count",
+                "api_version",
+                "authenticated",
+                "models",
+                "observed_at",
+                "plan_label",
+                "quota",
+                "state",
+            ]
+        );
+        assert!(status_body.get("email").is_none());
+        assert!(status_body.get("auth_url").is_none());
+        assert!(status_body.get("error_detail").is_none());
+
+        let missing = wire_request(
+            server.local_addr(),
+            "GET /v1/missing HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        );
+        assert!(missing.starts_with("HTTP/1.1 404"));
+        assert_eq!(body(&missing)["error"], "not_found");
+
+        let wrong_method = wire_request(
+            server.local_addr(),
+            "POST /v1/status HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        );
+        assert!(wrong_method.starts_with("HTTP/1.1 405"));
+        assert_eq!(body(&wrong_method)["error"], "method_not_allowed");
+
+        let wrong_details_method = wire_request(
+            server.local_addr(),
+            "POST /v1/details HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        );
+        assert!(wrong_details_method.starts_with("HTTP/1.1 405"));
+        server.shutdown();
+    }
+
+    #[test]
+    fn request_wire_contract_has_bounded_read_only_mapping() {
+        let _guard = api_server_test_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut server = ApiServer::start(loopback_config()).unwrap();
+        let address = server.local_addr();
+        let authority = authority_for(address);
+        let request = |start: &str, headers: &str, body: &str| {
+            format!("{start}\r\n{headers}\r\n\r\n{body}").into_bytes()
+        };
+        let host = format!("Host: {authority}\r\nConnection: close");
+
+        let mut cases: Vec<(Vec<u8>, u16, &str)> = vec![
+            (
+                request("GET /v1/status?query=1 HTTP/1.1", &host, ""),
+                404,
+                "not_found",
+            ),
+            (
+                request("GET http://127.0.0.1:8787/v1/status HTTP/1.1", &host, ""),
+                400,
+                "bad_request",
+            ),
+            (
+                request("GET //127.0.0.1/v1/status HTTP/1.1", &host, ""),
+                400,
+                "bad_request",
+            ),
+            (
+                request("GET /v1/status HTTP/1.1", "Connection: close", ""),
+                400,
+                "bad_request",
+            ),
+            (
+                request(
+                    "GET /v1/status HTTP/1.1",
+                    &format!("Host: {authority}\r\nhost: {authority}\r\nConnection: close"),
+                    "",
+                ),
+                400,
+                "bad_request",
+            ),
+            (
+                request(
+                    "GET /v1/status HTTP/1.1",
+                    "Host: 127.0.0.1:1\r\nConnection: close",
+                    "",
+                ),
+                400,
+                "bad_request",
+            ),
+            (
+                request(
+                    "GET /v1/status HTTP/1.1",
+                    &format!("{host}\r\nContent-Length: 1"),
+                    "x",
+                ),
+                413,
+                "request_body_not_allowed",
+            ),
+            (
+                request(
+                    "GET /v1/status HTTP/1.1",
+                    &format!("{host}\r\nTransfer-Encoding: chunked"),
+                    "",
+                ),
+                413,
+                "request_body_not_allowed",
+            ),
+            (
+                request(
+                    "GET /v1/status HTTP/1.1",
+                    &format!("{host}\r\nContent-Length: nope"),
+                    "",
+                ),
+                400,
+                "bad_request",
+            ),
+            (
+                request(
+                    "GET /v1/status HTTP/1.1",
+                    &format!("{host}\r\nAuthorization: Bearer redacted"),
+                    "",
+                ),
+                400,
+                "bad_request",
+            ),
+            (
+                request(
+                    "GET /v1/status HTTP/1.1",
+                    &format!("{host}\r\nAccept: */*\r\nAccept: application/json"),
+                    "",
+                ),
+                400,
+                "bad_request",
+            ),
+            (
+                request(
+                    "POST /v1/status HTTP/1.1",
+                    &format!("{host}\r\nContent-Length: 0"),
+                    "",
+                ),
+                405,
+                "method_not_allowed",
+            ),
+            (
+                request(
+                    "POST /v1/unknown HTTP/1.1",
+                    &format!("{host}\r\nContent-Length: 0"),
+                    "",
+                ),
+                404,
+                "not_found",
+            ),
+            (
+                request("GET /v1/status HTTP/1.1\n", &host, ""),
+                400,
+                "bad_request",
+            ),
+        ];
+
+        let oversized = format!("{host}\r\nX-Oversized: {}", "x".repeat(1_025));
+        cases.push((
+            request("GET /v1/status HTTP/1.1", &oversized, ""),
+            431,
+            "request_headers_too_large",
+        ));
+        let aggregate = (0..9)
+            .map(|index| format!("X-{index}: {}", "x".repeat(1_000)))
+            .collect::<Vec<_>>()
+            .join("\r\n");
+        cases.push((
+            request(
+                "GET /v1/status HTTP/1.1",
+                &format!("{host}\r\n{aggregate}"),
+                "",
+            ),
+            431,
+            "request_headers_too_large",
+        ));
+        let count = (0..33)
+            .map(|index| format!("X-{index}: x"))
+            .collect::<Vec<_>>()
+            .join("\r\n");
+        cases.push((
+            request("GET /v1/status HTTP/1.1", &format!("{host}\r\n{count}"), ""),
+            431,
+            "request_headers_too_large",
+        ));
+
+        for (raw_request, status, error) in cases {
+            let response = wire_request_raw(address, &raw_request);
+            assert!(
+                response.starts_with(&format!("HTTP/1.1 {status}")),
+                "{response:?}"
+            );
+            assert_eq!(body(&response)["error"], error, "request={raw_request:?}");
+            assert!(response.contains("content-type: application/json; charset=utf-8"));
+            assert!(response.contains("cache-control: no-store"));
+            assert!(response.contains("connection: close"));
+        }
+
+        let canonical = wire_request_raw(
+            address,
+            format!(
+                "GET /v1/health HTTP/1.1\r\nHost: {authority}\r\nAccept: */*\r\nUser-Agent: curl/8\r\n\r\n"
+            )
+            .as_bytes(),
+        );
+        assert!(canonical.starts_with("HTTP/1.1 200"), "{canonical:?}");
+        assert_eq!(body(&canonical)["service"], "codex-info");
+
+        server.shutdown();
+    }
+
+    #[test]
+    fn details_endpoint_publishes_additive_fields_without_status_drift() {
+        let _guard = api_server_test_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut server = ApiServer::start(loopback_config()).unwrap();
+        server
+            .publisher()
+            .publish_details(detailed_fixture())
+            .unwrap();
+
+        let details = wire_request(
+            server.local_addr(),
+            "GET /v1/details HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        );
+        assert!(details.starts_with("HTTP/1.1 200"));
+        assert!(details.contains("cache-control: no-store"));
+        let details_body = body(&details);
+        assert_eq!(details_body["api_version"], "v1");
+        assert_eq!(details_body["models"][0]["input_dollars"], 0.0045);
+        assert!(details_body["history_samples"][0]["remaining_percent"].is_null());
+        assert_eq!(details_body["history_periods"][0]["id"], "1780400000");
+        assert_eq!(details_body["threads"][0]["context_window_tokens"], 258400);
+        assert!(details_body.get("email").is_none());
+        assert!(details_body.get("auth_url").is_none());
+        assert!(details_body.get("error_detail").is_none());
+
+        let status = wire_request(
+            server.local_addr(),
+            "GET /v1/status HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        );
+        assert_eq!(body(&status)["models"][0].as_object().unwrap().len(), 4);
+        assert!(body(&status)["history_periods"].is_null());
+        server.shutdown();
+    }
+
+    #[test]
+    fn rejected_requests_cannot_mutate_the_published_pair() {
+        let _guard = api_server_test_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut server = ApiServer::start(loopback_config()).unwrap();
+        server
+            .publisher()
+            .publish_details(detailed_fixture())
+            .unwrap();
+        let before_status = body(&wire_request(
+            server.local_addr(),
+            "GET /v1/status HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        ));
+        let before_details = body(&wire_request(
+            server.local_addr(),
+            "GET /v1/details HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        ));
+
+        let cases = [
+            "DELETE /v1/status HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+                .to_owned(),
+            "GET /v1/unknown HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+                .to_owned(),
+            "GET /v1/status HTTP/1.1\r\nmalformed-header\r\nConnection: close\r\n\r\n"
+                .to_owned(),
+            format!(
+                "GET /v1/status HTTP/1.1\r\nHost: localhost\r\nX-Oversize: {}\r\nConnection: close\r\n\r\n",
+                "x".repeat(128 * 1024)
+            ),
+        ];
+        for request in cases {
+            let _ = wire_request(server.local_addr(), &request);
+            assert_eq!(
+                body(&wire_request(
+                    server.local_addr(),
+                    "GET /v1/status HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+                )),
+                before_status
+            );
+            assert_eq!(
+                body(&wire_request(
+                    server.local_addr(),
+                    "GET /v1/details HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+                )),
+                before_details
+            );
+        }
+        server.shutdown();
+    }
+
+    #[test]
+    fn invalid_publication_keeps_the_last_snapshot() {
+        let _guard = api_server_test_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut server = ApiServer::start(loopback_config()).unwrap();
+        let publisher = server.publisher();
+        let initial = PublicSnapshot {
+            state: PublicState::AuthRequired,
+            ..PublicSnapshot::default()
+        };
+        publisher.publish(initial).unwrap();
+        let invalid = PublicSnapshot {
+            quota: Some(PublicQuota {
+                remaining_percent: 101.0,
+                reset_at: 1,
+                window_seconds: 1,
+                monthly: false,
+            }),
+            ..PublicSnapshot::default()
+        };
+        assert_eq!(
+            publisher.publish(invalid),
+            Err(ApiSnapshotError::InvalidQuota)
+        );
+        let status = wire_request(
+            server.local_addr(),
+            "GET /v1/status HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        );
+        assert_eq!(body(&status)["state"], "auth_required");
+        server.shutdown();
+    }
+
+    #[test]
+    fn invalid_details_keep_the_last_atomic_generation() {
+        let _guard = api_server_test_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut server = ApiServer::start(loopback_config()).unwrap();
+        let publisher = server.publisher();
+        publisher.publish_details(detailed_fixture()).unwrap();
+        let mut invalid = detailed_fixture();
+        invalid.models[0].output_dollars = f64::NAN;
+        assert_eq!(
+            publisher.publish_details(invalid),
+            Err(ApiSnapshotError::InvalidModel)
+        );
+        let details = wire_request(
+            server.local_addr(),
+            "GET /v1/details HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        );
+        assert_eq!(body(&details)["estimated_cost_label"], "概算 $1");
+        server.shutdown();
+    }
+
+    #[test]
+    fn one_month_history_overflow_rejects_candidate_and_keeps_last_generation() {
+        let _guard = api_server_test_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut server = ApiServer::start(loopback_config()).unwrap();
+        let publisher = server.publisher();
+        publisher.publish_details(detailed_fixture()).unwrap();
+
+        let oversized = history_fixture(MAX_PUBLIC_HISTORY_SAMPLES + 1);
+        assert_eq!(
+            publisher.publish_details(oversized),
+            Err(ApiSnapshotError::ListTooLong)
+        );
+
+        let details = wire_request(
+            server.local_addr(),
+            "GET /v1/details HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        );
+        let details = body(&details);
+        assert_eq!(details["estimated_cost_label"], "概算 $1");
+        assert_eq!(details["history_samples"].as_array().unwrap().len(), 1);
+        server.shutdown();
+    }
+
+    #[test]
+    fn detail_validation_is_bounded_for_times_rates_lists_models_and_text() {
+        let mut invalid = detailed_fixture();
+        invalid.history_samples[0].timestamp = 0;
+        assert_eq!(
+            invalid.validate(),
+            Err(ApiSnapshotError::InvalidHistorySample)
+        );
+
+        let mut invalid = detailed_fixture();
+        invalid.history_samples[0].sol_dollars = f64::INFINITY;
+        assert_eq!(
+            invalid.validate(),
+            Err(ApiSnapshotError::InvalidHistorySample)
+        );
+
+        let mut invalid = detailed_fixture();
+        invalid.history_periods[0].label = "x".repeat(513);
+        assert_eq!(
+            invalid.validate(),
+            Err(ApiSnapshotError::InvalidHistoryPeriod)
+        );
+
+        let mut invalid = detailed_fixture();
+        invalid.threads[0].title = "x".repeat(513);
+        assert_eq!(invalid.validate(), Err(ApiSnapshotError::InvalidThread));
+
+        let mut invalid = detailed_fixture();
+        invalid.models = vec![invalid.models[0].clone(); MAX_PUBLIC_MODELS + 1];
+        assert_eq!(invalid.validate(), Err(ApiSnapshotError::ListTooLong));
+
+        let mut invalid = detailed_fixture();
+        invalid.models[0].name = "OTHER".into();
+        assert_eq!(invalid.validate(), Err(ApiSnapshotError::InvalidModel));
+    }
+
+    #[test]
+    fn shutdown_releases_the_bound_port() {
+        let _guard = api_server_test_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut server = ApiServer::start(loopback_config()).unwrap();
+        let address = server.local_addr();
+        let conflicting = ApiServerConfig::new(address).unwrap();
+        assert_eq!(
+            ApiServer::start(conflicting).err(),
+            Some(ApiServerError::BindFailed)
+        );
+        server.shutdown();
+        server.shutdown();
+        let rebound = TcpListener::bind(address);
+        assert!(rebound.is_ok());
+    }
+}
