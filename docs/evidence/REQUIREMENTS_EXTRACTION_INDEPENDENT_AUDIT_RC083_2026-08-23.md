@@ -2,7 +2,7 @@
 
 ## 判定
 
-- RC-083 scoped verdict: **PASS**
+- RC-083 scoped static verdict: **INCONCLUSIVE / HOLD**
 - 全体要求抽出 verdict: **HOLD**
 
 RC-083の契約伝播・競合状態・機械ゲートを、実装担当の結論を参照せずに確認した。ソースコードや既存のOPEN/OPEN_AUTHORITY_CONFLICT行は変更していない。
@@ -63,10 +63,13 @@ Raw output: empty.
 
 監査対象3ファイルのSHA-256とHEADは、この証跡作成時に取得した値を下記へ記録する。
 
-- HEAD: `0b6020bd786104154ad91810d8951ef6f5c23f39`
-- `docs/WINDOWS_REQUIREMENTS_OPEN_CONFLICTS_2026-08-23.md`: `d40f5aa64632fe1dd98e69d5253bc002839db6e485e5eb4ef5c2c70fd4f9dd28`
-- `docs/atomic-contracts/WIN_J_M_CONCRETE_CONTRACTS_2026-08-22.md`: `d78791d8111223cabe3efb5d4327f32395b842f7bf1631b321d4f229c26b8da9`
-- `scripts/windows_requirements_extraction_check.sh`: `1baabc3013db943ec4105e7216d85a4951ac0aa2938ad40e75aef546dcffff93`
+- `docs/WINDOWS_REQUIREMENTS_OPEN_CONFLICTS_2026-08-23.md`: `f1d6db5707b5d840c455ca7c28e6a4a37193b3a2788f7ed63c3e7c108c2eb6b3`
+- `docs/atomic-contracts/WIN_J_M_CONCRETE_CONTRACTS_2026-08-22.md`: `540d1dc923b4e2999706ef8692ae1c8b698d6781ac3586f7e82d51d151c37b6b`
+- `scripts/windows_requirements_extraction_check.sh`: `e36f963ebbd5d9e861f59d3c7a44e12d8786e16637b055afe3277e26269b98c2`
+- cross-scan: `6c28d0711e856cee629655c5ac4cc9636d71b92d68cf8fe79a238f0794c84513`
+- tracker: `42a036007f8a0b8a1296943f93ea2cae06b851d64136e9029bb5be587883b90f`
+- cross-scan current: `b59bb32e01d2eec7edc26d05dab0d267f03b1cd682f74743a164be7418d953a2`
+- tracker current: `ccddd949dc12dc2978d4251e541cb11f743f9b03a7c7550d7a8dd1f14265a4a6`
 
 ## 未検証事項
 

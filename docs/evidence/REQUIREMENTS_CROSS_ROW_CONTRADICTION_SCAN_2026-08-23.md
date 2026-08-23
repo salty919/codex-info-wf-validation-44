@@ -264,3 +264,54 @@ fresh独立監査の証跡は `docs/evidence/REQUIREMENTS_EXTRACTION_INDEPENDENT
 
 `DATA_PROTECTION_POLICY.md` §4.3 と `WIN-J-015` を突合し、old-schema startup reject、明示candidate success、candidate/lock/rename/fsync/reload/pair failureの3経路を固定した。`migration-switch-v1`のowner-only 0600 UTF-8 JSON <=64KiB、exact phase/interrupt、全row/type/value・unique key・quick_check・schema・row count・fingerprint・period/partition検証、current path missing/double/empty、rollback/roll-forward、回復前writer/publish=0、旧DB/backup/memory/root保持、同一operation再入とforeign operationのmutation=0をWIN-J-015へjoinした。RC-073を `FIXED_PENDING_FRESH_AUDIT` へ移行するが、runtime journal/recovery、same-release lineage、freeze未取得のためCLOSEDへ昇格しない。
 fresh独立監査の証跡は `docs/evidence/REQUIREMENTS_EXTRACTION_INDEPENDENT_AUDIT_RC073_2026-08-23.md`。静的projectionとmachine gateは整合したが、runtime journal/recovery、interrupt replay、publication/current oracle、release lineage、freeze captureがないため `INCONCLUSIVE/HOLD`。現行RC状態は `OPEN=48 / OPEN_AUTHORITY_CONFLICT=22 / FIXED_PENDING_FRESH_AUDIT=101 / CLOSED=3`。
+
+## RC-072 explicit restore operation boundary (V47)
+
+`CUSTOMER_OPERATIONS_RUNBOOK.md` §4、`WINDOWS_DATA_PROTECTION_ROW_CONTRACTS.md` の WIN-J-014/WIN-J-015、`DATA_PROTECTION_POLICY.md` §4.2/§4.3、および具体契約の RC-072 projection を行単位で突合した。顧客が実行するcommandは既存の `codex-info-server-setup restore --generation 1` に限定し、全writer/API/UI停止確認、現DBを削除しない退避、選択した完全verified世代のSHA/quick_check/schema/row count/deterministic fingerprint/reset-period境界検証、同一filesystem staging・flush・atomic replace、reload後のREST status/details pairとUI確認、失敗時の旧DB・全verified backup・old memory/root/history保持を固定した。`migrate --dry-run`/`migrate --apply`とは別operationとし、通常起動の自動restore、暗黙schema変換、current/backup削除、空DB置換、同一operation再入の二重replace/publication/generationを禁止した。新しい数値・path・成功値は追加していない。
+
+RC-072は `FIXED_PENDING_FRESH_AUDIT` へ移行するが、stop/order/path/hash/validation/replace/reloadのruntime trace、same-release artifact lineage、freeze captureが未取得のためCLOSEDへ昇格しない。fresh独立監査は静的projectionとmachine gateを再計算し、必須runtime/release/freeze証跡の欠落により `INCONCLUSIVE/HOLD` とした。現行RC状態は `OPEN=47 / OPEN_AUTHORITY_CONFLICT=22 / FIXED_PENDING_FRESH_AUDIT=102 / CLOSED=3`。
+
+## RC-074 database fault matrix boundary (V48)
+
+`DATA_PROTECTION_POLICY.md` §RC-168の11 fault enum、`WINDOWS_DATA_PROTECTION_ROW_CONTRACTS.md` のJ行fault join、WIN-J-006/J-009/J-012/J-014/J-015具体契約、およびRC-074投影を行単位で突合した。`BUSY`、`LOCKED`、`IOERR`、`FULL`、`READONLY`、`PERMISSION`、`CORRUPT`、`BACKUP_VALIDATION`、`BACKUP_ROTATION`、`PRUNE_CONTENTION`、`MIGRATION_LOCK`を既存の注入点・SQLite/OS結果・rollback/admission/prune/switch遷移・retry予算・保持対象へ固定し、各caseのoperation ID、hash、quick_check、restart open/read、publish/generation deltaを独立oracleとした。BUSY/LOCKEDのbounded next-cycle retry以外はsame-callback retry=0、fault結果の流用・partial publish・synthetic recovery・空DB再生成・未検証backup採用を禁止した。新しい数値・fault名・復旧経路は追加していない。
+
+RC-074は `FIXED_PENDING_FRESH_AUDIT` へ移行するが、11 faultの実注入・rollback/restart trace、same-release artifact lineage、freeze captureが未取得のためCLOSEDへ昇格しない。fresh独立評価は静的matrixとmachine gateを再計算し、runtime/release/freeze欠落により `INCONCLUSIVE/HOLD` を維持した。追加で `scripts/data_protection_gate.sh` は verified ledger rows 不足（DP-001/005/009 HOLD）でexit=1となり、RC-074の静的PASSへ混同しない。現行RC状態は `OPEN=46 / OPEN_AUTHORITY_CONFLICT=22 / FIXED_PENDING_FRESH_AUDIT=103 / CLOSED=3`。
+
+## RC-075 bounded daemon work boundary (V49)
+
+`DATA_PROTECTION_POLICY.md` §4.1/§8.7/§8.13、WIN-J-010/J-011 row contracts、J-M具体契約のRC-075 projection、既存RC-167 cursor規則を行単位で突合した。intervalは整数5..3600/default60、eventごとscan/transaction最大1、transaction最大1024 rows/1MiB、record/file/aggregate上限4MiB/256MiB/2GiB、canonical fingerprint、append/rotate/replace/truncate cursor規則、outage epochごとのbackfill latch=1、scan/restart retry最大1、same-callback retry=0、fingerprint不変時scan/write/retry=0を固定した。CPU/RSS値や未定義のretry動作は追加していない。
+
+RC-075は `FIXED_PENDING_FRESH_AUDIT` へ移行するが、実daemonのbounded counters、fingerprint/cursor/backfill/restart raw trace、same-release artifact lineage、freeze captureが未取得のためCLOSEDへ昇格しない。fresh独立評価は静的boundとmachine gateを再計算し、runtime/release/freeze欠落により `INCONCLUSIVE/HOLD` を維持した。現行RC状態は `OPEN=45 / OPEN_AUTHORITY_CONFLICT=22 / FIXED_PENDING_FRESH_AUDIT=104 / CLOSED=3`。
+
+## RC-076 local/REST resource boundary (V50)
+
+`DATA_PROTECTION_POLICY.md` resource table、`REST_API_V1.md` transfer limits、WIN-I-006/WIN-J-010 row contract、RC-076 conflict、およびRC-076 projectionを突合した。local JSONLのline/file/aggregate（4MiB/256MiB/2GiB、decode前bytes）、internal validated snapshot（1MiB）、REST transfer（header/status/details 8KiB/64KiB/32MiB、Content-Lengthとstream cutoff）を別resourceとして固定し、local record隔離の後続cumulative snapshot条件、internal candidate reject、REST PublishedPair全体reject、last-good保持を分離した。新しい上限やfailure単位は追加していない。
+
+RC-076は既存の `FIXED_PENDING_FRESH_AUDIT` を維持する。実byte counter、Content-Length/stream cutoff、local/internal/REST別state、same-release lineage、freeze captureが未取得のためCLOSEDへ昇格しない。fresh独立評価は静的resource境界とmachine gateの整合を確認したが、runtime/release/freeze欠落により `INCONCLUSIVE/HOLD` とした。RC状態は `OPEN=45 / OPEN_AUTHORITY_CONFLICT=22 / FIXED_PENDING_FRESH_AUDIT=104 / CLOSED=3`。
+## RC-077 current-source re-audit (V51)
+
+RC-077のRecorderDaemon/source→SQLite、SnapshotPublisher/PublishedPair、native UI/REST read-only共有、daemon単独HTTP listenerなし、owner/publisher/DB fault時のlast-good保持を、`REST_API_V1.md`と`DESIGN.md`へ再突合した。RC-076後の現行script・conflict ledger・REST・DESIGN・tracker/cross-scan SHAを監査記録へ更新し、既存の責務境界以外の値は追加していない。machine gateはPASS、intake guardはFAIL。実runtime、同一release lineage、freeze captureが未取得のため、RC-077は`FIXED_PENDING_FRESH_AUDIT`を維持し、現行release PASSへ昇格しない。RC状態は`OPEN=45 / OPEN_AUTHORITY_CONFLICT=22 / FIXED_PENDING_FRESH_AUDIT=104 / CLOSED=3`。
+
+## RC-078 status/details pair atomicity re-audit (V52)
+
+`REST_API_V1.md`のAtomic status/details client admissionと`DATA_PROTECTION_POLICY.md` §8.1/§8.3を、RC-078 conflict rowへ再突合した。status/detailsは各1回取得し、schema/domain/common-coreとrequest-cycle ID/canonical common-core hashが一致する同一候補だけを一括commitし、片側失敗・不一致では両方discardして直前完全pairを保持する。`auth_required`の可視性消去はdata pair commitと分離したsecurity transitionとして扱う。新しい世代値やfailure経路は追加していない。machine gateはPASS、intake guardはFAIL、実candidate trace・pair generation・auth-clear runtime・same-release lineage・freeze captureは未取得であるため、RC-078は`FIXED_PENDING_FRESH_AUDIT`を維持する。現行RC状態は`OPEN=45 / OPEN_AUTHORITY_CONFLICT=22 / FIXED_PENDING_FRESH_AUDIT=104 / CLOSED=3`。
+
+## RC-079 all-response header and route matrix re-audit (V53)
+
+`REST_API_V1.md`の全response header、known GET、non-GET=405、unknown/case-altered/normalized/query path=404、read-only effect set、status/details transfer limitsをRC-079 conflict rowと`DATA_PROTECTION_POLICY.md`へ突合した。全responseにexact JSON Content-Type、no-store、8 KiB header aggregateを適用し、fixed Content-LengthをUTF-8 body bytesへ結び付けた。新しいheader、route、上限、failure値は追加していない。machine gateはPASS、intake guardはFAIL。per-route runtime trace、body cutoff計測、same-release lineage、freeze captureが未取得のためRC-079は`FIXED_PENDING_FRESH_AUDIT`を維持する。現行RC状態は`OPEN=45 / OPEN_AUTHORITY_CONFLICT=22 / FIXED_PENDING_FRESH_AUDIT=104 / CLOSED=3`。
+
+## RC-080 all-endpoint read-only effect boundary re-audit (V54)
+
+`REST_API_V1.md`のRead-only effect setとRC-080 conflict rowを、health/status/detailsの成功、known-path non-GET=405、unknown path=404の全responseへ突合した。許可はrequest-lifetime heap、bounded in-memory counter、loopback socket、read-only open/statだけであり、SQLite/WAL/SHM、PublishedPair、backup/migration/checkpoint、filesystem/process/networkの永続副作用、Windows direct DB accessを禁止する。OS atimeは成功根拠にせず、re-entry副作用増加もFAIL/HOLDとした。新しい副作用分類や値は追加していない。machine gateはPASS、intake guardはFAIL。per-route syscall/effect trace、Windows DB trace、re-entry counters、same-release lineage、freeze capture未取得のためRC-080は`FIXED_PENDING_FRESH_AUDIT`を維持する。現行RC状態は`OPEN=45 / OPEN_AUTHORITY_CONFLICT=22 / FIXED_PENDING_FRESH_AUDIT=104 / CLOSED=3`。
+
+## RC-081 health actor and polling boundary re-audit (V55)
+
+`WIN-E-012`のSetup/bootstrap/reconnect health probe、`WIN-I-001`のhealth→status→auth-check→ready sequence、`WIN-M-017`のclient ownershipを、RC-081 conflict rowとREST health authorityへ突合した。healthは到達性の判定、通常pollはstatus/details、failureは`HealthUnavailable`と直前last-good保持であり、healthをdata snapshotやDB writerへ昇格させない。新しいactor、route、failure値は追加していない。machine gateはPASS、intake guardはFAIL。Setup/reconnect・normal-poll runtime trace、health failure遷移、same-release lineage、freeze capture未取得のためRC-081は`FIXED_PENDING_FRESH_AUDIT`を維持する。現行RC状態は`OPEN=45 / OPEN_AUTHORITY_CONFLICT=22 / FIXED_PENDING_FRESH_AUDIT=104 / CLOSED=3`。
+
+## RC-082 current-source bounded reconciliation (V56)
+
+`WIN_E_I_CONCRETE_CONTRACTS_2026-08-22.md`のRC-082 projection、`WIN-G-014`/`WIN-F-007`/`WIN-E-011`/`WIN-E-016`の既存oracleを再突合した。初回SetupとSettings再表示のCancel境界で静的に確定できる値だけを記録し、Backの直前step、初回Cancel/Close後のMain disconnected＋Settings recovery、再表示Cancel/Close時の旧6-key bytes完全保持はOPENのまま保持した。推測によるroute・保持値・副作用追加は行っていない。machine gateはPASS、intake guardはFAIL、runtime UIA/keyboard/process/settings、same-release lineage、freeze capture未取得のためRC-082は`OPEN / SETUP-UX`を維持する。現行RC状態は`OPEN=45 / OPEN_AUTHORITY_CONFLICT=22 / FIXED_PENDING_FRESH_AUDIT=104 / CLOSED=3`。
+
+## RC-083 current-source navigation re-audit (V57)
+
+`WIN-M-006 / WIN-M-007 surface-navigation addendum (RC-083)`と`WIN-M-012`の共有navigation ownerを、Graph/Threads各surfaceのBack/Close可視性、keyboard/UIA到達性、Main route復帰、surface固有保持値、非破壊境界へ突合した。共有行だけでの合格を許さず、各source_idのbounds/focus/key/route/hash evidence scopeを維持した。新しいsurface、route、保持値は追加していない。machine gateはPASS、intake guardはFAIL、実Windows/UIA/画像、same-release lineage、freeze capture未取得のためRC-083は`FIXED_PENDING_FRESH_AUDIT`を維持する。現行RC状態は`OPEN=45 / OPEN_AUTHORITY_CONFLICT=22 / FIXED_PENDING_FRESH_AUDIT=104 / CLOSED=3`。

@@ -599,6 +599,26 @@ for generation_journal_fragment in (
 ):
     if generation_journal_fragment not in jm_contract_text:
         fail(f"{CONTRACTS[2]}: RC-071 projection lacks exact fragment: {generation_journal_fragment}")
+restore_command_marker = "### WIN-J-014 / WIN-J-015 explicit restore operation projection (RC-072)"
+if restore_command_marker not in jm_contract_text:
+    fail(f"{CONTRACTS[2]}: RC-072 explicit restore projection is missing")
+for restore_command_fragment in (
+    "RC-072は顧客が実行する明示restoreだけを対象にし",
+    "source_id=WIN-J-014:restore-command",
+    "`codex-info-server-setup restore --generation 1`",
+    "all writer/API/UI services are stopped",
+    "retain current DB without deletion",
+    "file SHA-256, `quick_check`, schema, row count, deterministic fingerprint, and reset-period boundary",
+    "stage on the same filesystem",
+    "flush and atomically replace the current DB",
+    "verify REST status/details pair and UI reload",
+    "source_id=WIN-J-015:restore-boundary",
+    "explicit restore is separate from `migrate --dry-run` and `migrate --apply`",
+    "automatic restore, direct editing/deletion, and empty DB replacement=0",
+    "same operation ID cannot duplicate replace, publication, or generation",
+):
+    if restore_command_fragment not in jm_contract_text:
+        fail(f"{CONTRACTS[2]}: RC-072 projection lacks exact fragment: {restore_command_fragment}")
 migration_switch_marker = "### WIN-J-015 migration-switch projection (RC-073)"
 if migration_switch_marker not in jm_contract_text:
     fail(f"{CONTRACTS[2]}: RC-073 migration-switch projection is missing")
@@ -619,6 +639,67 @@ for migration_switch_fragment in (
 ):
     if migration_switch_fragment not in jm_contract_text:
         fail(f"{CONTRACTS[2]}: RC-073 projection lacks exact fragment: {migration_switch_fragment}")
+fault_matrix_marker = "### WIN-J-006 / WIN-J-009 / WIN-J-012 / WIN-J-014 / WIN-J-015 database fault matrix projection (RC-074)"
+if fault_matrix_marker not in jm_contract_text:
+    fail(f"{CONTRACTS[2]}: RC-074 database fault matrix projection is missing")
+for fault_matrix_fragment in (
+    "RC-074は`DATA_PROTECTION_POLICY.md` §RC-168の既存11 fault enumを",
+    "source_id=WIN-J-006/J-009/J-012/J-014/J-015:fault-matrix",
+    "cases=`BUSY`",
+    "`LOCKED`(shared-cache transaction/backup read",
+    "`IOERR`(source open/read, DB write, candidate or directory fsync",
+    "`FULL`(DB page write/backup fsync",
+    "`READONLY`(writer admission/DB or candidate open",
+    "`PERMISSION`(DB/backup open, rename, prune delete",
+    "`CORRUPT`(DB open/read or `quick_check`",
+    "`BACKUP_VALIDATION`(candidate quick_check/schema/row/hash/period",
+    "`BACKUP_ROTATION`(journaled rename/parent-directory fsync",
+    "`PRUNE_CONTENTION`(prune transaction before delete commit",
+    "`MIGRATION_LOCK`(migration lease/candidate switch",
+    "same-callback retry=0 and next cycle max1",
+    "fault success_commit/partial row/partial switch/delete/publish/synthetic recovery=0",
+    "empty DB regeneration and unverified backup adoption=0",
+):
+    if fault_matrix_fragment not in jm_contract_text:
+        fail(f"{CONTRACTS[2]}: RC-074 projection lacks exact fragment: {fault_matrix_fragment}")
+bounded_work_marker = "### WIN-J-010 / WIN-J-011 bounded daemon work projection (RC-075)"
+if bounded_work_marker not in jm_contract_text:
+    fail(f"{CONTRACTS[2]}: RC-075 bounded daemon projection is missing")
+for bounded_work_fragment in (
+    "RC-075は`DATA_PROTECTION_POLICY.md` §4.1/§8.7/§8.13およびJ-010/J-011既存値を",
+    "source_id=WIN-J-010:bounded-work",
+    "daemon interval accepts integer `5..3600`, default `60`",
+    "one event has at most one scan and one SQLite transaction",
+    "one transaction is at most `1024 rows` and `1 MiB`",
+    "one JSONL record is `4 MiB`, one source file `256 MiB`, session aggregate `2 GiB`",
+    "unchanged fingerprint→full scan/write/retry=0",
+    "rotate/replace resets cursor to0",
+    "truncate clamps to last durable LF boundary and overlaps at most one preceding complete record",
+    "one outage epoch consumes one backfill latch",
+    "scan/restart retry is at most1 and same-callback retry is0",
+    "source_id=WIN-J-011:backfill-restart",
+    "expired/tombstoned or AuthEpoch/nonce-mismatched hint is not a candidate",
+    "no timestamp-gap interpolation, copied sample, old-period reattribution",
+):
+    if bounded_work_fragment not in jm_contract_text:
+        fail(f"{CONTRACTS[2]}: RC-075 projection lacks exact fragment: {bounded_work_fragment}")
+resource_bound_marker = "### WIN-I-006 / WIN-J-010 resource-boundary projection (RC-076)"
+if resource_bound_marker not in jm_contract_text:
+    fail(f"{CONTRACTS[2]}: RC-076 resource-boundary projection is missing")
+for resource_bound_fragment in (
+    "RC-076はlocal JSONL入力、internal validated snapshot、REST transferを別resourceとして扱い",
+    "source_id=WIN-I-006/WIN-J-010:resource-boundary",
+    "local JSONL: line `4 MiB`, file `256 MiB`, aggregate `2 GiB`, decode前の受信bytes",
+    "internal snapshot `1 MiB` canonical JSON",
+    "REST transfer: response header `8 KiB`, status body `64 KiB`, details body `32 MiB`",
+    "fixed REST body Content-Length must equal UTF-8 body bytes",
+    "unknown-length stream stops at first excess byte",
+    "local oversize/invalid record is isolated only when a later validated cumulative snapshot covers the missing column",
+    "REST oversize rejects the whole PublishedPair",
+    "local input and REST transfer limits are not interchangeable",
+):
+    if resource_bound_fragment not in jm_contract_text:
+        fail(f"{CONTRACTS[2]}: RC-076 projection lacks exact fragment: {resource_bound_fragment}")
 extension_marker = "## RC-167〜169 exact extension for WIN-J-007..016"
 if extension_marker not in jm_contract_text:
     fail(f"{CONTRACTS[2]}: missing RC-167〜169 extension marker")

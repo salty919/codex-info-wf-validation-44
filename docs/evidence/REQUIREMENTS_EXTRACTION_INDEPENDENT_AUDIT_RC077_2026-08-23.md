@@ -23,10 +23,12 @@
 
 - `git diff --check`: exit 0.
 - `bash scripts/windows_requirements_extraction_check.sh`: exit 0, `MACHINE_GATE_PASS`.
-- Machine script SHA-256: `5af8c07e5ea125b109edfd956808fcb823784b34e63b899325ae3ed8b47a76f7`.
-- Conflict ledger SHA-256: `be252255597a9aec6de24063e456c2ee295d096ff6f15ef789b721035324224c`.
+- Machine script SHA-256: `e36f963ebbd5d9e861f59d3c7a44e12d8786e16637b055afe3277e26269b98c2`.
+- Conflict ledger SHA-256: `f1d6db5707b5d840c455ca7c28e6a4a37193b3a2788f7ed63c3e7c108c2eb6b3`.
 - REST authority SHA-256: `ffa2b830b76b878737d124723996cd820da9be30233305b010666a86fe2a28df`.
 - DESIGN SHA-256: `990d3b93d3acad36149b7de81b202ff88631b2e34cd29e9e63fcd970e594df40`.
+- Cross-scan SHA-256: `28b0c77d273c6abc1cbff37847dd7bb5401a48e917566802d08fc97ef615c230`.
+- Tracker SHA-256: `967010974498bb5748e0ca2c3317269b4df662f79b092773fdd1d3b20a9174a9`.
 
 ## Not verified
 

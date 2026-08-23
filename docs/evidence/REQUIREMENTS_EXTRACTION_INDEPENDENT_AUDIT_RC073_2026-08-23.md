@@ -31,6 +31,14 @@ Required but unavailable: same-release runtime path/inode/hash/phase, old-schema
 
 ## Audited bytes
 
+The bounded projection and contradiction-scan manifest references used for this audit are explicit:
+
+```text
+projection   docs/atomic-contracts/WINDOWS_LEGACY_GAP_PROJECTIONS_2026-08-23.md
+projection_sha 419494e9c8e34cbda311ea3d9b3903dda29b7e57772e799dbf1ba4f5f2d58219
+V46 manifest docs/evidence/REQUIREMENTS_CROSS_ROW_CONTRADICTION_SCAN_2026-08-23.md#V46
+```
+
 ```text
 script     06494168f4ca8732b20e7517f1c7bd4376bdbdd23b87d682afb5d29f2d6b13f6
 conflicts  e7c15e7de6bc858a8e13ab618e4c52a33078679a1dfc7b4c56840cff8f08a9a9
