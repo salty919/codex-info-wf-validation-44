@@ -16,6 +16,11 @@ public partial class App : Application
 
     public static ClientSettings CurrentSettings { get; internal set; } = ClientSettings.Default;
 
+    public static IClientSettingsSession SettingsSession { get; } = new ClientSettingsSession(
+        SettingsStore,
+        () => CurrentSettings,
+        settings => CurrentSettings = settings);
+
     public override void OnFrameworkInitializationCompleted()
     {
         if (ApplicationLifetime is IClassicDesktopStyleApplicationLifetime desktop)

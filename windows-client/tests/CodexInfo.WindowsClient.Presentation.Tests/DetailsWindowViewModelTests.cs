@@ -3,6 +3,7 @@
 
 using System.Diagnostics;
 using System.Globalization;
+using System.Collections.Concurrent;
 using CodexInfo.WindowsClient.Core;
 using CodexInfo.WindowsClient.Localization;
 using CodexInfo.WindowsClient.Settings;
@@ -189,7 +190,7 @@ public sealed class DetailsWindowViewModelTests
             [period], period.Samples, [], "estimated");
 
         using var main = new MainWindowViewModel(
-            new SingleStatusClient(StatusFetchResult.Success(ValidStatus(resetAt))),
+            new SingleStatusClient(StatusFetchResult.Success(StatusFromDetails(details))),
             new SingleDetailsClient(DetailsFetchResult.Success(details)));
         main.Start();
         await EventuallyAsync(() => main.HasDetails);
@@ -212,6 +213,67 @@ public sealed class DetailsWindowViewModelTests
     }
 
     [Fact]
+    public async Task SlowPeriodChangeShowsLoadingAndAtomicallyKeepsThePreviousGraphUntilReady()
+    {
+        var now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+        var current = new ApiHistoryPeriod("current", now - 3_600, now + 3_600, true, "current")
+        {
+            Samples =
+            [
+                new ApiHistorySample(now - 120, now + 3_600, 80, 1, 2, 3, 10, 20, 30),
+                new ApiHistorySample(now - 60, now + 3_600, 70, 2, 3, 4, 20, 30, 40),
+            ],
+        };
+        var oldStart = now - 5_000L * 60;
+        var old = new ApiHistoryPeriod("old", oldStart, oldStart + 5_000L * 60, false, "old")
+        {
+            Samples = Enumerable.Range(0, 5_000)
+                .Select(index => new ApiHistorySample(
+                    oldStart + index * 60L,
+                    oldStart + 5_000L * 60,
+                    100 - index / 100d,
+                    index,
+                    index * 2,
+                    index * 3,
+                    (ulong)index,
+                    (ulong)index * 2,
+                    (ulong)index * 3))
+                .ToArray(),
+        };
+        var details = new ApiDetailsSnapshot(
+            ApiState.Ready, now, true, "Pro", null, [], 0,
+            [current, old], current.Samples.Concat(old.Samples).ToArray(), [], "estimated");
+        using var main = new MainWindowViewModel(
+            new SingleStatusClient(StatusFetchResult.Success(StatusFromDetails(details))),
+            new SingleDetailsClient(DetailsFetchResult.Success(details)));
+        main.Start();
+        await EventuallyAsync(() => main.HasDetails);
+
+        var uiPublications = new ConcurrentQueue<Action>();
+        using var graph = new GraphWindowViewModel(main, action => uiPublications.Enqueue(action));
+        var previousPoints = graph.Points;
+        var previousStart = graph.SelectedPeriodStartAt;
+
+        graph.SelectedPeriod = old;
+
+        Assert.True(graph.IsLoading);
+        Assert.Same(previousPoints, graph.Points);
+        Assert.Equal(previousStart, graph.SelectedPeriodStartAt);
+        Assert.False(graph.HasLoadError);
+
+        Assert.True(SpinWait.SpinUntil(() => !uiPublications.IsEmpty, TimeSpan.FromSeconds(2)));
+        while (uiPublications.TryDequeue(out var publish))
+        {
+            publish();
+        }
+        Assert.False(graph.IsLoading);
+        Assert.Equal(oldStart, graph.SelectedPeriodStartAt);
+        Assert.Equal(old.Samples.Count + 1, graph.Points.Count);
+        Assert.NotSame(previousPoints, graph.Points);
+        Assert.False(graph.HasLoadError);
+    }
+
+    [Fact]
     public async Task ThreadsAreParentFirstAndRetainOrphanAndContextFields()
     {
         var threads = new List<ApiThreadDetails>
@@ -223,7 +285,7 @@ public sealed class DetailsWindowViewModelTests
         var details = new ApiDetailsSnapshot(
             ApiState.Ready, 100, true, "Pro", null, [], 3, [], [], threads, "estimated");
         using var main = new MainWindowViewModel(
-            new SingleStatusClient(StatusFetchResult.Success(ValidStatus(100))),
+            new SingleStatusClient(StatusFetchResult.Success(StatusFromDetails(details))),
             new SingleDetailsClient(DetailsFetchResult.Success(details)));
         main.Start();
         await EventuallyAsync(() => main.HasDetails);
@@ -265,8 +327,68 @@ public sealed class DetailsWindowViewModelTests
         Assert.True(setup.IsDoneStep);
     }
 
+    [Fact]
+    public void LegalNoticesPageThroughEveryChapterWithoutChangingNoticeText()
+    {
+        using var main = new MainWindowViewModel(
+            new SingleStatusClient(StatusFetchResult.Success(ValidStatus(DateTimeOffset.UtcNow.AddDays(1).ToUnixTimeSeconds()))));
+        using var legal = new LegalNoticesWindowViewModel(main);
+
+        Assert.True(legal.PageCount > 1);
+        Assert.Equal(legal.Notices.Count, legal.PageCount);
+        Assert.Equal(0, legal.CurrentPageIndex);
+        Assert.Equal(1, legal.CurrentPageNumber);
+        Assert.Equal(legal.Notices[0], legal.CurrentNotice);
+        Assert.Equal(legal.Notices[0].Name, legal.CurrentNoticeName);
+        Assert.Equal(legal.Notices[0].Text, legal.CurrentNoticeText);
+        Assert.False(legal.CanGoBack);
+        Assert.True(legal.CanGoNext);
+        Assert.False(legal.BackCommand.CanExecute(null));
+        Assert.True(legal.NextCommand.CanExecute(null));
+
+        for (var expectedIndex = 1; expectedIndex < legal.PageCount; expectedIndex++)
+        {
+            legal.NextCommand.Execute(null);
+            Assert.Equal(expectedIndex, legal.CurrentPageIndex);
+            Assert.Equal(expectedIndex + 1, legal.CurrentPageNumber);
+            Assert.Same(legal.Notices[expectedIndex], legal.CurrentNotice);
+            Assert.Equal(legal.Notices[expectedIndex].Text, legal.CurrentNoticeText);
+        }
+
+        Assert.False(legal.CanGoNext);
+        Assert.False(legal.NextCommand.CanExecute(null));
+        legal.NextCommand.Execute(null);
+        Assert.Equal(legal.PageCount - 1, legal.CurrentPageIndex);
+
+        for (var expectedIndex = legal.PageCount - 2; expectedIndex >= 0; expectedIndex--)
+        {
+            legal.BackCommand.Execute(null);
+            Assert.Equal(expectedIndex, legal.CurrentPageIndex);
+            Assert.Same(legal.Notices[expectedIndex], legal.CurrentNotice);
+            Assert.Equal(legal.Notices[expectedIndex].Text, legal.CurrentNoticeText);
+        }
+
+        Assert.False(legal.CanGoBack);
+        Assert.False(legal.BackCommand.CanExecute(null));
+        legal.BackCommand.Execute(null);
+        Assert.Equal(0, legal.CurrentPageIndex);
+    }
+
     private static ApiStatusSnapshot ValidStatus(long resetAt) => new(
         ApiState.Ready, 100, true, "Pro", new ApiQuota(75, resetAt, 604800, false), [], 0);
+
+    private static ApiStatusSnapshot StatusFromDetails(ApiDetailsSnapshot details) => new(
+        details.State,
+        details.ObservedAt,
+        details.Authenticated,
+        details.PlanLabel,
+        details.Quota,
+        details.Models.Select(model => new ApiModelUsage(
+            model.Name,
+            model.InputTokens,
+            model.CachedInputTokens,
+            model.OutputTokens)).ToArray(),
+        details.ActiveThreadCount);
 
     private static async Task EventuallyAsync(Func<bool> condition)
     {

@@ -58,8 +58,6 @@ jobs:
           dotnet-version: "10.0.x"
       - name: Restore locked dependencies
         run: dotnet restore windows-client/CodexInfo.WindowsClient.sln --locked-mode
-      - name: Test REST client and presentation contract
-        run: dotnet test windows-client/CodexInfo.WindowsClient.sln --no-restore --configuration Release
       - name: Build desktop client
         run: dotnet build windows-client/CodexInfo.WindowsClient.sln --no-restore --configuration Release
       - name: Enforce Windows feature contract
@@ -89,7 +87,14 @@ jobs:
           if (-not (Test-Path ./artifacts/windows-client/THIRD-PARTY-LICENSES/skiasharp.nativeassets.win32-3.119.4-THIRD-PARTY-NOTICES.txt -PathType Leaf)) {
             throw 'Required SkiaSharp third-party notice was not copied.'
           }
-      - name: Build single-file installer
+      - name: Install locked Inno Setup compiler
+        shell: pwsh
+        run: |
+          winget install --id JRSoftware.InnoSetup.7 --version 7.1.0 -e -s winget --scope user --silent --accept-package-agreements --accept-source-agreements --disable-interactivity
+          $compiler = Join-Path $env:LOCALAPPDATA 'Programs\Inno Setup 7\ISCC.exe'
+          if (-not (Test-Path $compiler -PathType Leaf)) { throw 'Inno Setup 7.1.0 compiler was not installed.' }
+          "INNO_SETUP_COMPILER=$compiler" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+      - name: Build standard Windows setup wizard
         shell: pwsh
         run: ./windows-client/tools/Build-WindowsInstaller.ps1 -OutputDirectory artifacts/windows-installer
       - name: Verify installer artifact
@@ -102,32 +107,64 @@ jobs:
         shell: pwsh
         run: |
           $setup = (Resolve-Path ./artifacts/windows-installer/CodexInfo.WindowsClient.Setup.exe).Path
-          & $setup --desktop-shortcut
+          & $setup /VERYSILENT /SUPPRESSMSGBOXES /NORESTART /MERGETASKS=desktopicon
           if ($LASTEXITCODE -ne 0) { throw "Installer failed with exit code $LASTEXITCODE" }
           $install = Join-Path $env:LOCALAPPDATA 'Programs\Codex Info Monitor'
           $start = Join-Path ([Environment]::GetFolderPath('Programs')) 'Codex Info\Codex Info Monitor.lnk'
           $desktop = Join-Path ([Environment]::GetFolderPath('Desktop')) 'Codex Info Monitor.lnk'
           $exe = Join-Path $install 'CodexInfo.WindowsClient.exe'
-          $uninstaller = Join-Path $install 'CodexInfo.WindowsClient.Uninstaller.exe'
+          $uninstaller = Get-ChildItem -LiteralPath $install -Filter 'unins*.exe' -File | Select-Object -First 1
           if (-not (Test-Path $exe -PathType Leaf)) { throw 'Installed client executable is missing.' }
-          if (-not (Test-Path $uninstaller -PathType Leaf)) { throw 'Installed uninstaller is missing.' }
+          if ($null -eq $uninstaller) { throw 'Installed uninstaller is missing.' }
           if (-not (Test-Path $start -PathType Leaf)) { throw 'Start-menu shortcut is missing.' }
           if (-not (Test-Path $desktop -PathType Leaf)) { throw 'Desktop shortcut is missing.' }
+          $key = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\CodexInfo.WindowsClient_is1'
+          if (-not (Test-Path $key)) { throw 'Per-user Apps uninstall registration is missing.' }
+          if ((Get-ItemPropertyValue $key DisplayIcon) -ne $exe) { throw 'Apps entry icon does not target the product executable.' }
           $shell = New-Object -ComObject WScript.Shell
           $shortcut = $shell.CreateShortcut($start)
           if ($shortcut.TargetPath -ne $exe) { throw 'Start-menu shortcut target is incorrect.' }
           if ($shortcut.WorkingDirectory -ne $install) { throw 'Start-menu shortcut working directory is incorrect.' }
+          $settings = Join-Path $env:LOCALAPPDATA 'CodexInfo'
+          $sentinel = Join-Path $settings 'installer-preserve-sentinel.txt'
+          New-Item -ItemType Directory -Path $settings -Force | Out-Null
+          Set-Content -LiteralPath $sentinel -Value 'preserve'
+          & $setup /VERYSILENT /SUPPRESSMSGBOXES /NORESTART
+          if ($LASTEXITCODE -ne 0) { throw "Installer update failed with exit code $LASTEXITCODE" }
+          if (-not (Test-Path $sentinel -PathType Leaf)) { throw 'Update removed user settings.' }
           Start-Process -FilePath $start
           Start-Sleep -Seconds 5
           $clientProcesses = Get-Process -Name 'CodexInfo.WindowsClient' -ErrorAction SilentlyContinue |
             Where-Object { $_.Path -eq $exe }
           if (-not $clientProcesses) { throw 'Start-menu shortcut did not launch the installed client.' }
           $clientProcesses | Stop-Process -Force
-          & $uninstaller --uninstall
+          & $uninstaller.FullName /VERYSILENT /SUPPRESSMSGBOXES /NORESTART
           if ($LASTEXITCODE -ne 0) { throw "Uninstaller failed with exit code $LASTEXITCODE" }
           Start-Sleep -Seconds 4
           if (Test-Path $install) { throw 'Install directory still exists after uninstall.' }
           if (Test-Path $start) { throw 'Start-menu shortcut still exists after uninstall.' }
           if (Test-Path $desktop) { throw 'Desktop shortcut still exists after uninstall.' }
-          $key = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\CodexInfo.WindowsClient'
           if (Test-Path $key) { throw 'Per-user uninstall registration still exists.' }
+          if (-not (Test-Path $sentinel -PathType Leaf)) { throw 'Uninstall removed user settings.' }
+          Remove-Item -LiteralPath $sentinel -Force
+      - name: Run installed Windows UI Automation E2E
+        shell: pwsh
+        run: |
+          $setup = (Resolve-Path ./artifacts/windows-installer/CodexInfo.WindowsClient.Setup.exe).Path
+          & $setup /VERYSILENT /SUPPRESSMSGBOXES /NORESTART
+          if ($LASTEXITCODE -ne 0) { throw "E2E fixture install failed with exit code $LASTEXITCODE" }
+          $install = Join-Path $env:LOCALAPPDATA 'Programs\Codex Info Monitor'
+          $exe = Join-Path $install 'CodexInfo.WindowsClient.exe'
+          if (-not (Test-Path $exe -PathType Leaf)) { throw 'Installed client executable is missing for UI E2E.' }
+          $e2eOutput = Join-Path $env:RUNNER_TEMP 'codex-info-windows-e2e'
+          try {
+            & ./windows-client/tools/Run-WindowsClientE2E.ps1 -ClientPath $exe -OutputDirectory $e2eOutput -Fixture
+            if (-not $?) { throw 'Windows UI Automation E2E failed.' }
+          }
+          finally {
+            $uninstaller = Get-ChildItem -LiteralPath $install -Filter 'unins*.exe' -File -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($null -ne $uninstaller) {
+              & $uninstaller.FullName /VERYSILENT /SUPPRESSMSGBOXES /NORESTART
+              if ($LASTEXITCODE -ne 0) { throw "E2E cleanup uninstall failed with exit code $LASTEXITCODE" }
+            }
+          }

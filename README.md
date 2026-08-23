@@ -21,7 +21,7 @@ cd codex_info_v2
 CODEX_INFO_DATA_DIR="$PWD/data" ./run.sh
 ```
 
-通常起動では、UIまたはRESTのプロセスとは別に記録daemon（`--record-daemon`）が自動起動します。daemonはセッションJSONLの変化がある場合だけ、既定60秒周期でbounded scanし、SQLiteへtransaction/upsertします。複数の`run.sh`やRESTを起動してもsingleton lockで1本に収束します。単体確認は`target/release/codex_info --record-daemon --once`、周期起動は`target/release/codex_info --record-daemon`です。`CODEX_INFO_DAEMON_INTERVAL_SECS`は5〜3600秒へ制限されます。
+起動モードは3つです。`./run.sh --service`は記録daemonとloopback RESTを1プロセスで起動し、`./run.sh --ui-only`は既存サービスへ追加するX UIだけを起動してdaemon/RESTを生成しません。引数なしの`./run.sh`（`--all`）は既存サービスを再利用し、なければdaemon+RESTを起動してからX UIを表示します。サービスを自動起動するには`bash scripts/install_systemd_recorder.sh`、自動起動から外すには`bash scripts/install_systemd_recorder.sh --remove`を使います。解除してもSQLite履歴、バックアップ、reset hint、実行ファイルは削除しません。収集周期`CODEX_INFO_DAEMON_INTERVAL_SECS`は5〜3600秒へ制限されます。
 
 初回起動時の画面内タイトルは`Codex Info`です。ネイティブタイトルバーは使わず、アプリ内では認証パネルが接続状態を案内します。
 
@@ -72,7 +72,7 @@ codex app-server --help
 
 ## Windowsからのイントラネット監視
 
- Linux / WSL 側でネイティブ画面を維持したまま、Windows クライアントから監視する場合は、`windows-client/` の Avalonia クライアントと loopback 限定 API、SSH ローカルポート転送を使用します。Windows配布物には本体payloadを埋め込んだ `CodexInfo.WindowsClient.Setup.exe` インストーラーを作成し、Startメニュー登録と「アプリと機能」からのアンインストールを提供します。インターネット公開や HTTPS 証明書の設定は必要ありません。Visual Studio Community での build、インストーラー作成、SSH 接続、API 契約、Windows 側の表示仕様は[Windows 監視クライアント](docs/WINDOWS_CLIENT.md)を参照してください。
+Linux / WSL 側でネイティブ画面を維持したまま、Windows クライアントから監視する場合は、`windows-client/` の Avalonia クライアントと loopback 限定 API、SSH ローカルポート転送を使用します。Windows配布物はInno Setup 7.1.0の標準GUIウィザードを使う `CodexInfo.WindowsClient.Setup.exe` とし、非管理者のユーザー単位インストール、更新、Startメニュー、「インストールされているアプリ」登録、標準アンインストールを提供します。本体、Setup、shortcut、uninstallerには同じ製品アイコンを設定します。インターネット公開や HTTPS 証明書の設定は必要ありません。Visual Studio Communityでのbuild、インストーラー作成、SSH接続、API契約、Windows側の表示仕様は[Windows 監視クライアント](docs/WINDOWS_CLIENT.md)を参照してください。
 
 ## 表示と更新
 
@@ -86,7 +86,7 @@ codex app-server --help
 - レート制限は1分ごとに再取得
 - ネイティブタイトルバーは使わず、各Windowの画面内タイトル領域に埋め込みフォントの見出しと自前の移動・最小化・閉じる操作を配置します。固定Windowには最大化操作を表示しません。
 - 認証済み画面の「グラフ」ボタンから1つのグラフウインドウを開きます。残り利用枠・LUNA/TERRA/SOLは凡例で個別に表示／非表示を切り替え、非表示系列は色とラベルのコントラストを下げて示します。初期状態は全系列表示です。各モデルの入力・キャッシュ・出力合計を独立した累積ラインで描き、表示中モデルの個別最大値をドル軸へ使います。全モデルの累積値が変化しない未使用区間は残量ラインを水平保持し、プロット下地の薄い帯で示します。モデルが進んでいるのに残量サンプルが同じ区間は、前後を実測された残量低下値で挟める場合だけ欠測サンプルとして線形補間し、`1→1→3` は `1→中点→3` として折返しや瞬間的な消費を描きません。次の実測値がない終端は最後の実測残量を保持します。右端の値は系列色のリーダー線で終端へ結びます。リセット直後（0）から現在時刻まで表示します
-- グラフの1分サンプルはSQLite（`history/usage_history.sqlite3`）へ保存します。同一リセット期間・同一分は最大値を保持して再計測で減少しません。通常起動で削除されるのは3か月より古い行だけです。グラフ上部の「ドル／トークン」で、ドルは累積額、トークンは各モデルの時間帯別使用量へ切り替えられます（初期値はドル）。
+- グラフの1分サンプルはSQLite（`history/usage_history.sqlite3`）へ過去3暦月分保存します。同一リセット期間・同一分は最大値を保持して再計測で減少しません。通常起動で削除されるのは3暦月より古い行だけです。1回の取得・REST応答・グラフ表示はその保持データ中の最長1暦月（最大44,640分点）に限定し、DB全体を読みません。グラフ上部の「ドル／トークン」で、ドルは累積額、トークンは各モデルの時間帯別使用量へ切り替えられます（初期値はドル）。
 - `CODEX_INFO_DATA_DIR`を指定すると、そのディレクトリ配下へ履歴を保存します
 - 週次または月間の対象期間の残り時間は、端数も含めた7セルのゲージで表示
 - `~/.codex/sessions`に履歴がある場合は、週次または月間の対象期間を表示し、その期間内のSOL/TERRA/LUNAの入力（非キャッシュ）・キャッシュ入力・出力トークン数と、[OpenAI Developer Docsのモデル料金表](https://developers.openai.com/api/docs/models)に基づく予想ドル額（整数部のみ）を各カテゴリの独立したドル列に表示します。見出しはモデル・入力・キャッシュ・出力だけです。クレジット換算は行いません。連続する同一累積スナップショットは差分0として二重計上しません。その他のモデルは表示しません。

@@ -25,13 +25,14 @@ public sealed class LoopbackStatusClient : ILoopbackStatusClient, ILoopbackDetai
     private const string DetailsEndpoint = "http://127.0.0.1:8787/v1/details";
     private const int MaxResponseHeaderBytes = 8 * 1024;
     private const int MaxBodyBytes = 64 * 1024;
-    // Three months of minute samples can be large; the endpoint still has a
-    // finite 32 MiB envelope and a separate 100,000-sample cap.
+    // SQLite retains three months, but one details response is bounded to one
+    // 31-day month of minute buckets. The byte envelope is independent.
     private const int MaxDetailsBodyBytes = 32 * 1024 * 1024;
     private const long MaxUnixSeconds = 253_402_300_799;
     private const int MaxHistoryPeriods = 128;
-    private const int MaxHistorySamples = 100_000;
+    private const int MaxHistorySamples = 31 * 24 * 60;
     private const int MaxThreads = 256;
+    private const long ResetAtToleranceSeconds = 60;
 
     private static readonly HashSet<string> TopLevelProperties = CreatePropertySet(
         "api_version",
@@ -82,6 +83,7 @@ public sealed class LoopbackStatusClient : ILoopbackStatusClient, ILoopbackDetai
         "id",
         "start_at",
         "end_at",
+        "reset_at",
         "label",
         "current");
 
@@ -133,7 +135,7 @@ public sealed class LoopbackStatusClient : ILoopbackStatusClient, ILoopbackDetai
 
         _httpClient = new HttpClient(handler, disposeHandler: true)
         {
-            Timeout = TimeSpan.FromSeconds(3),
+            Timeout = TimeSpan.FromSeconds(1),
         };
     }
 
@@ -163,7 +165,7 @@ public sealed class LoopbackStatusClient : ILoopbackStatusClient, ILoopbackDetai
                 return Failure(StatusFetchFailure.Response);
             }
 
-            if (!HasJsonContentType(response.Content))
+            if (!HasRequiredResponseHeaders(response))
             {
                 return Failure(StatusFetchFailure.Response);
             }
@@ -247,7 +249,7 @@ public sealed class LoopbackStatusClient : ILoopbackStatusClient, ILoopbackDetai
             }
 
             if (!HasAcceptableHeaderSize(response) ||
-                !HasJsonContentType(response.Content) ||
+                !HasRequiredResponseHeaders(response) ||
                 !TryGetContentLength(response.Content, out var contentLength))
             {
                 return DetailsFailure(DetailsFetchFailure.Response);
@@ -378,13 +380,18 @@ public sealed class LoopbackStatusClient : ILoopbackStatusClient, ILoopbackDetai
         return bytes;
     }
 
-    private static bool HasJsonContentType(HttpContent? content)
+    private static bool HasRequiredResponseHeaders(HttpResponseMessage response)
     {
         try
         {
-            var mediaType = content?.Headers.ContentType?.MediaType;
+            var contentType = response.Content?.Headers.ContentType;
+            var mediaType = contentType?.MediaType;
+            var charset = contentType?.CharSet?.Trim('"');
             return mediaType is not null &&
-                   mediaType.Equals("application/json", StringComparison.OrdinalIgnoreCase);
+                   mediaType.Equals("application/json", StringComparison.OrdinalIgnoreCase) &&
+                   charset is not null &&
+                   charset.Equals("utf-8", StringComparison.OrdinalIgnoreCase) &&
+                   response.Headers.CacheControl?.NoStore == true;
         }
         catch (Exception)
         {
@@ -580,17 +587,10 @@ public sealed class LoopbackStatusClient : ILoopbackStatusClient, ILoopbackDetai
                 return false;
             }
 
-            var samplesByReset = historySamples
-                .GroupBy(sample => sample.ResetAt)
-                .ToDictionary(group => group.Key, group =>
-                    (IReadOnlyList<ApiHistorySample>)new System.Collections.ObjectModel.ReadOnlyCollection<ApiHistorySample>(
-                        group.OrderBy(sample => sample.Timestamp).ToList()));
             historyPeriods = historyPeriods
                 .Select(period => period with
                 {
-                    Samples = samplesByReset.TryGetValue(period.ResetAt ?? 0, out var samples)
-                        ? samples
-                        : Array.Empty<ApiHistorySample>(),
+                    Samples = SamplesForCanonicalPeriod(period, historySamples),
                 })
                 .ToList();
 
@@ -624,6 +624,41 @@ public sealed class LoopbackStatusClient : ILoopbackStatusClient, ILoopbackDetai
         {
             return false;
         }
+    }
+
+    private static IReadOnlyList<ApiHistorySample> SamplesForCanonicalPeriod(
+        ApiHistoryPeriod period,
+        IReadOnlyList<ApiHistorySample> samples)
+    {
+        var minimumResetAt = period.ResetAt - ResetAtToleranceSeconds;
+        var selected = samples
+            .Where(sample => sample.ResetAt >= minimumResetAt && sample.ResetAt <= period.ResetAt)
+            .OrderBy(sample => sample.Timestamp)
+            .ThenBy(sample => sample.ResetAt);
+        var merged = new List<ApiHistorySample>();
+        foreach (var sample in selected)
+        {
+            var canonical = sample with { ResetAt = period.ResetAt };
+            if (merged.Count == 0 || merged[^1].Timestamp != canonical.Timestamp)
+            {
+                merged.Add(canonical);
+                continue;
+            }
+
+            var previous = merged[^1];
+            merged[^1] = canonical with
+            {
+                RemainingPercent = canonical.RemainingPercent ?? previous.RemainingPercent,
+                SolDollars = Math.Max(previous.SolDollars, canonical.SolDollars),
+                TerraDollars = Math.Max(previous.TerraDollars, canonical.TerraDollars),
+                LunaDollars = Math.Max(previous.LunaDollars, canonical.LunaDollars),
+                SolTokens = Math.Max(previous.SolTokens, canonical.SolTokens),
+                TerraTokens = Math.Max(previous.TerraTokens, canonical.TerraTokens),
+                LunaTokens = Math.Max(previous.LunaTokens, canonical.LunaTokens),
+            };
+        }
+
+        return new System.Collections.ObjectModel.ReadOnlyCollection<ApiHistorySample>(merged);
     }
 
     private static bool TryGetDetailsModels(
@@ -683,12 +718,14 @@ public sealed class LoopbackStatusClient : ILoopbackStatusClient, ILoopbackDetai
         var periodIds = new HashSet<string>(StringComparer.Ordinal);
         foreach (var period in property.EnumerateArray())
         {
-            if (!HasExactlyProperties(period, HistoryPeriodProperties, 5) ||
+            if (!HasExactlyProperties(period, HistoryPeriodProperties, 6) ||
                 !TryGetBoundedString(period, "id", 1, 512, out var id) ||
                 !periodIds.Add(id) ||
                 !TryGetUnixSeconds(period, "start_at", out var startAt) ||
                 !TryGetUnixSeconds(period, "end_at", out var endAt) ||
+                !TryGetUnixSeconds(period, "reset_at", out var resetAt) ||
                 endAt < startAt ||
+                resetAt < endAt ||
                 !TryGetBoundedString(period, "label", 1, 512, out var label) ||
                 !TryGetBoolean(period, "current", out var current))
             {
@@ -700,7 +737,10 @@ public sealed class LoopbackStatusClient : ILoopbackStatusClient, ILoopbackDetai
                 startAt,
                 endAt,
                 current,
-                label));
+                label)
+            {
+                ResetAt = resetAt,
+            });
         }
 
         return true;
@@ -794,6 +834,26 @@ public sealed class LoopbackStatusClient : ILoopbackStatusClient, ILoopbackDetai
             threads.Add(new ApiThreadDetails(item.Id, item.Title, item.ParentId, item.Model, item.ModelLabel,
                 item.TotalTokens, item.ContextTokens, item.ContextLimit, item.CreatedAt,
                 item.LastUserMessageAt, item.IsSubAgent, item.Depth, isOrphan));
+        }
+
+        // A cycle has no valid parent-first projection and must reject the
+        // complete details generation. Orphans remain representable because
+        // their missing parent is an explicit display state.
+        var parentById = pending.ToDictionary(item => item.Id, item => item.ParentId, StringComparer.Ordinal);
+        foreach (var id in parentById.Keys)
+        {
+            var seen = new HashSet<string>(StringComparer.Ordinal) { id };
+            var current = id;
+            while (parentById.TryGetValue(current, out var parentId) && parentId is not null &&
+                   parentById.ContainsKey(parentId))
+            {
+                if (!seen.Add(parentId))
+                {
+                    threads.Clear();
+                    return false;
+                }
+                current = parentId;
+            }
         }
 
         return true;

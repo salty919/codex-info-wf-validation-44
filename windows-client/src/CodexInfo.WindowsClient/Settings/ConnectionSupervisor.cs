@@ -3,6 +3,7 @@
 
 using System.ComponentModel;
 using System.Diagnostics;
+using CodexInfo.WindowsClient.Infrastructure;
 
 namespace CodexInfo.WindowsClient.Settings;
 
@@ -15,8 +16,20 @@ namespace CodexInfo.WindowsClient.Settings;
 public sealed class ConnectionSupervisor : IDisposable
 {
     private readonly object gate = new();
-    private Process? child;
+    private readonly IConnectionChildProcessFactory processFactory;
+    private IConnectionChildProcess? child;
     private bool disposed;
+
+    public ConnectionSupervisor()
+        : this(new SystemConnectionChildProcessFactory())
+    {
+    }
+
+    internal ConnectionSupervisor(IConnectionChildProcessFactory processFactory)
+    {
+        ArgumentNullException.ThrowIfNull(processFactory);
+        this.processFactory = processFactory;
+    }
 
     public bool IsRunning
     {
@@ -61,7 +74,7 @@ public sealed class ConnectionSupervisor : IDisposable
 
             try
             {
-                var next = new Process { StartInfo = startInfo, EnableRaisingEvents = true };
+                var next = processFactory.Create(startInfo);
                 next.Exited += OnChildExited;
                 if (!next.Start())
                 {
@@ -91,7 +104,7 @@ public sealed class ConnectionSupervisor : IDisposable
             child = null;
             try
             {
-                if (!process.HasExited) process.Kill(entireProcessTree: true);
+                if (!process.HasExited) process.Kill();
             }
             catch (InvalidOperationException)
             {
@@ -122,7 +135,7 @@ public sealed class ConnectionSupervisor : IDisposable
     {
         lock (gate)
         {
-            if (sender is not Process exited || !ReferenceEquals(child, exited)) return;
+            if (sender is not IConnectionChildProcess exited || !ReferenceEquals(child, exited)) return;
             child = null;
             exited.Dispose();
         }

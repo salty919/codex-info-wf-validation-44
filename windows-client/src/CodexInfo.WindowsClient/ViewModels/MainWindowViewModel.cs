@@ -406,23 +406,18 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
                 return;
             }
 
-            ApiStatusSnapshot? acceptedStatus = null;
-            if (result.Snapshot is { } validatedSnapshot)
-            {
-                ApplySnapshot(validatedSnapshot);
-                acceptedStatus = validatedSnapshot;
-            }
-            else
+            if (result.Snapshot is not { } validatedSnapshot)
             {
                 ApplyFailure(result.Failure ?? StatusFetchFailure.Transport);
+                return;
             }
 
             // Details are account-scoped.  Never issue or apply an auxiliary
             // snapshot after an unauthenticated status, otherwise a slower
             // details response could repopulate cleared rows from the prior
             // account generation.
-            if (detailsClient is not null && acceptedStatus?.Authenticated == true &&
-                acceptedStatus.State != ApiState.AuthRequired)
+            if (detailsClient is not null && validatedSnapshot.Authenticated &&
+                validatedSnapshot.State != ApiState.AuthRequired)
             {
                 DetailsFetchResult detailsResult;
                 try
@@ -445,14 +440,26 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
 
                 if (detailsResult.Snapshot is { } validatedDetails &&
                     validatedDetails.Authenticated &&
-                    validatedDetails.State != ApiState.AuthRequired)
+                    validatedDetails.State != ApiState.AuthRequired &&
+                    HasSamePublicCore(validatedSnapshot, validatedDetails))
                 {
+                    // Commit the pair only after both documents have passed
+                    // validation and their shared projection is identical.
+                    // Until this point the last complete UI generation stays
+                    // untouched.
+                    ApplySnapshot(validatedSnapshot);
                     ApplyDetails(validatedDetails);
                 }
                 else
                 {
-                    ApplyDetailsFailure(detailsResult.Failure ?? DetailsFetchFailure.Transport);
+                    ApplyFailure(detailsResult.Failure == DetailsFetchFailure.Transport
+                        ? StatusFetchFailure.Transport
+                        : StatusFetchFailure.Response);
                 }
+            }
+            else
+            {
+                ApplySnapshot(validatedSnapshot);
             }
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
@@ -471,6 +478,37 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
             SetRefreshing(false);
             refreshGate.Release();
         }
+    }
+
+    private static bool HasSamePublicCore(
+        ApiStatusSnapshot status,
+        ApiDetailsSnapshot details)
+    {
+        if (status.State != details.State ||
+            status.ObservedAt != details.ObservedAt ||
+            status.Authenticated != details.Authenticated ||
+            !string.Equals(status.PlanLabel, details.PlanLabel, StringComparison.Ordinal) ||
+            status.Quota != details.Quota ||
+            status.ActiveThreadCount != details.ActiveThreadCount ||
+            status.Models.Count != details.Models.Count)
+        {
+            return false;
+        }
+
+        for (var index = 0; index < status.Models.Count; index++)
+        {
+            var statusModel = status.Models[index];
+            var detailsModel = details.Models[index];
+            if (!string.Equals(statusModel.Name, detailsModel.Name, StringComparison.Ordinal) ||
+                statusModel.InputTokens != detailsModel.InputTokens ||
+                statusModel.CachedInputTokens != detailsModel.CachedInputTokens ||
+                statusModel.OutputTokens != detailsModel.OutputTokens)
+            {
+                return false;
+            }
+        }
+
+        return true;
     }
 
     private void ApplySnapshot(ApiStatusSnapshot validatedSnapshot)

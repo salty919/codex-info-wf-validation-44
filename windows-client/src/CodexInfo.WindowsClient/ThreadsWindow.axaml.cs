@@ -12,13 +12,11 @@ public partial class ThreadsWindow : Window
     public ThreadsWindow()
     {
         InitializeComponent();
-        WindowDragBehavior.Attach(this);
     }
 
     public ThreadsWindow(ThreadsWindowViewModel viewModel)
     {
         InitializeComponent();
-        WindowDragBehavior.Attach(this);
         DataContext = viewModel;
         Closed += (_, _) => viewModel.Dispose();
     }

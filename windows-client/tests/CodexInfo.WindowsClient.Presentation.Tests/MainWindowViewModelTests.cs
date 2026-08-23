@@ -184,8 +184,8 @@ public sealed class MainWindowViewModelTests
             true,
             "Pro",
             new ApiQuota(98.5, 2, 604800, false),
-            [new ApiDetailsModelUsage("SOL", 10, 2, 3, 1.25, 0.25, 0.5)],
-            0,
+            [new ApiDetailsModelUsage("SOL", 1, 2, 3, 1.25, 0.25, 0.5)],
+            3,
             [],
             [],
             [],
@@ -201,11 +201,40 @@ public sealed class MainWindowViewModelTests
         Assert.Equal("$1.25", viewModel.Models[0].InputDollarsText);
 
         viewModel.RefreshCommand.Execute(null);
-        await EventuallyAsync(() => viewModel.DetailsStatusText.Contains("応答エラー", StringComparison.Ordinal));
+        await EventuallyAsync(() => viewModel.StatusDetail.Contains("前回受信の値", StringComparison.Ordinal));
 
         Assert.True(viewModel.HasDetails);
         Assert.Equal("$1.25", viewModel.Models[0].InputDollarsText);
-        Assert.Equal("正常", viewModel.StatusTitle);
+        Assert.Contains("前回受信の値", viewModel.StatusDetail, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task MismatchedStatusDetailsPairKeepsTheLastCompleteGeneration()
+    {
+        var completeDetails = new ApiDetailsSnapshot(
+            ApiState.Ready, 1, true, "Pro",
+            new ApiQuota(98.5, 2, 604800, false),
+            [new ApiDetailsModelUsage("SOL", 1, 2, 3, 1.25, 0.25, 0.5)],
+            3, [], [], [], "概算 $2");
+        var mismatchedDetails = completeDetails with { ObservedAt = 99 };
+        using var viewModel = new MainWindowViewModel(
+            new SequenceClient(
+                StatusFetchResult.Success(ValidSnapshot()),
+                StatusFetchResult.Success(ValidSnapshot(observedAt: 2))),
+            new SequenceDetailsClient(
+                DetailsFetchResult.Success(completeDetails),
+                DetailsFetchResult.Success(mismatchedDetails)));
+
+        viewModel.Start();
+        await EventuallyAsync(() => viewModel.HasDetails);
+        var lastCompleteObservedAt = viewModel.ObservedAtText;
+        var lastCompleteDollars = viewModel.Models[0].InputDollarsText;
+
+        viewModel.RefreshCommand.Execute(null);
+        await EventuallyAsync(() => viewModel.StatusDetail.Contains("前回受信の値", StringComparison.Ordinal));
+
+        Assert.Equal(lastCompleteObservedAt, viewModel.ObservedAtText);
+        Assert.Equal(lastCompleteDollars, viewModel.Models[0].InputDollarsText);
     }
 
     [Fact]
@@ -218,13 +247,14 @@ public sealed class MainWindowViewModelTests
             "Pro",
             null,
             [],
-            7,
+            3,
             [],
             [],
             [],
             "概算 —");
         using var viewModel = new MainWindowViewModel(
-            new SequenceClient(StatusFetchResult.Success(ValidSnapshot())),
+            new SequenceClient(StatusFetchResult.Success(new ApiStatusSnapshot(
+                ApiState.Ready, 1, true, "Pro", null, [], 3))),
             new SequenceDetailsClient(DetailsFetchResult.Success(details)));
 
         viewModel.Start();
@@ -246,8 +276,8 @@ public sealed class MainWindowViewModelTests
             true,
             "Pro",
             new ApiQuota(98.5, 2, 604800, false),
-            [new ApiDetailsModelUsage("SOL", 10, 2, 3, 1.25, 0.25, 0.5)],
-            0,
+            [new ApiDetailsModelUsage("SOL", 1, 2, 3, 1.25, 0.25, 0.5)],
+            3,
             [],
             [],
             [],

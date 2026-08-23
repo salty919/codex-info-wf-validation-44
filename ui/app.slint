@@ -22,8 +22,7 @@ export component MainWindow inherits Window {
     no-frame: true;
     resize-border-width: 0px;
     title: root.window-title;
-    background: status-level == "warning" ? DesignTokens.canvas-warning :
-        status-level == "error" ? DesignTokens.canvas-error : DesignTokens.canvas;
+    background: DesignTokens.canvas;
     default-font-family: root.strings.font-family;
 
     changed maximized => {
@@ -85,9 +84,24 @@ export component MainWindow inherits Window {
         y: 0px;
         width: root.width;
         height: root.height;
-        background: status-level == "warning" ? DesignTokens.canvas-warning :
-            status-level == "error" ? DesignTokens.canvas-error : DesignTokens.canvas;
+        background: DesignTokens.canvas;
         z: -10;
+    }
+    if root.status-level == "warning" : Rectangle {
+        x: 0px;
+        y: 0px;
+        width: root.width;
+        height: root.height;
+        background: DesignTokens.canvas-warning;
+        z: -9;
+    }
+    if root.status-level == "error" : Rectangle {
+        x: 0px;
+        y: 0px;
+        width: root.width;
+        height: root.height;
+        background: DesignTokens.canvas-error;
+        z: -9;
     }
     WindowDragArea {
         x: 0px;

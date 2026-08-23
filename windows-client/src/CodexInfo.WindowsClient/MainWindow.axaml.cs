@@ -5,7 +5,6 @@ using Avalonia.Controls;
 using Avalonia;
 using Avalonia.Input;
 using Avalonia.Threading;
-using CodexInfo.WindowsClient.Settings;
 using CodexInfo.WindowsClient.ViewModels;
 
 namespace CodexInfo.WindowsClient;
@@ -21,7 +20,6 @@ public partial class MainWindow : Window
     public MainWindow()
     {
         InitializeComponent();
-        WindowDragBehavior.Attach(this);
         Opened += OnOpened;
         Closed += OnClosed;
     }
@@ -54,14 +52,11 @@ public partial class MainWindow : Window
         {
             Dispatcher.UIThread.Post(() => OnOpenSettings(this, new Avalonia.Interactivity.RoutedEventArgs()), DispatcherPriority.Loaded);
         }
-        else if (ShouldOpenSetup(App.CurrentSettings))
+        else if (PreviewEnvironment.IsSetup || SetupLaunchPolicy.ShouldOpen(App.CurrentSettings))
         {
             Dispatcher.UIThread.Post(OpenSetup, DispatcherPriority.Loaded);
         }
     }
-
-    internal static bool ShouldOpenSetup(ClientSettings settings) =>
-        !settings.SettingsCorrupt && !settings.SetupCompleted && !settings.ConnectionConfigured;
 
     private void CenterOnScreen()
     {
@@ -167,6 +162,7 @@ public partial class MainWindow : Window
         }
 
         var window = new SettingsWindow(new SettingsViewModel(App.SettingsStore, DataContext as MainWindowViewModel));
+        ApplyPreviewSize(window);
         settingsWindow = window;
         window.Closed += (_, _) => settingsWindow = null;
         window.Show(this);

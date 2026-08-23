@@ -12,13 +12,11 @@ public partial class LegalNoticesWindow : Window
     public LegalNoticesWindow()
     {
         InitializeComponent();
-        WindowDragBehavior.Attach(this);
     }
 
     public LegalNoticesWindow(LegalNoticesWindowViewModel viewModel)
     {
         InitializeComponent();
-        WindowDragBehavior.Attach(this);
         DataContext = viewModel;
         Closed += (_, _) => viewModel.Dispose();
     }

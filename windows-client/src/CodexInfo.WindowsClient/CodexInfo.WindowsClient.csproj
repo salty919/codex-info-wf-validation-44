@@ -9,6 +9,7 @@
     <AssemblyName>CodexInfo.WindowsClient</AssemblyName>
     <RootNamespace>CodexInfo.WindowsClient</RootNamespace>
     <RuntimeIdentifiers>win-x64</RuntimeIdentifiers>
+    <ApplicationIcon>Assets\CodexInfo.ico</ApplicationIcon>
   </PropertyGroup>
 
   <ItemGroup>
@@ -18,6 +19,7 @@
   <ItemGroup>
     <AvaloniaResource Include="..\..\..\assets\NotoSansJP.ttf" Link="Assets\NotoSansJP.ttf" />
     <AvaloniaResource Include="Assets\NotoSansJP-Medium.ttf" />
+    <AvaloniaResource Include="Assets\CodexInfo.ico" />
     <AvaloniaResource Include="..\..\..\assets\NotoSansKR.otf" Link="Assets\NotoSansKR.otf" />
   </ItemGroup>
 
@@ -25,5 +27,6 @@
     <PackageReference Include="Avalonia" Version="12.1.1" />
     <PackageReference Include="Avalonia.Desktop" Version="12.1.1" />
     <PackageReference Include="Avalonia.Themes.Fluent" Version="12.1.1" />
+    <PackageReference Include="ScottPlot.Avalonia" Version="5.1.59" />
   </ItemGroup>
 </Project>

@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
 using CodexInfo.WindowsClient.Core;
+using CodexInfo.WindowsClient.Localization;
 
 namespace CodexInfo.WindowsClient;
 
@@ -27,6 +28,24 @@ public static class PreviewEnvironment
     public static bool IsSetup => Scenario is "setup";
 
     public static bool IsChild(string child) => string.Equals(Scenario, child, StringComparison.OrdinalIgnoreCase);
+
+    public static int GraphPointCount
+    {
+        get
+        {
+            var value = Environment.GetEnvironmentVariable("CODEX_INFO_WINDOWS_PREVIEW_GRAPH_POINTS");
+            return int.TryParse(value, out var count) && count is >= 2 and <= 44_640 ? count : 3;
+        }
+    }
+
+    public static int GraphBuildDelayMilliseconds
+    {
+        get
+        {
+            var value = Environment.GetEnvironmentVariable("CODEX_INFO_WINDOWS_PREVIEW_GRAPH_BUILD_DELAY_MS");
+            return int.TryParse(value, out var delay) && delay is >= 0 and <= 5_000 ? delay : 0;
+        }
+    }
 
     public static bool TryGetSize(out double width, out double height)
     {
@@ -98,19 +117,39 @@ public sealed class PreviewLoopbackClient : ILoopbackStatusClient, ILoopbackDeta
         };
         var now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
         var reset = now + 4 * 86_400;
-        var start = reset - 7 * 86_400;
-        var samples = new[]
-        {
-            new ApiHistorySample(start + 86_400, reset, 92, 1.25, 0.75, 0.25, 1_200, 640, 300),
-            new ApiHistorySample(start + 3 * 86_400, reset, 67.5, 4.5, 2.25, 1.25, 4_800, 2_240, 1_100),
-            new ApiHistorySample(now - 900, reset, remainingPercent, 8.75, 4.5, 2.75, 8_400, 4_200, 2_100),
-        };
+        var graphPointCount = PreviewEnvironment.GraphPointCount;
+        var start = graphPointCount == 3
+            ? reset - 7 * 86_400
+            : now - (graphPointCount - 1L) * 60;
+        var samples = graphPointCount == 3
+            ?
+            [
+                new ApiHistorySample(start + 86_400, reset, 92, 1.25, 0.75, 0.25, 1_200, 640, 300),
+                new ApiHistorySample(start + 3 * 86_400, reset, 67.5, 4.5, 2.25, 1.25, 4_800, 2_240, 1_100),
+                new ApiHistorySample(now - 900, reset, remainingPercent, 8.75, 4.5, 2.75, 8_400, 4_200, 2_100),
+            ]
+            : Enumerable.Range(0, graphPointCount)
+                .Select(index =>
+                {
+                    var fraction = index / (double)(graphPointCount - 1);
+                    return new ApiHistorySample(
+                        start + index * 60L,
+                        reset,
+                        100 - (100 - remainingPercent) * fraction,
+                        8.75 * fraction,
+                        4.5 * fraction,
+                        2.75 * fraction,
+                        (ulong)(8_400 * fraction),
+                        (ulong)(4_200 * fraction),
+                        (ulong)(2_100 * fraction));
+                })
+                .ToArray();
         var period = new ApiHistoryPeriod(
             reset.ToString(System.Globalization.CultureInfo.InvariantCulture),
             start,
             reset,
             true,
-            "Current period")
+            LocalizationService.Current.Latest)
         {
             Samples = samples,
         };

@@ -58,15 +58,11 @@ Codex app-server / session JSONL / thread rollout
    現在の認証epoch・nonceに束縛されたauthenticated hintだけを受理し、未認証中の復旧値は公開しない。
 7. 同一障害中にlocal JSONL全走査やapp-server再起動を無限反復しない。通常の全走査はquota cycle、明示更新、または一度だけの障害復旧に限定する。
    fingerprint不変ならscan/writeは0、変化時も1 cycleにつき1 scan・1 transactionだけとする。
-8. collector全停止中の未取得データは後から捏造しない。常駐daemonは、Slint/X11/Wayland runtime dependencyを持たない
-   headless release binary `codex-info-server`の`record --interval 60`を`codex-info-recorder.service`が所有する
-   UI/REST独立の記録プロセスであり、同じcanonical DB profileの`UsageStore`、singleton lease、停止・更新・監視・再起動手順を実装してから有効化する。
-   `codex-info-server.target`が`codex-info-recorder.service`と`codex-info-api.service`を束ね、systemd unitsがinstalledなprofileでは
-   systemdだけがsupervisor/MaintenanceOwnerであり、UI/RESTがrecorderをspawnしない。units未使用時のfallbackは明示的な
-   `codex-info-server record --interval 60`だけがleaseを取得し、後続起動はno-opとなる。
-   daemon実装前の状態を実装済みと扱わない。binary installer、unit installation、update、rollback、uninstallの
-   要求順序・保持境界は`docs/CUSTOMER_OPERATIONS_RUNBOOK.md`を正本とするが、製品実装・同一release証拠・独立判定が
-   未取得の間は`PRODUCT_PENDING`であり、この規約から別commandを推測して補わない。
+8. collector全停止中の未取得データは後から捏造しない。常駐daemonとloopback RESTは
+   `codex_info --service --listen 127.0.0.1:8787`の同一processが所有し、同じcanonical DB profileの
+   `UsageStore`とsingleton recorder leaseを使う。`--ui-only`はdaemon、REST、recorder leaseを生成せず、
+   終了後にそれらを残さない。`--all`はhealthyな既存serviceを再利用し、存在しない場合だけserviceを開始する。
+   systemd自動起動の解除はunitだけを停止・削除し、DB、backup、hint、source JSONL、binaryを保持する。
 9. canonical DB profileごとに`MaintenanceOwner`を1つだけ許可する。起動時pruneの前に、writer admissionを止めた同一排他境界で
    SQLite online backupを3世代作成・検証する。backup失敗時はpruneを実行しない。検証失敗・writer競合時もpruneを実行しない。バックアップは`0600`、DBディレクトリは`0700`とする。
 10. 現行版は旧schemaを暗黙migrationしない。schema mismatchは拒否する（read/writeを拒否する）。将来migrationは別名DB、全行validate、件数/hash/期間境界比較、
@@ -120,11 +116,10 @@ Codex app-server / session JSONL / thread rollout
 - supervisorの状態は`Absent → Starting → Running → StopRequested → Stopped`または`Failed`だけを進む。
   unexpected exitはsupervisorが2秒以内に検知し、同一supervisor epochでは5秒backoff後の自動restartを1回だけ許可する。
   2回目のunexpected exitまたはrestart失敗後は`Failed`へlatchし、無限restartを行わない。明示startまたはsystemdの新activationだけが新epochを開始する。
-- `codex-info-server.target`、`codex-info-recorder.service`、`codex-info-api.service`がinstalledならsystemdが唯一のsupervisor/MaintenanceOwnerであり、
-  UI、REST、`run.sh`、個別のrecorder起動はrecorderをspawnせず既存leaseを検出してno-opになる。API serviceの起動はheadless
-  `codex-info-server serve --listen 127.0.0.1:8787`、recorder serviceの起動は`codex-info-server record --interval 60`である。
-  systemd未使用時は明示的なrecord commandだけがcanonical DB profileのleaseを取得する。UI/REST workerはrecorder ownerではなく、
-  UI/REST終了はrecorderを停止しない。explicit stopだけがTERM、drain、lease解放を順に行う。
+- `codex-info.service`がinstalledならsystemdがdaemon+RESTのsupervisorである。service processは
+  `codex_info --service --listen 127.0.0.1:8787`でrecorder leaseとREST listenerを同時に所有する。
+  `--ui-only`はlease/listenerを取得せず、`--all`はhealthyな既存serviceへ重複起動せずX UIだけを追加する。
+  serviceへのexplicit stopだけがTERM、worker停止、listener停止、lease解放を順に行う。
 - singletonのscopeは正規化canonical DB pathとprofileの組である。lease schemaは最大4KiBのUTF-8 JSON
   `recorder-lease-v1`（`pid`、`process_start`、`owner_nonce`、`canonical_db_path`、`device_or_volume_serial`、`file_index_or_inode`）とし、
   writer processは同じ`UsageStore`のtransaction/upsert契約を使う。通常のrecorder二重起動はlease前にno-op、競合試験だけが別の許可済みwriter processを使い、
@@ -204,6 +199,7 @@ DataGeneration、pair publicationを二重化しない。foreign/第二operation
 
 1. [製品要件](PRODUCT_REQUIREMENTS.md)または本書の該当箇所を更新し、要求と失敗境界を逆引きできる。
 2. 既存DB行のread-only row count/hashを変更前後で比較する。通常の3か月prune以外の減少はFAILとする。
+   DB保持は3暦月、1回の取得はその中の最長1暦月（最大44,640分点）であり、取得上限を保持期間の短縮へ読み替えない。
 3. malformed、empty、multiple writer、app-server停止、再起動、認証境界、migration/schema mismatchを検査する。
 4. `cargo fmt --check`、`cargo check --locked`、`cargo test --locked`、`cargo build --release --locked`を実行する。
 5. `scripts/data_protection_gate.sh`を実行する。
@@ -352,13 +348,13 @@ validでもjournal identity/hash/phaseだけで一意にrollbackまたはroll-fo
 
 ### 8.10 DP-REST-009 / RC-147 — boot recovery order
 
-systemd installed profileでは`codex-info-recorder.service`がDB/source mountを要求し、
-`Before=codex-info-api.service`でrecovery gateを所有する。API serviceはrecorderのjournal/lease/checkpoint検査が
-`RecoveryReady`になった後だけpublisher admissionを開く。BootIdを毎activationで取得し、旧BootIdのlease、未terminal
+systemd installed profileでは`codex-info.service`がDB/sourceとloopback RESTを同じactivationで所有する。
+serviceはrecorderのjournal/lease/checkpoint検査が`RecoveryReady`になった後だけpublisher admissionを開く。
+BootIdを毎activationで取得し、旧BootIdのlease、未terminal
 maintenance journal、file identity不一致checkpointがあればwrite/publishを0にして`RecoveryRequired`へ置く。
 
 同一BootId・service activation IDのStartLimit外再入は新CollectorEpochを作らずno-op、別BootIdでは旧callbackを全破棄して
-新SupervisorLeaseIdentity/CollectorEpochを各1件だけ発行する。systemd外の明示record commandも同じrecovery gateを通る。
+新SupervisorLeaseIdentity/CollectorEpochを各1件だけ発行する。systemd外の明示service commandも同じrecovery gateを通る。
 
 ### 8.11 DP-REST-010 / RC-148 — lineage schema
 
@@ -407,7 +403,7 @@ REST detailsへ公開するのはconfirmed rowだけで、raw path/cursor/proces
 `history_gaps` projectionとする。projectionは`gap_id,reset_at,start_at,end_at,reason`の5 exact field、
 同一period内で`start_at<=end_at`、重複/交差なし、canonical `(reset_at,start_at,end_at,gap_id)`順、最大4096件である。
 この追加は未出荷のREST v1 contract revision
-`rest-v1-details-gap-20260823`として明示し、server/client/release manifestのrevision一致を必須にする。
+`rest-v1-details-reset-at-20260823`として明示し、server/client/release manifestのrevision一致を必須にする。
 旧12-key details clientは新13-key bodyをrejectしてfail closedし、旧artifactと新serverを混在させて成功扱いにしない。
 API family/pathと`api_version="v1"`は維持するが、同一releaseに旧/new schemaを混在させない。
 

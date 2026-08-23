@@ -3,8 +3,8 @@
 
 using System.Collections.ObjectModel;
 using System.ComponentModel;
-using System.Diagnostics;
 using System.Runtime.CompilerServices;
+using CodexInfo.WindowsClient.Infrastructure;
 using CodexInfo.WindowsClient.Localization;
 using CodexInfo.WindowsClient.Settings;
 
@@ -107,7 +107,9 @@ public sealed record TimeZoneOption(string Id, string Label);
 public sealed class SetupViewModel : INotifyPropertyChanged, IDisposable
 {
     private readonly MainWindowViewModel main;
-    private Process? sshProcess;
+    private readonly IClientSettingsSession settingsSession;
+    private readonly ISetupConnectionEnvironment connectionEnvironment;
+    private IConnectionChildProcess? sshProcess;
     private string sshUser = string.Empty;
     private string sshHost = string.Empty;
     private string? selectedSshConfigAlias;
@@ -117,13 +119,31 @@ public sealed class SetupViewModel : INotifyPropertyChanged, IDisposable
     private int step;
 
     public SetupViewModel(MainWindowViewModel main)
+        : this(main, App.SettingsSession, new WindowsSetupConnectionEnvironment())
     {
+    }
+
+    public SetupViewModel(MainWindowViewModel main, IClientSettingsSession settingsSession)
+        : this(main, settingsSession, new WindowsSetupConnectionEnvironment())
+    {
+    }
+
+    internal SetupViewModel(
+        MainWindowViewModel main,
+        IClientSettingsSession settingsSession,
+        ISetupConnectionEnvironment connectionEnvironment)
+    {
+        ArgumentNullException.ThrowIfNull(main);
+        ArgumentNullException.ThrowIfNull(settingsSession);
+        ArgumentNullException.ThrowIfNull(connectionEnvironment);
         this.main = main;
+        this.settingsSession = settingsSession;
+        this.connectionEnvironment = connectionEnvironment;
         main.PropertyChanged += OnMainPropertyChanged;
         LocalizationService.LanguageChanged += OnLanguageChanged;
-        SshConfigAliases = LoadSshConfigAliases();
-        WslDistributions = LoadWslDistributions();
-        var saved = App.CurrentSettings;
+        SshConfigAliases = connectionEnvironment.LoadSshConfigAliases();
+        WslDistributions = connectionEnvironment.LoadWslDistributions();
+        var saved = settingsSession.Current;
         selectedConnectionProfile = saved.ConnectionProfile is ConnectionProfiles.Wsl or ConnectionProfiles.SshConfigAlias
             ? saved.ConnectionProfile
             : ConnectionProfiles.None;
@@ -156,6 +176,11 @@ public sealed class SetupViewModel : INotifyPropertyChanged, IDisposable
                 ConnectionProfiles.SshConfigAlias when SshConfigAliases.Count > 0 => SshConfigAliases[0],
                 _ => ConnectionSelectors.None,
             };
+            if (next == ConnectionProfiles.SshConfigAlias
+                && selectedConnectionSelector != ConnectionSelectors.None)
+            {
+                SshHost = selectedConnectionSelector;
+            }
             Notify();
             Notify(nameof(SelectedConnectionSelector));
             Notify(nameof(ConnectionSelectorOptions));
@@ -235,7 +260,7 @@ public sealed class SetupViewModel : INotifyPropertyChanged, IDisposable
     {
         if (SshRunning)
         {
-            try { sshProcess?.Kill(entireProcessTree: true); } catch { /* process may have exited */ }
+            try { sshProcess?.Kill(); } catch { /* process may have exited */ }
             return;
         }
 
@@ -243,20 +268,8 @@ public sealed class SetupViewModel : INotifyPropertyChanged, IDisposable
         try
         {
             sshLaunchFailed = false;
-            var process = new Process
-            {
-                StartInfo = new ProcessStartInfo
-                {
-                    FileName = "ssh.exe",
-                    UseShellExecute = true,
-                    WorkingDirectory = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
-                },
-                EnableRaisingEvents = true,
-            };
-            process.StartInfo.ArgumentList.Add("-N");
-            process.StartInfo.ArgumentList.Add("-L");
-            process.StartInfo.ArgumentList.Add("8787:127.0.0.1:8787");
-            process.StartInfo.ArgumentList.Add(string.IsNullOrWhiteSpace(SshUser) ? SshHost : $"{SshUser}@{SshHost}");
+            var target = string.IsNullOrWhiteSpace(SshUser) ? SshHost : $"{SshUser}@{SshHost}";
+            var process = connectionEnvironment.CreateSshProcess(target);
             process.Exited += OnSshExited;
             if (process.Start())
             {
@@ -301,6 +314,35 @@ public sealed class SetupViewModel : INotifyPropertyChanged, IDisposable
         ConnectionProfile = IsConnectionSelectionValid ? selectedConnectionProfile : ConnectionProfiles.None,
         ConnectionSelector = IsConnectionSelectionValid ? selectedConnectionSelector : ConnectionSelectors.None,
     };
+
+    public SetupAdvanceOutcome Advance()
+    {
+        if (IsConnectionStep && !CanContinue)
+        {
+            return SetupAdvanceOutcome.StayOpen;
+        }
+
+        if (IsAuthStep && !CanContinue)
+        {
+            StartAuthentication();
+            return SetupAdvanceOutcome.StayOpen;
+        }
+
+        if (IsDoneStep)
+        {
+            PersistSettings(setupCompleted: true);
+            return SetupAdvanceOutcome.CloseRequested;
+        }
+
+        if (IsConnectionStep)
+        {
+            PersistSettings(setupCompleted: false);
+        }
+
+        Continue();
+        return SetupAdvanceOutcome.StayOpen;
+    }
+
     public void Continue()
     {
         if (!CanContinue)
@@ -314,6 +356,18 @@ public sealed class SetupViewModel : INotifyPropertyChanged, IDisposable
 
         Step = Math.Min(2, Step + 1);
     }
+
+    private void PersistSettings(bool setupCompleted)
+    {
+        var current = settingsSession.Current;
+        var updated = BuildSettings(current) with
+        {
+            SetupCompleted = setupCompleted || current.SetupCompleted,
+            Language = Texts.LanguageCode,
+        };
+        settingsSession.Save(updated);
+    }
+
     public void Dispose()
     {
         main.PropertyChanged -= OnMainPropertyChanged;
@@ -365,72 +419,6 @@ public sealed class SetupViewModel : INotifyPropertyChanged, IDisposable
 
     private static bool IsSafeSshUser(string value) =>
         value.Length <= 128 && value.All(character => char.IsLetterOrDigit(character) || character is '.' or '-' or '_');
-
-    private static IReadOnlyList<string> LoadSshConfigAliases()
-    {
-        try
-        {
-            var path = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".ssh", "config");
-            if (!File.Exists(path)) return [];
-            return File.ReadLines(path)
-                .Take(512)
-                .Select(line => line.Trim())
-                .Where(line => line.StartsWith("Host ", StringComparison.OrdinalIgnoreCase)
-                    || line.StartsWith("Host\t", StringComparison.OrdinalIgnoreCase))
-                .Select(line =>
-                {
-                    var comment = line.IndexOf('#');
-                    return (comment >= 0 ? line[..comment] : line).Trim();
-                })
-                .SelectMany(line => line[(line.IndexOfAny([' ', '\t']) + 1)..]
-                    .Split([' ', '\t'], StringSplitOptions.RemoveEmptyEntries))
-                .Where(IsSafeSshHost)
-                .Distinct(StringComparer.OrdinalIgnoreCase)
-                .Take(32)
-                .ToArray();
-        }
-        catch (IOException)
-        {
-            return [];
-        }
-        catch (UnauthorizedAccessException)
-        {
-            return [];
-        }
-    }
-
-    private static IReadOnlyList<string> LoadWslDistributions()
-    {
-        try
-        {
-            using var process = new Process
-            {
-                StartInfo = new ProcessStartInfo
-                {
-                    FileName = "wsl.exe",
-                    UseShellExecute = false,
-                    RedirectStandardOutput = true,
-                    RedirectStandardError = true,
-                    CreateNoWindow = true,
-                },
-            };
-            process.StartInfo.ArgumentList.Add("-l");
-            process.StartInfo.ArgumentList.Add("-q");
-            if (!process.Start()) return [];
-            var output = process.StandardOutput.ReadToEnd();
-            process.WaitForExit(3000);
-            return output.Split(['\r', '\n'], StringSplitOptions.RemoveEmptyEntries)
-                .Select(value => value.Trim())
-                .Where(ConnectionSelectors.IsWslToken)
-                .Distinct(StringComparer.Ordinal)
-                .Take(32)
-                .ToArray();
-        }
-        catch
-        {
-            return [];
-        }
-    }
 
     private void Notify([CallerMemberName] string? propertyName = null) => PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(propertyName));
 }

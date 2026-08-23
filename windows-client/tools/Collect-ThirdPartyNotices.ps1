@@ -11,6 +11,10 @@ param(
 $ErrorActionPreference = 'Stop'
 
 function Get-NuGetGlobalPackagesPath {
+    if (-not [string]::IsNullOrWhiteSpace($env:NUGET_PACKAGES)) {
+        return [System.IO.Path]::GetFullPath($env:NUGET_PACKAGES)
+    }
+
     $output = (& dotnet nuget locals global-packages --list | Out-String)
     $match = [regex]::Match($output, '(?m)^global-packages:\s*(.+?)\s*$')
     if (-not $match.Success) {
@@ -65,7 +69,9 @@ $requiredFiles = @(
     @{ Name = 'harfbuzzsharp.nativeassets.win32'; Version = '8.3.1.3'; File = 'LICENSE.txt' },
     @{ Name = 'harfbuzzsharp.nativeassets.win32'; Version = '8.3.1.3'; File = 'THIRD-PARTY-NOTICES.txt' },
     @{ Name = 'skiasharp.nativeassets.win32'; Version = '3.119.4'; File = 'LICENSE.txt' },
-    @{ Name = 'skiasharp.nativeassets.win32'; Version = '3.119.4'; File = 'THIRD-PARTY-NOTICES.txt' }
+    @{ Name = 'skiasharp.nativeassets.win32'; Version = '3.119.4'; File = 'THIRD-PARTY-NOTICES.txt' },
+    @{ Name = 'scottplot'; Version = '5.1.59'; File = 'Notices/LICENSE.txt' },
+    @{ Name = 'scottplot'; Version = '5.1.59'; File = 'Notices/NOTICES.txt' }
 )
 
 foreach ($requiredFile in $requiredFiles) {

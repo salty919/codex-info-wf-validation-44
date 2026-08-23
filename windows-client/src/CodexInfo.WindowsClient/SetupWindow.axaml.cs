@@ -4,7 +4,6 @@
 using Avalonia.Controls;
 using Avalonia.Input;
 using Avalonia.Input.Platform;
-using CodexInfo.WindowsClient.Settings;
 using CodexInfo.WindowsClient.Core;
 using CodexInfo.WindowsClient.ViewModels;
 
@@ -17,7 +16,6 @@ public partial class SetupWindow : Window
     public SetupWindow(SetupViewModel viewModel)
     {
         InitializeComponent();
-        WindowDragBehavior.Attach(this);
         DataContext = viewModel;
         Closed += (_, _) => viewModel.Dispose();
     }
@@ -34,32 +32,11 @@ public partial class SetupWindow : Window
 
     private void OnContinue(object? sender, Avalonia.Interactivity.RoutedEventArgs e)
     {
-        if (DataContext is not SetupViewModel vm) return;
-        if (vm.IsConnectionStep && !vm.CanContinue) return;
-        if (vm.IsAuthStep && !vm.CanContinue)
+        if (DataContext is SetupViewModel viewModel
+            && viewModel.Advance() == SetupAdvanceOutcome.CloseRequested)
         {
-            vm.StartAuthentication();
-            return;
-        }
-        if (vm.IsDoneStep)
-        {
-            var updated = vm.BuildSettings(App.CurrentSettings) with { SetupCompleted = true, Language = vm.Texts.LanguageCode };
-            App.SettingsStore.Save(updated);
-            App.CurrentSettings = updated;
             Close();
-            return;
         }
-        if (vm.IsConnectionStep)
-        {
-            // A reachable API/auth-required response proves the local
-            // forwarding route, even when Linux authentication is still
-            // pending.  Persist only this non-sensitive completion marker;
-            // SSH host/user remain transient by design.
-            var updated = vm.BuildSettings(App.CurrentSettings) with { Language = vm.Texts.LanguageCode };
-            App.SettingsStore.Save(updated);
-            App.CurrentSettings = updated;
-        }
-        vm.Continue();
     }
 
     private async void OnCopySsh(object? sender, Avalonia.Interactivity.RoutedEventArgs e) => await CopyTextAsync((DataContext as SetupViewModel)?.SshCommand);

@@ -16,6 +16,8 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc::{self, RecvTimeoutError};
+use std::thread::{self, JoinHandle};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 pub(crate) const RESET_HINT_FILE_NAME: &str = "usage_reset_hint.json";
@@ -262,10 +264,79 @@ fn input_fingerprint(hint: Option<ResetHint>) -> Result<InputFingerprint, Daemon
     })
 }
 
-#[derive(Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 struct LockRecord {
     pid: u32,
     started_at: i64,
+    #[serde(default)]
+    starttime_ticks: u64,
+    #[serde(default)]
+    executable_device: u64,
+    #[serde(default)]
+    executable_inode: u64,
+    #[serde(default)]
+    owner_nonce: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ProcessIdentity {
+    pid: u32,
+    starttime_ticks: u64,
+    executable_device: u64,
+    executable_inode: u64,
+}
+
+#[cfg(unix)]
+fn process_identity(pid: u32) -> Option<ProcessIdentity> {
+    use std::os::unix::fs::MetadataExt;
+
+    if pid == 0 {
+        return None;
+    }
+    let process_root = Path::new("/proc").join(pid.to_string());
+    // `/proc/<pid>/stat` encloses comm in parentheses and comm may contain
+    // spaces. Split only after the final `) `; starttime is field 22, hence
+    // index 19 in the remaining field-3-based slice.
+    let stat = fs::read_to_string(process_root.join("stat")).ok()?;
+    let (_, fields) = stat.rsplit_once(") ")?;
+    let starttime_ticks = fields.split_whitespace().nth(19)?.parse().ok()?;
+    let executable = fs::metadata(process_root.join("exe")).ok()?;
+    Some(ProcessIdentity {
+        pid,
+        starttime_ticks,
+        executable_device: executable.dev(),
+        executable_inode: executable.ino(),
+    })
+}
+
+#[cfg(not(unix))]
+fn process_identity(pid: u32) -> Option<ProcessIdentity> {
+    (pid == std::process::id()).then_some(ProcessIdentity {
+        pid,
+        starttime_ticks: 0,
+        executable_device: 0,
+        executable_inode: 0,
+    })
+}
+
+#[cfg(unix)]
+fn owner_nonce() -> Result<String, DaemonError> {
+    let mut bytes = [0_u8; 16];
+    File::open("/dev/urandom")
+        .and_then(|mut file| file.read_exact(&mut bytes))
+        .map_err(DaemonError::Lock)?;
+    Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
+}
+
+#[cfg(not(unix))]
+fn owner_nonce() -> Result<String, DaemonError> {
+    // The recorder is a Linux/WSL service. Keep non-Unix builds compilable,
+    // while never treating this fallback as a cross-process authority.
+    Ok(format!(
+        "{:016x}{:016x}",
+        std::process::id(),
+        unix_now().unsigned_abs()
+    ))
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -302,34 +373,23 @@ fn lock_is_same_file(left: &fs::Metadata, right: &fs::Metadata) -> bool {
     lock_identity_from_metadata(left) == lock_identity_from_metadata(right)
 }
 
-#[cfg(unix)]
-fn process_is_alive(pid: u32) -> bool {
-    if pid == 0 {
-        return false;
-    }
-    // Unit tests acquire a lock in-process without the daemon command-line
-    // marker. Keep that owner live, while rejecting a stale lock whose PID
-    // has been reused by an unrelated process. A systemd restart can then
-    // reclaim the old file without ever deleting another process's lock.
-    if pid == std::process::id() {
-        return true;
-    }
-    let process_root = Path::new("/proc").join(pid.to_string());
-    if !process_root.is_dir() {
-        return false;
-    }
-    let Ok(command_line) = fs::read(process_root.join("cmdline")) else {
+fn lock_owner_is_current(record: &LockRecord) -> bool {
+    let Some(identity) = process_identity(record.pid) else {
         return false;
     };
-    command_line
-        .split(|byte| *byte == 0)
-        .filter(|argument| !argument.is_empty())
-        .any(|argument| argument == b"--record-daemon")
-}
-
-#[cfg(not(unix))]
-fn process_is_alive(pid: u32) -> bool {
-    pid == std::process::id()
+    // Legacy lock records do not carry enough identity to prove ownership.
+    // They may be reclaimed only when their PID is dead; a live legacy PID is
+    // retained fail-closed so an unrelated process is never disturbed.
+    if record.starttime_ticks == 0
+        || record.executable_device == 0
+        || record.executable_inode == 0
+        || record.owner_nonce.len() != 32
+    {
+        return true;
+    }
+    identity.starttime_ticks == record.starttime_ticks
+        && identity.executable_device == record.executable_device
+        && identity.executable_inode == record.executable_inode
 }
 
 fn lock_is_stale(path: &Path) -> Result<bool, DaemonError> {
@@ -347,7 +407,7 @@ fn lock_is_stale(path: &Path) -> Result<bool, DaemonError> {
         .map_err(DaemonError::Lock)?;
     if let Ok(record) = serde_json::from_slice::<LockRecord>(&bytes) {
         let _ = record.started_at;
-        return Ok(!process_is_alive(record.pid));
+        return Ok(!lock_owner_is_current(&record));
     }
     let old_enough = metadata
         .modified()
@@ -384,14 +444,27 @@ impl DaemonLock {
             }
             match options.open(&path) {
                 Ok(mut file) => {
-                    let record = format!(
-                        "{{\"pid\":{},\"started_at\":{}}}\n",
-                        std::process::id(),
-                        unix_now()
-                    );
+                    let process = process_identity(std::process::id()).ok_or_else(|| {
+                        DaemonError::Lock(std::io::Error::other(
+                            "current process identity is unavailable",
+                        ))
+                    })?;
+                    let record = LockRecord {
+                        pid: process.pid,
+                        started_at: unix_now(),
+                        starttime_ticks: process.starttime_ticks,
+                        executable_device: process.executable_device,
+                        executable_inode: process.executable_inode,
+                        owner_nonce: owner_nonce()?,
+                    };
+                    let record = serde_json::to_vec(&record).map_err(|_| {
+                        DaemonError::Lock(std::io::Error::other(
+                            "lock identity serialization failed",
+                        ))
+                    })?;
                     let result = (|| -> Result<fs::Metadata, DaemonError> {
-                        file.write_all(record.as_bytes())
-                            .map_err(DaemonError::Lock)?;
+                        file.write_all(&record).map_err(DaemonError::Lock)?;
+                        file.write_all(b"\n").map_err(DaemonError::Lock)?;
                         file.sync_all().map_err(DaemonError::Lock)?;
                         file.metadata().map_err(DaemonError::Lock)
                     })();
@@ -614,6 +687,120 @@ pub(crate) fn run_record_daemon(once: bool) -> Result<(), String> {
         .map_err(|error| error.to_string())
 }
 
+/// Recorder ownership embedded in the combined daemon+REST service.
+///
+/// Unlike `run_record_daemon`, this worker does not install a second signal
+/// handler. The service process owns SIGINT/SIGTERM and stops this bounded
+/// worker before releasing the REST listener.
+pub(crate) struct RecorderWorker {
+    shutdown: Option<mpsc::Sender<()>>,
+    worker: Option<JoinHandle<()>>,
+    active: bool,
+}
+
+impl RecorderWorker {
+    pub(crate) fn start() -> Result<Self, String> {
+        let (shutdown, shutdown_receiver) = mpsc::channel();
+        let (started, started_receiver) = mpsc::sync_channel(1);
+        let worker = thread::Builder::new()
+            .name("codex-info-recorder".into())
+            .spawn(move || {
+                let result = (|| -> Result<
+                    (PathBuf, Option<DaemonLock>, Option<InputFingerprint>),
+                    DaemonError,
+                > {
+                    let (_history, database, lock_path) = data_paths()?;
+                    let lock = DaemonLock::acquire(lock_path)?;
+                    Ok((database, lock, None::<InputFingerprint>))
+                })();
+                let (database, lock, mut previous) = match result {
+                    Ok(values) => values,
+                    Err(error) => {
+                        let _ = started.send(Err(error.to_string()));
+                        return;
+                    }
+                };
+                let Some(_lock) = lock else {
+                    // An already-running owner is not an error and must never
+                    // be killed or replaced by an X-only/combined launch.
+                    let _ = started.send(Ok(false));
+                    return;
+                };
+
+                match run_cycle(&database, &mut previous) {
+                    Ok(rows) if rows > 0 => {
+                        eprintln!("codex-info: recorder committed {rows} samples")
+                    }
+                    Ok(_) => {}
+                    Err(_) => {
+                        previous = None;
+                        eprintln!("codex-info: recorder skipped an unsafe input cycle");
+                    }
+                }
+                if started.send(Ok(true)).is_err() {
+                    return;
+                }
+
+                let interval = daemon_interval_from_environment();
+                loop {
+                    match shutdown_receiver.recv_timeout(interval) {
+                        Ok(()) | Err(RecvTimeoutError::Disconnected) => break,
+                        Err(RecvTimeoutError::Timeout) => {
+                            match run_cycle(&database, &mut previous) {
+                                Ok(rows) if rows > 0 => {
+                                    eprintln!("codex-info: recorder committed {rows} samples")
+                                }
+                                Ok(_) => {}
+                                Err(_) => {
+                                    previous = None;
+                                    eprintln!("codex-info: recorder skipped an unsafe input cycle");
+                                }
+                            }
+                        }
+                    }
+                }
+            })
+            .map_err(|_| DaemonError::Runtime.to_string())?;
+
+        match started_receiver.recv_timeout(Duration::from_secs(2)) {
+            Ok(Ok(active)) => Ok(Self {
+                shutdown: Some(shutdown),
+                worker: Some(worker),
+                active,
+            }),
+            Ok(Err(error)) => {
+                let _ = shutdown.send(());
+                let _ = worker.join();
+                Err(error)
+            }
+            Err(_) => {
+                let _ = shutdown.send(());
+                let _ = worker.join();
+                Err(DaemonError::Runtime.to_string())
+            }
+        }
+    }
+
+    pub(crate) fn is_active(&self) -> bool {
+        self.active
+    }
+
+    pub(crate) fn shutdown(&mut self) {
+        if let Some(shutdown) = self.shutdown.take() {
+            let _ = shutdown.send(());
+        }
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
+}
+
+impl Drop for RecorderWorker {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -676,6 +863,34 @@ mod tests {
         let first = DaemonLock::acquire(path.clone()).unwrap().unwrap();
         assert!(DaemonLock::acquire(path.clone()).unwrap().is_none());
         drop(first);
+        assert!(!path.exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn pid_reuse_identity_mismatch_is_reclaimed_without_touching_live_owner() {
+        let root = temp_root("pid-reuse");
+        let path = root.join(DAEMON_LOCK_FILE_NAME);
+        let current = process_identity(std::process::id()).unwrap();
+        let reused = LockRecord {
+            pid: current.pid,
+            started_at: unix_now(),
+            starttime_ticks: current.starttime_ticks.saturating_add(1),
+            executable_device: current.executable_device,
+            executable_inode: current.executable_inode,
+            owner_nonce: "00".repeat(16),
+        };
+        fs::write(&path, serde_json::to_vec(&reused).unwrap()).unwrap();
+
+        let acquired = DaemonLock::acquire(path.clone()).unwrap().unwrap();
+        let stored: LockRecord = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(stored.pid, current.pid);
+        assert_eq!(stored.starttime_ticks, current.starttime_ticks);
+        assert_eq!(stored.executable_device, current.executable_device);
+        assert_eq!(stored.executable_inode, current.executable_inode);
+        assert_eq!(stored.owner_nonce.len(), 32);
+        drop(acquired);
         assert!(!path.exists());
         let _ = fs::remove_dir_all(root);
     }

@@ -14,7 +14,6 @@ public partial class SettingsWindow : Window
     public SettingsWindow(SettingsViewModel viewModel)
     {
         InitializeComponent();
-        WindowDragBehavior.Attach(this);
         DataContext = viewModel;
         Closed += (_, _) => viewModel.Dispose();
     }

@@ -36,6 +36,17 @@
           "Avalonia": "12.1.1"
         }
       },
+      "ScottPlot.Avalonia": {
+        "type": "Direct",
+        "requested": "[5.1.59, )",
+        "resolved": "5.1.59",
+        "contentHash": "VbWAjgrkyniSQaelgE5tO1KvDLccoOquO5ZXojQRAQJ2LiLPW4fmNc2PiSrOxajgpMZTRLgH0OBJ1q3gq7TgPw==",
+        "dependencies": {
+          "Avalonia": "12.0.0",
+          "Avalonia.Skia": "12.0.0",
+          "ScottPlot": "5.1.59"
+        }
+      },
       "Avalonia.Angle.Windows.Natives": {
         "type": "Transitive",
         "resolved": "2.1.27548.20260419",
@@ -155,6 +166,17 @@
         "resolved": "0.11.6",
         "contentHash": "NdNWGDiZ6eS/Mf/9+QHR91cj1K7Hy+PX9yrHI/zM7xFYuj9IWT2uxtB6sCHjrnxAeLV9fut1R6zHDUGKX6f9lQ=="
       },
+      "ScottPlot": {
+        "type": "Transitive",
+        "resolved": "5.1.59",
+        "contentHash": "a2xnmMNfhspakKobDfAX5s1GPLFgmEXtRewR9p6bWM91QuCxF5SjHnDbixAcZoU50LPicrCe04sWzIVzdSrmNw==",
+        "dependencies": {
+          "HarfBuzzSharp.NativeAssets.Linux": "8.3.1.1",
+          "SkiaSharp": "3.119.0",
+          "SkiaSharp.HarfBuzz": "3.119.0",
+          "SkiaSharp.NativeAssets.Linux.NoDependencies": "3.119.0"
+        }
+      },
       "SkiaSharp": {
         "type": "Transitive",
         "resolved": "3.119.4",
@@ -164,10 +186,24 @@
           "SkiaSharp.NativeAssets.macOS": "3.119.4"
         }
       },
+      "SkiaSharp.HarfBuzz": {
+        "type": "Transitive",
+        "resolved": "3.119.0",
+        "contentHash": "5ocGzl+RYEZFnUPUbModshnEFvKTku4hTtOBsLvy5MCK2KAHjq5Nw2+uAVUx79Rjh0z8fTojT6ZVav8MJgW0ug==",
+        "dependencies": {
+          "HarfBuzzSharp": "8.3.1.1",
+          "SkiaSharp": "3.119.0"
+        }
+      },
       "SkiaSharp.NativeAssets.Linux": {
         "type": "Transitive",
         "resolved": "3.119.4",
         "contentHash": "UAyVzbqNfZsZbKbzj68zXLyUyF/SbTKmzTfOO6qDu++dtIUMMTzPBe8oOuzU/DiewpfKoUUlOSsJmqWc6blxBw=="
+      },
+      "SkiaSharp.NativeAssets.Linux.NoDependencies": {
+        "type": "Transitive",
+        "resolved": "3.119.0",
+        "contentHash": "e92vdqf1VOETPjy1T67Fs1zPxfGMM1nbrpt69GM5foXSI/iIbq6L9avPz/bl/DbWtb81D0yF/NKjRmXuOZoLcg=="
       },
       "SkiaSharp.NativeAssets.macOS": {
         "type": "Transitive",
@@ -226,6 +262,11 @@
         "type": "Transitive",
         "resolved": "3.119.4",
         "contentHash": "UAyVzbqNfZsZbKbzj68zXLyUyF/SbTKmzTfOO6qDu++dtIUMMTzPBe8oOuzU/DiewpfKoUUlOSsJmqWc6blxBw=="
+      },
+      "SkiaSharp.NativeAssets.Linux.NoDependencies": {
+        "type": "Transitive",
+        "resolved": "3.119.0",
+        "contentHash": "e92vdqf1VOETPjy1T67Fs1zPxfGMM1nbrpt69GM5foXSI/iIbq6L9avPz/bl/DbWtb81D0yF/NKjRmXuOZoLcg=="
       },
       "SkiaSharp.NativeAssets.macOS": {
         "type": "Transitive",

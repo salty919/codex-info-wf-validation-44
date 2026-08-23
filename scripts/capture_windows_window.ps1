@@ -3,11 +3,18 @@
 param(
     [Parameter(Mandatory = $true)][string]$OutputPath,
     [string]$Preview = 'setup',
-    [string]$PreviewSize = '760x680'
+    [string]$PreviewSize = '760x680',
+    [string]$ClientPath = '',
+    [int]$GraphPoints = 3,
+    [ValidateRange(0, 5000)][int]$GraphBuildDelayMilliseconds = 0,
+    [switch]$OpenGraphPeriodMenu,
+    [switch]$OpenGraphMetricMenu
 )
 
 $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName System.Drawing
+Add-Type -AssemblyName UIAutomationClient
+Add-Type -AssemblyName UIAutomationTypes
 Add-Type -TypeDefinition @'
 using System;
 using System.Runtime.InteropServices;
@@ -15,8 +22,11 @@ public static class CodexInfoCaptureWin32 {
     [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr hWnd, out RECT rect);
     [DllImport("user32.dll")] public static extern bool SetProcessDPIAware();
     [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hWnd);
+    [DllImport("user32.dll")] public static extern bool SetCursorPos(int x, int y);
+    [DllImport("user32.dll")] public static extern void mouse_event(uint flags, uint x, uint y, uint data, UIntPtr extra);
     [DllImport("user32.dll")] public static extern bool BringWindowToTop(IntPtr hWnd);
     [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr hWnd, int command);
+    [DllImport("user32.dll")] public static extern bool SetWindowPos(IntPtr hWnd, IntPtr after, int x, int y, int width, int height, uint flags);
     [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr hWnd);
     [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint processId);
     [DllImport("user32.dll")] public static extern int GetWindowText(IntPtr hWnd, System.Text.StringBuilder text, int count);
@@ -29,6 +39,8 @@ public static class CodexInfoCaptureWin32 {
 
 $env:CODEX_INFO_WINDOWS_PREVIEW = $Preview
 $env:CODEX_INFO_WINDOWS_PREVIEW_SIZE = $PreviewSize
+$env:CODEX_INFO_WINDOWS_PREVIEW_GRAPH_POINTS = $GraphPoints
+$env:CODEX_INFO_WINDOWS_PREVIEW_GRAPH_BUILD_DELAY_MS = $GraphBuildDelayMilliseconds
 $expectedTitle = switch ($Preview) {
     { $_ -in @('normal', 'auth', 'error', 'warning', 'danger', 'zero', 'full') } { 'Codex Info Monitor' }
     'graph' { 'Codex Info Graph' }
@@ -38,13 +50,20 @@ $expectedTitle = switch ($Preview) {
     default { 'Codex Info Setup' }
 }
 $script:codexInfoCaptureTitle = $expectedTitle
-$exe = Join-Path $env:LOCALAPPDATA 'Programs\Codex Info Monitor\CodexInfo.WindowsClient.exe'
+$exe = if ([string]::IsNullOrWhiteSpace($ClientPath)) {
+    Join-Path $env:LOCALAPPDATA 'Programs\Codex Info Monitor\CodexInfo.WindowsClient.exe'
+} else {
+    $ClientPath
+}
 if (-not (Test-Path -LiteralPath $exe -PathType Leaf)) { throw "Installed client not found: $exe" }
 $process = Start-Process -FilePath $exe -PassThru
 try {
     $window = [IntPtr]::Zero
     for ($i = 0; $i -lt 80 -and $window -eq [IntPtr]::Zero; $i++) {
-        Start-Sleep -Milliseconds 250
+        # Allow the DirectComposition surface to present a complete stable
+        # frame before GDI screen capture; partial compositor frames are not
+        # valid visual evidence.
+        Start-Sleep -Milliseconds 750
         $process.Refresh()
         $callback = [CodexInfoCaptureWin32+EnumWindowsProc] {
             param([IntPtr]$handle, [IntPtr]$extra)
@@ -62,9 +81,32 @@ try {
     }
     if ($window -eq [IntPtr]::Zero) { throw "Fresh $Preview window ($expectedTitle) did not open" }
     [CodexInfoCaptureWin32]::ShowWindow($window, 9) | Out-Null
+    [CodexInfoCaptureWin32]::SetWindowPos($window, [IntPtr]::Zero, 80, 80, 0, 0, 0x0015) | Out-Null
     [CodexInfoCaptureWin32]::BringWindowToTop($window) | Out-Null
     [CodexInfoCaptureWin32]::SetForegroundWindow($window) | Out-Null
     Start-Sleep -Milliseconds 500
+    if ($OpenGraphPeriodMenu -or $OpenGraphMetricMenu) {
+        # Locate the semantic control instead of scaling stale pixel
+        # coordinates. This remains correct across DPI and responsive widths.
+        $automationRoot = [System.Windows.Automation.AutomationElement]::FromHandle($window)
+        $automationId = if ($OpenGraphMetricMenu) { 'Graph.MetricSelector' } else { 'Graph.PeriodSelector' }
+        $condition = New-Object System.Windows.Automation.PropertyCondition(
+            [System.Windows.Automation.AutomationElement]::AutomationIdProperty,
+            $automationId)
+        $selector = $automationRoot.FindFirst(
+            [System.Windows.Automation.TreeScope]::Descendants,
+            $condition)
+        if ($null -eq $selector) { throw "Graph selector is missing: $automationId" }
+        $toggle = $null
+        if (-not $selector.TryGetCurrentPattern([System.Windows.Automation.TogglePattern]::Pattern, [ref]$toggle)) {
+            throw "Graph selector has no TogglePattern: $automationId"
+        }
+        $toggle.Toggle()
+        [CodexInfoCaptureWin32]::SetWindowPos($window, [IntPtr]::Zero, 80, 80, 0, 0, 0x0015) | Out-Null
+        Start-Sleep -Milliseconds 250
+    } else {
+        [CodexInfoCaptureWin32]::SetCursorPos(10, 10) | Out-Null
+    }
     $rect = New-Object CodexInfoCaptureWin32+RECT
     [CodexInfoCaptureWin32]::GetWindowRect($window, [ref]$rect) | Out-Null
     $width = $rect.Right - $rect.Left

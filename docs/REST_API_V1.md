@@ -5,9 +5,9 @@
 
 ## 目的と境界
 
-Linux / WSL 上で起動する既存の Codex Info に、Windows クライアント向けの読み取り専用 API を追加する。
-`codex-info-server`はSlint/X11/Wayland runtime dependencyを持たないheadless release binaryである。
-`RecorderDaemon`はその`record --interval 60` modeとしてsource JSONLを検証してSQLiteへ書く独立writerであり、HTTP listenerを持たない。
+Linux / WSL 上で起動する Codex Info のdaemonと、Windows クライアント向け読み取り専用 APIを、
+`codex_info --service`の1プロセスで所有する。このservice modeはSlint WindowやX event loopを生成せず、
+X UIを表示しない。`RecorderDaemon`はservice process内のbounded workerとしてsource JSONLを検証しSQLiteへ書く。
 `SnapshotPublisher`がcommit済みの完全な`DataGeneration/DataHash`と現行 admission tuple
 `(ProfileScopeId, AccountScopeId, StorageEpoch, SupervisorLeaseIdentity, CollectorEpoch, CycleSeq)`からimmutableなstatus/details
 `PublishedPair`を構築し、native UIとREST workerへ同じpairをread-onlyで渡す。HTTP要求からCodex
@@ -26,34 +26,28 @@ saved selectorのauto reconnectは`ArgumentList`＋`BatchMode=yes`で起動し�
 
 | 要望 | v1での対応 |
 | --- | --- |
-| Linux / WSL をサーバー化する | headless `codex-info-server serve --listen 127.0.0.1:8787`として実装する。Slint/X11/Waylandへ依存しない。 |
+| Linux / WSL をサーバー化する | `codex_info --service --listen 127.0.0.1:8787`でdaemon+RESTを1プロセスとして起動する。Windowは生成しない。 |
 | Windowsから監視する | SSHローカルポート転送先の固定JSONを、`windows-client/` の Windows 監視クライアントが表示する。 |
-| Linuxネイティブ環境を残す | APIは未設定なら起動せず、既存のUI更新経路を変更しない。 |
+| Linuxネイティブ環境を残す | `--ui-only`はX UIだけを起動し、daemon/RESTを生成・残留させない。`--all`は既存serviceを再利用する。 |
 | イントラネットだけを対象にする | loopbackだけへ束縛し、SSHを暗号化・認証境界にする。 |
 | インターネット経由は別設定にする | v1の設定や認証を再利用せず、今回の対象外として分離する。 |
 
 ## 起動と SSH トンネル
 
-API は既定で無効である。user-systemd unitsがinstalledなprofileでは
-`codex-info-api.service`の`codex-info-server serve --listen 127.0.0.1:8787`だけが開始する。
-fallbackでは同じserve commandを明示的に実行した場合だけ開始する。`0.0.0.0`、`::`、LAN アドレス、
+user-systemdを使うprofileでは`codex-info.service`が
+`codex_info --service --listen 127.0.0.1:8787`を開始する。手動時も同じcommandを使う。`0.0.0.0`、`::`、LAN アドレス、
 ホスト名は受け付けない。
 
 ```bash
-codex-info-server serve --listen 127.0.0.1:8787
+codex_info --service --listen 127.0.0.1:8787
+codex_info --ui-only
+codex_info --all
 ```
 
-`serve`は REST 専用のサイレント起動となり、Linux のネイティブUIは表示しない。UIを使う場合は
-native UIを別プロセスで起動する。`codex-info-recorder.service`は別に
-`codex-info-server record --interval 60`を実行し、API/REST/UIはrecorderを暗黙spawnしない。
-`codex-info-server.target`はこのrecorder serviceとAPI serviceを束ねる。
-installer、update、rollback、uninstallでのunit/binary保持順序はrunbook-ownedであり、runbook証拠がない間は`PRODUCT_PENDING`とする。
-
-REST専用workerは`SnapshotPublisher`のread-only consumerであり、recorder leaseやmaintenance
-ownerを取得しない。units installed時は`codex-info-recorder.service`とsystemdがrecorderを所有し、
-UI/REST/`run.sh`はrecorderをspawnしない。fallbackでは明示的なrecord commandだけがleaseを取得し、
-後続起動は既存lease発見時にno-opとなる。UI/RESTの終了はrecorderを停止しない。daemonが単独で動く間に
-HTTP listenerを暗黙生成せず、REST listenerとrecorderのlifecycleを分離する。
+`--service`はWindowを表示せず、recorder lockとREST listenerを同じprocess lifetimeで所有する。
+`--ui-only`は環境変数`CODEX_INFO_API_LISTEN`を継承していてもserviceへ変化しない。
+`--all`は`/v1/health`で既存loopback serviceを確認し、存在しない場合だけ同一実行ファイルの`--service`を開始する。
+systemd自動起動の解除は`bash scripts/install_systemd_recorder.sh --remove`で行い、DB/historyを保持する。
 
 Windows からは SSH のローカルポート転送を使う。
 
@@ -105,7 +99,19 @@ SQLite transaction、WAL/SHM、migration、prune、backup、DB row/hash、Publis
 | unknown、case-altered、末尾slash、query付きpath（methodを問わない） | any | `404` | 固定JSON error、同上header、DB/WAL/SHM/migration/prune/backup=0 |
 
 RESTのtransfer body上限はstatus `64 KiB`、details `32 MiB`、response header `8 KiB`である。
-detailsの配列上限はhistory periods `128`、history samples `100,000`、confirmed history gaps `4,096`、threads `256`、models `3`。
+SQLiteの保持期間は過去3暦月である。一方、1回のDB取得と`details`応答が扱う履歴は観測時刻で終わる
+最長1暦月の半開区間 `(one_month_before(observed_at), observed_at]` に限定する。history samples上限は
+31日分の1分bucketに相当する`44,640`、history periods `128`、confirmed history gaps `4,096`、threads `256`、models `3`である。
+
+### 応答時間SLOと容量条件
+
+warm-up後、loopback、in-flight 1でrequest送信開始からresponse body全受信までを測る。
+`/v1/health`、`/v1/status`、全4xxはP90 25 ms以下・P95 50 ms以下、`/v1/details`は
+7日相当10,080 samplesでP90 50 ms以下・P95 100 ms以下、契約最大1暦月44,640 samplesで
+P90 100 ms以下・P95 150 ms以下とする。各route/profileを30回以上測定し、client hard timeoutは
+1秒、timeout・欠測・上限超過はPASSへ丸めない。DB読出しはtimestamp/reset複合indexを使い、
+3暦月を保持したDBから1暦月窓かつ44,640行以下だけを一度materializeする。full table scan、無上限読出し、UI threadでの
+行単位publishを禁止し、candidate失敗時はlast-good publicationを保持する。
 これらはinternal validated snapshot `1 MiB`とは別resourceであり、どの上限もdecode後の推測値へ
 置換しない。上限超過、malformed、unknown/case key、duplicate key、domain errorは該当resourceの
 直前完全pairを保持し、部分候補を公開しない。現行 admission tupleのいずれかがstale・欠落・不一致の
@@ -152,7 +158,7 @@ candidate pair全体をrejectし、直前の完全pairを保持する。`/v1/hea
 
 ### `/v1/details` 完全schema
 
-`/v1/details` はcontract revision `rest-v1-details-gap-20260823`の次のトップレベル13キーだけを持つ。先頭7項目と
+`/v1/details` はcontract revision `rest-v1-details-reset-at-20260823`の次のトップレベル13キーだけを持つ。先頭7項目と
 `active_thread_count`は同じ`PublishedPair`からpublishされた`/v1/status`の同名値と一致し、
 `models`はstatusのtoken 4項目へdollar 3項目を加えた形である。片側の取得・検証が失敗した
 場合はstatusだけを先行更新せず、直前の完全pairを保持する。wire上に`version`、
@@ -168,8 +174,8 @@ candidate pair全体をrejectし、直前の完全pairを保持する。`/v1/hea
 | `quota` | `null`またはstatusと同じ4必須キーのobject |
 | `models` | 0..3件、`SOL`/`TERRA`/`LUNA`重複なし。各行は下記7必須キー |
 | `active_thread_count` | JSON非負整数`0..UInt64.MaxValue` |
-| `history_periods` | 0..128件。各行は下記5必須キー |
-| `history_samples` | 0..100,000件。各行は下記9必須キー |
+| `history_periods` | 0..128件。各行は下記6必須キー |
+| `history_samples` | 0..44,640件。観測時刻までの最長1暦月。各行は下記9必須キー |
 | `history_gaps` | 0..4,096件。`recorder_gap_ledger`のconfirmed rowだけを下記5必須キーへredactしたprojection |
 | `threads` | 0..256件。各行は下記12必須キー |
 | `estimated_cost_label` | control/bidi formattingなしの1..160 Unicode scalar。表示所有権は別途DESIGNで決め、schemaに存在するだけで重複表示を許可しない |
@@ -178,10 +184,15 @@ candidate pair全体をrejectし、直前の完全pairを保持する。`/v1/hea
 `input_dollars`、`cached_input_dollars`、`output_dollars`だけを持つ。tokenはJSON非負整数、
 dollarは有限かつ0以上のJSON numberである。ドルはcreditや為替へ変換しない。
 
-各history period行は`id`、`start_at`、`end_at`、`label`、`current`だけを持つ。`id`は
+各history period行は`id`、`start_at`、`end_at`、`reset_at`、`label`、`current`だけを持つ。`id`は
 1..512 Unicode scalarで集合内一意、時刻はUnix秒整数`1..253402300799`、
-`end_at >= start_at`、`label`はcontrol/bidi formattingなしの1..512 Unicode scalar、
+`start_at <= end_at <= reset_at`、`label`はcontrol/bidi formattingなしの1..512 Unicode scalar、
 `current=true`は集合内で最大1件である。
+
+`reset_at`はperiod groupのcanonical reset境界であり、sampleの所属判定に使う。`end_at`は現在期間では
+観測時刻、途中で次期間へ切り替わった過去期間では次期間開始へclipできるため、`end_at`をcanonical
+reset境界として代用してはならない。clientは`id`をparseせず、sampleの`reset_at`がperiodの
+`reset_at - 60 <= sample.reset_at <= reset_at`に入るものだけを同periodへcanonicalizeする。
 
 `label`はLinux/X側が同じperiod groupの表示に用いたreference labelであり、selection keyでもWindowsの
 日時parse入力でもない。serverは`DESIGN.md`のcanonical period ID、start/end、起動時timezone、DST offset、
@@ -255,7 +266,7 @@ write lockにより同じ`PublishedPair`からatomic publishする。Windowsが�
 
 ## 段階的な移行
 
-v1 は Linux ネイティブ UI と別プロセスの headless `codex-info-server serve --listen 127.0.0.1:8787` で起動する監視 API である。
+v1 は Linux ネイティブ UI と別プロセスの`codex_info --service --listen 127.0.0.1:8787`で起動する監視 API である。
 Windows 側には `windows-client/` の Avalonia / .NET 10 クライアントを用意し、Visual
 Studio Community から solution を開いて、この固定 JSON 契約を表示できる。詳細な
 接続・検証・表示仕様は[Windows クライアント](WINDOWS_CLIENT.md)を参照する。

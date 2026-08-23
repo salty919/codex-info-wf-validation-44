@@ -50,20 +50,18 @@ Windows側へ8787番ポートを公開するために、serverを`0.0.0.0`やLAN
 
 ### 2. Windows クライアントのインストール／アンインストール
 
-artifact filename `CodexInfo.WindowsClient.Setup.exe`、per-user install、Start Menu、uninstaller、
-rollbackは要求契約として記録する。installer binary、install root、shortcut、uninstallerのexact
-manifest/command/fresh Windows evidenceは未取得でPRODUCT_PENDINGであり、pathを推測して実行しない。
-インストーラーは資格情報、SSH鍵、raw接続先、selector以外の接続値を保存しない。
+配布物は `CodexInfo.WindowsClient.Setup.exe` というInno Setup 7.1.0の標準GUIウィザードである。
+`windows-client/tools/Build-WindowsInstaller.ps1` がlocked restore、win-x64 self-contained publish、
+第三者notice収集、`.iss`コンパイルを順に行う。SetupはUACを要求しないユーザー単位インストールで、既定の
+`%LOCALAPPDATA%\Programs\Codex Info Monitor`、Start Menu、Windowsの「インストールされているアプリ」へ
+登録する。同じAppIdの再実行は更新になり、稼働中の本体は標準のRestart Manager境界で閉じる。
 
-「アプリと機能」の登録名、Start Menu shortcut、uninstaller、rollbackの入口と、設定・Linux側履歴DBを
-保持する境界は要求契約として記録する。exactな登録・実行ファイル・install root・manifest・commandと
-physical Windows evidenceは未取得でPRODUCT_PENDINGであり、`CodexInfo.WindowsClient.Uninstaller.exe`や
-PowerShell/scriptのpathを推測して実行可能とは記載しない。installed serviceのinstall/start/stop/restart/
-uninstall/rollback commandも同じくPRODUCT_PENDINGである。
-
-配布用installerのself-contained payload、第三者notice、Start Menu公開、rollback transactionは要求抽出の
-対象である。Windows CI/.NET SDKによるexact build commandと生成物はrelease manifest確定後にだけ追加し、
-この文書では実行可能なinstaller commandを提供しない。設定とLinux側の履歴DBを削除しない保持条件は変更しない。
+アンインストールはInno Setupが生成する標準uninstallerから行う。本体payload、shortcut、Apps登録、既知の
+空ディレクトリを除去する一方、`%LOCALAPPDATA%\CodexInfo` の設定とLinux側の3か月履歴DBは削除しない。
+本体、Setup、uninstaller、shortcut、Apps登録のDisplayIconは同じ `CodexInfo.ico` を使用する。
+旧自作bootstrapperの登録と `CodexInfo.WindowsClient.Uninstaller.exe` は初回更新時に移行削除する。
+Setupは資格情報、SSH鍵、raw接続先を保存しない。Authenticode署名は外部のコード署名証明書があるrelease工程で
+のみ実施でき、証明書がないローカルbuildを署名済みと表明してはならない。
 
 ### 3. SSH 転送と初回セットアップ
 
@@ -167,8 +165,9 @@ PRODUCT_PENDING/HOLDを維持し、読者が未確定のpathやcommandを推測�
 decode前で、`/v1/status`は65,536 bytes以下、`/v1/details`は33,554,432 bytes以下とする。
 `Content-Length` が各上限を超える場合は本文を読まず、chunkedまたは不明長の本文は読み取り
 途中で各上限を超えた時点で停止する。自動解凍は無効なので`Content-Encoding`付き応答を
-解凍して受理しない。`/v1/details`は本文上限とは別にhistory periods 128件、history samples
-100,000件、threads 256件、models 3件を上限とし、どれか一つでも超えたcandidate全体を拒否する。
+解凍して受理しない。SQLiteは過去3暦月を保持するが、`/v1/details`の1回の取得は最長1暦月である。
+本文上限とは別にhistory periods 128件、history samples 44,640件、threads 256件、models 3件を
+上限とし、どれか一つでも超えたcandidate全体を拒否する。
 
 トップレベルでは `api_version`、`state`、`observed_at`、`authenticated`、
 `plan_label`、`quota`、`models`、`active_thread_count` の全キーが必須である。

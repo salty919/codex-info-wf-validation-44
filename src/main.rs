@@ -12,7 +12,7 @@ use codex_info::security;
 use codex_info::server::{
     ApiServer, ApiServerConfig, PublicDetailedModelUsage, PublicDetails, PublicHistoryPeriod,
     PublicHistorySample, PublicModelUsage, PublicQuota, PublicSnapshot, PublicState, PublicThread,
-    MAX_PUBLIC_HISTORY_SAMPLES, MAX_PUBLIC_THREADS,
+    MAX_PUBLIC_THREADS,
 };
 use codex_info::thread_contract::{
     self, PageAcceptance, ThreadCycleAccumulator, ThreadCycleOutcome, ValidatedThreadCandidate,
@@ -25,8 +25,10 @@ use slint::winit_030::{winit, EventResult, WinitWindowAccessor};
 use slint::{CloseRequestResponse, ComponentHandle, Timer, TimerMode};
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::OsString;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
+use std::net::{SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::rc::Rc;
@@ -1247,33 +1249,27 @@ fn open_codex_session_paths(
     Ok(open_files)
 }
 
+fn active_thread_paths(codex_root: &Path) -> Result<(PathBuf, BTreeSet<PathBuf>), ()> {
+    let sessions_root = codex_root.join("sessions");
+    let active_paths = open_codex_session_paths(Path::new("/proc"), &sessions_root)?;
+    debug_runtime(format!("thread active paths={}", active_paths.len()));
+    Ok((sessions_root, active_paths))
+}
+
 fn fetch_active_thread_update(
     input: &mut impl Write,
     output: &Receiver<RpcReadEvent>,
     next_id: &mut u64,
-    codex_root: Option<&Path>,
+    sessions_root: &Path,
+    active_paths: &BTreeSet<PathBuf>,
+    codex_root: &Path,
 ) -> ActiveThreadUpdate {
-    let Some(codex_root) = codex_root else {
-        return ActiveThreadUpdate::Failed;
-    };
-    let sessions_root = codex_root.join("sessions");
-    let active_paths = match open_codex_session_paths(Path::new("/proc"), &sessions_root) {
-        Ok(paths) => paths,
-        Err(_) => {
-            debug_runtime("thread active path scan failed");
-            return ActiveThreadUpdate::Failed;
-        }
-    };
-    debug_runtime(format!("thread active paths={}", active_paths.len()));
-    if active_paths.is_empty() {
-        return ActiveThreadUpdate::NoThread;
-    }
     fetch_active_thread_update_for_paths_and_state(
         input,
         output,
         next_id,
-        &sessions_root,
-        &active_paths,
+        sessions_root,
+        active_paths,
         Some(codex_root),
     )
 }
@@ -1807,16 +1803,25 @@ struct UsageHistory {
 
 impl UsageHistory {
     fn load() -> Self {
-        let mut history = Self::load_from_db_path(usage_history_db_path());
-        history.startup_maintenance(Utc::now());
+        let now = Utc::now();
+        let mut history = Self::load_from_db_path_at(usage_history_db_path(), now);
+        history.startup_maintenance(now);
         history
     }
 
+    #[cfg(test)]
     fn load_from_db_path(db_path: Option<PathBuf>) -> Self {
+        Self::load_from_db_path_at(db_path, Utc::now())
+    }
+
+    fn load_from_db_path_at(db_path: Option<PathBuf>, now: DateTime<Utc>) -> Self {
         let samples = db_path
             .as_ref()
             .and_then(|path| UsageStore::open(path).ok())
-            .and_then(|store| store.load_all().ok())
+            // Startup must never materialize an unbounded database. The
+            // bounded recent read uses the timestamp/reset index and the same
+            // cardinality ceiling as the public details contract.
+            .and_then(|store| store.load_recent_one_month(now).ok())
             .unwrap_or_default();
 
         let samples = samples
@@ -1940,9 +1945,11 @@ impl UsageHistory {
             return;
         }
         let mut sample = sample;
+        let acquisition_end = sample.timestamp;
         sample.reset_at = self.canonical_reset_at(sample.reset_at);
         merge_exact_sample(&mut self.samples, sample);
         self.normalize();
+        self.retain_acquisition_window(acquisition_end);
         self.save();
     }
 
@@ -1950,6 +1957,11 @@ impl UsageHistory {
         if samples.is_empty() {
             return;
         }
+        let acquisition_end = samples
+            .iter()
+            .filter(|sample| sample.is_valid())
+            .map(|sample| sample.timestamp)
+            .max();
         let storage_reset_at = self.canonical_reset_at(reset_at);
         for mut sample in samples {
             if !sample.is_valid() {
@@ -1959,6 +1971,9 @@ impl UsageHistory {
             merge_exact_sample(&mut self.samples, sample);
         }
         self.normalize();
+        if let Some(acquisition_end) = acquisition_end {
+            self.retain_acquisition_window(acquisition_end);
+        }
         self.save();
     }
 
@@ -2082,6 +2097,18 @@ impl UsageHistory {
         self.samples = normalized;
     }
 
+    /// Bounds the in-memory/API/graph working set without deleting SQLite
+    /// retention rows. Persistent deletion remains exclusively the three-month
+    /// startup prune.
+    fn retain_acquisition_window(&mut self, end_timestamp: i64) {
+        let Some(end) = DateTime::<Utc>::from_timestamp(end_timestamp, 0) else {
+            return;
+        };
+        let cutoff = one_month_before_utc(end);
+        self.samples
+            .retain(|sample| sample.timestamp > cutoff && sample.timestamp <= end_timestamp);
+    }
+
     fn save(&self) {
         let Some(path) = &self.db_path else {
             return;
@@ -2143,6 +2170,12 @@ fn usage_data_root() -> Option<PathBuf> {
 fn three_months_before_utc(now: DateTime<Utc>) -> i64 {
     now.checked_sub_months(Months::new(3))
         .expect("subtracting three calendar months from UTC now must be representable")
+        .timestamp()
+}
+
+fn one_month_before_utc(now: DateTime<Utc>) -> i64 {
+    now.checked_sub_months(Months::new(1))
+        .expect("subtracting one calendar month from UTC now must be representable")
         .timestamp()
 }
 
@@ -4295,6 +4328,7 @@ fn thread_server_worker(commands: Receiver<ThreadCommand>, events: Sender<Thread
     // thread/list before account authentication succeeds. Once started, this
     // worker owns its own child, stdin/stdout, reader and request-id sequence.
     let mut server: Option<RunningAppServer> = None;
+    let mut server_active_paths = BTreeSet::new();
     let mut next_id = 2u64;
     while let Ok(command) = commands.recv() {
         match command {
@@ -4306,10 +4340,55 @@ fn thread_server_worker(commands: Receiver<ThreadCommand>, events: Sender<Thread
             }
             ThreadCommand::Read { auth_epoch } => {
                 debug_runtime(format!("thread read requested epoch={auth_epoch}"));
+                let Some(codex_root) = codex_home_root() else {
+                    let _ = events.send(ThreadEvent::Error {
+                        auth_epoch,
+                        message: "スレッド情報を安全に取得できませんでした。".into(),
+                    });
+                    continue;
+                };
+                let (sessions_root, active_paths) = match active_thread_paths(&codex_root) {
+                    Ok(paths) => paths,
+                    Err(()) => {
+                        debug_runtime("thread active path scan failed");
+                        let _ = events.send(ThreadEvent::Error {
+                            auth_epoch,
+                            message: "スレッド情報を安全に取得できませんでした。".into(),
+                        });
+                        continue;
+                    }
+                };
+                if active_paths.is_empty() {
+                    if let Some(mut idle) = server.take() {
+                        let _ = idle.child.kill_and_reap();
+                    }
+                    server_active_paths.clear();
+                    next_id = 2;
+                    let _ = events.send(ThreadEvent::Update {
+                        auth_epoch,
+                        update: ActiveThreadUpdate::NoThread,
+                    });
+                    continue;
+                }
+
+                // Codex app-server snapshots its thread index when it starts.
+                // Reusing that process after the live rollout set changes can
+                // therefore publish a false zero to REST while the X client,
+                // started later, sees the running thread. Refresh exactly on
+                // the process-owned session-set boundary; steady-state polls
+                // keep the same child and do not create process churn.
+                if server.is_some() && server_active_paths != active_paths {
+                    if let Some(mut stale) = server.take() {
+                        let _ = stale.child.kill_and_reap();
+                    }
+                    server_active_paths.clear();
+                    next_id = 2;
+                }
                 if server.is_none() {
                     match start_app_server() {
                         Ok(started) => {
                             server = Some(started);
+                            server_active_paths = active_paths.clone();
                             let _ = events.send(ThreadEvent::Ready);
                         }
                         Err(message) => {
@@ -4324,12 +4403,13 @@ fn thread_server_worker(commands: Receiver<ThreadCommand>, events: Sender<Thread
                 let Some(server_ref) = server.as_mut() else {
                     continue;
                 };
-                let codex_root = codex_home_root();
                 let update = fetch_active_thread_update(
                     &mut server_ref.input,
                     &server_ref.output,
                     &mut next_id,
-                    codex_root.as_deref(),
+                    &sessions_root,
+                    &active_paths,
+                    &codex_root,
                 );
                 if update == ActiveThreadUpdate::Failed {
                     debug_runtime("thread read failed");
@@ -4343,6 +4423,7 @@ fn thread_server_worker(commands: Receiver<ThreadCommand>, events: Sender<Thread
                     if let Some(mut failed) = server.take() {
                         let _ = failed.child.kill_and_reap();
                     }
+                    server_active_paths.clear();
                     next_id = 2;
                 } else {
                     debug_runtime(match &update {
@@ -4620,6 +4701,9 @@ impl CodexInfoState {
         };
 
         let now = Utc::now().timestamp();
+        let history_cutoff = DateTime::<Utc>::from_timestamp(now, 0)
+            .map(one_month_before_utc)
+            .unwrap_or(now);
         let history_periods = if self.authenticated {
             self.history_periods()
                 .into_iter()
@@ -4640,6 +4724,7 @@ impl CodexInfoState {
                         } else {
                             period.end
                         },
+                        reset_at: period.canonical_reset_at,
                         label: period.label,
                         current,
                     }
@@ -4652,6 +4737,12 @@ impl CodexInfoState {
         let mut history_samples = if self.authenticated {
             display_history_samples(&self.history.samples)
                 .into_iter()
+                // SQLite retains three calendar months, but one REST
+                // document materializes only `(one month before now, now]`.
+                // Enforce the boundary here as well as at the store/working-
+                // set boundary so a malformed or synthetic in-memory state
+                // cannot freeze publication with old or future rows.
+                .filter(|sample| sample.timestamp > history_cutoff && sample.timestamp <= now)
                 .map(|sample| PublicHistorySample {
                     timestamp: sample.timestamp,
                     reset_at: sample.reset_at,
@@ -4669,10 +4760,9 @@ impl CodexInfoState {
             Vec::new()
         };
         history_samples.sort_by_key(|sample| (sample.reset_at, sample.timestamp));
-        if history_samples.len() > MAX_PUBLIC_HISTORY_SAMPLES {
-            let first = history_samples.len() - MAX_PUBLIC_HISTORY_SAMPLES;
-            history_samples.drain(..first);
-        }
+        // Do not silently truncate an over-capacity candidate. The REST
+        // publisher validates the complete candidate and keeps the previous
+        // atomic status/details generation when the public limit is exceeded.
 
         let mut threads = if self.authenticated {
             self.active_threads
@@ -5119,7 +5209,7 @@ impl CodexInfoState {
             }
             "error" => {
                 state.error = Some("preview".into());
-                state.status = "最新情報を取得できません。表示は12:34時点の値です。".into();
+                state.status = state.i18n.format_stale_status(state.last_success_at);
             }
             _ => {
                 state.status = state.normal_status();
@@ -7235,69 +7325,216 @@ fn clamp_graph_preview_size((width, height): (u32, u32)) -> (u32, u32) {
     (width.max(700), height.max(480))
 }
 
-fn spawn_record_daemon(preview: bool) {
-    if preview || std::env::var_os("CODEX_INFO_DISABLE_DAEMON").is_some() {
-        return;
+const DEFAULT_SERVICE_ADDRESS: &str = "127.0.0.1:8787";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LaunchMode {
+    /// Mode 1: one resident owner containing recorder + REST.
+    Service(ApiServerConfig),
+    /// Mode 2: X only. It never starts or owns a resident service.
+    UiOnly,
+    /// Mode 3: ensure mode 1 exists, then add the X UI.
+    All,
+    /// Backward-compatible diagnostic recorder command.
+    RecordOnly { once: bool },
+}
+
+fn default_service_config() -> Result<ApiServerConfig, String> {
+    DEFAULT_SERVICE_ADDRESS
+        .parse::<SocketAddr>()
+        .map_err(|_| "default service address is invalid".to_owned())
+        .and_then(|address| ApiServerConfig::new(address).map_err(|error| error.to_string()))
+}
+
+fn parse_launch_mode<I>(arguments: I) -> Result<LaunchMode, String>
+where
+    I: IntoIterator<Item = OsString>,
+{
+    let arguments = arguments.into_iter().collect::<Vec<_>>();
+    match arguments.as_slice() {
+        [] => Ok(LaunchMode::All),
+        [value] if value == "--all" => Ok(LaunchMode::All),
+        [value] if value == "--ui-only" => Ok(LaunchMode::UiOnly),
+        [value] if value == "--service" => default_service_config().map(LaunchMode::Service),
+        [service, listen, address] if service == "--service" && listen == "--listen" => {
+            let address = address
+                .to_str()
+                .ok_or_else(|| "--listen requires a numeric loopback address".to_owned())?
+                .parse::<SocketAddr>()
+                .map_err(|_| "--listen requires a numeric loopback address".to_owned())?;
+            ApiServerConfig::new(address)
+                .map(LaunchMode::Service)
+                .map_err(|error| error.to_string())
+        }
+        [record] if record == "--record-daemon" => Ok(LaunchMode::RecordOnly {
+            once: std::env::var_os("CODEX_INFO_DAEMON_ONESHOT").is_some_and(|value| value == "1"),
+        }),
+        [record, once] if record == "--record-daemon" && once == "--once" => {
+            Ok(LaunchMode::RecordOnly { once: true })
+        }
+        _ => Err("usage: codex_info [--all|--ui-only|--service [--listen 127.0.0.1:PORT]|--record-daemon [--once]]".to_owned()),
     }
-    let Ok(executable) = std::env::current_exe() else {
-        debug_runtime("recorder daemon auto-start could not resolve executable");
-        return;
+}
+
+fn service_is_healthy(address: SocketAddr) -> bool {
+    let timeout = Duration::from_millis(150);
+    let Ok(mut stream) = TcpStream::connect_timeout(&address, timeout) else {
+        return false;
     };
-    if Command::new(executable)
-        .arg("--record-daemon")
+    if stream.set_read_timeout(Some(timeout)).is_err()
+        || stream.set_write_timeout(Some(timeout)).is_err()
+        || stream
+            .write_all(b"GET /v1/health HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")
+            .is_err()
+    {
+        return false;
+    }
+    let mut response = Vec::with_capacity(512);
+    if std::io::Read::by_ref(&mut stream)
+        .take(4096)
+        .read_to_end(&mut response)
+        .is_err()
+    {
+        return false;
+    }
+    response.starts_with(b"HTTP/1.1 200")
+        && response
+            .windows(b"\"service\":\"codex-info\"".len())
+            .any(|window| window == b"\"service\":\"codex-info\"")
+}
+
+fn ensure_background_service(config: ApiServerConfig) -> Result<(), String> {
+    let address = config.listen_addr();
+    if service_is_healthy(address) {
+        return Ok(());
+    }
+    let executable = std::env::current_exe()
+        .map_err(|_| "combined service executable is unavailable".to_owned())?;
+    let address_text = address.to_string();
+    Command::new(executable)
+        .args(["--service", "--listen", address_text.as_str()])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
-        .is_err()
+        .map_err(|_| "combined daemon+REST service could not start".to_owned())?;
+    for _ in 0..20 {
+        if service_is_healthy(address) {
+            return Ok(());
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    Err("combined daemon+REST service did not become healthy".to_owned())
+}
+
+fn poll_service_state(state: &mut CodexInfoState) {
+    state.poll();
+    if account_refresh_due(
+        Instant::now(),
+        state.last_poll,
+        state.checking,
+        state.authenticated,
+        state.auth_polling,
+    ) {
+        let status = if state.auth_polling && !state.authenticated {
+            "認証完了を確認しています…"
+        } else {
+            "利用状況を更新しています…"
+        };
+        state.request_read(status);
+        state.last_poll = Instant::now();
+    }
+    if state.authenticated
+        && !state.thread_checking
+        && state.last_thread_poll.elapsed() >= Duration::from_secs(5)
     {
-        debug_runtime("recorder daemon auto-start failed");
+        state.request_thread_update();
     }
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let mut arguments = std::env::args().skip(1);
-    let record_daemon = arguments.any(|argument| argument == "--record-daemon");
-    if record_daemon {
-        let once = std::env::args().any(|argument| argument == "--once")
-            || std::env::var_os("CODEX_INFO_DAEMON_ONESHOT").is_some_and(|value| value == "1");
-        daemon::run_record_daemon(once).map_err(std::io::Error::other)?;
-        return Ok(());
+async fn service_shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        let ctrl_c = tokio::signal::ctrl_c();
+        if let Ok(mut terminate) = signal(SignalKind::terminate()) {
+            tokio::select! {
+                _ = ctrl_c => {}
+                _ = terminate.recv() => {}
+            }
+        } else {
+            let _ = ctrl_c.await;
+        }
     }
-    // Parse and bind the optional listener before starting any UI or Codex
-    // worker. An explicit invalid/non-loopback setting must fail closed.
-    let api_server = ApiServerConfig::from_environment()?
-        .map(ApiServer::start)
-        .transpose()?;
-    // REST-only launches are headless: the native window is kept alive only as
-    // the existing state/polling owner and is never presented to the user.
-    // An API listener is a REST-only process. Keep this invariant here as
-    // well as in `run.sh`, so direct launches cannot accidentally show the
-    // native window through an inherited environment override.
-    let rest_silent = api_server.is_some();
-    let api_publisher = api_server.as_ref().map(ApiServer::publisher);
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
+}
+
+fn run_combined_service(config: ApiServerConfig) -> Result<(), Box<dyn std::error::Error>> {
+    let mut api_server = ApiServer::start(config)?;
+    let publisher = api_server.publisher();
+    let mut recorder = daemon::RecorderWorker::start().map_err(std::io::Error::other)?;
+    let mut state = CodexInfoState::new();
+    publisher.publish_details(state.public_details())?;
+    let mut last_publish_error = None;
+    eprintln!(
+        "codex-info: daemon+REST listening on {} recorder_owner={}",
+        api_server.local_addr(),
+        recorder.is_active()
+    );
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_io()
+        .enable_time()
+        .build()?;
+    runtime.block_on(async {
+        let mut ticker = tokio::time::interval(Duration::from_secs(1));
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let shutdown = service_shutdown_signal();
+        tokio::pin!(shutdown);
+        loop {
+            tokio::select! {
+                _ = &mut shutdown => break,
+                _ = ticker.tick() => {
+                    poll_service_state(&mut state);
+                    match publisher.publish_details(state.public_details()) {
+                        Ok(()) => {
+                            if last_publish_error.take().is_some() {
+                                eprintln!("codex-info: REST snapshot publication recovered");
+                            }
+                        }
+                        Err(error) => {
+                            if last_publish_error != Some(error) {
+                                eprintln!("codex-info: REST snapshot publication rejected: {error}");
+                                last_publish_error = Some(error);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    });
+    recorder.shutdown();
+    api_server.shutdown();
+    Ok(())
+}
+
+fn run_ui() -> Result<(), Box<dyn std::error::Error>> {
     let ui = MainWindow::new()?;
-    if rest_silent {
-        let _ = ui.hide();
-    }
     install_fixed_window_guard(ui.window());
     let preview_size = std::env::var("CODEX_INFO_PREVIEW_SIZE")
         .ok()
         .and_then(|value| parse_preview_size(Some(value.as_str())));
     let graph_preview_size = preview_size.map(clamp_graph_preview_size);
     let preview_kind = std::env::var("CODEX_INFO_PREVIEW").ok();
-    spawn_record_daemon(preview_kind.is_some());
     let state = Rc::new(RefCell::new(
         preview_kind
             .clone()
             .map(|kind| CodexInfoState::preview(&kind))
             .unwrap_or_else(CodexInfoState::new),
     ));
-    // The publisher is one-way and contains no UI handle. The HTTP worker
-    // receives only this whitelisted copy of the native app state.
-    if let Some(publisher) = api_publisher.as_ref() {
-        let _ = publisher.publish_details(state.borrow().public_details());
-    }
     // One graph window owns the three model toggles. The initial state keeps
     // every series enabled, preserving the combined cumulative view.
     let graph_window = Rc::new(RefCell::new(None::<GraphWindow>));
@@ -7670,38 +7907,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let weak_ui = ui.as_weak();
     let graph_window_for_timer = Rc::clone(&graph_window);
     let threads_window_for_timer = Rc::clone(&threads_window);
-    let api_publisher_for_timer = api_publisher.clone();
     let timer = Timer::default();
     if !state.borrow().preview {
         timer.start(TimerMode::Repeated, Duration::from_secs(1), move || {
             if let Some(ui) = weak_ui.upgrade() {
                 let mut state = state.borrow_mut();
-                state.poll();
-                if account_refresh_due(
-                    Instant::now(),
-                    state.last_poll,
-                    state.checking,
-                    state.authenticated,
-                    state.auth_polling,
-                ) {
-                    let status = if state.auth_polling && !state.authenticated {
-                        "認証完了を確認しています…"
-                    } else {
-                        "利用状況を更新しています…"
-                    };
-                    debug_runtime(format!(
-                        "account refresh scheduled authenticated={} auth_polling={}",
-                        state.authenticated, state.auth_polling
-                    ));
-                    state.request_read(status);
-                    state.last_poll = Instant::now();
-                }
-                if state.authenticated
-                    && !state.thread_checking
-                    && state.last_thread_poll.elapsed() >= Duration::from_secs(5)
-                {
-                    state.request_thread_update();
-                }
+                poll_service_state(&mut state);
                 state.sync_ui(&ui);
                 if let Some(graph) = graph_window_for_timer.borrow().as_ref() {
                     if graph.window().is_visible() {
@@ -7713,24 +7924,36 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         sync_threads_window(&state, window);
                     }
                 }
-                if let Some(publisher) = api_publisher_for_timer.as_ref() {
-                    let _ = publisher.publish_details(state.public_details());
-                }
             }
         });
     }
-    // `ComponentHandle::run()` maps the component window as part of its
-    // startup sequence.  That is correct for the native client, but it
-    // defeats the REST-only contract even when the window was hidden above.
-    // Drive the shared timers/state through Slint's backend loop directly so
-    // the REST process never presents the native window at all.
-    if rest_silent {
-        slint::run_event_loop()?;
-    } else {
-        ui.run()?;
-    }
-    drop(api_server);
+    ui.run()?;
     Ok(())
+}
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let mut mode = parse_launch_mode(std::env::args_os().skip(1)).map_err(std::io::Error::other)?;
+    // Preserve the former environment-only REST entry point as mode 1. An
+    // explicit CLI mode always wins, so `--ui-only` cannot accidentally
+    // create a listener through an inherited environment variable.
+    if mode == LaunchMode::All {
+        if let Some(config) = ApiServerConfig::from_environment()? {
+            mode = LaunchMode::Service(config);
+        }
+    }
+    match mode {
+        LaunchMode::Service(config) => run_combined_service(config),
+        LaunchMode::UiOnly => run_ui(),
+        LaunchMode::All => {
+            let config = default_service_config().map_err(std::io::Error::other)?;
+            ensure_background_service(config).map_err(std::io::Error::other)?;
+            run_ui()
+        }
+        LaunchMode::RecordOnly { once } => {
+            daemon::run_record_daemon(once).map_err(std::io::Error::other)?;
+            Ok(())
+        }
+    }
 }
 
 #[cfg(test)]
@@ -7747,23 +7970,23 @@ mod tests {
         graph_paths, graph_paths_for_selection, graph_period_end, graph_points,
         graph_time_endpoints, minute_model_spend, minute_model_spend_for_metric,
         model_usage_timeline_from_events, monthly_window_seconds, native_account_window_title,
-        normal_status_text, open_codex_session_paths, parse_preview_size, parse_rate_limits,
-        parse_resize_direction, period_remaining_text, physical_size_for_logical, plan_type_label,
-        preview_model_row, read_recovery_entries, read_thread_rollout_path, recovery_timed_usage,
-        remaining_graph_points, remaining_graph_points_for_metric, remaining_graph_y,
-        remaining_marker_positions, remaining_marker_positions_on_points, request_with_timeout,
-        same_rollout_identity, separate_current_label_positions, session_event_model,
-        session_event_type, session_jsonl_files, session_token_snapshot, smooth_model_spend,
-        smooth_remaining_points, split_metric_line_paths, stacked_area_path,
-        thread_presentation_rows, three_months_before_utc, unused_interval_positions,
-        week_remaining_text, ActiveThread, ActiveThreadUpdate, CodexInfoState, Event,
-        FixedResizeDecision, GraphPaths, GraphWindow, HourlyModelSpend, LocalUsageResult,
-        ManualX11Geometry, ManualX11WindowAction, ModelDollarTotals, ModelTokenTotals,
-        ModelUsageRow, ModelUsageTotals, RpcReadEvent, SessionTraversalBudget, TokenSnapshot,
-        UnusedIntervalPosition, UsageEvent, UsageHistory, UsageHistorySample, UsageStore,
-        FIXED_WINDOW_HEIGHT, FIXED_WINDOW_WIDTH, GRAPH_METRIC_OPTIONS, GRAPH_WINDOW_PURPOSE,
-        LOCAL_ESTIMATE_PRICE_VERSION, THREADS_WINDOW_PURPOSE, UNAUTHENTICATED_WINDOW_TITLE,
-        WEEK_SECONDS,
+        normal_status_text, one_month_before_utc, open_codex_session_paths, parse_launch_mode,
+        parse_preview_size, parse_rate_limits, parse_resize_direction, period_remaining_text,
+        physical_size_for_logical, plan_type_label, preview_model_row, read_recovery_entries,
+        read_thread_rollout_path, recovery_timed_usage, remaining_graph_points,
+        remaining_graph_points_for_metric, remaining_graph_y, remaining_marker_positions,
+        remaining_marker_positions_on_points, request_with_timeout, same_rollout_identity,
+        separate_current_label_positions, session_event_model, session_event_type,
+        session_jsonl_files, session_token_snapshot, smooth_model_spend, smooth_remaining_points,
+        split_metric_line_paths, stacked_area_path, thread_presentation_rows,
+        three_months_before_utc, unused_interval_positions, week_remaining_text, ActiveThread,
+        ActiveThreadUpdate, CodexInfoState, Event, FixedResizeDecision, GraphPaths, GraphWindow,
+        HourlyModelSpend, LaunchMode, LocalUsageResult, ManualX11Geometry, ManualX11WindowAction,
+        ModelDollarTotals, ModelTokenTotals, ModelUsageRow, ModelUsageTotals, RpcReadEvent,
+        SessionTraversalBudget, TokenSnapshot, UnusedIntervalPosition, UsageEvent, UsageHistory,
+        UsageHistorySample, UsageStore, FIXED_WINDOW_HEIGHT, FIXED_WINDOW_WIDTH,
+        GRAPH_METRIC_OPTIONS, GRAPH_WINDOW_PURPOSE, LOCAL_ESTIMATE_PRICE_VERSION,
+        THREADS_WINDOW_PURPOSE, UNAUTHENTICATED_WINDOW_TITLE, WEEK_SECONDS,
     };
     use super::{
         claim_manual_x11_action, forbidden_x11_states, manual_resize_geometry,
@@ -7782,6 +8005,36 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::mpsc;
     use std::time::{Duration, Instant};
+
+    fn launch_args(values: &[&str]) -> Vec<std::ffi::OsString> {
+        values.iter().map(std::ffi::OsString::from).collect()
+    }
+
+    #[test]
+    fn launch_modes_are_explicit_and_ui_only_never_maps_to_service() {
+        assert_eq!(
+            parse_launch_mode(launch_args(&[])).unwrap(),
+            LaunchMode::All
+        );
+        assert_eq!(
+            parse_launch_mode(launch_args(&["--ui-only"])).unwrap(),
+            LaunchMode::UiOnly
+        );
+        assert_eq!(
+            parse_launch_mode(launch_args(&["--all"])).unwrap(),
+            LaunchMode::All
+        );
+        let LaunchMode::Service(config) =
+            parse_launch_mode(launch_args(&["--service", "--listen", "127.0.0.1:9876"])).unwrap()
+        else {
+            panic!("service mode was not selected");
+        };
+        assert_eq!(config.listen_addr(), "127.0.0.1:9876".parse().unwrap());
+        assert!(
+            parse_launch_mode(launch_args(&["--service", "--listen", "0.0.0.0:9876"])).is_err()
+        );
+        assert!(parse_launch_mode(launch_args(&["--ui-only", "--service"])).is_err());
+    }
 
     #[test]
     fn public_snapshot_is_whitelisted_and_tracks_auth_state() {
@@ -7840,6 +8093,38 @@ mod tests {
         let unlimited = CodexInfoState::preview("unlimited").public_snapshot();
         assert_eq!(unlimited.state, PublicState::Ready);
         assert!(unlimited.quota.is_none());
+    }
+
+    #[test]
+    fn public_details_materializes_exactly_one_calendar_month() {
+        let mut state = CodexInfoState::preview("normal");
+        let now = Utc::now();
+        let now_timestamp = now.timestamp();
+        let cutoff = one_month_before_utc(now);
+        let reset_at = now_timestamp + WEEK_SECONDS;
+        state.history.samples = [cutoff, cutoff + 1, now_timestamp, now_timestamp + 60]
+            .into_iter()
+            .map(|timestamp| UsageHistorySample {
+                timestamp,
+                reset_at,
+                remaining_percent: 80.0,
+                sol_dollars: 0.0,
+                terra_dollars: 0.0,
+                luna_dollars: 0.0,
+                sol_tokens: 0,
+                terra_tokens: 0,
+                luna_tokens: 0,
+            })
+            .collect();
+
+        let timestamps = state
+            .public_details()
+            .history_samples
+            .into_iter()
+            .map(|sample| sample.timestamp)
+            .collect::<Vec<_>>();
+
+        assert_eq!(timestamps, vec![cutoff + 1, now_timestamp]);
     }
 
     #[test]
@@ -8374,13 +8659,22 @@ mod tests {
         let source = include_str!("main.rs");
         let timer = source
             .split_once("let timer = Timer::default();")
-            .and_then(|(_, rest)| rest.split_once("// `ComponentHandle::run()`"))
+            .and_then(|(_, rest)| rest.split_once("    ui.run()?;"))
             .map(|(body, _)| body)
             .expect("account timer boundary must remain explicit");
         assert!(!timer.contains("collect_local_model_usage"));
         assert!(!timer.contains("session_jsonl_files"));
-        assert!(timer.contains("request_thread_update"));
-        assert!(timer.contains("account_refresh_due"));
+        assert!(timer.contains("poll_service_state"));
+
+        let poll = source
+            .split_once("fn poll_service_state")
+            .and_then(|(_, rest)| rest.split_once("async fn service_shutdown_signal"))
+            .map(|(body, _)| body)
+            .expect("shared poll boundary must remain explicit");
+        assert!(!poll.contains("collect_local_model_usage"));
+        assert!(!poll.contains("session_jsonl_files"));
+        assert!(poll.contains("request_thread_update"));
+        assert!(poll.contains("account_refresh_due"));
     }
 
     #[test]
@@ -11470,7 +11764,7 @@ mod tests {
             .unwrap();
         drop(store);
 
-        let mut history = UsageHistory::load_from_db_path(Some(db_path.clone()));
+        let mut history = UsageHistory::load_from_db_path_at(Some(db_path.clone()), now);
         history.startup_maintenance(now);
 
         assert_eq!(
@@ -11479,7 +11773,7 @@ mod tests {
                 .iter()
                 .map(|sample| sample.timestamp)
                 .collect::<Vec<_>>(),
-            vec![cutoff]
+            Vec::<i64>::new()
         );
         let persisted = UsageStore::open(&db_path).unwrap().load_all().unwrap();
         assert_eq!(persisted.len(), 1);
@@ -11706,7 +12000,7 @@ mod tests {
             .unwrap();
         drop(store);
 
-        let mut history = UsageHistory::load_from_db_path(Some(db_path.clone()));
+        let mut history = UsageHistory::load_from_db_path_at(Some(db_path.clone()), now);
         history.startup_maintenance(now);
         assert_eq!(
             history
@@ -11714,11 +12008,11 @@ mod tests {
                 .iter()
                 .map(|sample| sample.timestamp)
                 .collect::<Vec<_>>(),
-            vec![cutoff, now.timestamp()]
+            vec![now.timestamp()]
         );
         let periods = history.periods(now.timestamp(), Some(now.timestamp() + 30_000));
-        assert_eq!(periods.len(), 2);
-        assert_eq!(history.period_options(now.timestamp(), None).len(), 2);
+        assert_eq!(periods.len(), 1);
+        assert_eq!(history.period_options(now.timestamp(), None).len(), 1);
         for period in periods {
             assert_eq!(
                 history.period_id_for_label(
@@ -11762,7 +12056,8 @@ mod tests {
         store.upsert_sample(&sqlite_sample.to_store()).unwrap();
         drop(store);
 
-        let mut history = UsageHistory::load_from_db_path(Some(db_path.clone()));
+        let load_at = chrono::DateTime::<Utc>::from_timestamp(1_700_000_180, 0).unwrap();
+        let mut history = UsageHistory::load_from_db_path_at(Some(db_path.clone()), load_at);
         assert_eq!(history.samples, vec![sqlite_sample]);
         history.record(UsageHistorySample::new(
             1_700_000_180,
@@ -11791,7 +12086,8 @@ mod tests {
             )
             .unwrap();
         drop(store);
-        let history = UsageHistory::load_from_db_path(Some(db_path.clone()));
+        let load_at = chrono::DateTime::<Utc>::from_timestamp(100, 0).unwrap();
+        let history = UsageHistory::load_from_db_path_at(Some(db_path.clone()), load_at);
 
         let periods = history.periods(2_000, None);
         assert_eq!(
@@ -11868,7 +12164,8 @@ mod tests {
             .unwrap();
         drop(store);
 
-        let history = UsageHistory::load_from_db_path(Some(db_path.clone()));
+        let load_at = chrono::DateTime::<Utc>::from_timestamp(real_singleton_timestamp, 0).unwrap();
+        let history = UsageHistory::load_from_db_path_at(Some(db_path.clone()), load_at);
         let period_ids = history
             .periods(base + 300, None)
             .into_iter()

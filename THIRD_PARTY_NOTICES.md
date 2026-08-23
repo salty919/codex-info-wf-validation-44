@@ -66,6 +66,13 @@ Linux向けの固定依存グラフで許可される SPDX ライセンス集合
 - `Avalonia.Angle.Windows.Natives` `2.1.27548.20260419` は ANGLE Project Authors の
   BSD-3-Clause である。本文は [LICENSES/BSD-3-Clause-ANGLE.txt](LICENSES/BSD-3-Clause-ANGLE.txt)
   にも保持する。
+- `ScottPlot` / `ScottPlot.Avalonia` `5.1.59` は、Windowsグラフのローカル描画に
+  使用するMIT依存である。著作権は Copyright (c) 2018 Scott Harden / Harden
+  Technologies, LLC、上流は [ScottPlot/ScottPlot](https://github.com/ScottPlot/ScottPlot)
+  である。実行時のネットワークサービスやテレメトリには使用しない。
+- Windowsの標準セットアップウィザードは `Inno Setup 7.1.0` で生成する。
+  Copyright (C) 1997-2026 Jordan Russell、Portions Copyright (C) 2000-2026
+  Martijn Laan。配布条件は [Inno-Setup.txt](LICENSES/Inno-Setup.txt) に保持する。
 - Linux 向けに restore される `Tmds.DBus.Protocol` `0.94.1` と
   `System.IO.Pipelines` `8.0.0` は MIT である。Windows の publish payload には
   target RID が選んだ runtime asset だけを入れる。

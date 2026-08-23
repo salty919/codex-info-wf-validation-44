@@ -5,16 +5,13 @@ using System.Collections.ObjectModel;
 using System.ComponentModel;
 using System.Globalization;
 using System.Runtime.CompilerServices;
+using System.Windows.Input;
+using Avalonia.Threading;
 using CodexInfo.WindowsClient.Core;
+using CodexInfo.WindowsClient.Graphing;
 using CodexInfo.WindowsClient.Localization;
 
 namespace CodexInfo.WindowsClient.ViewModels;
-
-public enum GraphMetric
-{
-    Dollars,
-    Tokens,
-}
 
 public sealed class GraphPointViewModel
 {
@@ -75,23 +72,38 @@ public sealed class GraphPointViewModel
 
 public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
 {
+    internal const int MaxRenderedGraphPoints = 44_640;
+    private const int BackgroundBuildThreshold = 2_048;
     private readonly MainWindowViewModel main;
+    private readonly Action<Action> postToUi;
     private readonly ObservableCollection<ApiHistoryPeriod> periods = [];
-    private readonly ObservableCollection<GraphPointViewModel> points = [];
+    private IReadOnlyList<GraphPointViewModel> points = Array.Empty<GraphPointViewModel>();
+    private GraphScene scene = GraphScene.Empty();
     private ApiHistoryPeriod? selectedPeriod;
+    private ApiHistoryPeriod? displayedPeriod;
     private GraphMetric selectedMetric = GraphMetric.Dollars;
+    private GraphMetric displayedMetric = GraphMetric.Dollars;
     private bool showRemaining = true;
     private bool showModels = true;
     private bool showSol = true;
     private bool showTerra = true;
     private bool showLuna = true;
+    private CancellationTokenSource pointBuildCancellation = new();
+    private long pointBuildRevision;
+    private bool isLoading;
+    private bool hasLoadError;
     private bool disposed;
 
     public GraphWindowViewModel(MainWindowViewModel main)
+        : this(main, action => Dispatcher.UIThread.Post(action))
+    {
+    }
+
+    internal GraphWindowViewModel(MainWindowViewModel main, Action<Action> postToUi)
     {
         this.main = main;
+        this.postToUi = postToUi;
         Periods = new ReadOnlyObservableCollection<ApiHistoryPeriod>(periods);
-        Points = new ReadOnlyObservableCollection<GraphPointViewModel>(points);
         main.PropertyChanged += OnMainPropertyChanged;
         Rebuild();
     }
@@ -100,7 +112,9 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
 
     public ReadOnlyObservableCollection<ApiHistoryPeriod> Periods { get; }
 
-    public ReadOnlyObservableCollection<GraphPointViewModel> Points { get; }
+    public IReadOnlyList<GraphPointViewModel> Points => points;
+
+    public GraphScene Scene => scene;
 
     public UiText Texts => LocalizationService.Current;
 
@@ -119,7 +133,6 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
 
             selectedMetric = metric;
             RebuildPoints();
-            Notify(nameof(IsDollars));
             Notify();
         }
     }
@@ -152,15 +165,13 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
 
     public string SelectedPeriodText => selectedPeriod?.Label ?? Texts.UnavailableValue;
 
-    public long SelectedPeriodStartAt => selectedPeriod?.StartAt ?? 0;
+    public long SelectedPeriodStartAt => scene.HasPoints ? scene.PeriodStartAt : displayedPeriod?.StartAt ?? 0;
 
     // The API keeps the canonical reset boundary in end_at so clients can
     // label the period consistently.  For the active period the X client
     // clips the plot's right edge to the observation time; using the future
     // reset boundary here leaves an empty tail and changes the graph meaning.
-    public long SelectedPeriodEndAt => selectedPeriod is { } period
-        ? EffectiveGraphEnd(period, DateTimeOffset.UtcNow.ToUnixTimeSeconds())
-        : 0;
+    public long SelectedPeriodEndAt => scene.HasPoints ? scene.PeriodEndAt : 0;
 
     internal static long EffectiveGraphEnd(ApiHistoryPeriod period, long now)
     {
@@ -269,13 +280,49 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
         return result;
     }
 
+    internal static IReadOnlyList<ApiHistorySample> ReduceGraphSamples(
+        IReadOnlyList<ApiHistorySample> samples,
+        int maximum = MaxRenderedGraphPoints)
+    {
+        if (maximum < 2)
+        {
+            throw new ArgumentOutOfRangeException(nameof(maximum));
+        }
+        if (samples.Count <= maximum)
+        {
+            return samples;
+        }
+
+        // All graph series are cumulative and therefore monotonic. One
+        // endpoint per sub-pixel bucket preserves the first/last values and
+        // every visible trend while bounding paint work by viewport
+        // resolution instead of persisted history cardinality.
+        var reduced = new ApiHistorySample[maximum];
+        for (var index = 0; index < maximum; index++)
+        {
+            var sourceIndex = (int)Math.Round(
+                index * (samples.Count - 1d) / (maximum - 1d),
+                MidpointRounding.AwayFromZero);
+            reduced[index] = samples[sourceIndex];
+        }
+        return reduced;
+    }
+
     public string DetailsStatusText => main.DetailsStatusText;
 
-    public string MetricAxisText => selectedMetric == GraphMetric.Dollars
+    public bool IsLoading => isLoading;
+
+    public bool HasLoadError => hasLoadError;
+
+    public string LoadingText => Texts.GraphLoading;
+
+    public string LoadErrorText => Texts.GraphLoadFailed;
+
+    public string MetricAxisText => displayedMetric == GraphMetric.Dollars
         ? $"{Texts.Dollars} ({Texts.ModelUsage})"
         : $"{Texts.Tokens} ({Texts.ModelUsage})";
 
-    public bool IsDollars => selectedMetric == GraphMetric.Dollars;
+    public bool IsDollars => displayedMetric == GraphMetric.Dollars;
 
     public bool ShowRemaining
     {
@@ -311,6 +358,8 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
         }
 
         disposed = true;
+        pointBuildCancellation.Cancel();
+        pointBuildCancellation.Dispose();
         main.PropertyChanged -= OnMainPropertyChanged;
     }
 
@@ -354,18 +403,142 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
 
     private void RebuildPoints()
     {
-        points.Clear();
-        if (selectedPeriod is { } period)
+        pointBuildCancellation.Cancel();
+        pointBuildCancellation.Dispose();
+        pointBuildCancellation = new CancellationTokenSource();
+        var cancellationToken = pointBuildCancellation.Token;
+        var revision = ++pointBuildRevision;
+        var period = selectedPeriod;
+        var metric = selectedMetric;
+
+        if (period is null)
         {
-            foreach (var sample in BuildGraphSamples(period, DateTimeOffset.UtcNow.ToUnixTimeSeconds()))
-            {
-                points.Add(new GraphPointViewModel(sample, selectedMetric));
-            }
+            SetLoading(false);
+            PublishPoints(new GraphProjection(Array.Empty<GraphPointViewModel>(), GraphScene.Empty(metric)), null, metric);
+            return;
         }
 
+        var sourceCount = period.Samples.Count;
+        if (sourceCount <= BackgroundBuildThreshold)
+        {
+            try
+            {
+                PublishPoints(BuildProjection(period, metric), period, metric);
+            }
+            catch
+            {
+                PublishLoadFailure(revision);
+            }
+            return;
+        }
+
+        // Large history normalization/reduction never runs on the UI thread.
+        // The previously painted graph and its axis remain intact while the
+        // selected period is prepared. Only the final bounded immutable array
+        // crosses back in one atomic publish.
+        SetLoadError(false);
+        SetLoading(true);
+        var previewDelay = PreviewEnvironment.Enabled
+            ? PreviewEnvironment.GraphBuildDelayMilliseconds
+            : 0;
+        _ = Task.Run(() =>
+            {
+                if (previewDelay > 0)
+                {
+                    Task.Delay(previewDelay, cancellationToken).GetAwaiter().GetResult();
+                }
+                return BuildProjection(period, metric);
+            }, cancellationToken)
+            .ContinueWith(
+                task =>
+                {
+                    if (disposed || cancellationToken.IsCancellationRequested || revision != pointBuildRevision)
+                    {
+                        return;
+                    }
+                    postToUi(() =>
+                    {
+                        if (disposed || cancellationToken.IsCancellationRequested || revision != pointBuildRevision)
+                        {
+                            return;
+                        }
+                        if (task.Status == TaskStatus.RanToCompletion)
+                        {
+                            PublishPoints(task.Result, period, metric);
+                        }
+                        else
+                        {
+                            PublishLoadFailure(revision);
+                        }
+                    });
+                },
+                CancellationToken.None,
+                TaskContinuationOptions.ExecuteSynchronously,
+                TaskScheduler.Default);
+    }
+
+    private static GraphProjection BuildProjection(ApiHistoryPeriod period, GraphMetric metric)
+    {
+        var now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+        var samples = ReduceGraphSamples(BuildGraphSamples(period, now));
+        return new GraphProjection(
+            samples.Select(sample => new GraphPointViewModel(sample, metric)).ToArray(),
+            GraphScene.Create(samples, metric, period.StartAt, EffectiveGraphEnd(period, now)));
+    }
+
+    private void PublishPoints(
+        GraphProjection next,
+        ApiHistoryPeriod? period,
+        GraphMetric metric)
+    {
+        points = next.Points;
+        scene = next.Scene;
+        displayedPeriod = period;
+        displayedMetric = metric;
+        SetLoadError(false);
+        SetLoading(false);
+        Notify(nameof(Points));
+        Notify(nameof(Scene));
         Notify(nameof(HasPoints));
         Notify(nameof(HasNoPoints));
         Notify(nameof(MetricAxisText));
+        Notify(nameof(IsDollars));
+        Notify(nameof(SelectedPeriodStartAt));
+        Notify(nameof(SelectedPeriodEndAt));
+    }
+
+    private readonly record struct GraphProjection(
+        IReadOnlyList<GraphPointViewModel> Points,
+        GraphScene Scene);
+
+    private void PublishLoadFailure(long revision)
+    {
+        if (disposed || revision != pointBuildRevision)
+        {
+            return;
+        }
+        SetLoading(false);
+        SetLoadError(true);
+    }
+
+    private void SetLoading(bool value)
+    {
+        if (isLoading == value)
+        {
+            return;
+        }
+        isLoading = value;
+        Notify(nameof(IsLoading));
+    }
+
+    private void SetLoadError(bool value)
+    {
+        if (hasLoadError == value)
+        {
+            return;
+        }
+        hasLoadError = value;
+        Notify(nameof(HasLoadError));
     }
 
     private void Notify([CallerMemberName] string? propertyName = null)
@@ -529,7 +702,7 @@ public sealed class ThreadsWindowViewModel : INotifyPropertyChanged, IDisposable
     {
         var byId = source.ToDictionary(thread => thread.Id, StringComparer.Ordinal);
         var children = source.Where(thread => thread.ParentId is not null).GroupBy(thread => thread.ParentId!, StringComparer.Ordinal)
-            .ToDictionary(group => group.Key, group => group.OrderBy(thread => thread.Id, StringComparer.Ordinal).ToList(), StringComparer.Ordinal);
+            .ToDictionary(group => group.Key, group => group.ToList(), StringComparer.Ordinal);
         var result = new List<ApiThreadDetails>(source.Count);
         var visited = new HashSet<string>(StringComparer.Ordinal);
         void Visit(ApiThreadDetails item)
@@ -539,7 +712,7 @@ public sealed class ThreadsWindowViewModel : INotifyPropertyChanged, IDisposable
             if (children.TryGetValue(item.Id, out var nested))
                 foreach (var child in nested) Visit(child);
         }
-        foreach (var root in source.Where(thread => thread.ParentId is null || !byId.ContainsKey(thread.ParentId)).OrderBy(thread => thread.Id, StringComparer.Ordinal)) Visit(root);
+        foreach (var root in source.Where(thread => thread.ParentId is null || !byId.ContainsKey(thread.ParentId))) Visit(root);
         foreach (var item in source) Visit(item);
         return result;
     }
@@ -603,12 +776,17 @@ public sealed class LegalNoticesWindowViewModel : INotifyPropertyChanged, IDispo
 {
     private readonly MainWindowViewModel main;
     private readonly ObservableCollection<ApiLegalNotice> notices = [];
+    private readonly AsyncCommand backCommand;
+    private readonly AsyncCommand nextCommand;
+    private int currentPageIndex;
     private bool disposed;
 
     public LegalNoticesWindowViewModel(MainWindowViewModel main)
     {
         this.main = main;
         Notices = new ReadOnlyObservableCollection<ApiLegalNotice>(notices);
+        backCommand = new AsyncCommand(MoveBackAsync, () => CanGoBack);
+        nextCommand = new AsyncCommand(MoveNextAsync, () => CanGoNext);
         main.PropertyChanged += OnMainPropertyChanged;
         Rebuild();
     }
@@ -620,6 +798,73 @@ public sealed class LegalNoticesWindowViewModel : INotifyPropertyChanged, IDispo
     public UiText Texts => LocalizationService.Current;
 
     public bool HasNotices => notices.Count > 0;
+
+    /// <summary>The zero-based chapter index used by the navigation state.</summary>
+    public int CurrentPageIndex => currentPageIndex;
+
+    /// <summary>The one-based chapter number shown to the user.</summary>
+    public int CurrentPageNumber => notices.Count == 0 ? 0 : currentPageIndex + 1;
+
+    // Keep a short alias for callers that use the display-oriented name.
+    public int CurrentPage => CurrentPageNumber;
+
+    public int PageCount => notices.Count;
+
+    public ApiLegalNotice? CurrentNotice => notices.Count == 0 ? null : notices[currentPageIndex];
+
+    public string CurrentNoticeName => CurrentNotice?.Name ?? string.Empty;
+
+    public string CurrentNoticeText => CurrentNotice?.Text ?? string.Empty;
+
+    public bool CanGoBack => currentPageIndex > 0;
+
+    public bool CanGoNext => currentPageIndex + 1 < notices.Count;
+
+    public string BackText => Texts.LanguageCode switch
+    {
+        "ja" => "戻る",
+        "zh-Hans" => "返回",
+        "ko" => "뒤로",
+        "es" => "Atrás",
+        "fr" => "Retour",
+        "de" => "Zurück",
+        "pt" => "Voltar",
+        "it" => "Indietro",
+        "ru" => "Назад",
+        _ => "Back",
+    };
+
+    public string NextText => Texts.LanguageCode switch
+    {
+        "ja" => "次へ",
+        "zh-Hans" => "下一页",
+        "ko" => "다음",
+        "es" => "Siguiente",
+        "fr" => "Suivant",
+        "de" => "Weiter",
+        "pt" => "Próximo",
+        "it" => "Avanti",
+        "ru" => "Далее",
+        _ => "Next",
+    };
+
+    public string PagePositionText => Texts.LanguageCode switch
+    {
+        "ja" => $"ページ {CurrentPageNumber} / {PageCount}",
+        "zh-Hans" => $"第 {CurrentPageNumber} / {PageCount} 页",
+        "ko" => $"페이지 {CurrentPageNumber} / {PageCount}",
+        "es" => $"Página {CurrentPageNumber} / {PageCount}",
+        "fr" => $"Page {CurrentPageNumber} / {PageCount}",
+        "de" => $"Seite {CurrentPageNumber} / {PageCount}",
+        "pt" => $"Página {CurrentPageNumber} / {PageCount}",
+        "it" => $"Pagina {CurrentPageNumber} / {PageCount}",
+        "ru" => $"Страница {CurrentPageNumber} / {PageCount}",
+        _ => $"Page {CurrentPageNumber} / {PageCount}",
+    };
+
+    public ICommand BackCommand => backCommand;
+
+    public ICommand NextCommand => nextCommand;
 
     public string DetailsStatusText => main.DetailsStatusText;
 
@@ -674,7 +919,51 @@ public sealed class LegalNoticesWindowViewModel : INotifyPropertyChanged, IDispo
                 japanese ? "配布前に windows-client/tools/Collect-ThirdPartyNotices.ps1 を publish ディレクトリへ実行し、依存物の通知を同梱してください。" : "Before distribution, run windows-client/tools/Collect-ThirdPartyNotices.ps1 against the publish directory and include all dependency notices."));
         }
 
+        currentPageIndex = notices.Count == 0 ? 0 : Math.Clamp(currentPageIndex, 0, notices.Count - 1);
+        NotifyPageProperties();
+    }
+
+    private Task MoveBackAsync()
+    {
+        SetPage(currentPageIndex - 1);
+        return Task.CompletedTask;
+    }
+
+    private Task MoveNextAsync()
+    {
+        SetPage(currentPageIndex + 1);
+        return Task.CompletedTask;
+    }
+
+    private void SetPage(int requestedIndex)
+    {
+        var nextIndex = notices.Count == 0 ? 0 : Math.Clamp(requestedIndex, 0, notices.Count - 1);
+        if (nextIndex == currentPageIndex)
+        {
+            return;
+        }
+
+        currentPageIndex = nextIndex;
+        NotifyPageProperties();
+    }
+
+    private void NotifyPageProperties()
+    {
         Notify(nameof(HasNotices));
+        Notify(nameof(CurrentPageIndex));
+        Notify(nameof(CurrentPageNumber));
+        Notify(nameof(CurrentPage));
+        Notify(nameof(PageCount));
+        Notify(nameof(CurrentNotice));
+        Notify(nameof(CurrentNoticeName));
+        Notify(nameof(CurrentNoticeText));
+        Notify(nameof(CanGoBack));
+        Notify(nameof(CanGoNext));
+        Notify(nameof(BackText));
+        Notify(nameof(NextText));
+        Notify(nameof(PagePositionText));
+        backCommand.RaiseCanExecuteChanged();
+        nextCommand.RaiseCanExecuteChanged();
     }
 
     private void Notify([CallerMemberName] string? propertyName = null)

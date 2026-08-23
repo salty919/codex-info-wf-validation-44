@@ -79,32 +79,114 @@ public sealed record UiText(
 
     public string UnavailableValue => LanguageCode switch
     {
-        "ja" => "未取得", "zh-Hans" => "未获取", "ko" => "가져오지 못함", "es" => "No disponible", "fr" => "Indisponible", "de" => "Nicht verfügbar", "pt" => "Indisponível", "it" => "Non disponibile", "ru" => "Недоступно", _ => "Unavailable"
+        "ja" => "未取得",
+        "zh-Hans" => "未获取",
+        "ko" => "가져오지 못함",
+        "es" => "No disponible",
+        "fr" => "Indisponible",
+        "de" => "Nicht verfügbar",
+        "pt" => "Indisponível",
+        "it" => "Non disponibile",
+        "ru" => "Недоступно",
+        _ => "Unavailable"
+    };
+
+    public string GraphLoading => LanguageCode switch
+    {
+        "ja" => "期間データを読み込み中…",
+        "zh-Hans" => "正在加载时间段数据…",
+        "ko" => "기간 데이터를 불러오는 중…",
+        "es" => "Cargando datos del período…",
+        "fr" => "Chargement des données de la période…",
+        "de" => "Zeitraumdaten werden geladen…",
+        "pt" => "Carregando dados do período…",
+        "it" => "Caricamento dei dati del periodo…",
+        "ru" => "Загрузка данных периода…",
+        _ => "Loading period data…"
+    };
+
+    public string GraphLoadFailed => LanguageCode switch
+    {
+        "ja" => "期間データを更新できません。前のグラフを保持しています。",
+        "zh-Hans" => "无法更新时间段数据。仍显示之前的图表。",
+        "ko" => "기간 데이터를 업데이트할 수 없습니다. 이전 그래프를 유지합니다.",
+        "es" => "No se pudieron actualizar los datos. Se conserva el gráfico anterior.",
+        "fr" => "Impossible d’actualiser les données. Le graphique précédent est conservé.",
+        "de" => "Zeitraumdaten konnten nicht aktualisiert werden. Das vorherige Diagramm bleibt erhalten.",
+        "pt" => "Não foi possível atualizar os dados. O gráfico anterior foi mantido.",
+        "it" => "Impossibile aggiornare i dati. Il grafico precedente resta visualizzato.",
+        "ru" => "Не удалось обновить данные. Предыдущий график сохранён.",
+        _ => "Period data could not be updated. The previous graph is retained."
     };
 
     public string QuotaWaiting => LanguageCode switch
     {
-        "ja" => "利用枠の情報を待機しています", "zh-Hans" => "正在等待配额信息", "ko" => "사용량 정보를 기다리는 중입니다", "es" => "Esperando la información de cuota", "fr" => "En attente des informations de quota", "de" => "Warte auf Kontingentinformationen", "pt" => "Aguardando informações de cota", "it" => "In attesa delle informazioni sulla quota", "ru" => "Ожидание данных о квоте", _ => "Waiting for quota information"
+        "ja" => "利用枠の情報を待機しています",
+        "zh-Hans" => "正在等待配额信息",
+        "ko" => "사용량 정보를 기다리는 중입니다",
+        "es" => "Esperando la información de cuota",
+        "fr" => "En attente des informations de quota",
+        "de" => "Warte auf Kontingentinformationen",
+        "pt" => "Aguardando informações de cota",
+        "it" => "In attesa delle informazioni sulla quota",
+        "ru" => "Ожидание данных о квоте",
+        _ => "Waiting for quota information"
     };
 
     public string WeeklyQuota => LanguageCode switch
     {
-        "ja" => "7日間利用枠", "zh-Hans" => "7天配额", "ko" => "7일 사용량", "es" => "Cuota de 7 días", "fr" => "Quota de 7 jours", "de" => "7-Tage-Kontingent", "pt" => "Cota de 7 dias", "it" => "Quota di 7 giorni", "ru" => "Квота на 7 дней", _ => "7-day quota"
+        "ja" => "7日間利用枠",
+        "zh-Hans" => "7天配额",
+        "ko" => "7일 사용량",
+        "es" => "Cuota de 7 días",
+        "fr" => "Quota de 7 jours",
+        "de" => "7-Tage-Kontingent",
+        "pt" => "Cota de 7 dias",
+        "it" => "Quota di 7 giorni",
+        "ru" => "Квота на 7 дней",
+        _ => "7-day quota"
     };
 
     public string MonthlyQuota => LanguageCode switch
     {
-        "ja" => "月間利用枠", "zh-Hans" => "月度配额", "ko" => "월간 사용량", "es" => "Cuota mensual", "fr" => "Quota mensuel", "de" => "Monatliches Kontingent", "pt" => "Cota mensal", "it" => "Quota mensile", "ru" => "Месячная квота", _ => "Monthly quota"
+        "ja" => "月間利用枠",
+        "zh-Hans" => "月度配额",
+        "ko" => "월간 사용량",
+        "es" => "Cuota mensual",
+        "fr" => "Quota mensuel",
+        "de" => "Monatliches Kontingent",
+        "pt" => "Cota mensal",
+        "it" => "Quota mensile",
+        "ru" => "Месячная квота",
+        _ => "Monthly quota"
     };
 
     public string LastReceivedUnavailable => LanguageCode switch
     {
-        "ja" => "前回受信: 未取得", "zh-Hans" => "上次接收：未获取", "ko" => "마지막 수신: 가져오지 못함", "es" => "Última recepción: no disponible", "fr" => "Dernière réception : indisponible", "de" => "Letzter Empfang: nicht verfügbar", "pt" => "Último recebimento: indisponível", "it" => "Ultima ricezione: non disponibile", "ru" => "Последнее получение: недоступно", _ => "Last received: unavailable"
+        "ja" => "前回受信: 未取得",
+        "zh-Hans" => "上次接收：未获取",
+        "ko" => "마지막 수신: 가져오지 못함",
+        "es" => "Última recepción: no disponible",
+        "fr" => "Dernière réception : indisponible",
+        "de" => "Letzter Empfang: nicht verfügbar",
+        "pt" => "Último recebimento: indisponível",
+        "it" => "Ultima ricezione: non disponibile",
+        "ru" => "Последнее получение: недоступно",
+        _ => "Last received: unavailable"
     };
 
     public string AppearanceDescription => LanguageCode switch
     {
-        "ja" => "Windows向けの高コントラストなFluent配色、キーボードフォーカス、ツールチップを使用します。", "zh-Hans" => "使用适合 Windows 的高对比度 Fluent 配色、键盘焦点和工具提示。", "ko" => "Windows에 맞춘 고대비 Fluent 색상, 키보드 포커스 및 도구 설명을 사용합니다.", "es" => "Usa colores Fluent de alto contraste, foco de teclado y sugerencias para Windows.", "fr" => "Utilise une palette Fluent à contraste élevé, le focus clavier et des info-bulles Windows.", "de" => "Verwendet kontrastreiche Fluent-Farben, Tastaturfokus und Tooltips für Windows.", "pt" => "Usa cores Fluent de alto contraste, foco do teclado e dicas para Windows.", "it" => "Usa colori Fluent ad alto contrasto, focus da tastiera e suggerimenti per Windows.", "ru" => "Используются контрастная палитра Fluent, фокус клавиатуры и подсказки Windows.", _ => "Uses high-contrast Fluent colors, keyboard focus, and tooltips for Windows."
+        "ja" => "Windows向けの高コントラストなFluent配色、キーボードフォーカス、ツールチップを使用します。",
+        "zh-Hans" => "使用适合 Windows 的高对比度 Fluent 配色、键盘焦点和工具提示。",
+        "ko" => "Windows에 맞춘 고대비 Fluent 색상, 키보드 포커스 및 도구 설명을 사용합니다.",
+        "es" => "Usa colores Fluent de alto contraste, foco de teclado y sugerencias para Windows.",
+        "fr" => "Utilise une palette Fluent à contraste élevé, le focus clavier et des info-bulles Windows.",
+        "de" => "Verwendet kontrastreiche Fluent-Farben, Tastaturfokus und Tooltips für Windows.",
+        "pt" => "Usa cores Fluent de alto contraste, foco do teclado e dicas para Windows.",
+        "it" => "Usa colori Fluent ad alto contrasto, focus da tastiera e suggerimenti per Windows.",
+        "ru" => "Используются контрастная палитра Fluent, фокус клавиатуры и подсказки Windows.",
+        _ => "Uses high-contrast Fluent colors, keyboard focus, and tooltips for Windows."
     };
 
     public string Other => LanguageCode switch { "ja" => "その他", "zh-Hans" => "其他", "ko" => "기타", "es" => "Otros", "fr" => "Autres", "de" => "Andere", "pt" => "Outros", "it" => "Altro", "ru" => "Другие", _ => "Other" };
@@ -160,11 +242,29 @@ public sealed record UiText(
     {
         if (immediate) return LanguageCode switch
         {
-            "ja" => "まもなくリセット", "zh-Hans" => "即将重置", "ko" => "곧 재설정됩니다", "es" => "Restablecimiento inminente", "fr" => "Réinitialisation imminente", "de" => "Wird bald zurückgesetzt", "pt" => "Redefinição em breve", "it" => "Ripristino imminente", "ru" => "Скоро сброс", _ => "Resetting soon"
+            "ja" => "まもなくリセット",
+            "zh-Hans" => "即将重置",
+            "ko" => "곧 재설정됩니다",
+            "es" => "Restablecimiento inminente",
+            "fr" => "Réinitialisation imminente",
+            "de" => "Wird bald zurückgesetzt",
+            "pt" => "Redefinição em breve",
+            "it" => "Ripristino imminente",
+            "ru" => "Скоро сброс",
+            _ => "Resetting soon"
         };
         if (lessThanMinute) return LanguageCode switch
         {
-            "ja" => "残り 1分未満", "zh-Hans" => "剩余不到1分钟", "ko" => "1분 미만 남음", "es" => "Menos de 1 minuto", "fr" => "Moins d’une minute", "de" => "Weniger als 1 Minute", "pt" => "Menos de 1 minuto", "it" => "Meno di 1 minuto", "ru" => "Меньше минуты", _ => "Less than 1 minute"
+            "ja" => "残り 1分未満",
+            "zh-Hans" => "剩余不到1分钟",
+            "ko" => "1분 미만 남음",
+            "es" => "Menos de 1 minuto",
+            "fr" => "Moins d’une minute",
+            "de" => "Weniger als 1 Minute",
+            "pt" => "Menos de 1 minuto",
+            "it" => "Meno di 1 minuto",
+            "ru" => "Меньше минуты",
+            _ => "Less than 1 minute"
         };
         if (days <= 0 && hours <= 0 && minutes <= 0)
         {
@@ -232,11 +332,31 @@ public sealed record UiText(
         }
         if (LanguageCode == "zh-Hans") return state switch
         {
-            "Connecting" => "正在通过 SSH 本地转发检查 Linux。", "Ready" => "正在显示最新的 Linux 快照。", "QuotaDanger" => "剩余配额不超过 2%。", "QuotaWarning" => "剩余配额不超过 10%。", "ResetWarning" => "配额将在 24 小时内重置。", "Initializing" => "Linux 准备完成后将自动刷新。", "AuthRequired" => "请开始 Linux 认证，完成后将自动刷新。", "ApiError" => "连接路径可用，请检查 Linux 状态。", "TransportError" => "SSH 隧道或 Linux 应用不可用。", "ResponseError" => "Linux 未返回有效响应。", _ => "请检查 SSH 本地转发。"
+            "Connecting" => "正在通过 SSH 本地转发检查 Linux。",
+            "Ready" => "正在显示最新的 Linux 快照。",
+            "QuotaDanger" => "剩余配额不超过 2%。",
+            "QuotaWarning" => "剩余配额不超过 10%。",
+            "ResetWarning" => "配额将在 24 小时内重置。",
+            "Initializing" => "Linux 准备完成后将自动刷新。",
+            "AuthRequired" => "请开始 Linux 认证，完成后将自动刷新。",
+            "ApiError" => "连接路径可用，请检查 Linux 状态。",
+            "TransportError" => "SSH 隧道或 Linux 应用不可用。",
+            "ResponseError" => "Linux 未返回有效响应。",
+            _ => "请检查 SSH 本地转发。"
         };
         if (LanguageCode == "ko") return state switch
         {
-            "Connecting" => "SSH 로컬 전달을 통해 Linux를 확인하는 중입니다.", "Ready" => "최신 Linux 스냅샷을 표시합니다.", "QuotaDanger" => "남은 사용량이 2% 이하입니다.", "QuotaWarning" => "남은 사용량이 10% 이하입니다.", "ResetWarning" => "24시간 이내에 사용량이 재설정됩니다.", "Initializing" => "Linux 준비가 끝나면 자동으로 새로 고칩니다.", "AuthRequired" => "Linux 인증을 시작하면 완료 후 자동으로 갱신합니다.", "ApiError" => "경로는 사용할 수 있습니다. Linux 상태를 확인하세요.", "TransportError" => "SSH 터널 또는 Linux 앱을 사용할 수 없습니다.", "ResponseError" => "Linux에서 유효한 응답을 받지 못했습니다.", _ => "SSH 로컬 전달을 확인하세요."
+            "Connecting" => "SSH 로컬 전달을 통해 Linux를 확인하는 중입니다.",
+            "Ready" => "최신 Linux 스냅샷을 표시합니다.",
+            "QuotaDanger" => "남은 사용량이 2% 이하입니다.",
+            "QuotaWarning" => "남은 사용량이 10% 이하입니다.",
+            "ResetWarning" => "24시간 이내에 사용량이 재설정됩니다.",
+            "Initializing" => "Linux 준비가 끝나면 자동으로 새로 고칩니다.",
+            "AuthRequired" => "Linux 인증을 시작하면 완료 후 자동으로 갱신합니다.",
+            "ApiError" => "경로는 사용할 수 있습니다. Linux 상태를 확인하세요.",
+            "TransportError" => "SSH 터널 또는 Linux 앱을 사용할 수 없습니다.",
+            "ResponseError" => "Linux에서 유효한 응답을 받지 못했습니다.",
+            _ => "SSH 로컬 전달을 확인하세요."
         };
         if (LanguageCode == "es") return state switch { "Connecting" => "Comprobando Linux mediante el túnel SSH.", "Ready" => "Mostrando la instantánea más reciente de Linux.", "QuotaDanger" => "La cuota restante es del 2% o menos.", "QuotaWarning" => "La cuota restante es del 10% o menos.", "ResetWarning" => "La cuota se restablece en 24 horas.", "Initializing" => "Se actualizará cuando Linux esté listo.", "AuthRequired" => "Inicia la autenticación de Linux para actualizar.", "ApiError" => "La ruta está disponible; comprueba Linux.", "TransportError" => "El túnel SSH o la aplicación Linux no están disponibles.", "ResponseError" => "Linux no devolvió una respuesta válida.", _ => "Comprueba el túnel SSH." };
         if (LanguageCode == "fr") return state switch { "Connecting" => "Vérification de Linux via le tunnel SSH.", "Ready" => "Dernier instantané Linux affiché.", "QuotaDanger" => "Le quota restant est inférieur ou égal à 2 %.", "QuotaWarning" => "Le quota restant est inférieur ou égal à 10 %.", "ResetWarning" => "Le quota sera réinitialisé sous 24 heures.", "Initializing" => "Actualisation dès que Linux est prêt.", "AuthRequired" => "Démarrez l’authentification Linux pour actualiser.", "ApiError" => "La route est disponible ; vérifiez Linux.", "TransportError" => "Le tunnel SSH ou l’application Linux est indisponible.", "ResponseError" => "Linux n’a pas renvoyé de réponse valide.", _ => "Vérifiez le tunnel SSH." };
@@ -265,7 +385,16 @@ public sealed record UiText(
 
     public string StaleValueSuffix => LanguageCode switch
     {
-        "ja" => "（現在は更新できていません）", "zh-Hans" => "（当前无法更新）", "ko" => "(현재 업데이트할 수 없음)", "es" => " (no se puede actualizar ahora)", "fr" => " (mise à jour indisponible)", "de" => " (derzeit keine Aktualisierung)", "pt" => " (não é possível atualizar agora)", "it" => " (aggiornamento non disponibile)", "ru" => " (обновление недоступно)", _ => " (not updating now)"
+        "ja" => "（現在は更新できていません）",
+        "zh-Hans" => "（当前无法更新）",
+        "ko" => "(현재 업데이트할 수 없음)",
+        "es" => " (no se puede actualizar ahora)",
+        "fr" => " (mise à jour indisponible)",
+        "de" => " (derzeit keine Aktualisierung)",
+        "pt" => " (não é possível atualizar agora)",
+        "it" => " (aggiornamento non disponibile)",
+        "ru" => " (обновление недоступно)",
+        _ => " (not updating now)"
     };
 
     public string SshCommandHint => LanguageCode switch
@@ -284,54 +413,108 @@ public sealed record UiText(
 
     public string SshUserLabel => LanguageCode switch
     {
-        "ja" => "SSHユーザー名", "zh-Hans" => "SSH 用户名", "ko" => "SSH 사용자 이름", "de" => "SSH-Benutzer", "fr" => "Utilisateur SSH", "es" => "Usuario SSH", "pt" => "Usuário SSH", "it" => "Utente SSH", "ru" => "Пользователь SSH", _ => "SSH user"
+        "ja" => "SSHユーザー名",
+        "zh-Hans" => "SSH 用户名",
+        "ko" => "SSH 사용자 이름",
+        "de" => "SSH-Benutzer",
+        "fr" => "Utilisateur SSH",
+        "es" => "Usuario SSH",
+        "pt" => "Usuário SSH",
+        "it" => "Utente SSH",
+        "ru" => "Пользователь SSH",
+        _ => "SSH user"
     };
 
     public string SshHostLabel => LanguageCode switch
     {
-        "ja" => "Linuxホスト名 / IP", "zh-Hans" => "Linux 主机名 / IP", "ko" => "Linux 호스트 이름 / IP", "de" => "Linux-Hostname / IP", "fr" => "Hôte Linux / IP", "es" => "Host Linux / IP", "pt" => "Host Linux / IP", "it" => "Host Linux / IP", "ru" => "Имя хоста Linux / IP", _ => "Linux host / IP"
+        "ja" => "Linuxホスト名 / IP",
+        "zh-Hans" => "Linux 主机名 / IP",
+        "ko" => "Linux 호스트 이름 / IP",
+        "de" => "Linux-Hostname / IP",
+        "fr" => "Hôte Linux / IP",
+        "es" => "Host Linux / IP",
+        "pt" => "Host Linux / IP",
+        "it" => "Host Linux / IP",
+        "ru" => "Имя хоста Linux / IP",
+        _ => "Linux host / IP"
     };
 
     public string SshConfigAliasLabel => LanguageCode switch
     {
-        "ja" => "SSH configから選択（任意）", "zh-Hans" => "从 SSH config 选择（可选）", "ko" => "SSH config에서 선택(선택 사항)", _ => "Choose from SSH config (optional)"
+        "ja" => "SSH configから選択（任意）",
+        "zh-Hans" => "从 SSH config 选择（可选）",
+        "ko" => "SSH config에서 선택(선택 사항)",
+        _ => "Choose from SSH config (optional)"
     };
 
     public string SshConfigAliasPlaceholder => LanguageCode switch
     {
-        "ja" => "Host aliasが見つかった場合に選択できます", "zh-Hans" => "检测到 Host alias 时可在此选择", "ko" => "감지된 Host alias를 여기서 선택할 수 있습니다", _ => "Detected Host aliases appear here"
+        "ja" => "Host aliasが見つかった場合に選択できます",
+        "zh-Hans" => "检测到 Host alias 时可在此选择",
+        "ko" => "감지된 Host alias를 여기서 선택할 수 있습니다",
+        _ => "Detected Host aliases appear here"
     };
 
     public string SshUserPlaceholder => LanguageCode == "ja" ? "任意: salty（configのUser使用可）" : "Optional: salty (config User allowed)";
     public string SshHostPlaceholder => LanguageCode == "ja" ? "例: 192.168.1.20 または Host alias" : "e.g. 192.168.1.20 or a Host alias";
     public string SshStart => LanguageCode switch
     {
-        "ja" => "SSH転送を開始", "zh-Hans" => "启动 SSH 转发", "ko" => "SSH 전달 시작", "de" => "SSH-Weiterleitung starten", "fr" => "Démarrer le tunnel SSH", "es" => "Iniciar túnel SSH", "pt" => "Iniciar túnel SSH", "it" => "Avvia tunnel SSH", "ru" => "Запустить SSH-туннель", _ => "Start SSH forwarding"
+        "ja" => "SSH転送を開始",
+        "zh-Hans" => "启动 SSH 转发",
+        "ko" => "SSH 전달 시작",
+        "de" => "SSH-Weiterleitung starten",
+        "fr" => "Démarrer le tunnel SSH",
+        "es" => "Iniciar túnel SSH",
+        "pt" => "Iniciar túnel SSH",
+        "it" => "Avvia tunnel SSH",
+        "ru" => "Запустить SSH-туннель",
+        _ => "Start SSH forwarding"
     };
 
     public string SshStop => LanguageCode switch
     {
-        "ja" => "SSH転送を停止", "zh-Hans" => "停止 SSH 转发", "ko" => "SSH 전달 중지", "de" => "SSH-Weiterleitung stoppen", "fr" => "Arrêter le tunnel SSH", "es" => "Detener túnel SSH", "pt" => "Parar túnel SSH", "it" => "Arresta tunnel SSH", "ru" => "Остановить SSH-туннель", _ => "Stop SSH forwarding"
+        "ja" => "SSH転送を停止",
+        "zh-Hans" => "停止 SSH 转发",
+        "ko" => "SSH 전달 중지",
+        "de" => "SSH-Weiterleitung stoppen",
+        "fr" => "Arrêter le tunnel SSH",
+        "es" => "Detener túnel SSH",
+        "pt" => "Parar túnel SSH",
+        "it" => "Arresta tunnel SSH",
+        "ru" => "Остановить SSH-туннель",
+        _ => "Stop SSH forwarding"
     };
 
     public string SshNotReady => LanguageCode switch
     {
-        "ja" => "上の user@linux-host は例です。Linuxホスト名/IPまたはSSH configのHost aliasを入力してください。ユーザー名はconfigのUserを使う場合は空欄にできます。入力値は保存されません。", "zh-Hans" => "上面的 user@linux-host 只是示例。请输入 Linux 主机名/IP 或 SSH config 的 Host alias。若使用 config 的 User，可将用户名留空。输入内容不会保存。", "ko" => "위의 user@linux-host는 예시입니다. Linux 호스트 이름/IP 또는 SSH config의 Host alias를 입력하세요. config의 User를 사용하면 사용자 이름을 비워둘 수 있습니다. 입력값은 저장되지 않습니다.", _ => "The user@linux-host text above is an example. Enter a Linux host/IP or an SSH config Host alias. Leave the user empty to use User from config. Values are not saved."
+        "ja" => "上の user@linux-host は例です。Linuxホスト名/IPまたはSSH configのHost aliasを入力してください。ユーザー名はconfigのUserを使う場合は空欄にできます。入力値は保存されません。",
+        "zh-Hans" => "上面的 user@linux-host 只是示例。请输入 Linux 主机名/IP 或 SSH config 的 Host alias。若使用 config 的 User，可将用户名留空。输入内容不会保存。",
+        "ko" => "위의 user@linux-host는 예시입니다. Linux 호스트 이름/IP 또는 SSH config의 Host alias를 입력하세요. config의 User를 사용하면 사용자 이름을 비워둘 수 있습니다. 입력값은 저장되지 않습니다.",
+        _ => "The user@linux-host text above is an example. Enter a Linux host/IP or an SSH config Host alias. Leave the user empty to use User from config. Values are not saved."
     };
 
     public string SshRunningStatus => LanguageCode switch
     {
-        "ja" => "SSH転送を実行中です。接続を確認しています。", "zh-Hans" => "SSH 转发正在运行，正在检查连接。", "ko" => "SSH 전달이 실행 중이며 연결을 확인하고 있습니다.", _ => "SSH forwarding is running; checking the connection."
+        "ja" => "SSH転送を実行中です。接続を確認しています。",
+        "zh-Hans" => "SSH 转发正在运行，正在检查连接。",
+        "ko" => "SSH 전달이 실행 중이며 연결을 확인하고 있습니다.",
+        _ => "SSH forwarding is running; checking the connection."
     };
 
     public string SshLaunchFailedStatus => LanguageCode switch
     {
-        "ja" => "ssh.exeを起動できませんでした。Windows OpenSSHが利用可能か確認してください。", "zh-Hans" => "无法启动 ssh.exe。请确认 Windows OpenSSH 可用。", "ko" => "ssh.exe를 시작할 수 없습니다. Windows OpenSSH를 사용할 수 있는지 확인하세요.", _ => "ssh.exe could not be started. Check that Windows OpenSSH is available."
+        "ja" => "ssh.exeを起動できませんでした。Windows OpenSSHが利用可能か確認してください。",
+        "zh-Hans" => "无法启动 ssh.exe。请确认 Windows OpenSSH 可用。",
+        "ko" => "ssh.exe를 시작할 수 없습니다. Windows OpenSSH를 사용할 수 있는지 확인하세요.",
+        _ => "ssh.exe could not be started. Check that Windows OpenSSH is available."
     };
 
     public string SshReadyStatus => LanguageCode switch
     {
-        "ja" => "この接続先でSSH転送を開始できます。鍵・パスワード・ホスト鍵確認はssh.exeが表示します。", "zh-Hans" => "可以使用此目标启动 SSH 转发。密钥、密码和主机密钥确认由 ssh.exe 显示。", "ko" => "이 대상으로 SSH 전달을 시작할 수 있습니다. 키, 암호 및 호스트 키 확인은 ssh.exe가 표시합니다.", _ => "SSH forwarding is ready. ssh.exe will show key, password, and host-key prompts."
+        "ja" => "この接続先でSSH転送を開始できます。鍵・パスワード・ホスト鍵確認はssh.exeが表示します。",
+        "zh-Hans" => "可以使用此目标启动 SSH 转发。密钥、密码和主机密钥确认由 ssh.exe 显示。",
+        "ko" => "이 대상으로 SSH 전달을 시작할 수 있습니다. 키, 암호 및 호스트 키 확인은 ssh.exe가 표시합니다.",
+        _ => "SSH forwarding is ready. ssh.exe will show key, password, and host-key prompts."
     };
 }
 
@@ -346,8 +529,67 @@ public static class LocalizationService
 
     private static readonly UiText English = Japanese with
     {
-        LanguageCode = "en", LanguageName = "English", AppTitle = "Codex Info Monitor", AppSubtitle = "Windows monitoring client", UsageStatus = "Usage", Graph = "Trends", Threads = "Threads", Legal = "Legal", Settings = "Settings", Refresh = "Refresh", Refreshing = "Refreshing…",
-        RemainingQuota = "Remaining quota", Account = "Account", Authentication = "Authentication", Plan = "Plan", ResetTime = "Reset time", ObservedAt = "Linux observation", LastReceived = "Last received", RunningThreads = "Running threads", NoRunningThreads = "No running threads", Details = "Details", ModelUsage = "Usage by model", Input = "Input", CachedInput = "Cached input", Output = "Output", Tokens = "Tokens", Dollars = "Estimated dollars", Connection = "Connection", ConnectionEndpoint = "Endpoint: 127.0.0.1:8787 (SSH local forwarding)", Setup = "Setup", SetupTitle = "Welcome to Codex Info", SetupIntro = "We will verify the Linux API and SSH local forwarding before monitoring starts. Credentials and tokens are never stored.", ConnectionGuide = "Connection guide", ConnectionGuideBody = "Enter an SSH user and Linux host/IP or a Host alias from your SSH config, then press Start SSH forwarding. Launch Codex Info in headless API mode on Linux. The recorder daemon starts automatically and keeps history after the UI closes.", Copy = "Copy", Copied = "Copied", Continue = "Continue", OpenSettings = "Open settings", Save = "Save", Cancel = "Cancel", Close = "Close", Minimize = "Minimize", Maximize = "Maximize", Language = "Language", Appearance = "Appearance", Connected = "Connected", Connecting = "Connecting", Ready = "Ready", ApiError = "Linux API error", TransportError = "Connection error", Initializing = "Linux is preparing", AuthRequired = "Linux authentication required", QuotaDanger = "Quota critical", QuotaWarning = "Quota warning", ResetWarning = "Reset soon", Unavailable = "Unavailable", AuthStart = "Start authentication", AuthCheck = "Check authentication", Retry = "Retry", Latest = "Latest", UnavailableDetails = "Details unavailable"
+        LanguageCode = "en",
+        LanguageName = "English",
+        AppTitle = "Codex Info Monitor",
+        AppSubtitle = "Windows monitoring client",
+        UsageStatus = "Usage",
+        Graph = "Trends",
+        Threads = "Threads",
+        Legal = "Legal",
+        Settings = "Settings",
+        Refresh = "Refresh",
+        Refreshing = "Refreshing…",
+        RemainingQuota = "Remaining quota",
+        Account = "Account",
+        Authentication = "Authentication",
+        Plan = "Plan",
+        ResetTime = "Reset time",
+        ObservedAt = "Linux observation",
+        LastReceived = "Last received",
+        RunningThreads = "Running threads",
+        NoRunningThreads = "No running threads",
+        Details = "Details",
+        ModelUsage = "Usage by model",
+        Input = "Input",
+        CachedInput = "Cached input",
+        Output = "Output",
+        Tokens = "Tokens",
+        Dollars = "Estimated dollars",
+        Connection = "Connection",
+        ConnectionEndpoint = "Endpoint: 127.0.0.1:8787 (SSH local forwarding)",
+        Setup = "Setup",
+        SetupTitle = "Welcome to Codex Info",
+        SetupIntro = "We will verify the Linux API and SSH local forwarding before monitoring starts. Credentials and tokens are never stored.",
+        ConnectionGuide = "Connection guide",
+        ConnectionGuideBody = "Enter an SSH user and Linux host/IP or a Host alias from your SSH config, then press Start SSH forwarding. Launch Codex Info in headless API mode on Linux. The recorder daemon starts automatically and keeps history after the UI closes.",
+        Copy = "Copy",
+        Copied = "Copied",
+        Continue = "Continue",
+        OpenSettings = "Open settings",
+        Save = "Save",
+        Cancel = "Cancel",
+        Close = "Close",
+        Minimize = "Minimize",
+        Maximize = "Maximize",
+        Language = "Language",
+        Appearance = "Appearance",
+        Connected = "Connected",
+        Connecting = "Connecting",
+        Ready = "Ready",
+        ApiError = "Linux API error",
+        TransportError = "Connection error",
+        Initializing = "Linux is preparing",
+        AuthRequired = "Linux authentication required",
+        QuotaDanger = "Quota critical",
+        QuotaWarning = "Quota warning",
+        ResetWarning = "Reset soon",
+        Unavailable = "Unavailable",
+        AuthStart = "Start authentication",
+        AuthCheck = "Check authentication",
+        Retry = "Retry",
+        Latest = "Latest",
+        UnavailableDetails = "Details unavailable"
     };
 
     private static readonly Dictionary<string, UiText> Catalog = new(StringComparer.OrdinalIgnoreCase)
@@ -356,37 +598,403 @@ public static class LocalizationService
         ["en"] = English,
         ["zh-Hans"] = English with
         {
-            LanguageCode = "zh-Hans", LanguageName = "简体中文", AppSubtitle = "Windows 监控客户端", UsageStatus = "使用情况", Graph = "趋势", Legal = "法律声明", Settings = "设置", Refresh = "刷新", Refreshing = "刷新中…",
-            RemainingQuota = "剩余配额", Account = "账户", Authentication = "认证", Plan = "套餐", ResetTime = "重置时间", ObservedAt = "Linux 观测时间", LastReceived = "上次接收", RunningThreads = "运行中的线程", NoRunningThreads = "没有运行中的线程", Details = "详细信息", ModelUsage = "按模型用量", Input = "输入", CachedInput = "缓存输入", Output = "输出", Tokens = "令牌", Dollars = "预估美元", Connection = "连接", Setup = "初始设置", SetupTitle = "欢迎使用 Codex Info", Continue = "继续", OpenSettings = "打开设置", Save = "保存", Close = "关闭", Language = "语言", Appearance = "外观", Connected = "已连接", Connecting = "连接中", Ready = "正常", AuthRequired = "需要 Linux 认证", QuotaDanger = "配额不足", QuotaWarning = "配额警告", ResetWarning = "即将重置", Unavailable = "不可用", AuthStart = "开始认证", AuthCheck = "检查认证", Retry = "重试", Latest = "最新", UnavailableDetails = "详细数据不可用"
+            LanguageCode = "zh-Hans",
+            LanguageName = "简体中文",
+            AppSubtitle = "Windows 监控客户端",
+            UsageStatus = "使用情况",
+            Graph = "趋势",
+            Legal = "法律声明",
+            Settings = "设置",
+            Refresh = "刷新",
+            Refreshing = "刷新中…",
+            RemainingQuota = "剩余配额",
+            Account = "账户",
+            Authentication = "认证",
+            Plan = "套餐",
+            ResetTime = "重置时间",
+            ObservedAt = "Linux 观测时间",
+            LastReceived = "上次接收",
+            RunningThreads = "运行中的线程",
+            NoRunningThreads = "没有运行中的线程",
+            Details = "详细信息",
+            ModelUsage = "按模型用量",
+            Input = "输入",
+            CachedInput = "缓存输入",
+            Output = "输出",
+            Tokens = "令牌",
+            Dollars = "预估美元",
+            Connection = "连接",
+            Setup = "初始设置",
+            SetupTitle = "欢迎使用 Codex Info",
+            Continue = "继续",
+            OpenSettings = "打开设置",
+            Save = "保存",
+            Close = "关闭",
+            Language = "语言",
+            Appearance = "外观",
+            Connected = "已连接",
+            Connecting = "连接中",
+            Ready = "正常",
+            AuthRequired = "需要 Linux 认证",
+            QuotaDanger = "配额不足",
+            QuotaWarning = "配额警告",
+            ResetWarning = "即将重置",
+            Unavailable = "不可用",
+            AuthStart = "开始认证",
+            AuthCheck = "检查认证",
+            Retry = "重试",
+            Latest = "最新",
+            UnavailableDetails = "详细数据不可用"
         },
         ["ko"] = English with
         {
-            LanguageCode = "ko", LanguageName = "한국어", AppSubtitle = "Windows 모니터링 클라이언트", UsageStatus = "사용 현황", Graph = "추이", Legal = "법적 고지", Settings = "설정", Refresh = "새로 고침", Refreshing = "새로 고치는 중…",
-            RemainingQuota = "남은 사용량", Account = "계정", Authentication = "인증", Plan = "플랜", ResetTime = "재설정 시각", ObservedAt = "Linux 관측 시각", LastReceived = "마지막 수신", RunningThreads = "실행 중인 스레드", NoRunningThreads = "실행 중인 스레드가 없습니다", Details = "세부 정보", ModelUsage = "모델별 사용량", Input = "입력", CachedInput = "캐시 입력", Output = "출력", Tokens = "토큰", Dollars = "예상 달러", Connection = "연결", Setup = "초기 설정", SetupTitle = "Codex Info에 오신 것을 환영합니다", Continue = "계속", OpenSettings = "설정 열기", Save = "저장", Close = "닫기", Language = "언어", Appearance = "모양", Connected = "연결됨", Connecting = "연결 중", Ready = "정상", AuthRequired = "Linux 인증 필요", QuotaDanger = "잔여량 부족", QuotaWarning = "잔여량 경고", ResetWarning = "곧 재설정", Unavailable = "사용할 수 없음", AuthStart = "인증 시작", AuthCheck = "인증 확인", Retry = "다시 시도", Latest = "최신", UnavailableDetails = "세부 데이터를 가져올 수 없음"
+            LanguageCode = "ko",
+            LanguageName = "한국어",
+            AppSubtitle = "Windows 모니터링 클라이언트",
+            UsageStatus = "사용 현황",
+            Graph = "추이",
+            Legal = "법적 고지",
+            Settings = "설정",
+            Refresh = "새로 고침",
+            Refreshing = "새로 고치는 중…",
+            RemainingQuota = "남은 사용량",
+            Account = "계정",
+            Authentication = "인증",
+            Plan = "플랜",
+            ResetTime = "재설정 시각",
+            ObservedAt = "Linux 관측 시각",
+            LastReceived = "마지막 수신",
+            RunningThreads = "실행 중인 스레드",
+            NoRunningThreads = "실행 중인 스레드가 없습니다",
+            Details = "세부 정보",
+            ModelUsage = "모델별 사용량",
+            Input = "입력",
+            CachedInput = "캐시 입력",
+            Output = "출력",
+            Tokens = "토큰",
+            Dollars = "예상 달러",
+            Connection = "연결",
+            Setup = "초기 설정",
+            SetupTitle = "Codex Info에 오신 것을 환영합니다",
+            Continue = "계속",
+            OpenSettings = "설정 열기",
+            Save = "저장",
+            Close = "닫기",
+            Language = "언어",
+            Appearance = "모양",
+            Connected = "연결됨",
+            Connecting = "연결 중",
+            Ready = "정상",
+            AuthRequired = "Linux 인증 필요",
+            QuotaDanger = "잔여량 부족",
+            QuotaWarning = "잔여량 경고",
+            ResetWarning = "곧 재설정",
+            Unavailable = "사용할 수 없음",
+            AuthStart = "인증 시작",
+            AuthCheck = "인증 확인",
+            Retry = "다시 시도",
+            Latest = "최신",
+            UnavailableDetails = "세부 데이터를 가져올 수 없음"
         },
         ["es"] = English with
         {
-            LanguageCode = "es", LanguageName = "Español", AppSubtitle = "Cliente de supervisión para Windows", UsageStatus = "Uso", Graph = "Tendencias", Legal = "Avisos legales", Settings = "Configuración", Refresh = "Actualizar", Refreshing = "Actualizando…", RemainingQuota = "Cuota restante", Account = "Cuenta", Authentication = "Autenticación", Plan = "Plan", ResetTime = "Hora de restablecimiento", ObservedAt = "Observación de Linux", LastReceived = "Última recepción", RunningThreads = "Hilos activos", NoRunningThreads = "No hay hilos activos", Details = "Detalles", ModelUsage = "Uso por modelo", Input = "Entrada", CachedInput = "Entrada en caché", Output = "Salida", Tokens = "Tokens", Dollars = "Dólares estimados", Connection = "Conexión", Setup = "Configuración inicial", SetupTitle = "Te damos la bienvenida a Codex Info", Continue = "Continuar", OpenSettings = "Abrir configuración", Save = "Guardar", Close = "Cerrar", Language = "Idioma", Appearance = "Apariencia", Connected = "Conectado", Connecting = "Conectando", Ready = "Listo", AuthRequired = "Se requiere autenticación de Linux", QuotaDanger = "Cuota crítica", QuotaWarning = "Advertencia de cuota", ResetWarning = "Restablecimiento próximo", Unavailable = "No disponible", AuthStart = "Iniciar autenticación", AuthCheck = "Comprobar autenticación", Retry = "Reintentar", Latest = "Más reciente", UnavailableDetails = "Detalles no disponibles"
+            LanguageCode = "es",
+            LanguageName = "Español",
+            AppSubtitle = "Cliente de supervisión para Windows",
+            UsageStatus = "Uso",
+            Graph = "Tendencias",
+            Legal = "Avisos legales",
+            Settings = "Configuración",
+            Refresh = "Actualizar",
+            Refreshing = "Actualizando…",
+            RemainingQuota = "Cuota restante",
+            Account = "Cuenta",
+            Authentication = "Autenticación",
+            Plan = "Plan",
+            ResetTime = "Hora de restablecimiento",
+            ObservedAt = "Observación de Linux",
+            LastReceived = "Última recepción",
+            RunningThreads = "Hilos activos",
+            NoRunningThreads = "No hay hilos activos",
+            Details = "Detalles",
+            ModelUsage = "Uso por modelo",
+            Input = "Entrada",
+            CachedInput = "Entrada en caché",
+            Output = "Salida",
+            Tokens = "Tokens",
+            Dollars = "Dólares estimados",
+            Connection = "Conexión",
+            Setup = "Configuración inicial",
+            SetupTitle = "Te damos la bienvenida a Codex Info",
+            Continue = "Continuar",
+            OpenSettings = "Abrir configuración",
+            Save = "Guardar",
+            Close = "Cerrar",
+            Language = "Idioma",
+            Appearance = "Apariencia",
+            Connected = "Conectado",
+            Connecting = "Conectando",
+            Ready = "Listo",
+            AuthRequired = "Se requiere autenticación de Linux",
+            QuotaDanger = "Cuota crítica",
+            QuotaWarning = "Advertencia de cuota",
+            ResetWarning = "Restablecimiento próximo",
+            Unavailable = "No disponible",
+            AuthStart = "Iniciar autenticación",
+            AuthCheck = "Comprobar autenticación",
+            Retry = "Reintentar",
+            Latest = "Más reciente",
+            UnavailableDetails = "Detalles no disponibles"
         },
         ["fr"] = English with
         {
-            LanguageCode = "fr", LanguageName = "Français", AppSubtitle = "Client de surveillance Windows", UsageStatus = "Utilisation", Graph = "Tendances", Legal = "Mentions légales", Settings = "Paramètres", Refresh = "Actualiser", Refreshing = "Actualisation…", RemainingQuota = "Quota restant", Account = "Compte", Authentication = "Authentification", Plan = "Forfait", ResetTime = "Heure de réinitialisation", ObservedAt = "Observation Linux", LastReceived = "Dernière réception", RunningThreads = "Threads actifs", NoRunningThreads = "Aucun thread actif", Details = "Détails", ModelUsage = "Utilisation par modèle", Input = "Entrée", CachedInput = "Entrée en cache", Output = "Sortie", Tokens = "Jetons", Dollars = "Dollars estimés", Connection = "Connexion", Setup = "Configuration initiale", SetupTitle = "Bienvenue dans Codex Info", Continue = "Continuer", OpenSettings = "Ouvrir les paramètres", Save = "Enregistrer", Close = "Fermer", Language = "Langue", Appearance = "Apparence", Connected = "Connecté", Connecting = "Connexion…", Ready = "Prêt", AuthRequired = "Authentification Linux requise", QuotaDanger = "Quota critique", QuotaWarning = "Alerte de quota", ResetWarning = "Réinitialisation imminente", Unavailable = "Indisponible", AuthStart = "Démarrer l’authentification", AuthCheck = "Vérifier l’authentification", Retry = "Réessayer", Latest = "À jour", UnavailableDetails = "Détails indisponibles"
+            LanguageCode = "fr",
+            LanguageName = "Français",
+            AppSubtitle = "Client de surveillance Windows",
+            UsageStatus = "Utilisation",
+            Graph = "Tendances",
+            Legal = "Mentions légales",
+            Settings = "Paramètres",
+            Refresh = "Actualiser",
+            Refreshing = "Actualisation…",
+            RemainingQuota = "Quota restant",
+            Account = "Compte",
+            Authentication = "Authentification",
+            Plan = "Forfait",
+            ResetTime = "Heure de réinitialisation",
+            ObservedAt = "Observation Linux",
+            LastReceived = "Dernière réception",
+            RunningThreads = "Threads actifs",
+            NoRunningThreads = "Aucun thread actif",
+            Details = "Détails",
+            ModelUsage = "Utilisation par modèle",
+            Input = "Entrée",
+            CachedInput = "Entrée en cache",
+            Output = "Sortie",
+            Tokens = "Jetons",
+            Dollars = "Dollars estimés",
+            Connection = "Connexion",
+            Setup = "Configuration initiale",
+            SetupTitle = "Bienvenue dans Codex Info",
+            Continue = "Continuer",
+            OpenSettings = "Ouvrir les paramètres",
+            Save = "Enregistrer",
+            Close = "Fermer",
+            Language = "Langue",
+            Appearance = "Apparence",
+            Connected = "Connecté",
+            Connecting = "Connexion…",
+            Ready = "Prêt",
+            AuthRequired = "Authentification Linux requise",
+            QuotaDanger = "Quota critique",
+            QuotaWarning = "Alerte de quota",
+            ResetWarning = "Réinitialisation imminente",
+            Unavailable = "Indisponible",
+            AuthStart = "Démarrer l’authentification",
+            AuthCheck = "Vérifier l’authentification",
+            Retry = "Réessayer",
+            Latest = "À jour",
+            UnavailableDetails = "Détails indisponibles"
         },
         ["de"] = English with
         {
-            LanguageCode = "de", LanguageName = "Deutsch", AppSubtitle = "Windows-Überwachungsclient", UsageStatus = "Nutzung", Graph = "Verlauf", Legal = "Rechtliche Hinweise", Settings = "Einstellungen", Refresh = "Aktualisieren", Refreshing = "Wird aktualisiert…", RemainingQuota = "Verbleibendes Kontingent", Account = "Konto", Authentication = "Authentifizierung", Plan = "Tarif", ResetTime = "Zurücksetzzeit", ObservedAt = "Linux-Beobachtung", LastReceived = "Letzter Empfang", RunningThreads = "Aktive Threads", NoRunningThreads = "Keine aktiven Threads", Details = "Details", ModelUsage = "Nutzung nach Modell", Input = "Eingabe", CachedInput = "Cache-Eingabe", Output = "Ausgabe", Tokens = "Token", Dollars = "Geschätzte Dollar", Connection = "Verbindung", Setup = "Ersteinrichtung", SetupTitle = "Willkommen bei Codex Info", Continue = "Weiter", OpenSettings = "Einstellungen öffnen", Save = "Speichern", Close = "Schließen", Language = "Sprache", Appearance = "Darstellung", Connected = "Verbunden", Connecting = "Verbindung wird hergestellt", Ready = "Bereit", AuthRequired = "Linux-Authentifizierung erforderlich", QuotaDanger = "Kontingent kritisch", QuotaWarning = "Kontingentwarnung", ResetWarning = "Zurücksetzung steht bevor", Unavailable = "Nicht verfügbar", AuthStart = "Authentifizierung starten", AuthCheck = "Authentifizierung prüfen", Retry = "Erneut versuchen", Latest = "Aktuell", UnavailableDetails = "Details nicht verfügbar"
+            LanguageCode = "de",
+            LanguageName = "Deutsch",
+            AppSubtitle = "Windows-Überwachungsclient",
+            UsageStatus = "Nutzung",
+            Graph = "Verlauf",
+            Legal = "Rechtliche Hinweise",
+            Settings = "Einstellungen",
+            Refresh = "Aktualisieren",
+            Refreshing = "Wird aktualisiert…",
+            RemainingQuota = "Verbleibendes Kontingent",
+            Account = "Konto",
+            Authentication = "Authentifizierung",
+            Plan = "Tarif",
+            ResetTime = "Zurücksetzzeit",
+            ObservedAt = "Linux-Beobachtung",
+            LastReceived = "Letzter Empfang",
+            RunningThreads = "Aktive Threads",
+            NoRunningThreads = "Keine aktiven Threads",
+            Details = "Details",
+            ModelUsage = "Nutzung nach Modell",
+            Input = "Eingabe",
+            CachedInput = "Cache-Eingabe",
+            Output = "Ausgabe",
+            Tokens = "Token",
+            Dollars = "Geschätzte Dollar",
+            Connection = "Verbindung",
+            Setup = "Ersteinrichtung",
+            SetupTitle = "Willkommen bei Codex Info",
+            Continue = "Weiter",
+            OpenSettings = "Einstellungen öffnen",
+            Save = "Speichern",
+            Close = "Schließen",
+            Language = "Sprache",
+            Appearance = "Darstellung",
+            Connected = "Verbunden",
+            Connecting = "Verbindung wird hergestellt",
+            Ready = "Bereit",
+            AuthRequired = "Linux-Authentifizierung erforderlich",
+            QuotaDanger = "Kontingent kritisch",
+            QuotaWarning = "Kontingentwarnung",
+            ResetWarning = "Zurücksetzung steht bevor",
+            Unavailable = "Nicht verfügbar",
+            AuthStart = "Authentifizierung starten",
+            AuthCheck = "Authentifizierung prüfen",
+            Retry = "Erneut versuchen",
+            Latest = "Aktuell",
+            UnavailableDetails = "Details nicht verfügbar"
         },
         ["pt"] = English with
         {
-            LanguageCode = "pt", LanguageName = "Português", AppSubtitle = "Cliente de monitoramento do Windows", UsageStatus = "Uso", Graph = "Tendências", Legal = "Avisos legais", Settings = "Configurações", Refresh = "Atualizar", Refreshing = "Atualizando…", RemainingQuota = "Cota restante", Account = "Conta", Authentication = "Autenticação", Plan = "Plano", ResetTime = "Hora de redefinição", ObservedAt = "Observação do Linux", LastReceived = "Último recebimento", RunningThreads = "Threads em execução", NoRunningThreads = "Nenhuma thread em execução", Details = "Detalhes", ModelUsage = "Uso por modelo", Input = "Entrada", CachedInput = "Entrada em cache", Output = "Saída", Tokens = "Tokens", Dollars = "Dólares estimados", Connection = "Conexão", Setup = "Configuração inicial", SetupTitle = "Boas-vindas ao Codex Info", Continue = "Continuar", OpenSettings = "Abrir configurações", Save = "Salvar", Close = "Fechar", Language = "Idioma", Appearance = "Aparência", Connected = "Conectado", Connecting = "Conectando", Ready = "Pronto", AuthRequired = "Autenticação do Linux necessária", QuotaDanger = "Cota crítica", QuotaWarning = "Alerta de cota", ResetWarning = "Redefinição próxima", Unavailable = "Indisponível", AuthStart = "Iniciar autenticação", AuthCheck = "Verificar autenticação", Retry = "Tentar novamente", Latest = "Mais recente", UnavailableDetails = "Detalhes indisponíveis"
+            LanguageCode = "pt",
+            LanguageName = "Português",
+            AppSubtitle = "Cliente de monitoramento do Windows",
+            UsageStatus = "Uso",
+            Graph = "Tendências",
+            Legal = "Avisos legais",
+            Settings = "Configurações",
+            Refresh = "Atualizar",
+            Refreshing = "Atualizando…",
+            RemainingQuota = "Cota restante",
+            Account = "Conta",
+            Authentication = "Autenticação",
+            Plan = "Plano",
+            ResetTime = "Hora de redefinição",
+            ObservedAt = "Observação do Linux",
+            LastReceived = "Último recebimento",
+            RunningThreads = "Threads em execução",
+            NoRunningThreads = "Nenhuma thread em execução",
+            Details = "Detalhes",
+            ModelUsage = "Uso por modelo",
+            Input = "Entrada",
+            CachedInput = "Entrada em cache",
+            Output = "Saída",
+            Tokens = "Tokens",
+            Dollars = "Dólares estimados",
+            Connection = "Conexão",
+            Setup = "Configuração inicial",
+            SetupTitle = "Boas-vindas ao Codex Info",
+            Continue = "Continuar",
+            OpenSettings = "Abrir configurações",
+            Save = "Salvar",
+            Close = "Fechar",
+            Language = "Idioma",
+            Appearance = "Aparência",
+            Connected = "Conectado",
+            Connecting = "Conectando",
+            Ready = "Pronto",
+            AuthRequired = "Autenticação do Linux necessária",
+            QuotaDanger = "Cota crítica",
+            QuotaWarning = "Alerta de cota",
+            ResetWarning = "Redefinição próxima",
+            Unavailable = "Indisponível",
+            AuthStart = "Iniciar autenticação",
+            AuthCheck = "Verificar autenticação",
+            Retry = "Tentar novamente",
+            Latest = "Mais recente",
+            UnavailableDetails = "Detalhes indisponíveis"
         },
         ["it"] = English with
         {
-            LanguageCode = "it", LanguageName = "Italiano", AppSubtitle = "Client di monitoraggio Windows", UsageStatus = "Utilizzo", Graph = "Andamento", Legal = "Note legali", Settings = "Impostazioni", Refresh = "Aggiorna", Refreshing = "Aggiornamento…", RemainingQuota = "Quota residua", Account = "Account", Authentication = "Autenticazione", Plan = "Piano", ResetTime = "Ora di ripristino", ObservedAt = "Osservazione Linux", LastReceived = "Ultima ricezione", RunningThreads = "Thread in esecuzione", NoRunningThreads = "Nessun thread in esecuzione", Details = "Dettagli", ModelUsage = "Utilizzo per modello", Input = "Input", CachedInput = "Input in cache", Output = "Output", Tokens = "Token", Dollars = "Dollari stimati", Connection = "Connessione", Setup = "Configurazione iniziale", SetupTitle = "Benvenuto in Codex Info", Continue = "Continua", OpenSettings = "Apri impostazioni", Save = "Salva", Close = "Chiudi", Language = "Lingua", Appearance = "Aspetto", Connected = "Connesso", Connecting = "Connessione in corso", Ready = "Pronto", AuthRequired = "Autenticazione Linux richiesta", QuotaDanger = "Quota critica", QuotaWarning = "Avviso quota", ResetWarning = "Ripristino imminente", Unavailable = "Non disponibile", AuthStart = "Avvia autenticazione", AuthCheck = "Verifica autenticazione", Retry = "Riprova", Latest = "Più recente", UnavailableDetails = "Dettagli non disponibili"
+            LanguageCode = "it",
+            LanguageName = "Italiano",
+            AppSubtitle = "Client di monitoraggio Windows",
+            UsageStatus = "Utilizzo",
+            Graph = "Andamento",
+            Legal = "Note legali",
+            Settings = "Impostazioni",
+            Refresh = "Aggiorna",
+            Refreshing = "Aggiornamento…",
+            RemainingQuota = "Quota residua",
+            Account = "Account",
+            Authentication = "Autenticazione",
+            Plan = "Piano",
+            ResetTime = "Ora di ripristino",
+            ObservedAt = "Osservazione Linux",
+            LastReceived = "Ultima ricezione",
+            RunningThreads = "Thread in esecuzione",
+            NoRunningThreads = "Nessun thread in esecuzione",
+            Details = "Dettagli",
+            ModelUsage = "Utilizzo per modello",
+            Input = "Input",
+            CachedInput = "Input in cache",
+            Output = "Output",
+            Tokens = "Token",
+            Dollars = "Dollari stimati",
+            Connection = "Connessione",
+            Setup = "Configurazione iniziale",
+            SetupTitle = "Benvenuto in Codex Info",
+            Continue = "Continua",
+            OpenSettings = "Apri impostazioni",
+            Save = "Salva",
+            Close = "Chiudi",
+            Language = "Lingua",
+            Appearance = "Aspetto",
+            Connected = "Connesso",
+            Connecting = "Connessione in corso",
+            Ready = "Pronto",
+            AuthRequired = "Autenticazione Linux richiesta",
+            QuotaDanger = "Quota critica",
+            QuotaWarning = "Avviso quota",
+            ResetWarning = "Ripristino imminente",
+            Unavailable = "Non disponibile",
+            AuthStart = "Avvia autenticazione",
+            AuthCheck = "Verifica autenticazione",
+            Retry = "Riprova",
+            Latest = "Più recente",
+            UnavailableDetails = "Dettagli non disponibili"
         },
         ["ru"] = English with
         {
-            LanguageCode = "ru", LanguageName = "Русский", AppSubtitle = "Клиент мониторинга Windows", UsageStatus = "Использование", Graph = "Динамика", Legal = "Правовая информация", Settings = "Настройки", Refresh = "Обновить", Refreshing = "Обновление…", RemainingQuota = "Оставшаяся квота", Account = "Аккаунт", Authentication = "Аутентификация", Plan = "Тариф", ResetTime = "Время сброса", ObservedAt = "Наблюдение Linux", LastReceived = "Последнее получение", RunningThreads = "Активные потоки", NoRunningThreads = "Нет активных потоков", Details = "Подробности", ModelUsage = "Использование по моделям", Input = "Ввод", CachedInput = "Ввод из кэша", Output = "Вывод", Tokens = "Токены", Dollars = "Расчётные доллары", Connection = "Подключение", Setup = "Первоначальная настройка", SetupTitle = "Добро пожаловать в Codex Info", Continue = "Продолжить", OpenSettings = "Открыть настройки", Save = "Сохранить", Close = "Закрыть", Language = "Язык", Appearance = "Внешний вид", Connected = "Подключено", Connecting = "Подключение", Ready = "Готово", AuthRequired = "Требуется аутентификация Linux", QuotaDanger = "Критическая квота", QuotaWarning = "Предупреждение о квоте", ResetWarning = "Скорый сброс", Unavailable = "Недоступно", AuthStart = "Начать аутентификацию", AuthCheck = "Проверить аутентификацию", Retry = "Повторить", Latest = "Последние данные", UnavailableDetails = "Подробности недоступны"
+            LanguageCode = "ru",
+            LanguageName = "Русский",
+            AppSubtitle = "Клиент мониторинга Windows",
+            UsageStatus = "Использование",
+            Graph = "Динамика",
+            Legal = "Правовая информация",
+            Settings = "Настройки",
+            Refresh = "Обновить",
+            Refreshing = "Обновление…",
+            RemainingQuota = "Оставшаяся квота",
+            Account = "Аккаунт",
+            Authentication = "Аутентификация",
+            Plan = "Тариф",
+            ResetTime = "Время сброса",
+            ObservedAt = "Наблюдение Linux",
+            LastReceived = "Последнее получение",
+            RunningThreads = "Активные потоки",
+            NoRunningThreads = "Нет активных потоков",
+            Details = "Подробности",
+            ModelUsage = "Использование по моделям",
+            Input = "Ввод",
+            CachedInput = "Ввод из кэша",
+            Output = "Вывод",
+            Tokens = "Токены",
+            Dollars = "Расчётные доллары",
+            Connection = "Подключение",
+            Setup = "Первоначальная настройка",
+            SetupTitle = "Добро пожаловать в Codex Info",
+            Continue = "Продолжить",
+            OpenSettings = "Открыть настройки",
+            Save = "Сохранить",
+            Close = "Закрыть",
+            Language = "Язык",
+            Appearance = "Внешний вид",
+            Connected = "Подключено",
+            Connecting = "Подключение",
+            Ready = "Готово",
+            AuthRequired = "Требуется аутентификация Linux",
+            QuotaDanger = "Критическая квота",
+            QuotaWarning = "Предупреждение о квоте",
+            ResetWarning = "Скорый сброс",
+            Unavailable = "Недоступно",
+            AuthStart = "Начать аутентификацию",
+            AuthCheck = "Проверить аутентификацию",
+            Retry = "Повторить",
+            Latest = "Последние данные",
+            UnavailableDetails = "Подробности недоступны"
         },
     };
 

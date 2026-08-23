@@ -8,22 +8,16 @@
 //! snapshot into [`ApiSnapshotPublisher`]; HTTP handlers only read that copy.
 
 use crate::security;
-use axum::extract::State;
-use axum::http::{
-    header::{CACHE_CONTROL, CONNECTION, CONTENT_TYPE},
-    HeaderValue, StatusCode,
-};
-use axum::response::{IntoResponse, Response};
-use axum::routing::get;
-use axum::{Json, Router};
 use serde::Serialize;
 use std::collections::HashSet;
 use std::env;
 use std::fmt;
-use std::net::{IpAddr, SocketAddr, TcpListener};
+use std::io::{self, Read, Write};
+use std::net::{IpAddr, Shutdown, SocketAddr, TcpListener, TcpStream};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, RwLock};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::net::TcpListener as TokioTcpListener;
 use tokio::sync::oneshot;
 
@@ -32,15 +26,28 @@ pub const API_LISTEN_ENV: &str = "CODEX_INFO_API_LISTEN";
 pub const API_VERSION: &str = "v1";
 /// Maximum number of model rows accepted at the public boundary.
 pub const MAX_PUBLIC_MODELS: usize = 3;
-/// History is retained locally for three months. Keep the wire representation
-/// bounded even when a busy account has one sample per minute for that period.
+/// SQLite retains three calendar months, while one REST details snapshot is
+/// limited to one calendar month of minute buckets.
 pub const MAX_PUBLIC_HISTORY_PERIODS: usize = 128;
-pub const MAX_PUBLIC_HISTORY_SAMPLES: usize = 100_000;
+pub const MAX_PUBLIC_HISTORY_SAMPLES: usize = 31 * 24 * 60;
 pub const MAX_PUBLIC_THREADS: usize = 256;
 const API_START_TIMEOUT: Duration = Duration::from_secs(1);
 const MAX_PUBLIC_UNIX_SECONDS: i64 = 253_402_300_799; // 9999-12-31T23:59:59Z
 const MAX_PUBLIC_ID_SCALARS: usize = 512;
 const MAX_PUBLIC_HISTORY_LABEL_SCALARS: usize = 512;
+
+// These limits are the finite wire boundary from docs/REST_API_V1.md. The
+// parser closes every connection after one request, so no unbounded body or
+// pipeline is ever handed to the snapshot handlers.
+const MAX_REQUEST_LINE_BYTES: usize = 2_048;
+const MAX_METHOD_BYTES: usize = 8;
+const MAX_REQUEST_HEADERS: usize = 32;
+const MAX_HEADER_NAME_BYTES: usize = 64;
+const MAX_HEADER_VALUE_BYTES: usize = 1_024;
+const MAX_HEADER_AGGREGATE_BYTES: usize = 8 * 1_024;
+const MAX_ACTIVE_CONNECTIONS: usize = 16;
+const REQUEST_HEADER_DEADLINE: Duration = Duration::from_secs(3);
+const REQUEST_READ_POLL: Duration = Duration::from_millis(100);
 
 /// The public availability of the monitor data. No error detail is exported.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
@@ -90,6 +97,10 @@ pub struct PublicHistoryPeriod {
     pub id: String,
     pub start_at: i64,
     pub end_at: i64,
+    /// Canonical quota-reset boundary. `end_at` may be clipped when a newer
+    /// reset period begins before this boundary, so clients must not infer
+    /// sample ownership from the graph end.
+    pub reset_at: i64,
     pub label: String,
     pub current: bool,
 }
@@ -257,7 +268,9 @@ impl PublicDetails {
                 || !period_ids.insert(period.id.as_str())
                 || !valid_timestamp(period.start_at)
                 || !valid_timestamp(period.end_at)
+                || !valid_timestamp(period.reset_at)
                 || period.end_at < period.start_at
+                || period.reset_at < period.end_at
                 || !valid_text(&period.label, MAX_PUBLIC_HISTORY_LABEL_SCALARS)
                 || period.label.is_empty()
             {
@@ -381,6 +394,7 @@ pub enum ApiSnapshotError {
     InvalidHistorySample,
     InvalidThread,
     ListTooLong,
+    Serialization,
 }
 
 impl fmt::Display for ApiSnapshotError {
@@ -394,6 +408,7 @@ impl fmt::Display for ApiSnapshotError {
             Self::InvalidHistorySample => "public snapshot has an invalid history sample",
             Self::InvalidThread => "public snapshot has an invalid thread",
             Self::ListTooLong => "public snapshot has too many rows",
+            Self::Serialization => "public snapshot could not be serialized",
         };
         formatter.write_str(message)
     }
@@ -401,10 +416,51 @@ impl fmt::Display for ApiSnapshotError {
 
 impl std::error::Error for ApiSnapshotError {}
 
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Serialize)]
+struct StatusResponse<'a> {
+    api_version: &'static str,
+    #[serde(flatten)]
+    snapshot: &'a PublicSnapshot,
+}
+
+#[derive(Serialize)]
+struct DetailsResponse<'a> {
+    api_version: &'static str,
+    #[serde(flatten)]
+    details: &'a PublicDetails,
+}
+
+fn serialize_status(snapshot: &PublicSnapshot) -> Result<Vec<u8>, ApiSnapshotError> {
+    serde_json::to_vec(&StatusResponse {
+        api_version: API_VERSION,
+        snapshot,
+    })
+    .map_err(|_| ApiSnapshotError::Serialization)
+}
+
+fn serialize_details(details: &PublicDetails) -> Result<Vec<u8>, ApiSnapshotError> {
+    serde_json::to_vec(&DetailsResponse {
+        api_version: API_VERSION,
+        details,
+    })
+    .map_err(|_| ApiSnapshotError::Serialization)
+}
+
+#[derive(Clone, Debug, PartialEq)]
 struct PublishedSnapshot {
-    status: PublicSnapshot,
-    details: PublicDetails,
+    status_body: Vec<u8>,
+    details_body: Vec<u8>,
+}
+
+impl Default for PublishedSnapshot {
+    fn default() -> Self {
+        let status = PublicSnapshot::default();
+        let details = PublicDetails::default();
+        Self {
+            status_body: serialize_status(&status).expect("default status must serialize"),
+            details_body: serialize_details(&details).expect("default details must serialize"),
+        }
+    }
 }
 
 type SharedSnapshot = Arc<RwLock<PublishedSnapshot>>;
@@ -422,13 +478,15 @@ impl ApiSnapshotPublisher {
         snapshot.validate()?;
         let details = PublicDetails::from_snapshot(&snapshot);
         details.validate()?;
+        let status_body = serialize_status(&snapshot)?;
+        let details_body = serialize_details(&details)?;
         let mut current = self
             .snapshot
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         *current = PublishedSnapshot {
-            status: snapshot,
-            details,
+            status_body,
+            details_body,
         };
         Ok(())
     }
@@ -439,11 +497,16 @@ impl ApiSnapshotPublisher {
     pub fn publish_details(&self, details: PublicDetails) -> Result<(), ApiSnapshotError> {
         details.validate()?;
         let status = details.status_snapshot();
+        let status_body = serialize_status(&status)?;
+        let details_body = serialize_details(&details)?;
         let mut current = self
             .snapshot
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        *current = PublishedSnapshot { status, details };
+        *current = PublishedSnapshot {
+            status_body,
+            details_body,
+        };
         Ok(())
     }
 }
@@ -562,17 +625,16 @@ impl ApiServer {
                             return;
                         }
                     };
-                    let app = router(snapshot);
                     if started.send(Ok(())).is_err() {
                         return;
                     }
-                    // Snapshot responses are idempotent GETs. On shutdown we
-                    // stop accepting immediately, so an unavailable Windows
-                    // client simply reconnects to the next server instance.
-                    tokio::select! {
-                        _ = axum::serve(listener, app) => {}
-                        _ = shutdown_receiver => {}
-                    }
+                    serve_listener(
+                        listener,
+                        snapshot,
+                        authority_for(local_addr),
+                        shutdown_receiver,
+                    )
+                    .await;
                 });
             })
             .map_err(|_| ApiServerError::WorkerStartFailed)?;
@@ -630,107 +692,485 @@ struct HealthResponse {
 }
 
 #[derive(Serialize)]
-struct StatusResponse {
-    api_version: &'static str,
-    #[serde(flatten)]
-    snapshot: PublicSnapshot,
-}
-
-#[derive(Serialize)]
-struct DetailsResponse {
-    api_version: &'static str,
-    #[serde(flatten)]
-    details: PublicDetails,
-}
-
-#[derive(Serialize)]
 struct ErrorResponse {
     api_version: &'static str,
     error: &'static str,
 }
 
-fn router(snapshot: SharedSnapshot) -> Router {
-    Router::new()
-        .route("/v1/health", get(health).fallback(method_not_allowed))
-        .route("/v1/status", get(status).fallback(method_not_allowed))
-        .route("/v1/details", get(details).fallback(method_not_allowed))
-        .fallback(not_found)
-        .with_state(snapshot)
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ApiRoute {
+    Health,
+    Status,
+    Details,
 }
 
-async fn health() -> Response {
-    json_response(
-        StatusCode::OK,
-        HealthResponse {
-            api_version: API_VERSION,
-            service: "codex-info",
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ParseFailure {
+    BadRequest,
+    HeadersTooLarge,
+}
+
+#[derive(Debug)]
+enum HeaderRead {
+    Complete {
+        data: Vec<u8>,
+        line_end: usize,
+        terminator: usize,
+        trailing_data: bool,
+    },
+    Timeout,
+    BadRequest,
+    HeadersTooLarge,
+    Closed,
+}
+
+#[derive(Debug)]
+struct ParsedRequest {
+    route: Option<ApiRoute>,
+    is_get: bool,
+    body_not_allowed: bool,
+}
+
+fn authority_for(address: SocketAddr) -> String {
+    match address {
+        SocketAddr::V4(address) => format!("{}:{}", address.ip(), address.port()),
+        SocketAddr::V6(address) => format!("[{}]:{}", address.ip(), address.port()),
+    }
+}
+
+/// Accept at most one bounded HTTP/1.1 request on each socket. A small
+/// blocking worker per admitted socket keeps the parser independent from
+/// axum/hyper's permissive connection lifecycle while the listener itself
+/// remains asynchronous and shutdown-aware.
+async fn serve_listener(
+    listener: TokioTcpListener,
+    snapshot: SharedSnapshot,
+    authority: String,
+    mut shutdown_receiver: oneshot::Receiver<()>,
+) {
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let active = Arc::new(AtomicUsize::new(0));
+    let mut workers: Vec<JoinHandle<()>> = Vec::new();
+
+    loop {
+        tokio::select! {
+            _ = &mut shutdown_receiver => break,
+            accepted = listener.accept() => {
+                let Ok((stream, _peer)) = accepted else {
+                    continue;
+                };
+                let Ok(stream) = stream.into_std() else {
+                    continue;
+                };
+                let _ = stream.set_nonblocking(false);
+
+                if !try_admit_connection(&active) {
+                    let mut stream = stream;
+                    let _ = stream.set_write_timeout(Some(Duration::from_secs(1)));
+                    write_error_response(&mut stream, 429, "too_many_requests");
+                    let _ = stream.shutdown(Shutdown::Both);
+                    continue;
+                }
+
+                // Completed joins are reaped before retaining another handle,
+                // preventing a sequential client from growing this vector.
+                let mut worker_index = 0;
+                while worker_index < workers.len() {
+                    if workers[worker_index].is_finished() {
+                        let worker = workers.swap_remove(worker_index);
+                        let _ = worker.join();
+                    } else {
+                        worker_index += 1;
+                    }
+                }
+
+                let worker_shutdown = Arc::clone(&shutdown);
+                let worker_active = Arc::clone(&active);
+                let worker_snapshot = Arc::clone(&snapshot);
+                let worker_authority = authority.clone();
+                workers.push(thread::spawn(move || {
+                    handle_connection(
+                        stream,
+                        worker_snapshot,
+                        worker_authority,
+                        worker_shutdown,
+                    );
+                    worker_active.fetch_sub(1, Ordering::AcqRel);
+                }));
+            }
+        }
+    }
+
+    // Stop new admissions first, then give already accepted sockets the
+    // documented finite drain window. Their read deadline is also bounded by
+    // three seconds, so joining does not leave an orphaned listener worker.
+    shutdown.store(true, Ordering::Release);
+    for worker in workers {
+        let _ = worker.join();
+    }
+}
+
+fn try_admit_connection(active: &AtomicUsize) -> bool {
+    let mut current = active.load(Ordering::Acquire);
+    loop {
+        if current >= MAX_ACTIVE_CONNECTIONS {
+            return false;
+        }
+        match active.compare_exchange_weak(
+            current,
+            current + 1,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => return true,
+            Err(next) => current = next,
+        }
+    }
+}
+
+fn handle_connection(
+    mut stream: TcpStream,
+    snapshot: SharedSnapshot,
+    authority: String,
+    shutdown: Arc<AtomicBool>,
+) {
+    let _ = stream.set_read_timeout(Some(REQUEST_READ_POLL));
+    let _ = stream.set_write_timeout(Some(Duration::from_secs(3)));
+
+    if shutdown.load(Ordering::Acquire) {
+        let _ = stream.shutdown(Shutdown::Both);
+        return;
+    }
+
+    let response = match read_request_headers(&mut stream, &shutdown) {
+        HeaderRead::Complete {
+            data,
+            line_end,
+            terminator,
+            trailing_data,
+        } => match parse_request(&data, line_end, terminator, trailing_data, &authority) {
+            Ok(request) => match request.route {
+                None => (404, error_body("not_found")),
+                Some(_) if !request.is_get => (405, error_body("method_not_allowed")),
+                Some(_) if request.body_not_allowed => {
+                    (413, error_body("request_body_not_allowed"))
+                }
+                Some(ApiRoute::Health) => (200, health_body()),
+                Some(ApiRoute::Status) => {
+                    let body = snapshot
+                        .read()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .status_body
+                        .clone();
+                    (200, body)
+                }
+                Some(ApiRoute::Details) => {
+                    let body = snapshot
+                        .read()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .details_body
+                        .clone();
+                    (200, body)
+                }
+            },
+            Err(ParseFailure::BadRequest) => (400, error_body("bad_request")),
+            Err(ParseFailure::HeadersTooLarge) => (431, error_body("request_headers_too_large")),
         },
-    )
+        HeaderRead::Timeout => (408, error_body("request_timeout")),
+        HeaderRead::BadRequest => (400, error_body("bad_request")),
+        HeaderRead::HeadersTooLarge => (431, error_body("request_headers_too_large")),
+        HeaderRead::Closed => {
+            let _ = stream.shutdown(Shutdown::Both);
+            return;
+        }
+    };
+
+    write_json_response(&mut stream, response.0, &response.1);
+    let _ = stream.shutdown(Shutdown::Both);
 }
 
-async fn status(State(snapshot): State<SharedSnapshot>) -> Response {
-    let snapshot = snapshot
-        .read()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .status
-        .clone();
-    json_response(
-        StatusCode::OK,
-        StatusResponse {
-            api_version: API_VERSION,
-            snapshot,
-        },
-    )
+fn read_request_headers(stream: &mut TcpStream, shutdown: &AtomicBool) -> HeaderRead {
+    let started = Instant::now();
+    let mut data = Vec::with_capacity(4 * 1_024);
+
+    loop {
+        if shutdown.load(Ordering::Acquire) {
+            return HeaderRead::Closed;
+        }
+        if started.elapsed() >= REQUEST_HEADER_DEADLINE {
+            return HeaderRead::Timeout;
+        }
+
+        let mut chunk = [0_u8; 1_024];
+        match stream.read(&mut chunk) {
+            Ok(0) => return HeaderRead::Closed,
+            Ok(count) => {
+                data.extend_from_slice(&chunk[..count]);
+                if let Some(terminator) = find_bytes(&data, b"\r\n\r\n") {
+                    let Some(line_end) = find_bytes(&data, b"\r\n") else {
+                        return HeaderRead::BadRequest;
+                    };
+                    if line_end.saturating_add(2) > MAX_REQUEST_LINE_BYTES {
+                        return HeaderRead::BadRequest;
+                    }
+                    let header_start = line_end + 2;
+                    let header_aggregate =
+                        terminator.saturating_add(2).saturating_sub(header_start);
+                    if header_aggregate > MAX_HEADER_AGGREGATE_BYTES {
+                        return HeaderRead::HeadersTooLarge;
+                    }
+                    let header_end = terminator + 4;
+                    if invalid_header_line_endings(&data[..header_end]) {
+                        return HeaderRead::BadRequest;
+                    }
+                    return HeaderRead::Complete {
+                        trailing_data: data.len() > header_end,
+                        data,
+                        line_end,
+                        terminator,
+                    };
+                }
+
+                if find_bytes(&data, b"\r\n").is_none() {
+                    if data.len() > MAX_REQUEST_LINE_BYTES {
+                        return HeaderRead::BadRequest;
+                    }
+                } else if data.len() > MAX_REQUEST_LINE_BYTES + MAX_HEADER_AGGREGATE_BYTES + 4 {
+                    return HeaderRead::HeadersTooLarge;
+                }
+                if data
+                    .windows(2)
+                    .any(|window| window[1] == b'\n' && window[0] != b'\r')
+                    || data.first() == Some(&b'\n')
+                {
+                    return HeaderRead::BadRequest;
+                }
+            }
+            Err(error) if error.kind() == io::ErrorKind::TimedOut => continue,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(_) => return HeaderRead::Closed,
+        }
+    }
 }
 
-async fn details(State(snapshot): State<SharedSnapshot>) -> Response {
-    let details = snapshot
-        .read()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .details
-        .clone();
-    json_response(
-        StatusCode::OK,
-        DetailsResponse {
-            api_version: API_VERSION,
-            details,
-        },
-    )
+fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
 }
 
-async fn method_not_allowed() -> Response {
-    json_response(
-        StatusCode::METHOD_NOT_ALLOWED,
-        ErrorResponse {
-            api_version: API_VERSION,
-            error: "method_not_allowed",
-        },
-    )
+fn invalid_header_line_endings(data: &[u8]) -> bool {
+    data.iter().enumerate().any(|(index, byte)| {
+        (*byte == b'\n' && (index == 0 || data[index - 1] != b'\r'))
+            || (*byte == b'\r' && data.get(index + 1) != Some(&b'\n'))
+    })
 }
 
-async fn not_found() -> Response {
-    json_response(
-        StatusCode::NOT_FOUND,
-        ErrorResponse {
-            api_version: API_VERSION,
-            error: "not_found",
-        },
-    )
+fn parse_request(
+    data: &[u8],
+    line_end: usize,
+    terminator: usize,
+    trailing_data: bool,
+    authority: &str,
+) -> Result<ParsedRequest, ParseFailure> {
+    let request_line = &data[..line_end];
+    let mut fields = request_line.split(|byte| *byte == b' ');
+    let method = fields.next().ok_or(ParseFailure::BadRequest)?;
+    let target = fields.next().ok_or(ParseFailure::BadRequest)?;
+    let version = fields.next().ok_or(ParseFailure::BadRequest)?;
+    if fields.next().is_some()
+        || method.is_empty()
+        || method.len() > MAX_METHOD_BYTES
+        || !is_http_token(method)
+        || version != b"HTTP/1.1"
+        || target.is_empty()
+        || target.iter().any(|byte| !(0x21..=0x7e).contains(byte))
+    {
+        return Err(ParseFailure::BadRequest);
+    }
+
+    let route = classify_target(target)?;
+    let mut seen = HashSet::new();
+    let mut host = None;
+    let mut content_length = None;
+    let mut transfer_encoding = false;
+    let mut disallowed_header = false;
+    let header_section = &data[line_end + 2..terminator];
+    let mut cursor = 0;
+    let mut header_count = 0usize;
+    while cursor < header_section.len() {
+        let line = match find_bytes(&header_section[cursor..], b"\r\n") {
+            Some(offset) => {
+                let line = &header_section[cursor..cursor + offset];
+                cursor += offset + 2;
+                line
+            }
+            None => {
+                let line = &header_section[cursor..];
+                cursor = header_section.len();
+                line
+            }
+        };
+        if line.is_empty() || matches!(line.first(), Some(b' ' | b'\t')) {
+            return Err(ParseFailure::BadRequest);
+        }
+        header_count += 1;
+        if header_count > MAX_REQUEST_HEADERS {
+            return Err(ParseFailure::HeadersTooLarge);
+        }
+        let colon = line
+            .iter()
+            .position(|byte| *byte == b':')
+            .ok_or(ParseFailure::BadRequest)?;
+        let name = &line[..colon];
+        let raw_value = &line[colon + 1..];
+        if name.len() > MAX_HEADER_NAME_BYTES || raw_value.len() > MAX_HEADER_VALUE_BYTES {
+            return Err(ParseFailure::HeadersTooLarge);
+        }
+        if !is_http_token(name) {
+            return Err(ParseFailure::BadRequest);
+        }
+        let name = std::str::from_utf8(name)
+            .map_err(|_| ParseFailure::BadRequest)?
+            .to_ascii_lowercase();
+        if !seen.insert(name.clone()) {
+            return Err(ParseFailure::BadRequest);
+        }
+        let value = trim_ows(raw_value);
+        let value = std::str::from_utf8(value).map_err(|_| ParseFailure::BadRequest)?;
+        if value.chars().any(char::is_control) {
+            return Err(ParseFailure::BadRequest);
+        }
+
+        match name.as_str() {
+            "host" => host = Some(value.to_owned()),
+            "accept" | "user-agent" => {}
+            "connection" => {
+                if value
+                    .split(',')
+                    .any(|token| token.trim().eq_ignore_ascii_case("upgrade"))
+                {
+                    return Err(ParseFailure::BadRequest);
+                }
+            }
+            "content-length" => {
+                if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+                    return Err(ParseFailure::BadRequest);
+                }
+                let length = value.parse::<u64>().map_err(|_| ParseFailure::BadRequest)?;
+                content_length = Some(length);
+            }
+            "transfer-encoding" => transfer_encoding = true,
+            _ => disallowed_header = true,
+        }
+    }
+
+    if host.as_deref() != Some(authority) {
+        return Err(ParseFailure::BadRequest);
+    }
+    if disallowed_header {
+        return Err(ParseFailure::BadRequest);
+    }
+
+    Ok(ParsedRequest {
+        route,
+        is_get: method == b"GET",
+        body_not_allowed: trailing_data
+            || transfer_encoding
+            || content_length.is_some_and(|length| length != 0),
+    })
 }
 
-fn json_response<T>(status: StatusCode, value: T) -> Response
-where
-    T: Serialize,
-{
-    let mut response = (status, Json(value)).into_response();
-    let headers = response.headers_mut();
-    headers.insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
-    headers.insert(
-        CONTENT_TYPE,
-        HeaderValue::from_static("application/json; charset=utf-8"),
+fn classify_target(target: &[u8]) -> Result<Option<ApiRoute>, ParseFailure> {
+    if !target.starts_with(b"/") || target.starts_with(b"//") {
+        return Err(ParseFailure::BadRequest);
+    }
+    Ok(match target {
+        b"/v1/health" => Some(ApiRoute::Health),
+        b"/v1/status" => Some(ApiRoute::Status),
+        b"/v1/details" => Some(ApiRoute::Details),
+        _ => None,
+    })
+}
+
+fn is_http_token(value: &[u8]) -> bool {
+    !value.is_empty()
+        && value.iter().all(|byte| {
+            byte.is_ascii_alphanumeric()
+                || matches!(
+                    byte,
+                    b'!' | b'#'
+                        | b'$'
+                        | b'%'
+                        | b'&'
+                        | b'\''
+                        | b'*'
+                        | b'+'
+                        | b'-'
+                        | b'.'
+                        | b'^'
+                        | b'_'
+                        | b'`'
+                        | b'|'
+                        | b'~'
+                )
+        })
+}
+
+fn trim_ows(value: &[u8]) -> &[u8] {
+    let start = value
+        .iter()
+        .position(|byte| !matches!(byte, b' ' | b'\t'))
+        .unwrap_or(value.len());
+    let end = value
+        .iter()
+        .rposition(|byte| !matches!(byte, b' ' | b'\t'))
+        .map_or(start, |index| index + 1);
+    &value[start..end]
+}
+
+fn health_body() -> Vec<u8> {
+    serde_json::to_vec(&HealthResponse {
+        api_version: API_VERSION,
+        service: "codex-info",
+    })
+    .expect("fixed health response must serialize")
+}
+
+fn error_body(error: &'static str) -> Vec<u8> {
+    serde_json::to_vec(&ErrorResponse {
+        api_version: API_VERSION,
+        error,
+    })
+    .expect("fixed error response must serialize")
+}
+
+fn write_error_response(stream: &mut TcpStream, status: u16, error: &'static str) {
+    let body = error_body(error);
+    write_json_response(stream, status, &body);
+}
+
+fn write_json_response(stream: &mut TcpStream, status: u16, body: &[u8]) {
+    let reason = match status {
+        200 => "OK",
+        400 => "Bad Request",
+        404 => "Not Found",
+        405 => "Method Not Allowed",
+        408 => "Request Timeout",
+        413 => "Content Too Large",
+        429 => "Too Many Requests",
+        431 => "Request Header Fields Too Large",
+        500 => "Internal Server Error",
+        503 => "Service Unavailable",
+        _ => "Error",
+    };
+    let header = format!(
+        "HTTP/1.1 {status} {reason}\r\ncontent-type: application/json; charset=utf-8\r\ncache-control: no-store\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+        body.len()
     );
-    headers.insert(CONNECTION, HeaderValue::from_static("close"));
-    response
+    let _ = stream.write_all(header.as_bytes());
+    let _ = stream.write_all(body);
+    let _ = stream.flush();
 }
 
 #[cfg(test)]
@@ -740,6 +1180,7 @@ mod tests {
     use std::io::{Read, Write};
     use std::net::TcpStream;
     use std::sync::{Mutex, OnceLock};
+    use std::time::Instant;
 
     fn environment_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -756,11 +1197,20 @@ mod tests {
     }
 
     fn wire_request(address: SocketAddr, request: &str) -> String {
+        // Existing fixtures use a human-readable localhost Host. Wire it to
+        // the ephemeral listener authority so production parsing remains
+        // exact while the tests exercise the same origin-form contract.
+        let authority = authority_for(address);
+        let host_rewritten = request.replace("Host: localhost", &format!("Host: {authority}"));
+        wire_request_raw(address, host_rewritten.as_bytes())
+    }
+
+    fn wire_request_raw(address: SocketAddr, request: &[u8]) -> String {
         let mut stream = TcpStream::connect(address).unwrap();
         stream
             .set_read_timeout(Some(Duration::from_secs(2)))
             .unwrap();
-        stream.write_all(request.as_bytes()).unwrap();
+        stream.write_all(request).unwrap();
         stream.flush().unwrap();
         let mut response = String::new();
         stream.read_to_string(&mut response).unwrap();
@@ -798,6 +1248,7 @@ mod tests {
                 id: "1780400000".into(),
                 start_at: 1_779_395_200,
                 end_at: 1_780_400_000,
+                reset_at: 1_780_400_000,
                 label: "2026/06/01 — 2026/06/08".into(),
                 current: true,
             }],
@@ -828,6 +1279,102 @@ mod tests {
             }],
             estimated_cost_label: "概算 $1".into(),
         }
+    }
+
+    fn history_fixture(sample_count: usize) -> PublicDetails {
+        let mut details = detailed_fixture();
+        let end = 1_800_000_000_i64;
+        let start = end - sample_count as i64 * 60;
+        details.observed_at = Some(end);
+        details.quota = Some(PublicQuota {
+            remaining_percent: 48.0,
+            reset_at: end + 604_800,
+            window_seconds: 604_800,
+            monthly: false,
+        });
+        details.history_periods = vec![PublicHistoryPeriod {
+            id: "slo-period".into(),
+            start_at: start,
+            end_at: end + 604_800,
+            reset_at: end + 604_800,
+            label: "SLO fixture".into(),
+            current: true,
+        }];
+        details.history_samples = (0..sample_count)
+            .map(|index| {
+                let fraction = index as f64 / sample_count.max(1) as f64;
+                PublicHistorySample {
+                    timestamp: start + index as i64 * 60,
+                    reset_at: end + 604_800,
+                    remaining_percent: Some(100.0 - 52.0 * fraction),
+                    sol_dollars: 8.75 * fraction,
+                    terra_dollars: 4.5 * fraction,
+                    luna_dollars: 2.75 * fraction,
+                    sol_tokens: (8_400.0 * fraction) as u64,
+                    terra_tokens: (4_200.0 * fraction) as u64,
+                    luna_tokens: (2_100.0 * fraction) as u64,
+                }
+            })
+            .collect();
+        details
+    }
+
+    fn latency_percentiles(address: SocketAddr, route: &str, runs: usize) -> (f64, f64, f64) {
+        let request =
+            format!("GET {route} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+        for _ in 0..5 {
+            let _ = wire_request(address, &request);
+        }
+        let mut elapsed = Vec::with_capacity(runs);
+        for _ in 0..runs {
+            let started = Instant::now();
+            let response = wire_request(address, &request);
+            assert!(response.starts_with("HTTP/1.1"));
+            elapsed.push(started.elapsed().as_secs_f64() * 1_000.0);
+        }
+        elapsed.sort_by(f64::total_cmp);
+        let percentile = |percent: usize| elapsed[(runs * percent).div_ceil(100) - 1];
+        (percentile(90), percentile(95), elapsed[runs - 1])
+    }
+
+    #[test]
+    #[ignore = "explicit host loopback latency SLO gate"]
+    fn all_rest_routes_meet_latency_slo_at_supported_capacity() {
+        let _guard = api_server_test_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut server = ApiServer::start(loopback_config()).unwrap();
+        let address = server.local_addr();
+
+        for route in ["/v1/health", "/v1/status", "/v1/missing"] {
+            let (p90, p95, maximum) = latency_percentiles(address, route, 100);
+            eprintln!("SLO route={route} n=100 p90={p90:.3}ms p95={p95:.3}ms max={maximum:.3}ms");
+            assert!(p90 <= 25.0, "{route} p90 {p90:.3}ms exceeds 25ms");
+            assert!(p95 <= 50.0, "{route} p95 {p95:.3}ms exceeds 50ms");
+        }
+
+        for (sample_count, p90_limit, p95_limit) in [
+            (10_080, 50.0, 100.0),
+            (MAX_PUBLIC_HISTORY_SAMPLES, 100.0, 150.0),
+        ] {
+            server
+                .publisher()
+                .publish_details(history_fixture(sample_count))
+                .unwrap();
+            let (p90, p95, maximum) = latency_percentiles(address, "/v1/details", 30);
+            eprintln!(
+                "SLO route=/v1/details samples={sample_count} n=30 p90={p90:.3}ms p95={p95:.3}ms max={maximum:.3}ms"
+            );
+            assert!(
+                p90 <= p90_limit,
+                "details({sample_count}) p90 {p90:.3}ms exceeds {p90_limit}ms"
+            );
+            assert!(
+                p95 <= p95_limit,
+                "details({sample_count}) p95 {p95:.3}ms exceeds {p95_limit}ms"
+            );
+        }
+        server.shutdown();
     }
 
     #[test]
@@ -961,6 +1508,182 @@ mod tests {
     }
 
     #[test]
+    fn request_wire_contract_has_bounded_read_only_mapping() {
+        let _guard = api_server_test_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut server = ApiServer::start(loopback_config()).unwrap();
+        let address = server.local_addr();
+        let authority = authority_for(address);
+        let request = |start: &str, headers: &str, body: &str| {
+            format!("{start}\r\n{headers}\r\n\r\n{body}").into_bytes()
+        };
+        let host = format!("Host: {authority}\r\nConnection: close");
+
+        let mut cases: Vec<(Vec<u8>, u16, &str)> = vec![
+            (
+                request("GET /v1/status?query=1 HTTP/1.1", &host, ""),
+                404,
+                "not_found",
+            ),
+            (
+                request("GET http://127.0.0.1:8787/v1/status HTTP/1.1", &host, ""),
+                400,
+                "bad_request",
+            ),
+            (
+                request("GET //127.0.0.1/v1/status HTTP/1.1", &host, ""),
+                400,
+                "bad_request",
+            ),
+            (
+                request("GET /v1/status HTTP/1.1", "Connection: close", ""),
+                400,
+                "bad_request",
+            ),
+            (
+                request(
+                    "GET /v1/status HTTP/1.1",
+                    &format!("Host: {authority}\r\nhost: {authority}\r\nConnection: close"),
+                    "",
+                ),
+                400,
+                "bad_request",
+            ),
+            (
+                request(
+                    "GET /v1/status HTTP/1.1",
+                    "Host: 127.0.0.1:1\r\nConnection: close",
+                    "",
+                ),
+                400,
+                "bad_request",
+            ),
+            (
+                request(
+                    "GET /v1/status HTTP/1.1",
+                    &format!("{host}\r\nContent-Length: 1"),
+                    "x",
+                ),
+                413,
+                "request_body_not_allowed",
+            ),
+            (
+                request(
+                    "GET /v1/status HTTP/1.1",
+                    &format!("{host}\r\nTransfer-Encoding: chunked"),
+                    "",
+                ),
+                413,
+                "request_body_not_allowed",
+            ),
+            (
+                request(
+                    "GET /v1/status HTTP/1.1",
+                    &format!("{host}\r\nContent-Length: nope"),
+                    "",
+                ),
+                400,
+                "bad_request",
+            ),
+            (
+                request(
+                    "GET /v1/status HTTP/1.1",
+                    &format!("{host}\r\nAuthorization: Bearer redacted"),
+                    "",
+                ),
+                400,
+                "bad_request",
+            ),
+            (
+                request(
+                    "GET /v1/status HTTP/1.1",
+                    &format!("{host}\r\nAccept: */*\r\nAccept: application/json"),
+                    "",
+                ),
+                400,
+                "bad_request",
+            ),
+            (
+                request(
+                    "POST /v1/status HTTP/1.1",
+                    &format!("{host}\r\nContent-Length: 0"),
+                    "",
+                ),
+                405,
+                "method_not_allowed",
+            ),
+            (
+                request(
+                    "POST /v1/unknown HTTP/1.1",
+                    &format!("{host}\r\nContent-Length: 0"),
+                    "",
+                ),
+                404,
+                "not_found",
+            ),
+            (
+                request("GET /v1/status HTTP/1.1\n", &host, ""),
+                400,
+                "bad_request",
+            ),
+        ];
+
+        let oversized = format!("{host}\r\nX-Oversized: {}", "x".repeat(1_025));
+        cases.push((
+            request("GET /v1/status HTTP/1.1", &oversized, ""),
+            431,
+            "request_headers_too_large",
+        ));
+        let aggregate = (0..9)
+            .map(|index| format!("X-{index}: {}", "x".repeat(1_000)))
+            .collect::<Vec<_>>()
+            .join("\r\n");
+        cases.push((
+            request(
+                "GET /v1/status HTTP/1.1",
+                &format!("{host}\r\n{aggregate}"),
+                "",
+            ),
+            431,
+            "request_headers_too_large",
+        ));
+        let count = (0..33)
+            .map(|index| format!("X-{index}: x"))
+            .collect::<Vec<_>>()
+            .join("\r\n");
+        cases.push((
+            request("GET /v1/status HTTP/1.1", &format!("{host}\r\n{count}"), ""),
+            431,
+            "request_headers_too_large",
+        ));
+
+        for (raw_request, status, error) in cases {
+            let response = wire_request_raw(address, &raw_request);
+            assert!(
+                response.starts_with(&format!("HTTP/1.1 {status}")),
+                "{response:?}"
+            );
+            assert_eq!(body(&response)["error"], error, "request={raw_request:?}");
+            assert!(response.contains("content-type: application/json; charset=utf-8"));
+            assert!(response.contains("cache-control: no-store"));
+            assert!(response.contains("connection: close"));
+        }
+
+        let canonical = wire_request_raw(
+            address,
+            format!(
+                "GET /v1/health HTTP/1.1\r\nHost: {authority}\r\nAccept: */*\r\nUser-Agent: curl/8\r\n\r\n"
+            )
+            .as_bytes(),
+        );
+        assert!(canonical.starts_with("HTTP/1.1 200"), "{canonical:?}");
+        assert_eq!(body(&canonical)["service"], "codex-info");
+
+        server.shutdown();
+    }
+
+    #[test]
     fn details_endpoint_publishes_additive_fields_without_status_drift() {
         let _guard = api_server_test_lock()
             .lock()
@@ -993,6 +1716,57 @@ mod tests {
         );
         assert_eq!(body(&status)["models"][0].as_object().unwrap().len(), 4);
         assert!(body(&status)["history_periods"].is_null());
+        server.shutdown();
+    }
+
+    #[test]
+    fn rejected_requests_cannot_mutate_the_published_pair() {
+        let _guard = api_server_test_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut server = ApiServer::start(loopback_config()).unwrap();
+        server
+            .publisher()
+            .publish_details(detailed_fixture())
+            .unwrap();
+        let before_status = body(&wire_request(
+            server.local_addr(),
+            "GET /v1/status HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        ));
+        let before_details = body(&wire_request(
+            server.local_addr(),
+            "GET /v1/details HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        ));
+
+        let cases = [
+            "DELETE /v1/status HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+                .to_owned(),
+            "GET /v1/unknown HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+                .to_owned(),
+            "GET /v1/status HTTP/1.1\r\nmalformed-header\r\nConnection: close\r\n\r\n"
+                .to_owned(),
+            format!(
+                "GET /v1/status HTTP/1.1\r\nHost: localhost\r\nX-Oversize: {}\r\nConnection: close\r\n\r\n",
+                "x".repeat(128 * 1024)
+            ),
+        ];
+        for request in cases {
+            let _ = wire_request(server.local_addr(), &request);
+            assert_eq!(
+                body(&wire_request(
+                    server.local_addr(),
+                    "GET /v1/status HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+                )),
+                before_status
+            );
+            assert_eq!(
+                body(&wire_request(
+                    server.local_addr(),
+                    "GET /v1/details HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+                )),
+                before_details
+            );
+        }
         server.shutdown();
     }
 
@@ -1048,6 +1822,31 @@ mod tests {
             "GET /v1/details HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
         );
         assert_eq!(body(&details)["estimated_cost_label"], "概算 $1");
+        server.shutdown();
+    }
+
+    #[test]
+    fn one_month_history_overflow_rejects_candidate_and_keeps_last_generation() {
+        let _guard = api_server_test_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut server = ApiServer::start(loopback_config()).unwrap();
+        let publisher = server.publisher();
+        publisher.publish_details(detailed_fixture()).unwrap();
+
+        let oversized = history_fixture(MAX_PUBLIC_HISTORY_SAMPLES + 1);
+        assert_eq!(
+            publisher.publish_details(oversized),
+            Err(ApiSnapshotError::ListTooLong)
+        );
+
+        let details = wire_request(
+            server.local_addr(),
+            "GET /v1/details HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        );
+        let details = body(&details);
+        assert_eq!(details["estimated_cost_label"], "概算 $1");
+        assert_eq!(details["history_samples"].as_array().unwrap().len(), 1);
         server.shutdown();
     }
 

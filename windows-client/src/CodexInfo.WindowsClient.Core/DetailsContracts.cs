@@ -76,7 +76,11 @@ public sealed record ApiHistoryPeriod(
     bool Current,
     string Label)
 {
-    public long? ResetAt => long.TryParse(Id, out var value) ? value : null;
+    // `id` remains opaque. Historical `end_at` can be clipped by the start of
+    // a newer period, so sample ownership uses the explicit canonical reset
+    // boundary from the wire contract instead of parsing the ID or guessing
+    // from the graph end.
+    public long ResetAt { get; init; } = EndAt;
 
     public long WindowSeconds => Math.Max(1, EndAt - StartAt);
 

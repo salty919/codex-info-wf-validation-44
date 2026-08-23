@@ -11,9 +11,11 @@ require_text docs/PRODUCT_REQUIREMENTS.md '全直積、N倍、N二乗、N階乗�
 require_text docs/REGRESSION_PREVENTION_POLICY.md 'REG-WIN-DRAG'
 require_text windows-client/src/CodexInfo.WindowsClient/WindowDragBehavior.cs 'window.BeginMoveDrag(eventArgs)'
 require_text windows-client/src/CodexInfo.WindowsClient/ViewModels/DetailsWindowViewModels.cs 'EffectiveGraphEnd'
-require_text windows-client/src/CodexInfo.WindowsClient/Controls/GraphPlotControl.cs 'unobservedStart'
+require_text windows-client/src/CodexInfo.WindowsClient/Graphing/GraphPlotProjection.cs 'syntheticFirstObservation'
+require_text windows-client/tests/CodexInfo.WindowsClient.Presentation.Tests/GraphPlotControlTests.cs 'PlotProjectionHoldsSyntheticAnchorFlatThenChangesAtFirstObservation'
 require_text windows-client/src/CodexInfo.WindowsClient/Settings/ClientSettings.cs 'ConnectionConfigured'
-require_text windows-client/src/CodexInfo.WindowsClient/MainWindow.axaml.cs 'ShouldOpenSetup'
+require_text windows-client/src/CodexInfo.WindowsClient/ViewModels/SetupFlow.cs 'SetupLaunchPolicy'
+require_text windows-client/tests/CodexInfo.WindowsClient.Presentation.Tests/WindowDragGeometryTests.cs 'SetupLaunchPolicy.ShouldOpen'
 
 if rg -q 'SetCursorPos|mouse_event|SendInput' windows-client/src; then
     fail 'product source contains physical cursor or synthetic mouse API'

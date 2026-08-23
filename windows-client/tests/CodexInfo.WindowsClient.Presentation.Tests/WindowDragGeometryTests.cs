@@ -170,10 +170,10 @@ public sealed class WindowDragGeometryTests
     [Fact]
     public void Configured_connection_skips_intrusive_first_run_setup()
     {
-        Assert.True(MainWindow.ShouldOpenSetup(new ClientSettings("ja", false)));
-        Assert.False(MainWindow.ShouldOpenSetup(new ClientSettings("ja", false) { ConnectionConfigured = true }));
-        Assert.False(MainWindow.ShouldOpenSetup(new ClientSettings("ja", true)));
-        Assert.False(MainWindow.ShouldOpenSetup(new ClientSettings("ja", false) { SettingsCorrupt = true }));
+        Assert.True(SetupLaunchPolicy.ShouldOpen(new ClientSettings("ja", false)));
+        Assert.False(SetupLaunchPolicy.ShouldOpen(new ClientSettings("ja", false) { ConnectionConfigured = true }));
+        Assert.False(SetupLaunchPolicy.ShouldOpen(new ClientSettings("ja", true)));
+        Assert.False(SetupLaunchPolicy.ShouldOpen(new ClientSettings("ja", false) { SettingsCorrupt = true }));
     }
 
     [Fact]
