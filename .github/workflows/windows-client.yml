@@ -141,6 +141,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Install required test tools
+        run: sudo apt-get update && sudo apt-get install --no-install-recommends --yes ripgrep sqlite3
       - name: Enforce data protection policy
         run: bash scripts/data_protection_gate.sh
       - uses: actions/setup-dotnet@v4
@@ -188,8 +190,8 @@ jobs:
         shell: pwsh
         run: |
           $setup = (Resolve-Path ./artifacts/windows-installer/CodexInfo.WindowsClient.Setup.exe).Path
-          & $setup /VERYSILENT /SUPPRESSMSGBOXES /NORESTART /MERGETASKS=desktopicon
-          if ($LASTEXITCODE -ne 0) { throw "Installer failed with exit code $LASTEXITCODE" }
+          $installProcess = Start-Process -FilePath $setup -ArgumentList @('/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', '/MERGETASKS=desktopicon') -Wait -PassThru
+          if ($installProcess.ExitCode -ne 0) { throw "Installer failed with exit code $($installProcess.ExitCode)" }
           $install = Join-Path $env:LOCALAPPDATA 'Programs\Codex Info Monitor'
           $start = Join-Path ([Environment]::GetFolderPath('Programs')) 'Codex Info\Codex Info Monitor.lnk'
           $desktop = Join-Path ([Environment]::GetFolderPath('Desktop')) 'Codex Info Monitor.lnk'
@@ -212,8 +214,8 @@ jobs:
           $sentinel = Join-Path $settings 'installer-preserve-sentinel.txt'
           New-Item -ItemType Directory -Path $settings -Force | Out-Null
           Set-Content -LiteralPath $sentinel -Value 'preserve'
-          & $setup /VERYSILENT /SUPPRESSMSGBOXES /NORESTART
-          if ($LASTEXITCODE -ne 0) { throw "Installer update failed with exit code $LASTEXITCODE" }
+          $updateProcess = Start-Process -FilePath $setup -ArgumentList @('/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART') -Wait -PassThru
+          if ($updateProcess.ExitCode -ne 0) { throw "Installer update failed with exit code $($updateProcess.ExitCode)" }
           if (-not (Test-Path $sentinel -PathType Leaf)) { throw 'Update removed user settings.' }
           Start-Process -FilePath $start
           Start-Sleep -Seconds 5
@@ -221,8 +223,8 @@ jobs:
             Where-Object { $_.Path -eq $exe }
           if (-not $clientProcesses) { throw 'Start-menu shortcut did not launch the installed client.' }
           $clientProcesses | Stop-Process -Force
-          & $uninstaller.FullName /VERYSILENT /SUPPRESSMSGBOXES /NORESTART
-          if ($LASTEXITCODE -ne 0) { throw "Uninstaller failed with exit code $LASTEXITCODE" }
+          $uninstallProcess = Start-Process -FilePath $uninstaller.FullName -ArgumentList @('/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART') -Wait -PassThru
+          if ($uninstallProcess.ExitCode -ne 0) { throw "Uninstaller failed with exit code $($uninstallProcess.ExitCode)" }
           Start-Sleep -Seconds 4
           if (Test-Path $install) { throw 'Install directory still exists after uninstall.' }
           if (Test-Path $start) { throw 'Start-menu shortcut still exists after uninstall.' }
@@ -234,8 +236,8 @@ jobs:
         shell: pwsh
         run: |
           $setup = (Resolve-Path ./artifacts/windows-installer/CodexInfo.WindowsClient.Setup.exe).Path
-          & $setup /VERYSILENT /SUPPRESSMSGBOXES /NORESTART
-          if ($LASTEXITCODE -ne 0) { throw "E2E fixture install failed with exit code $LASTEXITCODE" }
+          $installProcess = Start-Process -FilePath $setup -ArgumentList @('/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART') -Wait -PassThru
+          if ($installProcess.ExitCode -ne 0) { throw "E2E fixture install failed with exit code $($installProcess.ExitCode)" }
           $install = Join-Path $env:LOCALAPPDATA 'Programs\Codex Info Monitor'
           $exe = Join-Path $install 'CodexInfo.WindowsClient.exe'
           if (-not (Test-Path $exe -PathType Leaf)) { throw 'Installed client executable is missing for UI E2E.' }
@@ -247,8 +249,8 @@ jobs:
           finally {
             $uninstaller = Get-ChildItem -LiteralPath $install -Filter 'unins*.exe' -File -ErrorAction SilentlyContinue | Select-Object -First 1
             if ($null -ne $uninstaller) {
-              & $uninstaller.FullName /VERYSILENT /SUPPRESSMSGBOXES /NORESTART
-              if ($LASTEXITCODE -ne 0) { throw "E2E cleanup uninstall failed with exit code $LASTEXITCODE" }
+              $uninstallProcess = Start-Process -FilePath $uninstaller.FullName -ArgumentList @('/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART') -Wait -PassThru
+              if ($uninstallProcess.ExitCode -ne 0) { throw "E2E cleanup uninstall failed with exit code $($uninstallProcess.ExitCode)" }
             }
           }
       - name: Run installed Windows graph latency budget
@@ -256,8 +258,8 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           $setup = (Resolve-Path ./artifacts/windows-installer/CodexInfo.WindowsClient.Setup.exe).Path
-          & $setup /VERYSILENT /SUPPRESSMSGBOXES /NORESTART
-          if ($LASTEXITCODE -ne 0) { throw "Graph latency fixture install failed with exit code $LASTEXITCODE" }
+          $installProcess = Start-Process -FilePath $setup -ArgumentList @('/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART') -Wait -PassThru
+          if ($installProcess.ExitCode -ne 0) { throw "Graph latency fixture install failed with exit code $($installProcess.ExitCode)" }
           $install = Join-Path $env:LOCALAPPDATA 'Programs\Codex Info Monitor'
           $exe = Join-Path $install 'CodexInfo.WindowsClient.exe'
           if (-not (Test-Path $exe -PathType Leaf)) { throw 'Installed client executable is missing for graph latency.' }
@@ -269,8 +271,8 @@ jobs:
           finally {
             $uninstaller = Get-ChildItem -LiteralPath $install -Filter 'unins*.exe' -File -ErrorAction SilentlyContinue | Select-Object -First 1
             if ($null -ne $uninstaller) {
-              & $uninstaller.FullName /VERYSILENT /SUPPRESSMSGBOXES /NORESTART
-              if ($LASTEXITCODE -ne 0) { throw "Graph latency cleanup uninstall failed with exit code $LASTEXITCODE" }
+              $uninstallProcess = Start-Process -FilePath $uninstaller.FullName -ArgumentList @('/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART') -Wait -PassThru
+              if ($uninstallProcess.ExitCode -ne 0) { throw "Graph latency cleanup uninstall failed with exit code $($uninstallProcess.ExitCode)" }
             }
           }
       - name: Upload CI installer artifact
