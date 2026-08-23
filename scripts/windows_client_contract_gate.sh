@@ -138,6 +138,9 @@ if rg -q --fixed-strings 'mouse_event' windows-client/tools/Measure-WindowsGraph
     fail 'graph latency probe must use checked SendInput rather than deprecated mouse_event'
 fi
 require_text windows-client/tools/Measure-WindowsGraphLatency.ps1 'Threading.Thread]::Yield'
+require_text windows-client/tools/Measure-WindowsGraphLatency.ps1 'graphMenuPaintProbeExtraHeight = 72'
+require_text windows-client/tools/Measure-WindowsGraphLatency.ps1 'Get-VisibleGraphMenuItemCount $menu'
+require_text windows-client/tools/Measure-WindowsGraphLatency.ps1 'ToggleState]::On'
 require_text windows-client/tools/Measure-WindowsGraphLatency.ps1 'P90Limit 75'
 require_text windows-client/tools/Measure-WindowsGraphLatency.ps1 'P95Limit 100'
 require_text windows-client/tools/Measure-WindowsGraphLatency.ps1 'P90Limit 100'

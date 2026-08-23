@@ -305,6 +305,7 @@ public static class CodexInfoWindowsGraphLatencyWin32 {
 [CodexInfoWindowsGraphLatencyWin32]::SetProcessDPIAware() | Out-Null
 $script:graphPhysicalInputSettleMilliseconds =
     [int][CodexInfoWindowsGraphLatencyWin32]::GetDoubleClickTime() + 50
+$script:graphMenuPaintProbeExtraHeight = 72
 
 function Complete-GraphPhysicalClickCycle {
     # P90/P95 stop at the first changed paint.  This interval is outside the
@@ -571,10 +572,15 @@ function Get-VisibleGraphMenuItemCount {
 }
 
 function Get-GraphMenuItemCount {
-    param([Parameter(Mandatory = $true)][IntPtr]$Handle)
+    param(
+        [Parameter(Mandatory = $true)][IntPtr]$Handle,
+        [Parameter(Mandatory = $true)][string]$MenuAutomationId
+    )
 
     try {
-        return Get-VisibleGraphMenuItemCount (Get-GraphUiaRoot $Handle)
+        $menu = Find-GraphElementByAutomationId (Get-GraphUiaRoot $Handle) $MenuAutomationId
+        if ($null -eq $menu) { return -1 }
+        return Get-VisibleGraphMenuItemCount $menu
     }
     catch {
         # Do not treat an unavailable UIA tree as a closed menu; that would
@@ -613,16 +619,18 @@ function Wait-GraphMenuState {
 
     $description = if ($Open) { "$MenuAutomationId open" } else { "$MenuAutomationId closed" }
     Wait-GraphLatencyPredicate -Description $description -TimeoutMilliseconds $TimeoutMilliseconds -Probe {
-        if ($Open) {
-            try {
-                $menu = Find-GraphElementByAutomationId (Get-GraphUiaRoot $Handle) $MenuAutomationId
-                if ($null -ne $menu -and $menu.Current.IsEnabled) { return $true }
+        try {
+            $menu = Find-GraphElementByAutomationId (Get-GraphUiaRoot $Handle) $MenuAutomationId
+            if ($null -eq $menu) { return $false }
+            $count = Get-GraphMenuItemCount $Handle $MenuAutomationId
+            if ($Open) {
+                $bounds = $menu.Current.BoundingRectangle
+                return $menu.Current.IsEnabled -and -not $menu.Current.IsOffscreen -and
+                    $bounds.Width -gt 0 -and $bounds.Height -gt 0 -and $count -gt 0
             }
-            catch { }
+            return -not $menu.Current.IsEnabled -and $count -eq 0
         }
-        $count = Get-GraphMenuItemCount $Handle
-        if ($Open) { return $count -gt 0 }
-        return $count -eq 0
+        catch { return $false }
     } | Out-Null
 }
 
@@ -950,7 +958,7 @@ function Measure-GraphMenu {
     Wait-GraphElementByAutomationId $Handle $AutomationId | Out-Null
     $initialMenu = Find-GraphElementByAutomationId (Get-GraphUiaRoot $Handle) $MenuAutomationId
     Assert-GraphLatency ($null -ne $initialMenu) "$Name menu UIA root is missing."
-    Assert-GraphLatency ((Get-GraphMenuItemCount $Handle) -eq 0) "$Name menu did not start closed."
+    Assert-GraphLatency ((Get-GraphMenuItemCount $Handle $MenuAutomationId) -eq 0) "$Name menu did not start closed."
 
     $samples = [System.Collections.Generic.List[object]]::new()
     for ($index = 1; $index -le $Count; $index++) {
@@ -958,9 +966,11 @@ function Measure-GraphMenu {
         Assert-GraphLatency ((Get-GraphToggleState $element) -eq [System.Windows.Automation.ToggleState]::Off) `
             "$Name selector did not start sample $index closed."
         $sample = Measure-GraphActionPaint -Handle $Handle -Element $element -Action toggle `
-            -Description "$Name sample $index" -ObservationExtraHeight 480 `
+            -Description "$Name sample $index" -ObservationExtraHeight $script:graphMenuPaintProbeExtraHeight `
             -TimeoutMilliseconds $PaintTimeoutMilliseconds
         try {
+            Wait-GraphToggleState -Handle $Handle -AutomationId $AutomationId `
+                -Expected ([System.Windows.Automation.ToggleState]::On)
             Wait-GraphMenuState -Handle $Handle -MenuAutomationId $MenuAutomationId -Open $true
         }
         catch {
@@ -987,7 +997,7 @@ function Measure-GraphMenu {
             try { [CodexInfoWindowsGraphLatencyWin32]::CaptureWindowPng($Handle, $failureImage) } catch { }
             Write-GraphLatencyLog ("menu-transition-fail: name={0} index={1} expected_open=true selector_state={2} menu_enabled={3} menu_offscreen={4} menu_bounds={5} items={6} foreground=0x{7:X} expected_hwnd=0x{8:X} cursor={9},{10} image={11}" -f
                 $Name, $index, $selectorState, $menuEnabled, $menuOffscreen,
-                $menuBounds, (Get-GraphMenuItemCount $Handle), $foreground.ToInt64(), $Handle.ToInt64(),
+                $menuBounds, (Get-GraphMenuItemCount $Handle $MenuAutomationId), $foreground.ToInt64(), $Handle.ToInt64(),
                 $cursor.X, $cursor.Y, $failureImage)
             throw
         }
@@ -1029,8 +1039,10 @@ function Assert-GraphMenuRoundTripAfterToggles {
 
     $open = Wait-GraphElementByAutomationId $Handle $AutomationId
     Measure-GraphActionPaint -Handle $Handle -Element $open -Action toggle `
-        -Description "$Name post-toggle verification open" -ObservationExtraHeight 480 `
+        -Description "$Name post-toggle verification open" -ObservationExtraHeight $script:graphMenuPaintProbeExtraHeight `
         -TimeoutMilliseconds $PaintTimeoutMilliseconds | Out-Null
+    Wait-GraphToggleState -Handle $Handle -AutomationId $AutomationId `
+        -Expected ([System.Windows.Automation.ToggleState]::On)
     Wait-GraphMenuState -Handle $Handle -MenuAutomationId $MenuAutomationId -Open $true
     Complete-GraphPhysicalClickCycle
 
