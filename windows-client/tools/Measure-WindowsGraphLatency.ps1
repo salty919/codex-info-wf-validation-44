@@ -102,6 +102,7 @@ if (-not ('CodexInfoWindowsGraphLatencyWin32' -as [type])) {
     $drawingReferences = @(
         $drawingImplementation.Location
         [System.Drawing.Size].Assembly.Location
+        [System.Security.Cryptography.SHA256].Assembly.Location
     )
     $drawingDependencyPattern = '^(System\.Private\.Windows\.|Microsoft\.Win32\.SystemEvents$)'
     $pendingDrawingDependencies = @($drawingImplementation.GetReferencedAssemblies() |
