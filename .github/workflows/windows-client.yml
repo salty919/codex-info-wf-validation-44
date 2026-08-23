@@ -362,13 +362,21 @@ jobs:
 
           # Keep the Release invisible until both exact assets have uploaded
           # and their server-side names, byte sizes, and state are verified.
-          gh release create $tag `
-            --repo $repository `
-            --verify-tag `
-            --draft `
-            --title "Codex Info Monitor $env:VERSION" `
-            --notes "Windows client $env:VERSION"
+          $createdReleaseJson = & gh api --method POST "repos/$repository/releases" `
+            -H 'Accept: application/vnd.github+json' `
+            -H 'X-GitHub-Api-Version: 2022-11-28' `
+            -f "tag_name=$tag" `
+            -f "name=Codex Info Monitor $env:VERSION" `
+            -f "body=Windows client $env:VERSION" `
+            -F draft=true `
+            -F prerelease=false
           if ($LASTEXITCODE -ne 0) { throw "Draft GitHub Release creation failed for $tag" }
+          $createdRelease = $createdReleaseJson | ConvertFrom-Json
+          if ($null -eq $createdRelease.id -or $createdRelease.tag_name -ne $tag -or
+              -not $createdRelease.draft -or $createdRelease.prerelease) {
+            throw "Created draft GitHub Release state is invalid for $tag"
+          }
+          $draftReleaseEndpoint = "repos/$repository/releases/$($createdRelease.id)"
 
           gh release upload $tag $setup $manifest --repo $repository
           if ($LASTEXITCODE -ne 0) { throw "Draft GitHub Release asset upload failed for $tag" }
@@ -376,7 +384,7 @@ jobs:
           $releaseJson = & gh api `
             -H 'Accept: application/vnd.github+json' `
             -H 'X-GitHub-Api-Version: 2022-11-28' `
-            $releaseEndpoint
+            $draftReleaseEndpoint
           if ($LASTEXITCODE -ne 0) { throw "Could not inspect the draft GitHub Release for $tag" }
           $release = $releaseJson | ConvertFrom-Json
           if ($release.tag_name -ne $tag -or -not $release.draft -or $release.prerelease) {

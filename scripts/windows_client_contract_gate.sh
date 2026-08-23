@@ -75,7 +75,8 @@ require_text .github/workflows/windows-client.yml 'needs: [version-policy, core-
 require_text .github/workflows/windows-client.yml 'cancel-in-progress: false'
 require_text .github/workflows/windows-client.yml 'Get-GitHubResourceStatus'
 require_text .github/workflows/windows-client.yml 'gh api --method POST "repos/$repository/git/refs"'
-require_text .github/workflows/windows-client.yml 'gh release create $tag'
+require_text .github/workflows/windows-client.yml 'gh api --method POST "repos/$repository/releases"'
+require_text .github/workflows/windows-client.yml '$draftReleaseEndpoint = "repos/$repository/releases/$($createdRelease.id)"'
 require_text .github/workflows/windows-client.yml 'gh release upload $tag $setup $manifest'
 require_text .github/workflows/windows-client.yml '-F draft=false'
 require_file windows-client/src/CodexInfo.WindowsClient/Settings/ClientSettingsSession.cs
