@@ -98,10 +98,28 @@ if (-not ('CodexInfoWindowsGraphLatencyWin32' -as [type])) {
     Add-Type -AssemblyName System.Drawing
     Add-Type -AssemblyName UIAutomationClient
     Add-Type -AssemblyName UIAutomationTypes
+    $drawingImplementation = [System.Drawing.Bitmap].Assembly
     $drawingReferences = @(
-        [System.Drawing.Bitmap].Assembly.Location
+        $drawingImplementation.Location
         [System.Drawing.Size].Assembly.Location
-    ) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -Unique
+    )
+    $drawingDependencyPattern = '^(System\.Private\.Windows\.|Microsoft\.Win32\.SystemEvents$)'
+    $pendingDrawingDependencies = @($drawingImplementation.GetReferencedAssemblies() |
+        Where-Object { $_.Name -match $drawingDependencyPattern })
+    $loadedDrawingDependencies = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    for ($dependencyIndex = 0; $dependencyIndex -lt $pendingDrawingDependencies.Count; $dependencyIndex++) {
+        $dependencyName = $pendingDrawingDependencies[$dependencyIndex]
+        if (-not $loadedDrawingDependencies.Add($dependencyName.FullName)) {
+            continue
+        }
+        $dependencyAssembly = [Reflection.Assembly]::Load($dependencyName)
+        $drawingReferences += $dependencyAssembly.Location
+        $pendingDrawingDependencies += @($dependencyAssembly.GetReferencedAssemblies() |
+            Where-Object { $_.Name -match $drawingDependencyPattern })
+    }
+    $drawingReferences = @($drawingReferences |
+        Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
+        Select-Object -Unique)
     Assert-GraphLatency ($drawingReferences.Count -gt 0) 'System.Drawing implementation assembly could not be resolved.'
     Add-Type -ReferencedAssemblies $drawingReferences -TypeDefinition @'
 using System;
