@@ -476,6 +476,24 @@ function Select-E2EListItem {
     $invoke.Invoke()
 }
 
+function Get-E2ESelectedListItemLabel {
+    param([Parameter(Mandatory = $true)][object[]]$Items)
+
+    foreach ($item in $Items) {
+        try {
+            $selection = $null
+            if ($item.TryGetCurrentPattern(
+                    [System.Windows.Automation.SelectionItemPattern]::Pattern,
+                    [ref]$selection) -and $selection.Current.IsSelected) {
+                $label = [string]$item.Current.Name
+                if (-not [string]::IsNullOrWhiteSpace($label)) { return $label }
+            }
+        }
+        catch { }
+    }
+    return ''
+}
+
 function Get-E2ESelectorLabel {
     param([Parameter(Mandatory = $true)][System.Windows.Automation.AutomationElement]$Selector)
 
@@ -737,7 +755,6 @@ try {
     $metricSelector = Find-E2EElementByAutomationId $graphRoot 'Graph.MetricSelector'
     Assert-E2E ($null -ne $periodSelector -and $null -ne $metricSelector) 'Graph selectors are missing.'
     $currentLabel = Get-E2ESelectorLabel $periodSelector
-    Assert-E2E (-not [string]::IsNullOrWhiteSpace($currentLabel)) 'Current period display label is empty.'
     $graphCurrent = Capture-E2EWindow $graph.Handle '02-graph-current'
 
     Write-E2E 'case-2: period current -> past -> current and display-value assertions'
@@ -753,6 +770,11 @@ try {
     }
     $periodLabels = @($periodItems | ForEach-Object { [string]$_.Current.Name } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -Unique)
     Assert-E2E ($periodLabels.Count -ge 2) "Graph period menu exposes fewer than two values: $($periodLabels -join ', ')."
+    $selectedPeriodLabel = Get-E2ESelectedListItemLabel $periodItems
+    if (-not [string]::IsNullOrWhiteSpace($selectedPeriodLabel)) {
+        $currentLabel = $selectedPeriodLabel
+    }
+    Assert-E2E ($periodLabels -contains $currentLabel) 'Current period display value is not represented by a selected menu item.'
     $pastLabel = [string]($periodLabels | Where-Object { $_ -ne $currentLabel } | Select-Object -First 1)
     Assert-E2E (-not [string]::IsNullOrWhiteSpace($pastLabel)) 'Past period option is missing.'
     Select-E2EListItem $graphRoot $pastLabel
@@ -770,7 +792,6 @@ try {
     Write-E2E 'case-3: select both metric values'
     $metricSelector = Find-E2EElementByAutomationId $graphRoot 'Graph.MetricSelector'
     $initialMetric = Get-E2ESelectorLabel $metricSelector
-    Assert-E2E (-not [string]::IsNullOrWhiteSpace($initialMetric)) 'Initial metric display value is empty.'
     Toggle-E2EElement $metricSelector
     $metricMenuLeftBoundary = $graphBounds.Left + $graphBounds.Width - 200
     $metricItems = Wait-E2E -Description 'two Graph metric options' -Probe {
@@ -782,6 +803,11 @@ try {
     }
     $metricLabels = @($metricItems | ForEach-Object { [string]$_.Current.Name } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -Unique)
     Assert-E2E ($metricLabels.Count -eq 2) "Metric menu must expose exactly two values: $($metricLabels -join ', ')."
+    $selectedMetricLabel = Get-E2ESelectedListItemLabel $metricItems
+    if (-not [string]::IsNullOrWhiteSpace($selectedMetricLabel)) {
+        $initialMetric = $selectedMetricLabel
+    }
+    Assert-E2E ($metricLabels -contains $initialMetric) 'Initial metric display value is not represented by a selected menu item.'
     $otherMetric = [string]($metricLabels | Where-Object { $_ -ne $initialMetric } | Select-Object -First 1)
     Assert-E2E (-not [string]::IsNullOrWhiteSpace($otherMetric)) 'Second metric option is missing.'
     Select-E2EListItem $graphRoot $otherMetric

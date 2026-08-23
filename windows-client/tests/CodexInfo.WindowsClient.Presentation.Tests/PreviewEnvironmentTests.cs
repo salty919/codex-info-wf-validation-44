@@ -40,12 +40,12 @@ public sealed class PreviewEnvironmentTests
         Assert.True(status.IsSuccess);
         Assert.True(status.Snapshot!.Authenticated);
         Assert.Equal(ApiState.Ready, status.Snapshot.State);
-        Assert.Equal(3UL, status.Snapshot.ActiveThreadCount);
+        Assert.Equal(6UL, status.Snapshot.ActiveThreadCount);
         Assert.Equal(3, status.Snapshot.Models.Count);
 
         Assert.True(details.IsSuccess);
         Assert.Equal(3, details.Snapshot!.HistoryPeriods.Single().Samples.Count);
-        Assert.Equal(3, details.Snapshot.Threads.Count);
+        Assert.Equal(6, details.Snapshot.Threads.Count);
         Assert.Contains(details.Snapshot.Threads, thread => thread.IsOrphan);
         Assert.Contains(details.Snapshot.Threads, thread => thread.ParentId == "preview-root");
         Assert.True(details.Snapshot.EstimatedCostLabel.Length > 0);

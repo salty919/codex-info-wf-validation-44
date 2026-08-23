@@ -135,6 +135,13 @@ same viewport. Graph keeps period, metric, series, plot, current value, Back,
 and Close in the same viewport. The complete X/native collection is preserved;
 only the Windows arrival method is split into these semantic units.
 
+Threads keeps its `900×480 logical` client size and shows six complete compact
+two-line rows without a vertical scrollbar. Each row is 56 logical pixels high
+with a 4-pixel gap. Only the seventh and later rows may use the list's internal
+vertical scrollbar; the Window itself never scrolls. A single row is not
+expanded, fonts are not reduced to increase capacity, and tree rails never
+overlap title or parent text.
+
 For every surface/monitor/DPI/size cell, the supported predicate is the
 following AND:
 
@@ -253,7 +260,7 @@ when they are unavailable.
 | WIN-PAR-05 | Preserve seven-cell period gauge and countdown. | 0%, intermediate, 100%, zero-day wording, weekly/monthly period. | Quota reset/window data | Quota boundary tests and fresh 0/10/100% host images | verified |
 | WIN-PAR-06 | Preserve graph and history. | Current/old periods, dollar/token metric, model visibility, no-history state, persistence. Period selection immediately acknowledges input, shows bounded loading when work spans a paint, retains the prior complete graph on failure/cancel, and atomically publishes only the latest revision. Right-edge labels remain at their series endpoints, move only to resolve collisions, preserve vertical order, and have zero crossing leader lines as in the X graph. X's 1%/99% vertical safety area, dedicated endpoint-label gutter, 1px flat/3px rising model paths, first-observation boundary, and sub-pixel idle-band suppression are mandatory rendering invariants. | SQLite history and graph samples | Graph fixture/cancellation/label-layout tests, SQLite persistence tests, fresh current/loading Graph images at 700x480, 940x640, and 1200x800, physical click P90/P95, independent parity review | implementation + fresh three-size current images; independent review pending |
 | WIN-PAR-14 | X版のグラフ時間軸と意味を変更しないこと。 | 現行期間の右端は将来のリセット境界ではなく観測時刻（`min(reset_at, now)`）までを使用し、開始から現在までのプロット領域を使う。過去期間は確定境界を保持する。無断の軸・系列・補間変更は受入失敗。 | Rust `graph_period_end` / `HistoryPeriod::end` と Windows `EffectiveGraphEnd` | X/Windows同一fixture、現在期間右端単体テスト、fresh Graph画像、独立レビュー | implementation + current image; independent review pending |
-| WIN-PAR-07 | Preserve active-thread details. | Empty, one thread, multiple parent/child/orphan rows, context/token data, stale/error retention. | thread/list and model context data | Thread fixture tests and fresh 1000x800 Threads image | verified |
+| WIN-PAR-07 | Preserve active-thread details. | Empty, one thread, multiple parent/child/orphan rows, context/token data, stale/error retention. Keep the fixed 900×480 client; show six complete 56px two-line cards with 4px gaps and no scrollbar, then allow list-only vertical scrolling from row seven. A one-row result is not expanded and tree rails do not overlap text. | thread/list and model context data | Thread fixture tests plus fresh 900×480 images for six rows/no scrollbar and seven rows/list scrollbar, with pixel overlap measurement | implementation; fresh installed evidence pending |
 | WIN-PAR-08 | Preserve legal-notice view and licensing text. | Accessible while authenticated and unauthenticated; `UX-20260822-UX-002` pre-authored chapter paging exposes the complete text in the fixed viewport, with chapter position, Back, and Close always visible. | Repository license notices, `UX-20260822-UX-002` chapter paging | Legal source/paragraph manifest, page-hash join, and fresh Legal image | unverified |
 | WIN-PAR-09 | Preserve locale/timezone behavior. | Supported locales, fallback locale, absolute vs relative time semantics. | Existing localization/time helpers | Localization tests, en/de/unknown fresh images, timezone settings image | verified |
 | WIN-PAR-10 | Preserve custom window behavior where applicable. | No accidental data loss on close; child windows are single-instance and cancellable; all six top-level surfaces support one native move gesture plus Minimize/Close, while only Graph supports native resize and Maximize/Restore. | Windows geometry/DPI/non-scroll authority, UX-002, window lifecycle | Fresh process HWND/rect/control trace and child-window captures | unverified |

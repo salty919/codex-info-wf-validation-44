@@ -81,7 +81,10 @@ try {
     }
     if ($window -eq [IntPtr]::Zero) { throw "Fresh $Preview window ($expectedTitle) did not open" }
     [CodexInfoCaptureWin32]::ShowWindow($window, 9) | Out-Null
-    [CodexInfoCaptureWin32]::SetWindowPos($window, [IntPtr]::Zero, 80, 80, 0, 0, 0x0015) | Out-Null
+    # Acceptance capture must not silently photograph an unrelated window if
+    # foreground activation is denied. Keep only this fresh test HWND topmost
+    # for its short capture lifetime; the process is terminated in `finally`.
+    [CodexInfoCaptureWin32]::SetWindowPos($window, [IntPtr](-1), 80, 80, 0, 0, 0x0001) | Out-Null
     [CodexInfoCaptureWin32]::BringWindowToTop($window) | Out-Null
     [CodexInfoCaptureWin32]::SetForegroundWindow($window) | Out-Null
     Start-Sleep -Milliseconds 500
@@ -102,7 +105,7 @@ try {
             throw "Graph selector has no TogglePattern: $automationId"
         }
         $toggle.Toggle()
-        [CodexInfoCaptureWin32]::SetWindowPos($window, [IntPtr]::Zero, 80, 80, 0, 0, 0x0015) | Out-Null
+        [CodexInfoCaptureWin32]::SetWindowPos($window, [IntPtr](-1), 80, 80, 0, 0, 0x0001) | Out-Null
         Start-Sleep -Milliseconds 250
     } else {
         [CodexInfoCaptureWin32]::SetCursorPos(10, 10) | Out-Null

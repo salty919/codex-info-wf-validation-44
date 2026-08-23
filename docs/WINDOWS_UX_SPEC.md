@@ -60,14 +60,15 @@ X版はデータ意味論、状態、所有権の参照元であり、Windows版
 - Setup: 現在の手順、入力、検証結果、次へ/戻る/キャンセルを同一viewportに置く。
 - Settings: 編集対象、現在値、保存、取消、復旧、戻るを同一viewportに置く。
 - Graph: 期間、metric、系列操作、plot、現在値を同一viewportに置く。
-- Threads: 空/単一/比較対象3件と更新、戻る、閉じるを同一viewportに置く。4件以上はページング、
-  選択詳細、折りたたみ等で主操作を隠さず、画面全体の縦スクロールを使わない。
+- Threads: Windowを900×480から拡大せず、空状態または先頭6件の2行カードと閉じる操作を
+  同一viewportに置く。7件目以降だけ一覧内の縦スクロールを許可し、画面全体はスクロールしない。
 - Legal: 本文を分割表示できる章/ページとし、戻る・閉じるを常時表示する。長文を理由にアプリ全体の
   ナビゲーションをスクロールの下へ追いやらない。
 
 スクロールバー、マウスホイール、トラックパッドによる画面移動を、主要画面の到達手段として
 採用しない。長い一覧・本文はページング、章切替、選択詳細、折りたたみで分割し、現在位置と
-次の操作を固定表示する。内部スクロールで隠すだけの解決はFAILとする。
+次の操作を固定表示する。例外はThreadsの7件目以降だけであり、先頭6件を完全表示した同じ一覧内
+`ScrollViewer`で追加行へ到達してよい。画面全体のスクロールや6件以下でのscrollbarはFAILとする。
   ページングや折りたたみでも主要情報を同時に比較できない場合は、レイアウトを再設計する。
 
 ### 2.1.1 Window geometry、DPI、topologyの正本
@@ -144,10 +145,11 @@ residual、HWND count、native move/resize/control-hit、foreground/cursor trace
 ### 2.1.2 旧スクロール要求のsupersede境界
 
 rootまたは内部`ScrollViewer`だけを到達手段にする旧要求は、このDecision
-`UX-20260822-UX-002`により明示的にsupersedeする。Main、Setup、Settings、Threads、Legalは、
+`UX-20260822-UX-002`により明示的にsupersedeする。Main、Setup、Settings、Legalは、
 page/step/detail/chapter/collapseで全主要情報、primary action、Back、Closeを同一viewportへ
-置く。Graphもperiod/metric/series/plot/現在値とBack/Closeを同一viewportへ置く。scrollbarや
-wheelを主要情報の到達手段にせず、既存のX版データを削除・要約・再順序化しない。
+置く。Graphもperiod/metric/series/plot/現在値とBack/Closeを同一viewportへ置く。Threadsは
+先頭6件とWindow操作を同一viewportへ置き、7件目以降に限って一覧内scrollを使う。既存のX版
+データを削除・要約・再順序化しない。
 
 ### 2.2 一目で分かる情報階層
 
@@ -255,10 +257,13 @@ component順や表示所有者を変更しない。
 
 ### 4.3 Threads
 
-- 最初のviewportで空状態または比較対象を読める。
+- 900×480 logical clientを拡大せず、カードの余白と行高を抑えて先頭6件を完全表示する。
+- 各カードは高56px・間隔4pxの2行構造とし、title/model/context/経過とparent/role/depth/token/指示年齢を配置する。1件だけでもカードを拡大しない。
+- 6件以下では縦scrollbarを表示せず、7件目以降だけ同じ一覧内で縦scrollを許可する。
 - 親子関係、role、model、context、token、経過、指示年齢を同じ行または選択詳細で追跡できる。
+- 64pxのtree gutterと本文開始位置を分離し、rail・junction・title・parent textの重なりを0pxにする。
 - stale、停止済みchild、orphan、cycle、部分snapshotは誤って実行中として表示しない。
-- 一覧件数が増えても本文フォントを極端に縮小せず、主操作を隠さないページ構造にする。
+- 一覧件数が増えても本文fontを縮小せず、Window拡大や空疎なcardで情報密度を下げない。
 
 ### 4.4 Setup / Settings
 

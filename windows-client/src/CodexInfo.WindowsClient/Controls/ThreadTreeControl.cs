@@ -30,9 +30,10 @@ public sealed class ThreadTreeControl : Control
     {
         base.Render(context);
         var rail = new Pen(new SolidColorBrush(Color.Parse("#D5A43A")), 2);
-        const double baseX = 22;
-        const double step = 16;
-        const double junctionY = 30;
+        const double baseX = 8;
+        const double step = 12;
+        var junctionY = Bounds.Height / 2;
+        var junctionEndX = Math.Max(baseX + step, Bounds.Width - 5);
         var depth = Math.Clamp(TreeDepth, 0, 3);
         if (AncestorGuide1) context.DrawLine(rail, new Point(baseX, 0), new Point(baseX, Bounds.Height));
         if (AncestorGuide2) context.DrawLine(rail, new Point(baseX + step, 0), new Point(baseX + step, Bounds.Height));
@@ -41,8 +42,8 @@ public sealed class ThreadTreeControl : Control
         {
             var x = baseX + Math.Max(0, depth - 1) * step;
             context.DrawLine(rail, new Point(x, 0), new Point(x, HasNextSibling ? Bounds.Height : junctionY));
-            context.DrawLine(rail, new Point(x, junctionY), new Point(baseX + depth * step + 30, junctionY));
-            context.DrawEllipse(rail.Brush, null, new Point(baseX + depth * step + 30, junctionY), 3, 3);
+            context.DrawLine(rail, new Point(x, junctionY), new Point(junctionEndX, junctionY));
+            context.DrawEllipse(rail.Brush, null, new Point(junctionEndX, junctionY), 3, 3);
         }
         if (HasChildren)
         {

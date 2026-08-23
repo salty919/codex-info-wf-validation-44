@@ -157,6 +157,9 @@ public sealed class PreviewLoopbackClient : ILoopbackStatusClient, ILoopbackDeta
         {
             new ApiThreadDetails("preview-root", "Preview root task", null, "gpt-preview-terra", "TERRA", 12_400, 4_000, 16_000, now - 5_400, now - 300, false, 0, false),
             new ApiThreadDetails("preview-child", "Child analysis", "preview-root", "gpt-preview-luna", "LUNA", 4_800, 2_100, 16_000, now - 3_600, now - 600, true, 1, false),
+            new ApiThreadDetails("preview-grandchild", "Graph parity evaluation", "preview-child", "gpt-preview-sol", "SOL", 3_900, 1_600, 16_000, now - 3_000, now - 480, true, 2, false),
+            new ApiThreadDetails("preview-second-root", "Windows installer verification", null, "gpt-preview-sol", "SOL", 9_200, 3_300, 16_000, now - 4_200, now - 420, false, 0, false),
+            new ApiThreadDetails("preview-second-child", "REST boundary tests", "preview-second-root", "gpt-preview-terra", "TERRA", 5_600, 2_700, 16_000, now - 2_700, now - 240, true, 1, false),
             new ApiThreadDetails("preview-orphan", "Recovered worker", "missing-parent", "gpt-preview-sol", "SOL", 1_200, null, null, now - 1_800, null, true, null, true),
         };
 
