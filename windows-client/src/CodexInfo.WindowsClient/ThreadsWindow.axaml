@@ -69,8 +69,7 @@
             <DataTemplate x:DataType="vm:ThreadItemViewModel">
               <Border Classes="thread-card"
                       Margin="0,0,0,4"
-                      AutomationProperties.Name="{Binding Title}"
-                      AutomationProperties.AutomationId="{Binding Id}">
+                      AutomationProperties.Name="{Binding Title}">
                 <Grid>
                   <tree:ThreadTreeControl Width="64" HorizontalAlignment="Left" IsHitTestVisible="False"
                     TreeDepth="{Binding TreeDepth}" ConnectedToParent="{Binding ConnectedToParent}"
@@ -83,6 +82,7 @@
                     <TextBlock FontSize="14"
                                FontWeight="SemiBold"
                                VerticalAlignment="Center"
+                               AutomationProperties.AutomationId="{Binding Id}"
                                Text="{Binding Title}"
                                TextTrimming="CharacterEllipsis"
                                ToolTip.Tip="{Binding Id}" />

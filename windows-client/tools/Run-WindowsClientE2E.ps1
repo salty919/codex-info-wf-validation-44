@@ -891,22 +891,27 @@ try {
     $fixtureRows = @(
         @{ Title = 'E2E root task'; Id = 'e2e-root'; Model = 'TERRA'; Column = 'Depth 0' },
         @{ Title = 'E2E child task'; Id = 'e2e-child'; Model = 'LUNA'; Column = 'Depth 1' },
-        @{ Title = 'E2E orphan task'; Id = 'e2e-orphan'; Model = 'SOL'; Column = 'missing-parent' }
+        @{ Title = 'E2E orphan task'; Id = 'e2e-orphan'; Model = 'SOL'; Column = 'Sub' }
     )
     if ($Fixture) {
         foreach ($row in $fixtureRows) {
             Assert-E2E (@($threadTexts | Where-Object { $_ -eq $row.Title }).Count -gt 0) "Threads row title missing: $($row.Title)"
-            Assert-E2E (@($threadTexts | Where-Object { $_ -eq $row.Id }).Count -gt 0) "Threads ID column missing: $($row.Id)"
+            $rowElement = Wait-E2E -Description "Threads row identity '$($row.Id)'" -Probe {
+                $candidate = Find-E2EElementByAutomationId $threadsRoot $row.Id
+                if ($null -ne $candidate) { return $candidate }
+                return $false
+            }
+            Assert-E2E ([string]$rowElement.Current.Name -eq $row.Title) "Threads row identity/title mismatch: $($row.Id)"
             Assert-E2E (@($threadTexts | Where-Object { $_ -eq $row.Model }).Count -gt 0) "Threads model column missing: $($row.Model)"
             Assert-E2E (@($threadTexts | Where-Object { $_ -like "*$($row.Column)*" }).Count -gt 0) "Threads metadata column missing: $($row.Column)"
         }
         Assert-E2E (@($threadTexts | Where-Object { $_ -like '*Parent: e2e-root*' }).Count -gt 0) 'Child parent column is missing.'
-        Assert-E2E (@($threadTexts | Where-Object { $_ -like '*missing-parent*' }).Count -gt 0) 'Orphan parent column is missing.'
+        Assert-E2E ($threadTexts -contains 'Parent thread is not currently running') 'Orphan row does not expose the unavailable-parent state.'
     }
     else {
         # Real data mode accepts the server's row identities, but still
-        # requires a row container with several visible cells (title, id,
-        # model and metadata). An empty or status-only window cannot pass.
+        # requires a row container with several visible cells (title, model,
+        # and metadata). An empty or status-only window cannot pass.
         $threadRows = @(Get-E2EControlElements $threadsRoot ([System.Windows.Automation.ControlType]::ListItem))
         if ($threadRows.Count -gt 0) {
             $richRows = @($threadRows | Where-Object { @(Get-E2ETextValues $_).Count -ge 4 })
