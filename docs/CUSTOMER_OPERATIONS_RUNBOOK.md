@@ -1,6 +1,6 @@
 # 顧客向け運用ランブック（要求抽出契約）
 
-状態: `EXTRACTION_CONTRACT / PRODUCT_PENDING`
+状態: `REQUIREMENTS_SELECTED / PRODUCT_PENDING`
 
 この文書はRC-061〜063の操作・証拠契約である。コード、installer、installed API service、Windows hostの
 実装・実行証拠は未取得なので、`PRODUCT_PENDING`の操作を現行成果物で実行可能と表示しない。ここで

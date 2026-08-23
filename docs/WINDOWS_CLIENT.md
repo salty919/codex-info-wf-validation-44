@@ -11,7 +11,7 @@ Avalonia / .NET 10 プロジェクトであり、Windows が配布先、Linux / 
 Linux と Windows の両方で同じ font fallback に依存しない。ライセンスは既存の
 `assets/NOTICE.txt` の記載を引き継ぐ。
 
-状態: `EXTRACTION_CONTRACT / PRODUCT_PENDING`。SSH-001/RC-061〜063の設定、接続、headless、
+状態: `REQUIREMENTS_SELECTED / PRODUCT_PENDING`。SSH-001/RC-061〜063の設定、接続、headless、
 supervisor、recorder、service lifecycleは要求抽出正本であり、実装・host・artifact・fresh image・
 独立製品証拠を取得するまで製品PASSを主張しない。installed API serviceとrecorder serviceのexact
 install/start/stop/restart/uninstall/rollback commandは未確定で、読者にpathやbinaryを推測させない。

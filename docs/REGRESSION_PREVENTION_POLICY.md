@@ -6,7 +6,7 @@
 
 | 契約ID | 固定する振る舞い | 回帰オラクル |
 | --- | --- | --- |
-| REG-WIN-DRAG | 全ボーダーレス画面は上端タイトル領域の明示的な左ドラッグで移動でき、ボタン操作を奪わない | `WindowDragBehavior.Attach` / `BeginMoveDrag`、Presentationテスト、同一SHAの実機証拠（物理入力は明示許可時のみ） |
+| REG-WIN-DRAG | 全ボーダーレス画面は上端タイトル領域の明示的な左ドラッグで移動でき、ボタン操作を奪わない | `WindowDragBehavior.Attach` / `BeginMoveDrag`、Presentationテスト、対象release artifactの実機証拠（物理入力は明示許可時のみ） |
 | REG-GRAPH-END | 現行グラフの終端は`min(reset_at, now)`で、開始アンカーから右端まで使用する | `EffectiveGraphEnd`テスト、グラフfresh画像、X版差分監査 |
 | REG-GRAPH-SERIES | 累積最大値、初回未観測区間の水平保持、flat/rising線幅・opacityを維持する。通常sample内の両側実測で挟まれた欠測だけは正本規則で補間し、source cursorから回収不能と確定したdaemon gapは補間・旧値複製・推測をしない | Graph fixture、gap種別付きsource/DB/API契約検査、独立X/Windowsグラフ監査 |
 | REG-SETUP-ONCE | 接続確認済みならSetupを再表示せず、6-key設定へ再接続に必要な非秘密profile selectorだけを保存する。raw host/user、OpenSSH展開値、password/token/key/path/API URL/commandは保存しない | 6-key atomic保存・old4 recovery・次回自動再接続・`ShouldOpenSetup`テスト、設定JSON secret scan |
@@ -22,4 +22,4 @@
 
 ## 回帰発生時
 
-回帰を検出した時点で、前回のPASS証拠を「現行成果物の証拠」として再利用してはならない。影響を受ける全行を`unverified`へ戻し、同一SHAで再ビルド・再検証する。過去DB・履歴を削除して見かけ上直すことは禁止する。
+回帰を検出した時点で、前回のPASS証拠を現行成果物の証拠として再利用しない。影響する観測結果だけを再検証し、無関係な検査や文書hash更新を連鎖させない。過去DB・履歴を削除して見かけ上直すことは禁止する。

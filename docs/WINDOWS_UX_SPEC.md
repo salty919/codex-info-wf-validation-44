@@ -1,11 +1,11 @@
-# Windowsクライアント UX設計仕様（要求抽出凍結版）
+# Windowsクライアント UX設計仕様
 
 ## 0. 状態と適用範囲
 
-状態: `FROZEN / EXTRACTION_INCOMPLETE`
+状態: `REQUIREMENTS_SELECTED / PRODUCT_PENDING`
 
 SSH-001/RC-061〜063の接続・保存・headless契約は本仕様へ伝播する抽出正本であり、状態は
-`EXTRACTION_CONTRACT / PRODUCT_PENDING`とする。installed API serviceのexact command、実装、host、
+`REQUIREMENTS_SELECTED / PRODUCT_PENDING`とする。installed API serviceのexact command、実装、host、
 artifact、fresh image、独立製品判定は未取得で、文書から製品PASSを主張しない。
 
 この文書は、Windows版を「表示できるもの」にするためではなく、顧客が迷わず
@@ -136,10 +136,10 @@ same-DPI crossing、different-DPI crossing、negative/nonzero origin、taskbar-s
 この変更の目的は、logical clientとphysical client/frame/work-areaを分離し、DPI変更・複数monitor・
 native moveの境界を要求抽出時に一意化することである。理由は、固定WindowへGraph minimumを
 誤適用したり、実装のcenter helperを正本へ昇格したりすると、未確認のgeometryを仕様として
-固定するためである。証拠計画は、同一artifact SHAのfresh processごとに全matrix/topology/DPI
-cellを起動し、raw OS DPI、logical/physical/client/frame/work-area rect、round式、center
+固定するためである。検証は、一つの評価対象release artifactで各軸を最低1回、既知の相互作用を
+有限のrisk-based caseとして起動し、raw OS DPI、logical/physical/client/frame/work-area rect、round式、center
 residual、HWND count、native move/resize/control-hit、foreground/cursor traceを採取し、
-実装者とは別の担当が独立再計算する。抽出中は証拠取得済みとみなさず、`HOLD`を維持する。
+実装者とは別の担当が再計算する。未実行のWindows caseは製品PASSとみなさない。
 
 ### 2.1.2 旧スクロール要求のsupersede境界
 
@@ -387,52 +387,3 @@ Setupの製品名と導入見出しを一つの文字列へ結合しない。`ap
 8. 一つでも未確認、`INCONCLUSIVE`、`HOLD`、FAILがあればUXと製品を完了扱いにしない。
 
 このゲートは、実装者の「見た目は良い」「動いた」という自己判断を受入証拠の代わりにしない。
-
-## 8. 既存文書との差分決定（抽出候補記録済み・独立監査／実装証拠待ち）
-
-`DESIGN.md` にあったThreads全件表示、Graph期間選択popup、Legal長文の縦スクロール旧仕様は
-廃止した。正本は `UX-20260822-UX-002`
-（`docs/UX_DECISION_NON_SCROLL_2026-08-22.md`）とし、ページング/選択詳細/折りたたみ、Legalの
-章切替、viewport固定、overflow/clip/focus/DPI条件を採用する。データ意味論、情報所有権、既存の寸法・座標・文字安全域・
-popup geometryなどのレイアウト契約を削除・変更する根拠にはしない。仕様衝突の解消だけで実装受入が
-済んだとは扱わず、実装後の証拠取得まで製品受入状態は `HOLD` とする。
-この決定記録は仕様選択の抽出候補であり、IDの存在だけでユーザー承認済みまたは独立監査済みとしない。
-`WIN-M-030`のdecision sourceは次の11件をexact path/IDでfreeze anchorへjoinする：
-`docs/UX_DECISION_ERROR_RECOVERY_2026-08-23.md`=`UX-20260823-ERROR-001`、
-`docs/UX_DECISION_FULL_STATE_MATRIX_2026-08-23.md`=`UX-20260823-FULL-STATE-001`、
-`docs/UX_DECISION_GRAPH_LABELS_2026-08-22.md`=`UX-20260822-GRAPH-001`、
-`docs/UX_DECISION_HELP_FOCUS_2026-08-23.md`=`UX-20260823-HELP-FOCUS-001`、
-`docs/UX_DECISION_INSTALLER_LIFECYCLE_2026-08-23.md`=`UX-20260823-INSTALLER-001`、
-`docs/UX_DECISION_KEYBOARD_FOCUS_2026-08-23.md`=`UX-20260823-KEYBOARD-001`、
-`docs/UX_DECISION_NON_SCROLL_2026-08-22.md`=`UX-20260822-UX-002`、
-`docs/UX_DECISION_SSH_CONNECTION_2026-08-23.md`=`UX-20260822-SSH-001`、
-`docs/UX_DECISION_ACCESSIBILITY_SCALE_2026-08-23.md`=`UX-20260823-ACCESSIBILITY-SCALE-001`、
-`docs/UX_DECISION_RELEASE_SUPPLY_CHAIN_2026-08-23.md`=`UX-20260823-RELEASE-SUPPLY-CHAIN-001`、
-`docs/UX_DECISION_B2B_CUSTOMER_DELIVERY_2026-08-23.md`=`UX-20260823-B2B-CUSTOMER-DELIVERY-001`。
-freeze anchorは`docs/WINDOWS_REQUIREMENTS_FREEZE_MANIFEST_CONTRACT_2026-08-23.md` §3であり、
-現行実装・host・artifact・独立監査の未取得状態は`PRODUCT_PENDING / HOLD`として保持する。
-`WIN-M-007`、`WIN-M-009`、`WIN-M-010`、`WIN-M-030` の独立抽出監査と実装後受入証拠は未取得で、
-状態は `EXTRACTION_INCOMPLETE` のままとする。
-
-## 9. RC-139..159 cross-surface authority join（抽出中）
-
-`RC-139..149`は、`REST_API_V1.md`がownerとなるwire/route境界と、
-`DATA_PROTECTION_POLICY.md`がownerとなるstate/retention境界を
-`DP-REST-001..011`でtyped joinする。health schema、server error envelope、request resource
-boundary、RESTの非SQLite副作用、profile/account/AuthEpoch partition、cursor/DB commit、generation
-namespace、restore journal、host reboot re-entry、source→DB→PublishedPair→HTTP→Windows lineage、
-combined load scopeの未決値を、UXのready・last-good・表示成功へ推測昇格しない。
-malformed、stale、foreign owner、partial、generation mismatch、lineage欠落、scope外証拠は
-candidateを公開せず、現行route・last-good pair・旧表示を保持する。
-
-`RC-150..159`は、`UX-20260823-B2B-CUSTOMER-DELIVERY-001`、
-`UX-20260823-RELEASE-SUPPLY-CHAIN-001`、`UX-20260823-ACCESSIBILITY-SCALE-001`と、
-`B2B_RELEASE_ACCEPTANCE.md`のrelease/artifact/document/reviewer境界へjoinする。
-全受入行はAND判定とし、HOLD、FAIL、INCONCLUSIVE、欠落、stale、別release、未知mode/role/cellが
-1件でもあればdelivery、顧客claim、new Help/Legal link/page、アクセシビリティ完了表示を0にし、
-`PRODUCT_PENDING`を維持する。Accessibility cellはsurface/state/failure/locale/text-scale/DPI/
-theme/motion/assistive-tech、文書UI exposureはkind/surface/entry/locale/window/text-scale/DPIの
-manifestへ結合し、欠落・重複・unknownは既存routeとlast-goodを保持する。
-
-これらは要求抽出のsource-owner joinであり、同文段落の複製を意味証拠にしない。製品操作、実Windows
-画像、artifact、独立評価が未取得であるため、UX状態は`EXTRACTION_INCOMPLETE / HOLD`のままとする。

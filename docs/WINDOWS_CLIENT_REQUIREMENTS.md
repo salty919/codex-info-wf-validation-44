@@ -2,11 +2,11 @@
 
 # Windows client parity ledger
 
-Document state: `REQUIREMENTS_EXTRACTION_INCOMPLETE` (the authority additions below are not
+Document state: `REQUIREMENTS_SELECTED / PRODUCT_PENDING` (requirements selection is not
 implementation or product-acceptance evidence).
 
 SSH-001/RC-061〜063の追加契約もこのledgerの抽出正本へjoinする。状態は
-`EXTRACTION_CONTRACT / PRODUCT_PENDING`であり、installed API serviceのexact install/start/stop/restart/
+`REQUIREMENTS_SELECTED / PRODUCT_PENDING`であり、installed API serviceのexact install/start/stop/restart/
 uninstall/rollback command、実装、host、artifact、fresh image、独立製品判定は未取得である。
 
 This ledger records the user correction that the Windows client must not lose
@@ -96,12 +96,12 @@ binary. Its observable surfaces are:
   warning/danger, reset warning, API error, local-history error, thread error,
   transport failure, and stale last-good retention.
 
-## Windows geometry/DPI/non-scroll authority (extraction-only)
+## Windows geometry/DPI/non-scroll authority
 
 The following is the requirements authority for the six top-level Windows
 surfaces. It must not be inferred from the current Avalonia/Win32 source,
 installed images, or a fixture's host dimensions. Evidence is intentionally
-pending while this ledger remains `REQUIREMENTS_EXTRACTION_INCOMPLETE`.
+pending until the corresponding Windows runtime checks are executed.
 
 All dimensions below are logical client dimensions and exclude the OS frame.
 `unbounded` means that the product contract places no maximum on that axis.
@@ -264,7 +264,7 @@ when they are unavailable.
 | WIN-SET-01 | New request: initial setup flow. | First launch explains the fixed SSH/loopback architecture; profile is one of [none,wsl,sshConfigAlias]; WSL uses an installed distribution exact token, SSH uses a literal Host alias matching `^[A-Za-z0-9][A-Za-z0-9._-]{0,254}$`; setup performs health→status→auth-start→separate auth-check→ready without persisting secrets or raw manual host/user. | Settings persistence, status client, auth command, Windows OpenSSH process | Extraction contract only; direct process/host/fresh image evidence remains PRODUCT_PENDING | unverified |
 | WIN-SET-02 | New request: settings/recovery path. | Settings can change language and safe presentation preferences, show connection status/help, retry/recheck/authenticate, open legal notices, and recover from failed setup without losing last-good data. | Main VM lifecycle and settings store | Settings view-model tests, final Settings image, API error/auth fixtures, DB reload evidence | verified |
 | WIN-SET-03 | UX correction: do not show the SSH confirmation/setup screen on every launch. | After health/status and, when needed, separate auth-check, atomically persist the exact six-key settings object including non-secret `connectionProfile` and `connectionSelector`. Subsequent launches use the saved selector for Main auto-reconnect; SSH raw manual host/user remains one-session only. | ClientSettingsStore, MainWindow startup gate, SetupWindow step transition | Extraction contract only; saved-selector reload and host evidence remain PRODUCT_PENDING | unverified |
-| WIN-SET-04 | Regression found: corrupt or partially-written settings must not reopen the welcome wizard on every launch. | Old four-key, invalid JSON, and invalid selector are safe disconnected states, never configured connection; startup remains Main disconnected and Settings owns recovery, with automatic recovery command count zero. | ClientSettingsStore, MainWindow startup gate | malformed/empty/truncated/old4/invalid-selector fixtures; same-SHA host evidence remains PRODUCT_PENDING | unverified |
+| WIN-SET-04 | Regression found: corrupt or partially-written settings must not reopen the welcome wizard on every launch. | Old four-key, invalid JSON, and invalid selector are safe disconnected states, never configured connection; startup remains Main disconnected and Settings owns recovery, with automatic recovery command count zero. | ClientSettingsStore, MainWindow startup gate | malformed/empty/truncated/old4/invalid-selector fixtures; Windows host check remains PRODUCT_PENDING | unverified |
 | WIN-ACC-01 | New request: missing perspectives must be addressed. | UI has visible focus, keyboard navigation, accessible names/tooltips, exact logical client/DPI matrix, reduced-motion-safe transitions, and no color-only status meaning. | Common controls, geometry/DPI authority, and all states | Focus styles, AutomationProperties, keyboard traversal smoke, matrix/topology images, text status labels | unverified |
 | WIN-ACC-02 | Regression found: every borderless Windows surface must be movable. | Main, Setup, Settings, Graph, Threads, and Legal windows must respond to one native left-button drag on the title region; control hits must not start a move and close/minimize remain clickable. Only Graph exposes native resize/maximize/restore; Help remains Main-internal with no HWND. A source-only handler is insufficient. | Windows geometry/DPI and viewport authority, common title-bar behavior | Fresh host process drag/control/HWND/rect results, contract gate, independent visual review | unverified |
 | WIN-ACC-03 | UX correction: the client must not take control of the user's mouse. | Product code never calls cursor-position or synthetic mouse APIs. Physical-input smoke is opt-in via `-AllowPhysicalInput`; default acceptance runs do not move the host cursor and report movement as unverified rather than PASS. | Window drag behavior and test harness | Static API scan, default smoke SKIP output, independent review | implemented |

@@ -68,13 +68,14 @@ require_text windows-client/tools/Build-WindowsInstaller.ps1 'Collect-ThirdParty
 require_text windows-client/tools/Build-WindowsInstaller.ps1 '--locked-mode'
 require_text docs/WINDOWS_CLIENT_REQUIREMENTS.md 'WIN-PAR-13'
 require_text docs/WINDOWS_CLIENT_REQUIREMENTS.md 'WIN-INSTALL-01'
-require_text docs/PRODUCT_REQUIREMENTS.md 'CodexInfo 製品要件'
+require_text docs/PRODUCT_REQUIREMENTS.md '# Codex Info 製品要件'
 
 if command -v dotnet >/dev/null 2>&1; then
     dotnet restore windows-client/CodexInfo.WindowsClient.sln --locked-mode
     dotnet test windows-client/CodexInfo.WindowsClient.sln --no-restore --configuration Release
 else
-    echo 'windows-client-contract-gate: dotnet unavailable; static contract checks PASS'
+    echo 'windows-client-contract-gate: UNVERIFIED: dotnet unavailable; Windows tests were not executed' >&2
+    exit 2
 fi
 
 echo 'windows-client-contract-gate: PASS'

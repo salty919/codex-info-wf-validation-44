@@ -83,7 +83,5 @@ presentationでは、accepted set内にnon-null `parent_thread_id`が存在し�
 4. 0件なら正常なempty、1件以上なら完全snapshotとしてatomic publishする。
 5. 途中の一部成功、別process snapshot、旧lease/epoch/cycleを前回snapshotへ混ぜない。
 
-本マトリクスのfreeze登録、具体契約への同一意味伝播、fresh独立監査、実workload/observer/PID再利用/
-複数process再起動、実画面キャプチャが終わるまで要求ID `LIVE-001` は`HOLD`とする。現時点の実行ログ・
-captureは `docs/evidence/LIVE_STATE_RUNTIME_2026-08-22.md` に保存しているが、captureのviewport切れと
-停止/再起動・複数server/observer identity trace未取得が残るため、これは現行releaseのPASS証拠ではない。
+この判定を変更する場合は、実workload、observer、PID再利用、複数process再起動を有限のrisk-based
+caseで再現し、atomic snapshotと停止済みthread非表示を確認する。実行していないcaseをPASSにしない。
