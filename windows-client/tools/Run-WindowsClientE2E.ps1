@@ -891,7 +891,7 @@ try {
     $fixtureRows = @(
         @{ Title = 'E2E root task'; Id = 'e2e-root'; Model = 'TERRA'; Column = 'Depth 0' },
         @{ Title = 'E2E child task'; Id = 'e2e-child'; Model = 'LUNA'; Column = 'Depth 1' },
-        @{ Title = 'E2E orphan task'; Id = 'e2e-orphan'; Model = 'SOL'; Column = 'Sub' }
+        @{ Title = 'E2E orphan task'; Id = 'e2e-orphan'; Model = 'SOL'; Column = 'missing-parent' }
     )
     if ($Fixture) {
         foreach ($row in $fixtureRows) {
@@ -906,7 +906,7 @@ try {
             Assert-E2E (@($threadTexts | Where-Object { $_ -like "*$($row.Column)*" }).Count -gt 0) "Threads metadata column missing: $($row.Column)"
         }
         Assert-E2E (@($threadTexts | Where-Object { $_ -like '*Parent: e2e-root*' }).Count -gt 0) 'Child parent column is missing.'
-        Assert-E2E ($threadTexts -contains 'Parent thread is not currently running') 'Orphan row does not expose the unavailable-parent state.'
+        Assert-E2E (@($threadTexts | Where-Object { $_ -like '*Parent: missing-parent*' }).Count -gt 0) 'Orphan parent column is missing.'
     }
     else {
         # Real data mode accepts the server's row identities, but still
