@@ -30,7 +30,7 @@ use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::rc::Rc;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Mutex, OnceLock};
@@ -7326,6 +7326,8 @@ fn clamp_graph_preview_size((width, height): (u32, u32)) -> (u32, u32) {
 }
 
 const DEFAULT_SERVICE_ADDRESS: &str = "127.0.0.1:8787";
+const BACKGROUND_SERVICE_START_TIMEOUT: Duration = Duration::from_secs(5);
+const BACKGROUND_CHILD_CLEANUP_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum LaunchMode {
@@ -7333,8 +7335,8 @@ enum LaunchMode {
     Service(ApiServerConfig),
     /// Mode 2: X only. It never starts or owns a resident service.
     UiOnly,
-    /// Mode 3: ensure mode 1 exists, then add the X UI.
-    All,
+    /// Mode 3: ensure mode 1 exists at this address, then add the X UI.
+    All(ApiServerConfig),
     /// Backward-compatible diagnostic recorder command.
     RecordOnly { once: bool },
 }
@@ -7352,8 +7354,8 @@ where
 {
     let arguments = arguments.into_iter().collect::<Vec<_>>();
     match arguments.as_slice() {
-        [] => Ok(LaunchMode::All),
-        [value] if value == "--all" => Ok(LaunchMode::All),
+        [] => default_service_config().map(LaunchMode::All),
+        [value] if value == "--all" => default_service_config().map(LaunchMode::All),
         [value] if value == "--ui-only" => Ok(LaunchMode::UiOnly),
         [value] if value == "--service" => default_service_config().map(LaunchMode::Service),
         [service, listen, address] if service == "--service" && listen == "--listen" => {
@@ -7376,55 +7378,171 @@ where
     }
 }
 
+fn apply_launch_environment(
+    mode: LaunchMode,
+    arguments_were_explicit: bool,
+    environment_config: Option<ApiServerConfig>,
+) -> LaunchMode {
+    match (mode, arguments_were_explicit, environment_config) {
+        // Preserve the legacy environment-only service entry point only when
+        // no CLI mode was supplied.
+        (LaunchMode::All(_), false, Some(config)) => LaunchMode::Service(config),
+        // An explicit --all keeps its UI and uses the requested loopback
+        // address for the background daemon+REST service it ensures.
+        (LaunchMode::All(_), true, Some(config)) => LaunchMode::All(config),
+        (mode, _, _) => mode,
+    }
+}
+
+fn is_service_health_response(response: &[u8]) -> bool {
+    if !response.starts_with(b"HTTP/1.1 200 ") {
+        return false;
+    }
+    let Some(header_end) = response.windows(4).position(|window| window == b"\r\n\r\n") else {
+        return false;
+    };
+    let body = &response[header_end + 4..];
+    serde_json::from_slice::<Value>(body).is_ok_and(|value| {
+        value.get("api_version").and_then(Value::as_str) == Some("v1")
+            && value.get("service").and_then(Value::as_str) == Some("codex-info")
+    })
+}
+
 fn service_is_healthy(address: SocketAddr) -> bool {
     let timeout = Duration::from_millis(150);
     let Ok(mut stream) = TcpStream::connect_timeout(&address, timeout) else {
         return false;
     };
+    let request =
+        format!("GET /v1/health HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\n\r\n");
     if stream.set_read_timeout(Some(timeout)).is_err()
         || stream.set_write_timeout(Some(timeout)).is_err()
-        || stream
-            .write_all(b"GET /v1/health HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")
-            .is_err()
+        || stream.write_all(request.as_bytes()).is_err()
     {
         return false;
     }
     let mut response = Vec::with_capacity(512);
-    if std::io::Read::by_ref(&mut stream)
-        .take(4096)
-        .read_to_end(&mut response)
-        .is_err()
-    {
-        return false;
+    let mut buffer = [0_u8; 512];
+    while response.len() < 4096 {
+        let remaining = 4096 - response.len();
+        let read_limit = remaining.min(buffer.len());
+        match stream.read(&mut buffer[..read_limit]) {
+            Ok(0) => break,
+            Ok(read) => {
+                response.extend_from_slice(&buffer[..read]);
+                // The server supplies Content-Length and may keep the socket
+                // open. A complete, validated body is success; EOF is not a
+                // health requirement.
+                if is_service_health_response(&response) {
+                    return true;
+                }
+            }
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                break;
+            }
+            Err(_) => return false,
+        }
     }
-    response.starts_with(b"HTTP/1.1 200")
-        && response
-            .windows(b"\"service\":\"codex-info\"".len())
-            .any(|window| window == b"\"service\":\"codex-info\"")
+    is_service_health_response(&response)
+}
+
+fn healthy_combined_service_owner(address: SocketAddr) -> Option<u32> {
+    service_is_healthy(address)
+        .then(daemon::current_daemon_owner_pid)
+        .flatten()
+}
+
+fn terminate_and_reap_owned_child(child: &mut Child) -> bool {
+    if matches!(child.try_wait(), Ok(Some(_))) {
+        return true;
+    }
+    // Never block indefinitely in `wait`: after requesting termination,
+    // `try_wait` both observes and reaps the child within a fixed deadline.
+    let _ = child.kill();
+    let deadline = Instant::now() + BACKGROUND_CHILD_CLEANUP_TIMEOUT;
+    loop {
+        if matches!(child.try_wait(), Ok(Some(_))) {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
 }
 
 fn ensure_background_service(config: ApiServerConfig) -> Result<(), String> {
     let address = config.listen_addr();
-    if service_is_healthy(address) {
+    if healthy_combined_service_owner(address).is_some() {
         return Ok(());
     }
     let executable = std::env::current_exe()
         .map_err(|_| "combined service executable is unavailable".to_owned())?;
     let address_text = address.to_string();
-    Command::new(executable)
+    let child = Command::new(executable)
         .args(["--service", "--listen", address_text.as_str()])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
         .map_err(|_| "combined daemon+REST service could not start".to_owned())?;
-    for _ in 0..20 {
-        if service_is_healthy(address) {
+    let child_pid = child.id();
+    let mut owned_child = Some(child);
+    let deadline = Instant::now() + BACKGROUND_SERVICE_START_TIMEOUT;
+    loop {
+        let healthy_owner = healthy_combined_service_owner(address);
+        if healthy_owner == Some(child_pid) {
+            // This is the resident child this --all invocation intentionally
+            // created. Dropping the process handle detaches it; it must remain
+            // alive after the X UI closes.
             return Ok(());
+        }
+        if healthy_owner.is_some() {
+            // A concurrent --all/--service won recorder ownership and became
+            // healthy. This invocation must reap only the child it spawned
+            // before attaching its UI to that winner.
+            if let Some(child) = owned_child.as_mut() {
+                if !terminate_and_reap_owned_child(child) {
+                    return Err("losing combined service child could not be reaped".to_owned());
+                }
+            }
+            return Ok(());
+        }
+
+        if let Some(child) = owned_child.as_mut() {
+            match child.try_wait() {
+                Ok(Some(_)) => owned_child = None,
+                Ok(None) => {}
+                Err(_) => {
+                    let reaped = terminate_and_reap_owned_child(child);
+                    return Err(if reaped {
+                        "combined daemon+REST service state is unavailable".to_owned()
+                    } else {
+                        "combined daemon+REST service state is unavailable and its child could not be reaped".to_owned()
+                    });
+                }
+            }
+        }
+        if owned_child.is_none() && daemon::current_daemon_owner_pid().is_none() {
+            return Err("combined daemon+REST service exited before becoming healthy".to_owned());
+        }
+        if Instant::now() >= deadline {
+            let reaped = owned_child
+                .as_mut()
+                .is_none_or(terminate_and_reap_owned_child);
+            return Err(if reaped {
+                "combined daemon+REST service did not become healthy".to_owned()
+            } else {
+                "combined daemon+REST service did not become healthy and its child could not be reaped".to_owned()
+            });
         }
         thread::sleep(Duration::from_millis(50));
     }
-    Err("combined daemon+REST service did not become healthy".to_owned())
 }
 
 fn poll_service_state(state: &mut CodexInfoState) {
@@ -7473,9 +7591,20 @@ async fn service_shutdown_signal() {
 }
 
 fn run_combined_service(config: ApiServerConfig) -> Result<(), Box<dyn std::error::Error>> {
+    let mut recorder = daemon::RecorderWorker::start().map_err(std::io::Error::other)?;
+    if !recorder.is_active() {
+        recorder.shutdown();
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "combined daemon+REST service is already owned by another process",
+        )
+        .into());
+    }
+    // Bind REST only after this process owns the recorder. Concurrent service
+    // children therefore exit before publishing a listener, and an API bind
+    // failure drops the worker and releases its exact lock identity.
     let mut api_server = ApiServer::start(config)?;
     let publisher = api_server.publisher();
-    let mut recorder = daemon::RecorderWorker::start().map_err(std::io::Error::other)?;
     let mut state = CodexInfoState::new();
     publisher.publish_details(state.public_details())?;
     let mut last_publish_error = None;
@@ -7932,20 +8061,21 @@ fn run_ui() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let mut mode = parse_launch_mode(std::env::args_os().skip(1)).map_err(std::io::Error::other)?;
-    // Preserve the former environment-only REST entry point as mode 1. An
-    // explicit CLI mode always wins, so `--ui-only` cannot accidentally
-    // create a listener through an inherited environment variable.
-    if mode == LaunchMode::All {
-        if let Some(config) = ApiServerConfig::from_environment()? {
-            mode = LaunchMode::Service(config);
-        }
-    }
+    let arguments = std::env::args_os().skip(1).collect::<Vec<_>>();
+    let arguments_were_explicit = !arguments.is_empty();
+    let parsed_mode = parse_launch_mode(arguments).map_err(std::io::Error::other)?;
+    // Only modes that may own a service inspect the legacy listen variable;
+    // --ui-only remains unable to create any listener through inheritance.
+    let environment_config = if matches!(parsed_mode, LaunchMode::All(_)) {
+        ApiServerConfig::from_environment()?
+    } else {
+        None
+    };
+    let mode = apply_launch_environment(parsed_mode, arguments_were_explicit, environment_config);
     match mode {
         LaunchMode::Service(config) => run_combined_service(config),
         LaunchMode::UiOnly => run_ui(),
-        LaunchMode::All => {
-            let config = default_service_config().map_err(std::io::Error::other)?;
+        LaunchMode::All(config) => {
             ensure_background_service(config).map_err(std::io::Error::other)?;
             run_ui()
         }
@@ -7961,14 +8091,15 @@ mod tests {
     use super::winit;
     use super::{
         account_refresh_due, account_window_title, active_thread_model_counts,
-        active_thread_rows_at, add_recovery_usage, automatic_refresh_interval,
-        clamp_graph_preview_size, collapse_remaining_change_points, collect_session_file,
-        complete_rollout_prefix_len, current_label_connector_path, detail_window_title,
-        fetch_active_thread_update_for_paths, fetch_active_thread_update_for_paths_and_state,
-        fixed_resize_decision, fixed_resize_decision_for_scale, format_elapsed,
-        format_estimated_cost, format_model_usage_columns, format_percent, format_period_label,
-        graph_paths, graph_paths_for_selection, graph_period_end, graph_points,
-        graph_time_endpoints, minute_model_spend, minute_model_spend_for_metric,
+        active_thread_rows_at, add_recovery_usage, apply_launch_environment,
+        automatic_refresh_interval, clamp_graph_preview_size, collapse_remaining_change_points,
+        collect_session_file, complete_rollout_prefix_len, current_label_connector_path,
+        detail_window_title, fetch_active_thread_update_for_paths,
+        fetch_active_thread_update_for_paths_and_state, fixed_resize_decision,
+        fixed_resize_decision_for_scale, format_elapsed, format_estimated_cost,
+        format_model_usage_columns, format_percent, format_period_label, graph_paths,
+        graph_paths_for_selection, graph_period_end, graph_points, graph_time_endpoints,
+        is_service_health_response, minute_model_spend, minute_model_spend_for_metric,
         model_usage_timeline_from_events, monthly_window_seconds, native_account_window_title,
         normal_status_text, one_month_before_utc, open_codex_session_paths, parse_launch_mode,
         parse_preview_size, parse_rate_limits, parse_resize_direction, period_remaining_text,
@@ -7976,17 +8107,19 @@ mod tests {
         read_thread_rollout_path, recovery_timed_usage, remaining_graph_points,
         remaining_graph_points_for_metric, remaining_graph_y, remaining_marker_positions,
         remaining_marker_positions_on_points, request_with_timeout, same_rollout_identity,
-        separate_current_label_positions, session_event_model, session_event_type,
-        session_jsonl_files, session_token_snapshot, smooth_model_spend, smooth_remaining_points,
-        split_metric_line_paths, stacked_area_path, thread_presentation_rows,
-        three_months_before_utc, unused_interval_positions, week_remaining_text, ActiveThread,
-        ActiveThreadUpdate, CodexInfoState, Event, FixedResizeDecision, GraphPaths, GraphWindow,
-        HourlyModelSpend, LaunchMode, LocalUsageResult, ManualX11Geometry, ManualX11WindowAction,
-        ModelDollarTotals, ModelTokenTotals, ModelUsageRow, ModelUsageTotals, RpcReadEvent,
-        SessionTraversalBudget, TokenSnapshot, UnusedIntervalPosition, UsageEvent, UsageHistory,
-        UsageHistorySample, UsageStore, FIXED_WINDOW_HEIGHT, FIXED_WINDOW_WIDTH,
-        GRAPH_METRIC_OPTIONS, GRAPH_WINDOW_PURPOSE, LOCAL_ESTIMATE_PRICE_VERSION,
-        THREADS_WINDOW_PURPOSE, UNAUTHENTICATED_WINDOW_TITLE, WEEK_SECONDS,
+        separate_current_label_positions, service_is_healthy, session_event_model,
+        session_event_type, session_jsonl_files, session_token_snapshot, smooth_model_spend,
+        smooth_remaining_points, split_metric_line_paths, stacked_area_path,
+        terminate_and_reap_owned_child, thread_presentation_rows, three_months_before_utc,
+        unused_interval_positions, week_remaining_text, ActiveThread, ActiveThreadUpdate,
+        ApiServer, ApiServerConfig, CodexInfoState, Event, FixedResizeDecision, GraphPaths,
+        GraphWindow, HourlyModelSpend, LaunchMode, LocalUsageResult, ManualX11Geometry,
+        ManualX11WindowAction, ModelDollarTotals, ModelTokenTotals, ModelUsageRow,
+        ModelUsageTotals, RpcReadEvent, SessionTraversalBudget, TokenSnapshot,
+        UnusedIntervalPosition, UsageEvent, UsageHistory, UsageHistorySample, UsageStore,
+        DEFAULT_SERVICE_ADDRESS, FIXED_WINDOW_HEIGHT, FIXED_WINDOW_WIDTH, GRAPH_METRIC_OPTIONS,
+        GRAPH_WINDOW_PURPOSE, LOCAL_ESTIMATE_PRICE_VERSION, THREADS_WINDOW_PURPOSE,
+        UNAUTHENTICATED_WINDOW_TITLE, WEEK_SECONDS,
     };
     use super::{
         claim_manual_x11_action, forbidden_x11_states, manual_resize_geometry,
@@ -8012,18 +8145,21 @@ mod tests {
 
     #[test]
     fn launch_modes_are_explicit_and_ui_only_never_maps_to_service() {
-        assert_eq!(
-            parse_launch_mode(launch_args(&[])).unwrap(),
-            LaunchMode::All
-        );
+        let default_address = DEFAULT_SERVICE_ADDRESS.parse().unwrap();
+        let LaunchMode::All(default_config) = parse_launch_mode(launch_args(&[])).unwrap() else {
+            panic!("default mode was not all");
+        };
+        assert_eq!(default_config.listen_addr(), default_address);
         assert_eq!(
             parse_launch_mode(launch_args(&["--ui-only"])).unwrap(),
             LaunchMode::UiOnly
         );
-        assert_eq!(
-            parse_launch_mode(launch_args(&["--all"])).unwrap(),
-            LaunchMode::All
-        );
+        let LaunchMode::All(explicit_all_config) =
+            parse_launch_mode(launch_args(&["--all"])).unwrap()
+        else {
+            panic!("explicit --all mode was not selected");
+        };
+        assert_eq!(explicit_all_config.listen_addr(), default_address);
         let LaunchMode::Service(config) =
             parse_launch_mode(launch_args(&["--service", "--listen", "127.0.0.1:9876"])).unwrap()
         else {
@@ -8034,6 +8170,63 @@ mod tests {
             parse_launch_mode(launch_args(&["--service", "--listen", "0.0.0.0:9876"])).is_err()
         );
         assert!(parse_launch_mode(launch_args(&["--ui-only", "--service"])).is_err());
+    }
+
+    #[test]
+    fn explicit_all_keeps_ui_while_implicit_environment_mode_stays_compatible() {
+        let environment_config = ApiServerConfig::new("127.0.0.1:9877".parse().unwrap()).unwrap();
+        let parsed_all = parse_launch_mode(launch_args(&["--all"])).unwrap();
+        assert_eq!(
+            apply_launch_environment(parsed_all, true, Some(environment_config)),
+            LaunchMode::All(environment_config)
+        );
+
+        let implicit = parse_launch_mode(launch_args(&[])).unwrap();
+        assert_eq!(
+            apply_launch_environment(implicit, false, Some(environment_config)),
+            LaunchMode::Service(environment_config)
+        );
+
+        assert_eq!(
+            apply_launch_environment(LaunchMode::UiOnly, true, Some(environment_config)),
+            LaunchMode::UiOnly
+        );
+    }
+
+    #[test]
+    fn service_health_requires_a_complete_success_json_body_without_waiting_for_eof() {
+        let valid = b"HTTP/1.1 200 OK\r\nContent-Length: 43\r\nConnection: keep-alive\r\n\r\n{\"api_version\":\"v1\",\"service\":\"codex-info\"}";
+        assert!(is_service_health_response(valid));
+        assert!(!is_service_health_response(
+            b"HTTP/1.1 200 OK\r\nX-Service: codex-info\r\n\r\n{}"
+        ));
+        assert!(!is_service_health_response(
+            b"HTTP/1.1 500 Error\r\n\r\n{\"api_version\":\"v1\",\"service\":\"codex-info\"}"
+        ));
+        assert!(!is_service_health_response(
+            b"HTTP/1.1 200 OK\r\n\r\n{\"api_version\":\"v1\",\"service\":\"codex-info\""
+        ));
+    }
+
+    #[test]
+    fn service_health_accepts_the_live_loopback_server_response() {
+        let server =
+            ApiServer::start(ApiServerConfig::new("127.0.0.1:0".parse().unwrap()).unwrap())
+                .unwrap();
+        assert!(service_is_healthy(server.local_addr()));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn owned_background_child_cleanup_is_bounded_and_reaps() {
+        let mut child = std::process::Command::new("sh")
+            .args(["-c", "exec sleep 60"])
+            .spawn()
+            .unwrap();
+        let started = Instant::now();
+        assert!(terminate_and_reap_owned_child(&mut child));
+        assert!(started.elapsed() < Duration::from_secs(3));
+        assert!(child.try_wait().unwrap().is_some());
     }
 
     #[test]

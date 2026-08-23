@@ -1,6 +1,7 @@
 # Measures the installed Graph preview through the same UI Automation actions
-# exposed to a user.  The completion signal for every sample is an independent
-# GDI screen observation; UI Automation state is only a bounded postcondition.
+# exposed to a user.  Toggle samples complete only after the expected UIA
+# ToggleState and a changed Graph.Plot GDI frame are both observed.  Menu
+# samples retain their existing screen-change plus UIA postcondition contract.
 [CmdletBinding()]
 param(
     [string]$ClientPath = '',
@@ -681,6 +682,99 @@ function Measure-GraphActionPaint {
     }
 }
 
+function Measure-GraphToggleAction {
+    param(
+        [Parameter(Mandatory = $true)][IntPtr]$Handle,
+        [Parameter(Mandatory = $true)][System.Windows.Automation.AutomationElement]$Element,
+        [Parameter(Mandatory = $true)][System.Windows.Automation.AutomationElement]$PlotElement,
+        [Parameter(Mandatory = $true)][string]$AutomationId,
+        [Parameter(Mandatory = $true)][System.Windows.Automation.ToggleState]$ExpectedToggleState,
+        [Parameter(Mandatory = $true)][string]$Description,
+        [int]$TimeoutMilliseconds = 2000
+    )
+
+    # Establish the plot baseline before the physical input timestamp.
+    # The plot element is re-queried after the click because Avalonia can
+    # replace its UIA subtree while presenting a new series frame.
+    Wait-GraphInputTarget $Handle
+    $script:graphPhysicalInputSequence++
+    $horizontalFraction = if (($script:graphPhysicalInputSequence % 2) -eq 0) { 0.35 } else { 0.65 }
+    Position-GraphPointer -Element $Element -HorizontalFraction $horizontalFraction
+    $plotObservation = $PlotElement
+    try {
+        $freshPlot = Find-GraphElementByAutomationId (Get-GraphUiaRoot $Handle) 'Graph.Plot'
+        if ($null -ne $freshPlot) { $plotObservation = $freshPlot }
+    }
+    catch { }
+    $plotBaseline = Wait-GraphStableFrame -Handle $Handle -ObservationElement $plotObservation `
+        -TimeoutMilliseconds $TimeoutMilliseconds
+    $baselineState = Get-GraphToggleState $Element
+    Assert-GraphLatency ($baselineState -ne $ExpectedToggleState) `
+        "$Description started in the expected ToggleState $ExpectedToggleState."
+
+    $inputStart = [Diagnostics.Stopwatch]::GetTimestamp()
+    Invoke-GraphToggle $Element
+    $deadline = [Diagnostics.Stopwatch]::GetTimestamp() +
+        [long]($TimeoutMilliseconds * [Diagnostics.Stopwatch]::Frequency / 1000.0)
+    $plotPaint = $null
+    $observedState = $null
+    $toggleStateObserved = $false
+    $plotChanged = $false
+    while ([Diagnostics.Stopwatch]::GetTimestamp() -lt $deadline) {
+        if ($null -eq $plotPaint) {
+            try {
+                $plotObservation = $PlotElement
+                $freshPlot = Find-GraphElementByAutomationId (Get-GraphUiaRoot $Handle) 'Graph.Plot'
+                if ($null -ne $freshPlot) { $plotObservation = $freshPlot }
+                $candidatePlot = Get-GraphScreenFrame $Handle $plotObservation
+                if ($candidatePlot.Hash -ne $plotBaseline.Hash) {
+                    $plotPaint = $candidatePlot
+                    $plotChanged = $true
+                }
+            }
+            catch { }
+        }
+        try {
+            $currentElement = Find-GraphElementByAutomationId (Get-GraphUiaRoot $Handle) $AutomationId
+            if ($null -ne $currentElement) {
+                $currentState = Get-GraphToggleState $currentElement
+                $observedState = $currentState
+                if ($currentState -eq $ExpectedToggleState) {
+                    $toggleStateObserved = $true
+                }
+            }
+        }
+        catch { }
+        if ($toggleStateObserved -and $plotChanged) { break }
+        [Threading.Thread]::Yield() | Out-Null
+    }
+    if (-not $toggleStateObserved -or -not $plotChanged) {
+        $observedStateText = if ($null -eq $observedState) { 'unobserved' } else { [string]$observedState }
+        $plotHashText = if ($null -eq $plotPaint) { 'unobserved' } else { $plotPaint.Hash }
+        Write-GraphLatencyLog ("toggle-transition-timeout: name={0} expected_state={1} observed_state={2} toggle_state_observed={3} graph_plot_changed={4} baseline_plot_hash={5} plot_hash={6}" -f
+            $Description, $ExpectedToggleState, $observedStateText, $toggleStateObserved, $plotChanged,
+            $plotBaseline.Hash, $plotHashText)
+        throw "TIMEOUT: $Description did not observe ToggleState $ExpectedToggleState and Graph.Plot change (${TimeoutMilliseconds}ms)"
+    }
+
+    $elapsed = Get-GraphLatencyMilliseconds $inputStart
+    return [pscustomobject]@{
+        latency_ms = $elapsed
+        # Keep the legacy sample field names, but bind them to the plot
+        # observation now that the plot is the measured visual completion.
+        baseline_hash = $plotBaseline.Hash
+        paint_hash = $plotPaint.Hash
+        plot_baseline_hash = $plotBaseline.Hash
+        plot_hash = $plotPaint.Hash
+        expected_toggle_state = [string]$ExpectedToggleState
+        observed_toggle_state = [string]$observedState
+        toggle_state_observed = $toggleStateObserved
+        graph_plot_changed = $plotChanged
+        width = $plotPaint.Width
+        height = $plotPaint.Height
+    }
+}
+
 function Get-GraphLatencyStats {
     param(
         [Parameter(Mandatory = $true)][object[]]$Samples,
@@ -692,6 +786,30 @@ function Get-GraphLatencyStats {
     $p90Index = [Math]::Max(0, [int][Math]::Ceiling($values.Count * 0.90) - 1)
     $p95Index = [Math]::Max(0, [int][Math]::Ceiling($values.Count * 0.95) - 1)
     return [pscustomobject]@{
+        count = $values.Count
+        p90_ms = $values[$p90Index]
+        p95_ms = $values[$p95Index]
+        max_ms = $values[-1]
+        min_ms = $values[0]
+    }
+}
+
+function Get-GraphLatencyDiagnosticStats {
+    param([object[]]$Samples)
+
+    $values = @($Samples | ForEach-Object { [double]$_.latency_ms } | Sort-Object)
+    if ($values.Count -eq 0) {
+        return [ordered]@{
+            count = 0
+            p90_ms = $null
+            p95_ms = $null
+            max_ms = $null
+            min_ms = $null
+        }
+    }
+    $p90Index = [Math]::Max(0, [int][Math]::Ceiling($values.Count * 0.90) - 1)
+    $p95Index = [Math]::Max(0, [int][Math]::Ceiling($values.Count * 0.95) - 1)
+    return [ordered]@{
         count = $values.Count
         p90_ms = $values[$p90Index]
         p95_ms = $values[$p95Index]
@@ -718,12 +836,27 @@ function Assert-GraphLatencyBudget {
 function Measure-GraphToggleSeries {
     param(
         [Parameter(Mandatory = $true)][IntPtr]$Handle,
+        [Parameter(Mandatory = $true)][System.Windows.Automation.AutomationElement]$PlotElement,
         [Parameter(Mandatory = $true)][string]$AutomationId,
         [Parameter(Mandatory = $true)][string]$Name,
         [int]$Count = 30
     )
 
     $samples = [System.Collections.Generic.List[object]]::new()
+    $activeControl = [ordered]@{
+        name = $Name
+        automation_id = $AutomationId
+        plot_automation_id = 'Graph.Plot'
+        kind = 'toggle'
+        phase = 'starting'
+        samples = @()
+        stats = Get-GraphLatencyDiagnosticStats -Samples @()
+    }
+    if ($null -ne $script:graphLatencyActiveCase) {
+        $script:graphLatencyActiveCase['controls'] = @($script:graphLatencyActiveCase['controls']) + @($activeControl)
+        $script:graphLatencyActiveCase['phase'] = "toggle:$Name"
+        Save-GraphLatencyCheckpoint "toggle-start:$Name"
+    }
     $first = Wait-GraphElementByAutomationId $Handle $AutomationId
     $state = Get-GraphToggleState $first
     for ($index = 1; $index -le $Count; $index++) {
@@ -734,26 +867,48 @@ function Measure-GraphToggleSeries {
         else {
             [System.Windows.Automation.ToggleState]::On
         }
-        $sample = Measure-GraphActionPaint -Handle $Handle -Element $element -Action toggle `
+        $activeControl['phase'] = "sample-$index-input"
+        $sample = Measure-GraphToggleAction -Handle $Handle -Element $element -PlotElement $PlotElement `
+            -AutomationId $AutomationId -ExpectedToggleState $expected `
             -Description "$Name sample $index" -TimeoutMilliseconds $PaintTimeoutMilliseconds
-        Wait-GraphToggleState -Handle $Handle -AutomationId $AutomationId -Expected $expected
-        $samples.Add([pscustomobject]@{
+        $sampleRecord = [pscustomobject]@{
             index = $index
             latency_ms = $sample.latency_ms
             state = [string]$expected
             baseline_hash = $sample.baseline_hash
             paint_hash = $sample.paint_hash
-        })
+            plot_automation_id = 'Graph.Plot'
+            plot_baseline_hash = $sample.plot_baseline_hash
+            plot_hash = $sample.plot_hash
+            toggle_state_observed = [bool]$sample.toggle_state_observed
+            plot_changed = [bool]$sample.graph_plot_changed
+        }
+        $samples.Add($sampleRecord)
+        $activeControl['samples'] = @($activeControl['samples']) + @($sampleRecord)
+        $activeControl['stats'] = Get-GraphLatencyDiagnosticStats -Samples @($activeControl['samples'])
+        $activeControl['completed_samples'] = $index
+        $activeControl['phase'] = "sample-$index-observed"
+        Write-GraphLatencyLog ("sample: kind=toggle name={0} index={1} latency_ms={2} expected_state={3} graph_plot_changed={4}" -f
+            $Name, $index, $sample.latency_ms, $expected, $sample.graph_plot_changed)
+        Wait-GraphToggleState -Handle $Handle -AutomationId $AutomationId -Expected $expected
         $state = $expected
         Complete-GraphPhysicalClickCycle
     }
     $stats = Get-GraphLatencyStats -Samples @($samples) -Description $Name
     $coldMilliseconds = [double]$samples[0].latency_ms
+    $activeControl['stats'] = $stats
+    $activeControl['cold_ms'] = $coldMilliseconds
+    $activeControl['phase'] = 'budget-check'
+    Write-GraphLatencyLog ("series-stats: kind=toggle name={0} count={1} p90_ms={2} p95_ms={3} cold_ms={4}" -f
+        $Name, $stats.count, $stats.p90_ms, $stats.p95_ms, $coldMilliseconds)
+    Save-GraphLatencyCheckpoint "toggle-stats:$Name"
     Assert-GraphLatencyBudget -Stats $stats -P90Limit 75 -P95Limit 100 `
         -ColdLimit 250 -ColdMilliseconds $coldMilliseconds -Description "toggle $Name"
+    $activeControl['phase'] = 'pass'
     return [pscustomobject]@{
         name = $Name
         automation_id = $AutomationId
+        plot_automation_id = 'Graph.Plot'
         kind = 'toggle'
         samples = @($samples)
         stats = $stats
@@ -879,11 +1034,23 @@ function Invoke-GraphPointCase {
     $env:CODEX_INFO_WINDOWS_PREVIEW_SIZE = '940x640'
     $env:CODEX_INFO_WINDOWS_PREVIEW_GRAPH_POINTS = [string]$Points
     $env:CODEX_INFO_WINDOWS_PREVIEW_GRAPH_BUILD_DELAY_MS = '0'
+    $script:graphLatencyActiveCase = [ordered]@{
+        points = $Points
+        logical_size = '940x640'
+        phase = 'starting'
+        process_id = $null
+        window_handle = $null
+        controls = @()
+    }
+    $script:graphLatencyReport['active_case'] = $script:graphLatencyActiveCase
+    Save-GraphLatencyCheckpoint "case-start:$Points"
     $process = $null
     try {
         Write-GraphLatencyLog "case-start: points=$Points size=940x640"
         $startupStart = [Diagnostics.Stopwatch]::GetTimestamp()
         $process = Start-Process -FilePath $ResolvedClientPath -PassThru
+        $script:graphLatencyActiveCase['process_id'] = $process.Id
+        $script:graphLatencyActiveCase['phase'] = 'window-discovery'
         $window = Wait-GraphLatencyPredicate -Description "fresh Graph window for $Points points" -TimeoutMilliseconds 10000 -Probe {
             if ($process.HasExited) { return $false }
             $candidate = Find-GraphWindow -ProcessId $process.Id
@@ -891,12 +1058,17 @@ function Invoke-GraphPointCase {
             return $candidate
         }
         Bring-GraphWindowToFront $window
+        $script:graphLatencyActiveCase['window_handle'] = ('0x{0:X}' -f $window.ToInt64())
+        $script:graphLatencyActiveCase['phase'] = 'startup-paint'
         # Process startup is not the click-to-paint SLO.  Keep it as a
         # diagnostic while applying the 250 ms cold limit to the first real
         # interaction of every selector/toggle below.
         $startup = Wait-GraphFirstPaint -Handle $window -StartTimestamp $startupStart -TimeoutMilliseconds 10000
         Write-GraphLatencyLog ("startup: points={0} latency_ms={1} gdi_hash={2} bounds={3}x{4}" -f
             $Points, $startup.latency_ms, $startup.paint_hash, $startup.width, $startup.height)
+        $script:graphLatencyActiveCase['startup_first_paint'] = $startup
+        $script:graphLatencyActiveCase['phase'] = 'controls'
+        Save-GraphLatencyCheckpoint "startup:$Points"
 
         $plot = Wait-GraphElementByAutomationId -Handle $window -AutomationId 'Graph.Plot'
         Assert-GraphLatency ($plot.Current.BoundingRectangle.Width -gt 0 -and
@@ -914,7 +1086,7 @@ function Invoke-GraphPointCase {
             @{ Id = 'Graph.Toggle.SOL'; Name = 'SOL' }
         )
         foreach ($toggleCase in $toggleCases) {
-            $controls.Add((Measure-GraphToggleSeries -Handle $window -AutomationId $toggleCase.Id `
+            $controls.Add((Measure-GraphToggleSeries -Handle $window -PlotElement $plot -AutomationId $toggleCase.Id `
                 -Name $toggleCase.Name -Count $Iterations))
         }
         Assert-GraphMenuRoundTripAfterToggles -Handle $window -AutomationId 'Graph.PeriodSelector' `
@@ -936,6 +1108,12 @@ function Invoke-GraphPointCase {
             -ColdLimit 250 -ColdMilliseconds $toggleColdMax -Description 'all toggles'
         Assert-GraphLatencyBudget -Stats $menuStats -P90Limit 100 -P95Limit 120 `
             -ColdLimit 250 -ColdMilliseconds $menuColdMax -Description 'all menus'
+        $script:graphLatencyActiveCase['phase'] = 'pass'
+        $script:graphLatencyActiveCase['aggregate'] = [ordered]@{
+            toggles = $toggleStats
+            menus = $menuStats
+        }
+        Save-GraphLatencyCheckpoint "case-pass:$Points"
         Write-GraphLatencyLog ("case-pass: points={0} toggle_p90_ms={1} toggle_p95_ms={2} menu_p90_ms={3} menu_p95_ms={4}" -f
             $Points, $toggleStats.p90_ms, $toggleStats.p95_ms, $menuStats.p90_ms, $menuStats.p95_ms)
         return [pscustomobject]@{
@@ -997,6 +1175,20 @@ function Save-GraphLatencyReport {
         [System.Text.UTF8Encoding]::new($false))
 }
 
+function Save-GraphLatencyCheckpoint {
+    param([Parameter(Mandatory = $true)][string]$Reason)
+
+    try {
+        Save-GraphLatencyReport
+    }
+    catch {
+        # A report write must not hide the measured failure.  The final log
+        # still records this checkpoint failure and the top-level catch makes
+        # one last best-effort JSON write.
+        Write-GraphLatencyLog ("report-checkpoint-fail: reason={0} error={1}" -f $Reason, $_.Exception.Message)
+    }
+}
+
 $oldPreview = $env:CODEX_INFO_WINDOWS_PREVIEW
 $oldPreviewSize = $env:CODEX_INFO_WINDOWS_PREVIEW_SIZE
 $oldPreviewPoints = $env:CODEX_INFO_WINDOWS_PREVIEW_GRAPH_POINTS
@@ -1006,6 +1198,8 @@ try {
     foreach ($points in @(10080, 44640)) {
         $case = Invoke-GraphPointCase -ResolvedClientPath $resolvedClientPath -Points $points
         $script:graphLatencyReport['cases'] += $case
+        $script:graphLatencyReport.Remove('active_case') | Out-Null
+        $script:graphLatencyActiveCase = $null
         Save-GraphLatencyReport
     }
     $allToggleSamples = [System.Collections.Generic.List[object]]::new()

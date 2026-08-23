@@ -392,6 +392,42 @@ fn lock_owner_is_current(record: &LockRecord) -> bool {
         && identity.executable_inode == record.executable_inode
 }
 
+fn current_lock_owner_pid_at(path: &Path) -> Option<u32> {
+    let path_metadata = fs::symlink_metadata(path).ok()?;
+    if path_metadata.file_type().is_symlink()
+        || !path_metadata.is_file()
+        || path_metadata.len() > MAX_LOCK_BYTES
+    {
+        return None;
+    }
+    let mut file = File::open(path).ok()?;
+    let file_metadata = file.metadata().ok()?;
+    if !lock_is_same_file(&path_metadata, &file_metadata) {
+        return None;
+    }
+    let mut bytes = Vec::with_capacity(path_metadata.len() as usize);
+    file.read_to_end(&mut bytes).ok()?;
+    if bytes.len() > MAX_LOCK_BYTES as usize {
+        return None;
+    }
+    let current_path_metadata = fs::symlink_metadata(path).ok()?;
+    if current_path_metadata.file_type().is_symlink()
+        || !lock_is_same_file(&current_path_metadata, &file_metadata)
+    {
+        return None;
+    }
+    let record = serde_json::from_slice::<LockRecord>(&bytes).ok()?;
+    lock_owner_is_current(&record).then_some(record.pid)
+}
+
+/// Return only the PID from a complete, current recorder lock identity.
+/// Callers use this to distinguish the service child they own from a
+/// concurrently-started winner; malformed, stale, or replaced locks are not
+/// treated as authority.
+pub(crate) fn current_daemon_owner_pid() -> Option<u32> {
+    current_lock_owner_pid_at(&daemon_lock_path()?)
+}
+
 fn lock_is_stale(path: &Path) -> Result<bool, DaemonError> {
     let metadata = fs::symlink_metadata(path).map_err(DaemonError::Lock)?;
     if metadata.file_type().is_symlink() || !metadata.is_file() {
@@ -568,10 +604,14 @@ fn scan_and_store(database: &Path, hint: ResetHint) -> Result<usize, DaemonError
         .iter()
         .map(crate::UsageHistorySample::to_store)
         .collect::<Vec<_>>();
-    let mut store = UsageStore::open(database).map_err(|_| DaemonError::Store)?;
-    store
-        .upsert_samples(&rows)
-        .map_err(|_| DaemonError::Store)?;
+    let mut store = UsageStore::open(database).map_err(|_| {
+        crate::debug_runtime("recorder history store open failed");
+        DaemonError::Store
+    })?;
+    store.upsert_samples(&rows).map_err(|error| {
+        crate::debug_runtime(format!("recorder history batch commit failed: {error}"));
+        DaemonError::Store
+    })?;
     Ok(rows.len())
 }
 
@@ -861,8 +901,10 @@ mod tests {
         let path = root.join(DAEMON_LOCK_FILE_NAME);
         fs::write(&path, b"{\"pid\":4294967294,\"started_at\":1}\n").unwrap();
         let first = DaemonLock::acquire(path.clone()).unwrap().unwrap();
+        assert_eq!(current_lock_owner_pid_at(&path), Some(std::process::id()));
         assert!(DaemonLock::acquire(path.clone()).unwrap().is_none());
         drop(first);
+        assert_eq!(current_lock_owner_pid_at(&path), None);
         assert!(!path.exists());
         let _ = fs::remove_dir_all(root);
     }

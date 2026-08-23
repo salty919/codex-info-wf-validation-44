@@ -46,7 +46,7 @@ codex_info --all
 
 `--service`はWindowを表示せず、recorder lockとREST listenerを同じprocess lifetimeで所有する。
 `--ui-only`は環境変数`CODEX_INFO_API_LISTEN`を継承していてもserviceへ変化しない。
-`--all`は`/v1/health`で既存loopback serviceを確認し、存在しない場合だけ同一実行ファイルの`--service`を開始する。
+引数なしで`CODEX_INFO_API_LISTEN`だけを指定した後方互換起動はservice modeになり、明示的な`--all`は同じ環境変数のaddressでもX UIを保持する。`--all`は`/v1/health`で既存loopback serviceを確認し、存在しない場合だけ同一実行ファイルの`--service`を開始する。
 systemd自動起動の解除は`bash scripts/install_systemd_recorder.sh --remove`で行い、DB/historyを保持する。
 
 Windows からは SSH のローカルポート転送を使う。

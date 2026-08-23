@@ -283,7 +283,11 @@ public sealed class GraphPlotControl : AvaPlot
         SetVisible(solSeries, solConnector, solLabel, ShowModels && ShowSol);
         SetVisible(terraSeries, terraConnector, terraLabel, ShowModels && ShowTerra);
         SetVisible(lunaSeries, lunaConnector, lunaLabel, ShowModels && ShowLuna);
-        Refresh();
+        // AvaPlot.Refresh() always posts at Background priority. Visibility
+        // changes originate on the UI thread, so invalidate immediately and
+        // let the next compositor frame paint both the toggle and the plot.
+        // This avoids an extra dispatcher turn on every series ON/OFF action.
+        InvalidateVisual();
     }
 
     private static void SetVisible(

@@ -29,7 +29,13 @@ if rg -q '^PrivateTmp=true$' packaging/codex-info.service; then
     fail 'PrivateTmp=true hides live Codex /proc state from the Threads snapshot'
 fi
 
-tmp_root="$(mktemp -d /tmp/codex-info-daemon-e2e.XXXXXX)"
+temp_parent="${RUNNER_TEMP:-${TMPDIR:-/tmp}}"
+temp_parent="$(cd -- "$temp_parent" 2>/dev/null && pwd -P)" \
+    || fail 'temporary parent is unavailable'
+case "$temp_parent/" in
+    "$ROOT_DIR/"*) fail 'temporary acceptance data must stay outside the repository' ;;
+esac
+tmp_root="$(mktemp -d "$temp_parent/codex-info-daemon-e2e.XXXXXX")"
 case_root=""
 case_data=""
 case_home=""
@@ -98,6 +104,17 @@ process_matches_scope() {
     esac
 }
 
+find_ui_pids() {
+    local proc pid
+    for proc in /proc/[0-9]*; do
+        [[ -d "$proc" ]] || continue
+        pid="${proc##*/}"
+        if process_matches_scope "$pid" ui; then
+            printf '%s\n' "$pid"
+        fi
+    done
+}
+
 find_service_pids() {
     local proc pid
     for proc in /proc/[0-9]*; do
@@ -149,9 +166,14 @@ terminate_scoped_pid() {
 }
 
 stop_ui() {
-    local pid="${ui_pid:-}"
-    [[ -n "$pid" ]] || return 0
-    terminate_scoped_pid "$pid" ui 'UI' || true
+    local pid pids=()
+    mapfile -t pids < <(find_ui_pids)
+    if [[ "${#pids[@]}" -eq 0 && -n "${ui_pid:-}" ]]; then
+        pids=("$ui_pid")
+    fi
+    for pid in "${pids[@]}"; do
+        terminate_scoped_pid "$pid" ui 'UI' || true
+    done
     ui_pid=""
 }
 
@@ -168,7 +190,7 @@ cleanup() {
     stop_ui || true
     stop_services || true
     case "$tmp_root" in
-        /tmp/codex-info-daemon-e2e.*)
+        "$temp_parent"/codex-info-daemon-e2e.*)
             rm -rf -- "$tmp_root"
             ;;
         *)
@@ -217,6 +239,7 @@ setup_case() {
         "CODEX_HOME=$case_home"
         "CODEX_INFO_DATA_DIR=$case_data"
         "CODEX_INFO_DAEMON_INTERVAL_SECS=5"
+        "CODEX_INFO_DEBUG=1"
     )
 }
 
@@ -334,6 +357,55 @@ wait_for_ui_window() {
     return 1
 }
 
+wait_for_two_ui_windows() {
+    local first_pid="$1" second_pid="$2" tree window_count
+    command -v xwininfo >/dev/null 2>&1 || return 1
+    for _ in $(seq 1 60); do
+        if ! kill -0 "$first_pid" 2>/dev/null \
+            || ! kill -0 "$second_pid" 2>/dev/null \
+            || ! process_matches_scope "$first_pid" ui \
+            || ! process_matches_scope "$second_pid" ui; then
+            return 1
+        fi
+        tree="$(xwininfo -root -tree 2>/dev/null || true)"
+        window_count="$(awk '{ count += gsub(/preview@example[.]com/, "&") } END { print count + 0 }' <<<"$tree")"
+        if ((window_count >= 2)); then
+            return 0
+        fi
+        sleep 0.25
+    done
+    return 1
+}
+
+is_descendant_of() {
+    local pid="$1" ancestor="$2" ppid
+    [[ "$pid" != "$ancestor" ]] || return 1
+    for _ in $(seq 1 32); do
+        ppid="$(awk '/^PPid:/ { print $2; exit }' "/proc/$pid/status" 2>/dev/null || true)"
+        [[ "$ppid" =~ ^[0-9]+$ && "$ppid" != "$pid" ]] || return 1
+        [[ "$ppid" == "$ancestor" ]] && return 0
+        [[ "$ppid" != 1 ]] || return 1
+        pid="$ppid"
+    done
+    return 1
+}
+
+find_service_zombies() {
+    local first_pid="$1" second_pid="$2" proc pid state name
+    for proc in /proc/[0-9]*; do
+        [[ -r "$proc/status" ]] || continue
+        pid="${proc##*/}"
+        state="$(awk '/^State:/ { print $2; exit }' "$proc/status" 2>/dev/null || true)"
+        [[ "$state" == Z ]] || continue
+        name="$(awk '/^Name:/ { print $2; exit }' "$proc/status" 2>/dev/null || true)"
+        [[ "$name" == "${BINARY##*/}" ]] || continue
+        if is_descendant_of "$pid" "$first_pid" \
+            || is_descendant_of "$pid" "$second_pid"; then
+            printf '%s\n' "$pid"
+        fi
+    done
+}
+
 ui_display_available=0
 if [[ -n "${DISPLAY:-}" ]] && command -v xdpyinfo >/dev/null 2>&1 \
     && xdpyinfo >/dev/null 2>&1; then
@@ -375,7 +447,10 @@ run_service_cold_start() {
         [[ "$after" -ge 240 ]] && break
         sleep 0.5
     done
-    [[ "$after" -ge 240 ]] || fail "$case_label: daemon did not record changed session input"
+    if [[ "$after" -lt 240 ]]; then
+        sed -n '1,160p' "$case_root/service-cold.log" >&2 || true
+        fail "$case_label: daemon did not record changed session input (observed luna_tokens=$after)"
+    fi
     if [[ "$(listener_count "$case_port")" != 1 ]] || ! service_health; then
         fail "$case_label: REST became unavailable during recording"
     fi
@@ -522,6 +597,59 @@ run_all_with_service() {
         "$case_label" "$owner"
 }
 
+run_simultaneous_all_without_service() {
+    local first_ui second_ui owner pids=() zombies=()
+    setup_case simultaneous-all-without-service
+    write_fixture
+    if [[ "$ui_display_available" != 1 ]]; then
+        mark_ui_hold "$case_label" 'X11 display is unavailable; UI was not rendered'
+        return
+    fi
+    launch_all all-concurrent-first
+    first_ui="$ui_pid"
+    launch_all all-concurrent-second
+    second_ui="$ui_pid"
+    require_ready
+    require_one_service
+    owner="$service_pid"
+    [[ "$owner" != "$first_ui" && "$owner" != "$second_ui" ]] \
+        || fail "$case_label: --all UI PID became the service owner"
+    process_matches_scope "$first_ui" ui \
+        || fail "$case_label: first --all launcher is not a scoped UI"
+    process_matches_scope "$second_ui" ui \
+        || fail "$case_label: second --all launcher is not a scoped UI"
+    if ! wait_for_two_ui_windows "$first_ui" "$second_ui"; then
+        if ! xdpyinfo >/dev/null 2>&1; then
+            stop_ui
+            stop_current_service
+            mark_ui_hold "$case_label" 'X11 display became unavailable; UI was not rendered'
+            return
+        fi
+        sed -n '1,120p' "$case_root"/all-concurrent-*.log >&2 2>/dev/null || true
+        fail "$case_label: concurrent --all launchers did not render two preview windows"
+    fi
+    require_one_service "$owner"
+    mapfile -t pids < <(find_service_pids)
+    [[ "${#pids[@]}" -eq 1 && "${pids[0]}" == "$owner" ]] \
+        || fail "$case_label: concurrent --all launchers left extra service processes"
+    mapfile -t zombies < <(find_service_zombies "$first_ui" "$second_ui")
+    [[ "${#zombies[@]}" -eq 0 ]] \
+        || fail "$case_label: losing --all service zombie remains (${zombies[*]})"
+    service_health || fail "$case_label: concurrent --all service became unavailable"
+
+    terminate_scoped_pid "$first_ui" ui 'first concurrent --all UI'
+    terminate_scoped_pid "$second_ui" ui 'second concurrent --all UI'
+    ui_pid=""
+    [[ ! -e "/proc/$first_ui" && ! -e "/proc/$second_ui" ]] \
+        || fail "$case_label: one of the concurrent --all UIs remained resident"
+    require_one_service "$owner"
+    service_health || fail "$case_label: sole service did not survive both UI exits"
+    stop_current_service
+    require_no_service
+    printf 'CASE %s: PASS (simultaneous --all UIs=%s,%s, sole service owner/listener=%s, clean stop)\n' \
+        "$case_label" "$first_ui" "$second_ui" "$owner"
+}
+
 run_simultaneous_service_launches() {
     local first second owner loser pids=()
     setup_case simultaneous-service-launches
@@ -572,6 +700,7 @@ run_ui_only_without_service
 run_ui_only_with_service
 run_all_without_service
 run_all_with_service
+run_simultaneous_all_without_service
 run_simultaneous_service_launches
 
 if ((hold_count > 0)); then

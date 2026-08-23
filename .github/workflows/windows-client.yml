@@ -253,6 +253,13 @@ jobs:
               if ($uninstallProcess.ExitCode -ne 0) { throw "E2E cleanup uninstall failed with exit code $($uninstallProcess.ExitCode)" }
             }
           }
+      - name: Upload Windows UI E2E evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-ui-e2e
+          path: ${{ runner.temp }}/codex-info-windows-e2e
+          if-no-files-found: warn
       - name: Run installed Windows graph latency budget
         shell: pwsh
         run: |
@@ -275,6 +282,13 @@ jobs:
               if ($uninstallProcess.ExitCode -ne 0) { throw "Graph latency cleanup uninstall failed with exit code $($uninstallProcess.ExitCode)" }
             }
           }
+      - name: Upload Windows graph latency evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-graph-latency
+          path: ${{ runner.temp }}/codex-info-windows-graph-latency
+          if-no-files-found: warn
       - name: Upload CI installer artifact
         if: always()
         uses: actions/upload-artifact@v4

@@ -15,6 +15,8 @@
 
 `--listen`はnumeric loopback addressだけを受理する。`0.0.0.0`、`::`、LAN address、hostnameは拒否する。
 `--ui-only`は`CODEX_INFO_API_LISTEN`を継承していてもservice modeへ変化しない。
+後方互換のため、引数なしで`CODEX_INFO_API_LISTEN`だけを指定した起動はWindowを生成しないservice modeになる。
+同じ環境変数のaddressで全体起動するときは`--all`を明示し、X UIを必ず追加する。
 
 repositoryから起動する場合は同じ引数を`run.sh`へ渡す。
 
