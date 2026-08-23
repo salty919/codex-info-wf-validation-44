@@ -52,6 +52,40 @@ public sealed class DetailsPresentationCoverageTests
     }
 
     [Fact]
+    public async Task GraphWindow_DetailsRefreshKeepsMetricOptionsIdentityAndNotificationSilent()
+    {
+        var period = CreateSmallPeriod("current", 2_000_000, 2_000_120, current: false, remaining: 80, token: 100);
+        using var main = await StartMainAsync(CreateDetails([period], Array.Empty<ApiThreadDetails>()));
+        using var graph = new GraphWindowViewModel(main);
+
+        await EventuallyAsync(() => main.CanRefresh);
+        var initialOptions = graph.MetricOptions;
+        var changed = new List<string?>();
+        graph.PropertyChanged += (_, args) => changed.Add(args.PropertyName);
+
+        main.RefreshCommand.Execute(null);
+        await EventuallyAsync(() => changed.Contains(nameof(GraphWindowViewModel.SelectedPeriod)));
+
+        Assert.Same(initialOptions, graph.MetricOptions);
+        Assert.DoesNotContain(nameof(GraphWindowViewModel.MetricOptions), changed);
+
+        var previousLanguage = LocalizationService.Current.LanguageCode;
+        var nextLanguage = previousLanguage.Equals("en", StringComparison.OrdinalIgnoreCase) ? "ja" : "en";
+        try
+        {
+            changed.Clear();
+            LocalizationService.SetLanguage(nextLanguage);
+
+            Assert.Contains(nameof(GraphWindowViewModel.MetricOptions), changed);
+            Assert.NotSame(initialOptions, graph.MetricOptions);
+        }
+        finally
+        {
+            LocalizationService.SetLanguage(previousLanguage);
+        }
+    }
+
+    [Fact]
     public async Task GraphWindow_CancelledLargeBuildCannotOverwriteLatestPeriod()
     {
         var first = CreateLargePeriod("first", 2_100_000, 2_104_600, seed: 1);
