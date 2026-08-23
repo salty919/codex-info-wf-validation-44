@@ -87,6 +87,7 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
     private ApiHistoryPeriod? displayedPeriod;
     private GraphMetric selectedMetric = GraphMetric.Dollars;
     private GraphMetric displayedMetric = GraphMetric.Dollars;
+    private IReadOnlyList<string> metricOptions = Array.Empty<string>();
     private bool showRemaining = true;
     private bool showModels = true;
     private bool showSol = true;
@@ -108,6 +109,7 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
         this.main = main;
         this.postToUi = postToUi;
         Periods = new ReadOnlyObservableCollection<ApiHistoryPeriod>(periods);
+        RebuildMetricOptions();
         main.PropertyChanged += OnMainPropertyChanged;
         Rebuild();
     }
@@ -122,7 +124,7 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
 
     public UiText Texts => LocalizationService.Current;
 
-    public IReadOnlyList<string> MetricOptions => [Texts.Dollars, Texts.Tokens];
+    public IReadOnlyList<string> MetricOptions => metricOptions;
 
     public string SelectedMetric
     {
@@ -377,16 +379,33 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
 
     private void OnMainPropertyChanged(object? sender, PropertyChangedEventArgs eventArgs)
     {
-        if (eventArgs.PropertyName is nameof(MainWindowViewModel.DetailsSnapshot) or
-            nameof(MainWindowViewModel.DetailsStatusText) or nameof(MainWindowViewModel.Texts))
+        if (eventArgs.PropertyName == nameof(MainWindowViewModel.DetailsSnapshot))
         {
             Rebuild();
+            return;
+        }
+
+        if (eventArgs.PropertyName == nameof(MainWindowViewModel.DetailsStatusText))
+        {
             Notify(nameof(DetailsStatusText));
+            return;
+        }
+
+        if (eventArgs.PropertyName == nameof(MainWindowViewModel.Texts))
+        {
+            RebuildMetricOptions();
+            RebuildPoints();
             Notify(nameof(Texts));
             Notify(nameof(MetricOptions));
             Notify(nameof(SelectedMetric));
+            Notify(nameof(SelectedPeriodText));
             Notify(nameof(MetricAxisText));
         }
+    }
+
+    private void RebuildMetricOptions()
+    {
+        metricOptions = [Texts.Dollars, Texts.Tokens];
     }
 
     private void Rebuild()

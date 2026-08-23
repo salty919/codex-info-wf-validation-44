@@ -17,6 +17,8 @@ require_text windows-client/src/CodexInfo.WindowsClient/MainWindow.axaml 'Click=
 require_text windows-client/src/CodexInfo.WindowsClient/MainWindow.axaml 'Click="OnOpenThreads"'
 require_text windows-client/src/CodexInfo.WindowsClient/MainWindow.axaml 'Click="OnOpenLegal"'
 require_text windows-client/src/CodexInfo.WindowsClient/MainWindow.axaml 'Click="OnOpenSettings"'
+require_text windows-client/src/CodexInfo.WindowsClient/MainWindow.axaml 'AutomationProperties.AutomationId="Main.QuotaPeriodGauge"'
+require_text windows-client/src/CodexInfo.WindowsClient/MainWindow.axaml 'Classes="quota-segment"'
 require_text windows-client/src/CodexInfo.WindowsClient/GraphWindow.axaml 'IsChecked="{Binding ShowRemaining}"'
 require_text windows-client/src/CodexInfo.WindowsClient/GraphWindow.axaml 'IsChecked="{Binding ShowSol}"'
 require_text windows-client/src/CodexInfo.WindowsClient/GraphWindow.axaml 'IsChecked="{Binding ShowTerra}"'
@@ -25,6 +27,9 @@ require_text windows-client/src/CodexInfo.WindowsClient/GraphWindow.axaml 'Autom
 require_text windows-client/src/CodexInfo.WindowsClient/GraphWindow.axaml 'AutomationProperties.AutomationId="Graph.MetricMenu"'
 require_text windows-client/src/CodexInfo.WindowsClient/GraphWindow.axaml 'IsCheckedChanged="OnPeriodSelectorCheckedChanged"'
 require_text windows-client/src/CodexInfo.WindowsClient/GraphWindow.axaml 'IsCheckedChanged="OnMetricSelectorCheckedChanged"'
+require_text windows-client/src/CodexInfo.WindowsClient/ViewModels/DetailsWindowViewModels.cs 'private IReadOnlyList<string> metricOptions'
+require_text windows-client/src/CodexInfo.WindowsClient/GraphWindow.axaml.cs 'periodSelectionAtOpen'
+require_text windows-client/src/CodexInfo.WindowsClient/GraphWindow.axaml.cs 'metricSelectionAtOpen'
 require_text windows-client/src/CodexInfo.WindowsClient/ViewModels/DetailsWindowViewModels.cs 'MaxRenderedGraphPoints = 2_048'
 require_text windows-client/src/CodexInfo.WindowsClient/ThreadsWindow.axaml 'ThreadTreeControl'
 require_text windows-client/src/CodexInfo.WindowsClient/LegalNoticesWindow.axaml 'CurrentNoticeText'
@@ -119,6 +124,8 @@ require_text windows-client/tools/Measure-WindowsGraphLatency.ps1 'Graph.PeriodS
 require_text windows-client/tools/Measure-WindowsGraphLatency.ps1 'Graph.MetricSelector'
 require_text windows-client/tools/Measure-WindowsGraphLatency.ps1 'CopyFromScreen'
 require_text windows-client/tools/Measure-WindowsGraphLatency.ps1 'SendInput'
+require_text windows-client/tools/Run-WindowsClientE2E.ps1 'Assert-E2EQuotaGaugePalette'
+require_text windows-client/tools/Run-WindowsClientE2E.ps1 "main-quota-gauge: seven cells, two X-authority surface colors, and half-period boundary PASS"
 if rg -q --fixed-strings 'mouse_event' windows-client/tools/Measure-WindowsGraphLatency.ps1; then
     fail 'graph latency probe must use checked SendInput rather than deprecated mouse_event'
 fi

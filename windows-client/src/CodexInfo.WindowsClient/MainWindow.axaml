@@ -82,6 +82,14 @@
       <Setter Property="Background" Value="#24415E" />
       <Setter Property="BorderBrush" Value="#5EA7E5" />
     </Style>
+    <!-- WeekGauge cells use a fixed two-surface template instead of a themed
+         progress control.  This keeps the gauge free of hover, animation, and
+         indeterminate layers. -->
+    <Style Selector="Border.quota-segment">
+      <Setter Property="Background" Value="#326799" />
+      <Setter Property="Height" Value="12" />
+      <Setter Property="Margin" Value="0,0,4,0" />
+    </Style>
     <Style Selector="Border.app-mark">
       <Setter Property="Width" Value="36" />
       <Setter Property="Height" Value="36" />
@@ -219,7 +227,10 @@
           <ItemsControl Grid.Column="1"
                         VerticalAlignment="Center"
                         ItemsSource="{Binding QuotaSegments}"
-                        IsVisible="{Binding HasQuota}">
+                        IsVisible="{Binding HasQuota}"
+                        AutomationProperties.AutomationId="Main.QuotaPeriodGauge"
+                        AutomationProperties.Name="{Binding QuotaWindowText}"
+                        AutomationProperties.HelpText="{Binding QuotaRemainingText}">
             <ItemsControl.ItemsPanel>
               <ItemsPanelTemplate>
                 <UniformGrid Rows="1" Columns="7" />
@@ -227,11 +238,17 @@
             </ItemsControl.ItemsPanel>
             <ItemsControl.ItemTemplate>
               <DataTemplate x:DataType="vm:QuotaSegmentViewModel">
-                <ProgressBar Minimum="0"
-                             Maximum="1"
-                             Value="{Binding Fill}"
-                             Height="12"
-                             Margin="0,0,4,0" />
+                <Border x:Name="QuotaSegmentCell" Classes="quota-segment" ClipToBounds="True">
+                  <Border Background="#56B2F5"
+                          HorizontalAlignment="Stretch"
+                          VerticalAlignment="Stretch"
+                          RenderTransformOrigin="0%,50%">
+                    <Border.RenderTransform>
+                      <ScaleTransform x:CompileBindings="False"
+                                      ScaleX="{Binding DataContext.Fill, ElementName=QuotaSegmentCell}" />
+                    </Border.RenderTransform>
+                  </Border>
+                </Border>
               </DataTemplate>
             </ItemsControl.ItemTemplate>
           </ItemsControl>

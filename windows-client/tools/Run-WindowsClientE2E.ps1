@@ -577,6 +577,51 @@ function Assert-E2EImageChanged {
     Assert-E2E ($Before.Hash -ne $After.Hash) "$Description did not change the rendered window."
 }
 
+function Assert-E2EQuotaGaugePalette {
+    param(
+        [Parameter(Mandatory = $true)][System.Windows.Automation.AutomationElement]$Root,
+        [Parameter(Mandatory = $true)][IntPtr]$Handle,
+        [Parameter(Mandatory = $true)][psobject]$Capture
+    )
+
+    $gauge = Find-E2EElementByAutomationId $Root 'Main.QuotaPeriodGauge'
+    Assert-E2E ($null -ne $gauge) 'Main quota period gauge is missing.'
+    $rectangle = $gauge.Current.BoundingRectangle
+    Assert-E2E (-not $gauge.Current.IsOffscreen -and $rectangle.Width -gt 70 -and $rectangle.Height -ge 8) `
+        'Main quota period gauge has invalid rendered bounds.'
+    $window = Get-E2EWindowBounds $Handle
+    $cellWidth = $rectangle.Width / 7.0
+    $sampleY = [int][Math]::Floor($rectangle.Top - $window.Top + $rectangle.Height / 2.0)
+    # The fixture has one half of its reset window remaining.  These samples
+    # cover full, fractional, and empty cells away from the one-pixel boundary.
+    $samples = @(
+        @{ name = 'full-1'; cell = 0; fraction = 0.50; expected = '#56B2F5' },
+        @{ name = 'full-3'; cell = 2; fraction = 0.50; expected = '#56B2F5' },
+        @{ name = 'partial-filled'; cell = 3; fraction = 0.25; expected = '#56B2F5' },
+        @{ name = 'partial-unfilled'; cell = 3; fraction = 0.75; expected = '#326799' },
+        @{ name = 'empty-5'; cell = 4; fraction = 0.50; expected = '#326799' },
+        @{ name = 'empty-7'; cell = 6; fraction = 0.50; expected = '#326799' }
+    )
+    $bitmap = [System.Drawing.Bitmap]::FromFile($Capture.Path)
+    try {
+        foreach ($sample in $samples) {
+            $sampleX = [int][Math]::Floor(
+                $rectangle.Left - $window.Left + ($sample.cell + $sample.fraction) * $cellWidth)
+            Assert-E2E ($sampleX -ge 0 -and $sampleX -lt $bitmap.Width -and
+                $sampleY -ge 0 -and $sampleY -lt $bitmap.Height) `
+                "Quota palette sample '$($sample.name)' is outside the captured window."
+            $pixel = $bitmap.GetPixel($sampleX, $sampleY)
+            $actual = '#{0:X2}{1:X2}{2:X2}' -f $pixel.R, $pixel.G, $pixel.B
+            Assert-E2E ($actual -eq $sample.expected) `
+                "Quota palette sample '$($sample.name)' is $actual, expected $($sample.expected)."
+        }
+    }
+    finally {
+        $bitmap.Dispose()
+    }
+    Write-E2E 'main-quota-gauge: seven cells, two X-authority surface colors, and half-period boundary PASS'
+}
+
 function New-E2EFixtureDocuments {
     $now = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
     $currentStart = $now - 7200
@@ -753,6 +798,7 @@ try {
     $mainRoot = Get-E2EUiaRoot $mainHandle
     $mainCapture = Capture-E2EWindow $mainHandle '01-main-ready'
     Assert-E2E ($mainCapture.Hash.Length -eq 64) 'Main screenshot hash is missing.'
+    Assert-E2EQuotaGaugePalette -Root $mainRoot -Handle $mainHandle -Capture $mainCapture
 
     # Finite path: one Graph window, one period round-trip, two metrics, then
     # one OFF/ON cycle for each of four independent series.  No combinations

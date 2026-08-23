@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
 using System.Diagnostics;
+using System.Xml.Linq;
 using CodexInfo.WindowsClient;
 using CodexInfo.WindowsClient.Core;
 using CodexInfo.WindowsClient.Graphing;
@@ -54,6 +55,20 @@ public sealed class PresentationBoundaryTests
             Assert.False(string.IsNullOrWhiteSpace(language.UnavailableValue));
             Assert.False(string.IsNullOrWhiteSpace(language.ConnectionEndpoint));
         });
+    }
+
+    [Fact]
+    public void UiTextPeriodLabelsNameResetAndDistinguishWeeklyAndMonthly()
+    {
+        var japanese = LocalizationService.Languages.Single(language => language.LanguageCode == "ja");
+
+        Assert.Equal("7日周期：リセットまで", japanese.WeeklyQuota);
+        Assert.Equal("月間：リセットまで", japanese.MonthlyQuota);
+        Assert.Contains("リセット", japanese.WeeklyQuota, StringComparison.Ordinal);
+        Assert.Contains("リセット", japanese.MonthlyQuota, StringComparison.Ordinal);
+        Assert.NotEqual(japanese.WeeklyQuota, japanese.MonthlyQuota);
+        Assert.DoesNotContain("利用枠", japanese.WeeklyQuota, StringComparison.Ordinal);
+        Assert.DoesNotContain("利用枠", japanese.MonthlyQuota, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -216,6 +231,70 @@ public sealed class PresentationBoundaryTests
     }
 
     [Fact]
+    public async Task MainMonthlyQuotaLabelNamesResetAndKeepsSevenCellBoundary()
+    {
+        var originalLanguage = LocalizationService.Current.LanguageCode;
+        try
+        {
+            LocalizationService.SetLanguage("ja");
+            var now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+            var quota = new ApiQuota(40, now + 500, 2_592_000, true);
+            using var viewModel = new MainWindowViewModel(new SequenceStatusClient(
+                StatusFetchResult.Success(new ApiStatusSnapshot(ApiState.Ready, now, true, "Pro", quota, [], 0))));
+
+            viewModel.Start();
+            await EventuallyAsync(() => viewModel.IsAuthenticated);
+
+            Assert.Equal("月間：リセットまで", viewModel.QuotaWindowText);
+            Assert.Equal(7, viewModel.QuotaSegments.Count);
+        }
+        finally
+        {
+            LocalizationService.SetLanguage(originalLanguage);
+        }
+    }
+
+    [Fact]
+    public void MainQuotaGaugeUsesSevenCellsAndOnlyItsTwoDeclaredSurfaceColors()
+    {
+        var source = LoadRepositoryFile("windows-client", "src", "CodexInfo.WindowsClient", "MainWindow.axaml");
+        var document = XDocument.Parse(source);
+        var gaugeStyle = document.Descendants()
+            .Single(element => element.Name.LocalName == "Style" && element.Attribute("Selector")?.Value == "Border.quota-segment");
+
+        var gauge = document.Descendants()
+            .Single(element => element.Name.LocalName == "ItemsControl" && element.Attribute("AutomationProperties.AutomationId")?.Value == "Main.QuotaPeriodGauge");
+        var colors = gaugeStyle.Descendants()
+            .Attributes("Value")
+            .Select(attribute => attribute.Value)
+            .Where(value => value.StartsWith("#", StringComparison.Ordinal))
+            .Concat(gauge.Descendants()
+                .Attributes("Background")
+                .Select(attribute => attribute.Value)
+                .Where(value => value.StartsWith("#", StringComparison.Ordinal)))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+        var xAccentPrimary = ReadSlintColor("accent-primary");
+        var xAccentMuted = ReadSlintColor("accent-muted");
+        Assert.Equal(["#56B2F5", "#326799"], [xAccentPrimary, xAccentMuted]);
+        Assert.Equal(
+            [xAccentMuted, xAccentPrimary],
+            colors.Select(color => color.ToUpperInvariant()).ToArray());
+        Assert.DoesNotContain(gaugeStyle.Descendants(), element => element.Name.LocalName is "Animation" or "Transitions");
+        Assert.DoesNotContain(gauge.Descendants(), element => element.Name.LocalName == "ProgressBar");
+
+        Assert.Equal("{Binding QuotaWindowText}", gauge.Attribute("AutomationProperties.Name")?.Value);
+        Assert.Equal("{Binding QuotaRemainingText}", gauge.Attribute("AutomationProperties.HelpText")?.Value);
+        Assert.Equal("7", gauge.Descendants().Single(element => element.Name.LocalName == "UniformGrid").Attribute("Columns")?.Value);
+        Assert.Equal("0,0,4,0", gaugeStyle.Descendants()
+            .Single(element => element.Name.LocalName == "Setter" && element.Attribute("Property")?.Value == "Margin")
+            .Attribute("Value")?.Value);
+        var scale = gauge.Descendants().Single(element => element.Name.LocalName == "ScaleTransform");
+        Assert.Equal("False", scale.Attribute("{http://schemas.microsoft.com/winfx/2006/xaml}CompileBindings")?.Value);
+        Assert.Equal("{Binding DataContext.Fill, ElementName=QuotaSegmentCell}", scale.Attribute("ScaleX")?.Value);
+    }
+
+    [Fact]
     public async Task MainDetailsFailureDoesNotPublishAPartialAccountGeneration()
     {
         var status = ValidStatus(DateTimeOffset.UtcNow.AddHours(2).ToUnixTimeSeconds());
@@ -345,6 +424,30 @@ public sealed class PresentationBoundaryTests
 
             await Task.Delay(10);
         }
+    }
+
+    private static string LoadRepositoryFile(params string[] segments)
+    {
+        for (var directory = new DirectoryInfo(AppContext.BaseDirectory); directory is not null; directory = directory.Parent)
+        {
+            var candidate = Path.Combine([directory.FullName, .. segments]);
+            if (File.Exists(candidate))
+            {
+                return File.ReadAllText(candidate);
+            }
+        }
+
+        throw new FileNotFoundException($"Could not locate repository file: {Path.Combine(segments)}");
+    }
+
+    private static string ReadSlintColor(string token)
+    {
+        var source = LoadRepositoryFile("ui", "theme.slint");
+        var line = source
+            .Split('\n', StringSplitOptions.RemoveEmptyEntries)
+            .Single(line => line.Contains($"out property <color> {token}:", StringComparison.Ordinal));
+        var colon = line.IndexOf(':');
+        return line[(colon + 1)..].Trim().TrimEnd(';').ToUpperInvariant();
     }
 
     private sealed class SequenceStatusClient(params StatusFetchResult[] results) : ILoopbackStatusClient

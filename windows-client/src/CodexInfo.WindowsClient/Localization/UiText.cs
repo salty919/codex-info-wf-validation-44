@@ -135,30 +135,30 @@ public sealed record UiText(
 
     public string WeeklyQuota => LanguageCode switch
     {
-        "ja" => "7日間利用枠",
-        "zh-Hans" => "7天配额",
-        "ko" => "7일 사용량",
-        "es" => "Cuota de 7 días",
-        "fr" => "Quota de 7 jours",
-        "de" => "7-Tage-Kontingent",
-        "pt" => "Cota de 7 dias",
-        "it" => "Quota di 7 giorni",
-        "ru" => "Квота на 7 дней",
-        _ => "7-day quota"
+        "ja" => "7日周期：リセットまで",
+        "zh-Hans" => "7天周期：重置倒计时",
+        "ko" => "7일 주기: 재설정까지",
+        "es" => "Ciclo de 7 días: hasta el restablecimiento",
+        "fr" => "Cycle de 7 jours : jusqu’à la réinitialisation",
+        "de" => "7-Tage-Zyklus: bis zum Zurücksetzen",
+        "pt" => "Ciclo de 7 dias: até a redefinição",
+        "it" => "Ciclo di 7 giorni: fino al ripristino",
+        "ru" => "Цикл 7 дней: до сброса",
+        _ => "7-day cycle: until reset"
     };
 
     public string MonthlyQuota => LanguageCode switch
     {
-        "ja" => "月間利用枠",
-        "zh-Hans" => "月度配额",
-        "ko" => "월간 사용량",
-        "es" => "Cuota mensual",
-        "fr" => "Quota mensuel",
-        "de" => "Monatliches Kontingent",
-        "pt" => "Cota mensal",
-        "it" => "Quota mensile",
-        "ru" => "Месячная квота",
-        _ => "Monthly quota"
+        "ja" => "月間：リセットまで",
+        "zh-Hans" => "月度：重置倒计时",
+        "ko" => "월간: 재설정까지",
+        "es" => "Mensual: hasta el restablecimiento",
+        "fr" => "Mensuel : jusqu’à la réinitialisation",
+        "de" => "Monatlich: bis zum Zurücksetzen",
+        "pt" => "Mensal: até a redefinição",
+        "it" => "Mensile: fino al ripristino",
+        "ru" => "Месячный: до сброса",
+        _ => "Monthly: until reset"
     };
 
     public string LastReceivedUnavailable => LanguageCode switch

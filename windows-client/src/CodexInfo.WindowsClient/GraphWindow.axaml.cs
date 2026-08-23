@@ -7,12 +7,16 @@ using Avalonia.Controls.Primitives;
 using Avalonia.Input;
 using Avalonia.Interactivity;
 using Avalonia.VisualTree;
+using CodexInfo.WindowsClient.Core;
 using CodexInfo.WindowsClient.ViewModels;
 
 namespace CodexInfo.WindowsClient;
 
 public partial class GraphWindow : Window
 {
+    private string? periodSelectionAtOpen;
+    private string? metricSelectionAtOpen;
+
     public GraphWindow()
     {
         InitializeComponent();
@@ -45,6 +49,9 @@ public partial class GraphWindow : Window
     private void OnPeriodSelectorCheckedChanged(object? sender, RoutedEventArgs eventArgs)
     {
         var open = PeriodSelector.IsChecked == true;
+        periodSelectionAtOpen = open
+            ? (DataContext as GraphWindowViewModel)?.SelectedPeriod?.Id
+            : null;
         SetMenuOpen(PeriodMenu, open);
         if (open)
         {
@@ -56,6 +63,9 @@ public partial class GraphWindow : Window
     private void OnMetricSelectorCheckedChanged(object? sender, RoutedEventArgs eventArgs)
     {
         var open = MetricSelector.IsChecked == true;
+        metricSelectionAtOpen = open
+            ? (DataContext as GraphWindowViewModel)?.SelectedMetric
+            : null;
         SetMenuOpen(MetricMenu, open);
         if (open)
         {
@@ -66,12 +76,24 @@ public partial class GraphWindow : Window
 
     private void OnPeriodSelectionChanged(object? sender, SelectionChangedEventArgs eventArgs)
     {
+        if (!PeriodMenu.IsEnabled || sender is not ListBox { SelectedItem: ApiHistoryPeriod selected } ||
+            string.Equals(selected.Id, periodSelectionAtOpen, StringComparison.Ordinal))
+        {
+            return;
+        }
+
         SetMenuOpen(PeriodMenu, false);
         PeriodSelector.IsChecked = false;
     }
 
     private void OnMetricSelectionChanged(object? sender, SelectionChangedEventArgs eventArgs)
     {
+        if (!MetricMenu.IsEnabled || sender is not ListBox { SelectedItem: string selected } ||
+            string.Equals(selected, metricSelectionAtOpen, StringComparison.Ordinal))
+        {
+            return;
+        }
+
         SetMenuOpen(MetricMenu, false);
         MetricSelector.IsChecked = false;
     }
