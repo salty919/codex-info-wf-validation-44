@@ -88,7 +88,7 @@ public sealed class WindowDragGeometryTests
     }
 
     [Fact]
-    public void Graph_samples_exclude_observations_outside_period_boundaries()
+    public void Graph_samples_keep_the_historical_reset_boundary_observation()
     {
         var period = new ApiHistoryPeriod("2000", 1_000, 2_000, false, "historical")
         {
@@ -104,14 +104,14 @@ public sealed class WindowDragGeometryTests
 
         var samples = GraphWindowViewModel.BuildGraphSamples(period, 1_500);
 
-        Assert.Equal([1_000L, 1_500L, 2_000L], samples.Select(sample => sample.Timestamp));
+        Assert.Equal([1_000L, 1_500L, 1_980L, 2_000L], samples.Select(sample => sample.Timestamp));
         Assert.Equal(2, samples[0].SolDollars);
         Assert.Equal(3, samples[1].SolDollars);
-        Assert.Equal(3, samples[^1].SolDollars);
+        Assert.Equal(99, samples[^1].SolDollars);
     }
 
     [Fact]
-    public void Graph_samples_anchor_at_period_end_without_including_end_observation()
+    public void Graph_samples_include_the_historical_reset_boundary_observation()
     {
         var period = new ApiHistoryPeriod("2000", 1_000, 2_000, false, "historical")
         {
@@ -126,9 +126,27 @@ public sealed class WindowDragGeometryTests
         var samples = GraphWindowViewModel.BuildGraphSamples(period, 2_000);
 
         Assert.Equal([1_000L, 1_980L, 2_000L], samples.Select(sample => sample.Timestamp));
-        Assert.Equal(2, samples[^1].SolDollars);
-        Assert.Equal(20UL, samples[^1].SolTokens);
-        Assert.Equal(70, samples[^1].RemainingPercent);
+        Assert.Equal(99, samples[^1].SolDollars);
+        Assert.Equal(99UL, samples[^1].SolTokens);
+        Assert.Equal(60, samples[^1].RemainingPercent);
+    }
+
+    [Fact]
+    public void Historical_period_with_only_reset_boundary_sample_keeps_sol_series()
+    {
+        var period = new ApiHistoryPeriod("2000", 1_000, 2_000, false, "historical")
+        {
+            Samples =
+            [
+                new ApiHistorySample(2_000, 2_000, 60, 9, 0, 0, 90, 0, 0),
+            ],
+        };
+
+        var samples = GraphWindowViewModel.BuildGraphSamples(period, 2_500);
+
+        Assert.Equal([1_000L, 1_980L, 2_000L], samples.Select(sample => sample.Timestamp));
+        Assert.Equal(9, samples[^1].SolDollars);
+        Assert.Equal(90UL, samples[^1].SolTokens);
     }
 
     [Fact]
