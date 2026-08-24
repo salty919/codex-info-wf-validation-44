@@ -76,6 +76,19 @@ release処理は同一refで直列化し、HTTP 404だけを不存在として�
 非公開Draftへexact 2資産をuploadし、名前・byte size・upload状態・tagのcommit SHAを検証してから公開する。
 既存tag/Release、通信失敗、5xx、部分uploadへ上書き・追記して継続しない。
 
+### クライアント変更とバージョンの必須対応
+
+`windows-client/src/**`、`windows-client/installer/**`、`windows-client/Directory.Build.props`、
+または配布物・更新マニフェストを生成する`windows-client/tools/Build-WindowsInstaller.ps1`、
+`New-WindowsUpdateManifest.ps1`、`Collect-ThirdPartyNotices.ps1`を変更する場合は、同じ変更で
+`Directory.Build.props`の`Version`を直前の安定版より上げる。版番号を上げない実装変更をPRへ出してはならない。
+版番号を上げないテストだけの変更は、配布物を変えないためこの規則の対象外である。
+
+PRのWindows workflowはbuild/testを通すだけでは配布反映を意味しない。`main`へmerge後のpushで、版番号が
+単調増加し、全Windows gateがPASSした場合だけ新しいSetup、`windows-vX.Y.Z` Release、update manifestが
+生成される。したがって「Windows workflowが成功した」ことと「利用者のクライアントが更新される」ことを
+同一視しない。版番号が据え置きの実装変更はrelease holdとする。
+
 ### 3. SSH 転送と初回セットアップ
 
 初回起動時は、画面の「初期設定」に従って次の順序で進む。
