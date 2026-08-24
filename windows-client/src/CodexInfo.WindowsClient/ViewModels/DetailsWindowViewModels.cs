@@ -193,7 +193,15 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
     {
         var end = EffectiveGraphEnd(period, now);
         var observed = period.Samples
-            .Where(sample => sample.Timestamp >= period.StartAt && sample.Timestamp < end)
+            // A historical period owns its canonical reset-boundary sample.
+            // The native/X graph keeps that terminal observation as the
+            // endpoint; dropping it here made a period whose last (or only)
+            // sample was recorded at reset render without its SOL/TERRA/LUNA
+            // totals.  The active period remains clipped to the observation
+            // time, so future rows cannot fabricate usage.
+            .Where(sample => sample.Timestamp >= period.StartAt &&
+                             (sample.Timestamp < end ||
+                              (!period.Current && sample.Timestamp == end)))
             .OrderBy(sample => sample.Timestamp)
             .ToList();
         if (observed.Count == 0)

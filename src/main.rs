@@ -2543,8 +2543,16 @@ fn graph_time_endpoints(
         }
         extended.push(point);
     }
-    // 時間バケットの途中で終わらず、現在時刻を右端に固定する。
-    if let Some(last) = points.last().copied() {
+    // 時間バケットの途中で終わらず、期間の観測終端を右端に固定する。
+    // 期間外（たとえば reset 後に遅れて届いた未来行）の値を terminal
+    // endpoint へ持ち込まない。歴史期間の canonical reset 観測は
+    // `<= period_end` なので、X と Windows が同じ終端値を描く。
+    if let Some(last) = points
+        .iter()
+        .copied()
+        .filter(|point| point.timestamp <= period_end)
+        .next_back()
+    {
         let endpoint = HourlyModelSpend {
             timestamp: period_end,
             ..last
@@ -12404,6 +12412,92 @@ mod tests {
         assert!(data.contains("1700200000"));
         assert!(!data.contains("1700100000"));
         assert!(data.contains("remaining_percent"));
+    }
+
+    #[test]
+    fn historical_graph_keeps_terminal_reset_sample_for_model_lines() {
+        let reset_at = 1_700_100_000;
+        let samples = [
+            UsageHistorySample::new_with_usage(
+                1_700_000_000,
+                reset_at,
+                80.0,
+                ModelDollarTotals {
+                    sol: 2.0,
+                    terra: 0.0,
+                    luna: 0.0,
+                },
+                ModelTokenTotals {
+                    sol: 20,
+                    terra: 0,
+                    luna: 0,
+                },
+            ),
+            // A quota/usage observation exactly at the historical reset
+            // boundary is owned by that period's canonical reset_at.  It is
+            // the last visible SOL point after the next period begins.
+            UsageHistorySample::new_with_usage(
+                reset_at,
+                reset_at,
+                70.0,
+                ModelDollarTotals {
+                    sol: 9.0,
+                    terra: 0.0,
+                    luna: 0.0,
+                },
+                ModelTokenTotals {
+                    sol: 90,
+                    terra: 0,
+                    luna: 0,
+                },
+            ),
+        ];
+        let references = samples.iter().collect::<Vec<_>>();
+        let points = graph_time_endpoints(
+            minute_model_spend_for_metric(&references, false),
+            samples[0].timestamp,
+            reset_at,
+        );
+        assert_eq!(points.last().map(|point| point.timestamp), Some(reset_at));
+        assert_eq!(points.last().map(|point| point.sol), Some(9.0));
+    }
+
+    #[test]
+    fn graph_endpoint_does_not_import_a_future_reset_sample() {
+        let start = 1_700_000_000;
+        let end = 1_700_100_000;
+        let samples = [
+            UsageHistorySample::new_with_usage(
+                end - 60,
+                end,
+                70.0,
+                ModelDollarTotals {
+                    sol: 3.0,
+                    terra: 0.0,
+                    luna: 0.0,
+                },
+                ModelTokenTotals::default(),
+            ),
+            UsageHistorySample::new_with_usage(
+                end + 60,
+                end + WEEK_SECONDS,
+                100.0,
+                ModelDollarTotals {
+                    sol: 99.0,
+                    terra: 0.0,
+                    luna: 0.0,
+                },
+                ModelTokenTotals::default(),
+            ),
+        ];
+        let references = samples.iter().collect::<Vec<_>>();
+        let points = graph_time_endpoints(
+            minute_model_spend_for_metric(&references, false),
+            start,
+            end,
+        );
+        assert_eq!(points.last().map(|point| point.timestamp), Some(end));
+        assert_eq!(points.last().map(|point| point.sol), Some(3.0));
     }
 
     #[test]
