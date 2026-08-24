@@ -1764,7 +1764,42 @@ fn reset_sample_groups(samples: &[UsageHistorySample]) -> Vec<ResetSampleGroup> 
             samples: members,
         });
     }
-    groups
+    let mut merged = Vec::with_capacity(groups.len());
+    for mut group in groups {
+        let should_attach_to_previous = group.samples.len() == 1
+            && group.samples[0].sol_dollars == 0.0
+            && group.samples[0].terra_dollars == 0.0
+            && group.samples[0].luna_dollars == 0.0
+            && group.samples[0].sol_tokens == 0
+            && group.samples[0].terra_tokens == 0
+            && group.samples[0].luna_tokens == 0
+            && merged.last().is_some_and(|previous: &ResetSampleGroup| {
+                previous.samples.iter().any(|sample| {
+                    sample.timestamp == group.samples[0].timestamp
+                        && (sample.sol_dollars > 0.0
+                            || sample.terra_dollars > 0.0
+                            || sample.luna_dollars > 0.0
+                            || sample.sol_tokens > 0
+                            || sample.terra_tokens > 0
+                            || sample.luna_tokens > 0)
+                })
+            });
+        if should_attach_to_previous {
+            if let Some(previous) = merged.last_mut() {
+                let sample = group.samples.remove(0);
+                merge_exact_sample(&mut previous.samples, sample);
+                previous.start = previous
+                    .samples
+                    .iter()
+                    .map(|sample| sample.timestamp)
+                    .min()
+                    .unwrap_or(previous.start);
+            }
+        } else {
+            merged.push(group);
+        }
+    }
+    merged
 }
 
 /// Groups reset observations by an anchored sixty-second window, with a
@@ -12529,6 +12564,67 @@ mod tests {
         );
         assert!(graph.luna_rising.contains('L'));
         assert_eq!(graph.current_luna_label, "$0.02");
+    }
+
+    #[test]
+    fn singleton_reset_snapshot_overlapping_a_spend_period_does_not_split_history() {
+        let history = UsageHistory {
+            samples: vec![
+                UsageHistorySample::from_model_history_with_usage(
+                    1_800_000_000,
+                    1_800_604_800,
+                    ModelDollarTotals {
+                        sol: 100.0,
+                        ..ModelDollarTotals::default()
+                    },
+                    ModelTokenTotals::default(),
+                ),
+                UsageHistorySample::from_model_history_with_usage(
+                    1_800_000_120,
+                    1_800_604_800,
+                    ModelDollarTotals {
+                        sol: 420.0,
+                        ..ModelDollarTotals::default()
+                    },
+                    ModelTokenTotals::default(),
+                ),
+                UsageHistorySample::new(
+                    1_800_000_120,
+                    1_800_650_000,
+                    14.0,
+                    ModelDollarTotals::default(),
+                ),
+                UsageHistorySample::from_model_history_with_usage(
+                    1_800_000_240,
+                    1_800_604_800,
+                    ModelDollarTotals {
+                        sol: 420.0,
+                        ..ModelDollarTotals::default()
+                    },
+                    ModelTokenTotals::default(),
+                ),
+            ],
+            ..UsageHistory::default()
+        };
+
+        let periods = history.periods(1_800_700_000, None);
+        assert_eq!(periods.len(), 1);
+        assert_eq!(periods[0].canonical_reset_at, 1_800_604_800);
+        let selected = history.samples_for_reset(Some(1_800_604_800));
+        assert_eq!(selected.len(), 3);
+        assert_eq!(selected[1].remaining_percent, 14.0);
+        assert_eq!(selected[1].sol_dollars, 420.0);
+        let references = selected.iter().collect::<Vec<_>>();
+        let graph = graph_paths_for_selection(
+            &references,
+            periods[0].start,
+            periods[0].end,
+            false,
+            false,
+            true,
+            false,
+        );
+        assert_eq!(graph.current_sol_label, "$420.00");
     }
 
     #[test]
