@@ -1715,7 +1715,7 @@ fn moving_reset_observation_belongs_to_anchor(
     candidate: &UsageHistorySample,
 ) -> bool {
     let reset_delta = candidate.reset_at.saturating_sub(anchor.reset_at);
-    if reset_delta <= RESET_AT_TOLERANCE_SECONDS {
+    if candidate.reset_at == anchor.reset_at || reset_delta <= RESET_AT_TOLERANCE_SECONDS {
         return true;
     }
     let timestamp_delta = candidate.timestamp.saturating_sub(anchor.timestamp);
@@ -1742,7 +1742,12 @@ fn reset_sample_groups(samples: &[UsageHistorySample]) -> Vec<ResetSampleGroup> 
         let mut members = Vec::new();
         let mut canonical_reset_at = anchor.reset_at;
         while let Some(candidate) = sorted.get(index) {
-            if !moving_reset_observation_belongs_to_anchor(&anchor, candidate) {
+            let same_reset_as_last = members
+                .last()
+                .is_some_and(|last: &UsageHistorySample| last.reset_at == candidate.reset_at);
+            if !same_reset_as_last
+                && !moving_reset_observation_belongs_to_anchor(&anchor, candidate)
+            {
                 break;
             }
             canonical_reset_at = canonical_reset_at.max(candidate.reset_at);
@@ -12460,6 +12465,70 @@ mod tests {
             .canonical_samples()
             .iter()
             .all(|sample| sample.reset_at == 1_800_605_040));
+    }
+
+    #[test]
+    fn observed_moving_reset_sequence_keeps_the_spend_in_the_selected_graph() {
+        // This is the shape found in the affected database: reset_at advances
+        // with each observation, while the first few snapshots are idle and
+        // the later snapshots contain the actual spend.
+        let observations = [
+            (1_787_540_040, 1_788_144_861),
+            (1_787_540_100, 1_788_144_861),
+            (1_787_540_100, 1_788_144_930),
+            (1_787_540_160, 1_788_144_930),
+            (1_787_540_160, 1_788_144_980),
+            (1_787_540_220, 1_788_144_980),
+            (1_787_540_220, 1_788_145_050),
+            (1_787_540_280, 1_788_145_050),
+            (1_787_540_280, 1_788_145_101),
+            (1_787_540_340, 1_788_145_101),
+        ];
+        let samples = observations
+            .into_iter()
+            .enumerate()
+            .map(|(index, (timestamp, reset_at))| {
+                UsageHistorySample::new_with_usage(
+                    timestamp,
+                    reset_at,
+                    100.0,
+                    ModelDollarTotals {
+                        luna: if index < 8 { 0.0 } else { 0.01528528 },
+                        ..ModelDollarTotals::default()
+                    },
+                    ModelTokenTotals {
+                        luna: if index < 8 { 0 } else { 255_973 },
+                        ..ModelTokenTotals::default()
+                    },
+                )
+            })
+            .collect::<Vec<_>>();
+        let history = UsageHistory {
+            samples,
+            ..UsageHistory::default()
+        };
+
+        assert!(super::moving_reset_observation_belongs_to_anchor(
+            &history.samples[0],
+            &history.samples[4]
+        ));
+
+        let periods = history.periods(1_788_145_200, None);
+        assert_eq!(periods.len(), 1);
+        let selected = history.samples_for_reset(Some(periods[0].canonical_reset_at));
+        assert_eq!(selected.len(), 6);
+        let references = selected.iter().collect::<Vec<_>>();
+        let graph = graph_paths_for_selection(
+            &references,
+            periods[0].start,
+            periods[0].end,
+            true,
+            false,
+            false,
+            false,
+        );
+        assert!(graph.luna_rising.contains('L'));
+        assert_eq!(graph.current_luna_label, "$0.02");
     }
 
     #[test]
