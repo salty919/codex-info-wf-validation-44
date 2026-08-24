@@ -272,6 +272,14 @@ impl ModelDollarTotals {
 
 const WEEK_SECONDS: i64 = 7 * 86_400;
 const RESET_AT_TOLERANCE_SECONDS: i64 = 60;
+// Some quota snapshots move the weekly reset timestamp forward together with
+// the observation timestamp (for example 11:54 -> 11:56 -> 11:58).  Those
+// rows are one period, not three two-minute periods.  Keep the ordinary
+// sixty-second authority boundary, but admit this bounded moving-reset shape
+// when both timestamps advance by the same amount.
+const MOVING_RESET_GROUP_MAX_DRIFT_SECONDS: i64 = 5 * 60;
+const MOVING_RESET_STEP_TOLERANCE_SECONDS: i64 = 30;
+const MOVING_RESET_MIN_HORIZON_SECONDS: i64 = 86_400;
 const LEGACY_MOVING_RESET_HORIZON_TOLERANCE_SECONDS: i64 = 120;
 const LEGACY_MOVING_RESET_PAIR_GAP_SECONDS: i64 = 3_600;
 const LEGACY_MOVING_RESET_PAIR_HORIZON_TOLERANCE_SECONDS: i64 = 60;
@@ -1695,56 +1703,141 @@ fn display_history_samples(samples: &[UsageHistorySample]) -> Vec<&UsageHistoryS
         .collect()
 }
 
-/// Groups reset observations by an anchored sixty-second window. The anchor
-/// is never advanced by a member of the group, which prevents a chain of
-/// small jitters from swallowing a distinct period.
+#[derive(Clone, Debug)]
+struct ResetSampleGroup {
+    canonical_reset_at: i64,
+    start: i64,
+    samples: Vec<UsageHistorySample>,
+}
+
+fn moving_reset_observation_belongs_to_anchor(
+    anchor: &UsageHistorySample,
+    candidate: &UsageHistorySample,
+) -> bool {
+    let reset_delta = candidate.reset_at.saturating_sub(anchor.reset_at);
+    if candidate.reset_at == anchor.reset_at || reset_delta <= RESET_AT_TOLERANCE_SECONDS {
+        return true;
+    }
+    let timestamp_delta = candidate.timestamp.saturating_sub(anchor.timestamp);
+    let anchor_horizon = anchor.reset_at.saturating_sub(anchor.timestamp);
+    let candidate_horizon = candidate.reset_at.saturating_sub(candidate.timestamp);
+    reset_delta <= MOVING_RESET_GROUP_MAX_DRIFT_SECONDS
+        && timestamp_delta > 0
+        && anchor_horizon >= MOVING_RESET_MIN_HORIZON_SECONDS
+        && candidate_horizon >= MOVING_RESET_MIN_HORIZON_SECONDS
+        && anchor_horizon.abs_diff(candidate_horizon) <= MOVING_RESET_STEP_TOLERANCE_SECONDS as u64
+        && reset_delta.abs_diff(timestamp_delta) <= MOVING_RESET_STEP_TOLERANCE_SECONDS as u64
+}
+
+fn reset_sample_groups(samples: &[UsageHistorySample]) -> Vec<ResetSampleGroup> {
+    let mut sorted = display_history_samples(samples)
+        .into_iter()
+        .cloned()
+        .collect::<Vec<_>>();
+    sorted.sort_by_key(|sample| (sample.reset_at, sample.timestamp));
+
+    let mut groups = Vec::new();
+    let mut index = 0;
+    while let Some(anchor) = sorted.get(index).cloned() {
+        let mut members = Vec::new();
+        let mut canonical_reset_at = anchor.reset_at;
+        while let Some(candidate) = sorted.get(index) {
+            let same_reset_as_last = members
+                .last()
+                .is_some_and(|last: &UsageHistorySample| last.reset_at == candidate.reset_at);
+            if !same_reset_as_last
+                && !moving_reset_observation_belongs_to_anchor(&anchor, candidate)
+            {
+                break;
+            }
+            canonical_reset_at = canonical_reset_at.max(candidate.reset_at);
+            members.push(candidate.clone());
+            index += 1;
+        }
+        groups.push(ResetSampleGroup {
+            canonical_reset_at,
+            start: members
+                .iter()
+                .map(|sample| sample.timestamp)
+                .min()
+                .unwrap_or(anchor.timestamp),
+            samples: members,
+        });
+    }
+    let mut merged = Vec::with_capacity(groups.len());
+    for mut group in groups {
+        let should_attach_to_previous = group.samples.len() == 1
+            && group.samples[0].sol_dollars == 0.0
+            && group.samples[0].terra_dollars == 0.0
+            && group.samples[0].luna_dollars == 0.0
+            && group.samples[0].sol_tokens == 0
+            && group.samples[0].terra_tokens == 0
+            && group.samples[0].luna_tokens == 0
+            && merged.last().is_some_and(|previous: &ResetSampleGroup| {
+                previous.samples.iter().any(|sample| {
+                    sample.timestamp == group.samples[0].timestamp
+                        && (sample.sol_dollars > 0.0
+                            || sample.terra_dollars > 0.0
+                            || sample.luna_dollars > 0.0
+                            || sample.sol_tokens > 0
+                            || sample.terra_tokens > 0
+                            || sample.luna_tokens > 0)
+                })
+            });
+        if should_attach_to_previous {
+            if let Some(previous) = merged.last_mut() {
+                let sample = group.samples.remove(0);
+                merge_exact_sample(&mut previous.samples, sample);
+                previous.start = previous
+                    .samples
+                    .iter()
+                    .map(|sample| sample.timestamp)
+                    .min()
+                    .unwrap_or(previous.start);
+            }
+        } else {
+            merged.push(group);
+        }
+    }
+    merged
+}
+
+/// Groups reset observations by an anchored sixty-second window, with a
+/// bounded moving-reset exception for snapshots whose reset and observation
+/// timestamps advance together. The anchor is never advanced by a member of
+/// the group, which prevents a chain of small jitters from swallowing a
+/// distinct period.
 fn history_periods_for_samples(
     samples: &[UsageHistorySample],
     now: i64,
     current_reset_at: Option<i64>,
 ) -> Vec<HistoryPeriod> {
-    let mut sorted = display_history_samples(samples);
-    sorted.sort_by_key(|sample| (sample.reset_at, sample.timestamp));
-
-    let mut groups: Vec<(i64, i64, i64)> = Vec::new();
-    let mut index = 0;
-    while let Some(first) = sorted.get(index) {
-        let anchor = first.reset_at;
-        let mut canonical = anchor;
-        let mut start = first.timestamp;
-        while let Some(sample) = sorted.get(index) {
-            if sample.reset_at.saturating_sub(anchor) > RESET_AT_TOLERANCE_SECONDS {
-                break;
-            }
-            canonical = canonical.max(sample.reset_at);
-            start = start.min(sample.timestamp);
-            index += 1;
-        }
-        groups.push((anchor, canonical, start));
-    }
+    let groups = reset_sample_groups(samples);
 
     let mut periods = groups
         .iter()
         .enumerate()
-        .map(|(index, &(anchor, canonical, start))| {
-            let next_start = groups.get(index + 1).map(|group| group.2);
-            let period_end = next_start.map_or(canonical, |next| canonical.min(next));
+        .map(|(index, group)| {
+            let next_start = groups.get(index + 1).map(|next| next.start);
+            let period_end = next_start.map_or(group.canonical_reset_at, |next| {
+                group.canonical_reset_at.min(next)
+            });
             let is_current = current_reset_at.is_some_and(|current| {
-                current.abs_diff(canonical) <= RESET_AT_TOLERANCE_SECONDS as u64 && now < canonical
+                current.abs_diff(group.canonical_reset_at) <= RESET_AT_TOLERANCE_SECONDS as u64
+                    && now < group.canonical_reset_at
             });
             let end = if is_current {
-                now.max(start).min(canonical)
+                now.max(group.start).min(group.canonical_reset_at)
             } else {
                 period_end
             };
-            let _ = anchor;
             // Labels are a presentation concern. Production UI labels are
             // rebuilt by `CodexInfoState::history_periods` with the one
             // startup-pinned I18n/timezone instance. The test-only label
             // keeps the legacy grouping fixtures readable without allowing a
             // fixed JST formatter into the runtime path.
             #[cfg(test)]
-            let mut label = format_period_label(start, period_end);
+            let mut label = format_period_label(group.start, period_end);
             #[cfg(not(test))]
             let label = String::new();
             #[cfg(test)]
@@ -1752,8 +1845,8 @@ fn history_periods_for_samples(
                 label.push_str("（現在）");
             }
             HistoryPeriod {
-                canonical_reset_at: canonical,
-                start,
+                canonical_reset_at: group.canonical_reset_at,
+                start: group.start,
                 end,
                 label,
             }
@@ -2044,40 +2137,52 @@ impl UsageHistory {
         let Some(reset_at) = reset_at else {
             return Vec::new();
         };
-        let selected_period = self.period_for_id(reset_at, 0, None).or_else(|| {
-            self.periods(0, None).into_iter().find(|period| {
-                period.canonical_reset_at.abs_diff(reset_at) <= RESET_AT_TOLERANCE_SECONDS as u64
-            })
-        });
-        let Some(selected_period) = selected_period else {
+        let canonical_reset_at = self
+            .period_for_id(reset_at, 0, None)
+            .map(|period| period.canonical_reset_at)
+            .or_else(|| {
+                self.periods(0, None)
+                    .into_iter()
+                    .find(|period| {
+                        period.canonical_reset_at.abs_diff(reset_at)
+                            <= RESET_AT_TOLERANCE_SECONDS as u64
+                    })
+                    .map(|period| period.canonical_reset_at)
+            });
+        let Some(canonical_reset_at) = canonical_reset_at else {
             return Vec::new();
         };
-        let mut selected = display_history_samples(&self.samples)
+        let mut selected = reset_sample_groups(&self.samples)
             .into_iter()
-            .filter(|sample| {
-                sample.reset_at
-                    >= selected_period
-                        .canonical_reset_at
-                        .saturating_sub(RESET_AT_TOLERANCE_SECONDS)
-                    && sample.reset_at <= selected_period.canonical_reset_at
-            })
-            .cloned()
-            .collect::<Vec<_>>();
+            .find(|group| group.canonical_reset_at == canonical_reset_at)
+            .map(|group| group.samples)
+            .unwrap_or_default();
         selected.sort_by_key(|sample| (sample.timestamp, sample.reset_at));
-        let reset_at = selected_period.canonical_reset_at;
         let mut merged: Vec<UsageHistorySample> = Vec::with_capacity(selected.len());
         for mut sample in selected {
-            sample.reset_at = reset_at;
+            sample.reset_at = canonical_reset_at;
             if let Some(existing) = merged.last_mut() {
                 if existing.timestamp == sample.timestamp {
                     merge_sample_values(existing, sample);
-                    existing.reset_at = reset_at;
+                    existing.reset_at = canonical_reset_at;
                     continue;
                 }
             }
             merged.push(sample);
         }
         merged
+    }
+
+    fn canonical_samples(&self) -> Vec<UsageHistorySample> {
+        reset_sample_groups(&self.samples)
+            .into_iter()
+            .flat_map(|group| {
+                group.samples.into_iter().map(move |mut sample| {
+                    sample.reset_at = group.canonical_reset_at;
+                    sample
+                })
+            })
+            .collect()
     }
 
     fn normalize(&mut self) {
@@ -4743,7 +4848,8 @@ impl CodexInfoState {
         };
 
         let mut history_samples = if self.authenticated {
-            display_history_samples(&self.history.samples)
+            self.history
+                .canonical_samples()
                 .into_iter()
                 // SQLite retains three calendar months, but one REST
                 // document materializes only `(one month before now, now]`.
@@ -12331,6 +12437,194 @@ mod tests {
             vec!["履歴なし"]
         );
         let _ = fs::remove_dir_all(db_path.parent().unwrap());
+    }
+
+    #[test]
+    fn moving_reset_snapshots_stay_in_one_period_and_keep_model_values() {
+        let samples = [
+            UsageHistorySample::new_with_usage(
+                1_800_000_000,
+                1_800_604_800,
+                80.0,
+                ModelDollarTotals {
+                    sol: 3.0,
+                    ..ModelDollarTotals::default()
+                },
+                ModelTokenTotals {
+                    sol: 30,
+                    ..ModelTokenTotals::default()
+                },
+            ),
+            // The quota endpoint moved reset_at by the same 120 seconds as
+            // the observation. These are still one weekly period.
+            UsageHistorySample::new_with_usage(
+                1_800_000_120,
+                1_800_604_920,
+                70.0,
+                ModelDollarTotals {
+                    sol: 9.0,
+                    ..ModelDollarTotals::default()
+                },
+                ModelTokenTotals {
+                    sol: 90,
+                    ..ModelTokenTotals::default()
+                },
+            ),
+            UsageHistorySample::new_with_usage(
+                1_800_000_240,
+                1_800_605_040,
+                60.0,
+                ModelDollarTotals {
+                    sol: 12.0,
+                    ..ModelDollarTotals::default()
+                },
+                ModelTokenTotals {
+                    sol: 120,
+                    ..ModelTokenTotals::default()
+                },
+            ),
+        ];
+        let history = UsageHistory {
+            samples: samples.to_vec(),
+            ..UsageHistory::default()
+        };
+
+        let periods = history.periods(1_800_700_000, None);
+        assert_eq!(periods.len(), 1);
+        assert_eq!(periods[0].canonical_reset_at, 1_800_605_040);
+        let selected = history.samples_for_reset(Some(1_800_605_040));
+        assert_eq!(selected.len(), 3);
+        assert_eq!(selected[1].sol_dollars, 9.0);
+        assert_eq!(selected[2].sol_tokens, 120);
+        assert!(history
+            .canonical_samples()
+            .iter()
+            .all(|sample| sample.reset_at == 1_800_605_040));
+    }
+
+    #[test]
+    fn observed_moving_reset_sequence_keeps_the_spend_in_the_selected_graph() {
+        // This is the shape found in the affected database: reset_at advances
+        // with each observation, while the first few snapshots are idle and
+        // the later snapshots contain the actual spend.
+        let observations = [
+            (1_787_540_040, 1_788_144_861),
+            (1_787_540_100, 1_788_144_861),
+            (1_787_540_100, 1_788_144_930),
+            (1_787_540_160, 1_788_144_930),
+            (1_787_540_160, 1_788_144_980),
+            (1_787_540_220, 1_788_144_980),
+            (1_787_540_220, 1_788_145_050),
+            (1_787_540_280, 1_788_145_050),
+            (1_787_540_280, 1_788_145_101),
+            (1_787_540_340, 1_788_145_101),
+        ];
+        let samples = observations
+            .into_iter()
+            .enumerate()
+            .map(|(index, (timestamp, reset_at))| {
+                UsageHistorySample::new_with_usage(
+                    timestamp,
+                    reset_at,
+                    100.0,
+                    ModelDollarTotals {
+                        luna: if index < 8 { 0.0 } else { 0.01528528 },
+                        ..ModelDollarTotals::default()
+                    },
+                    ModelTokenTotals {
+                        luna: if index < 8 { 0 } else { 255_973 },
+                        ..ModelTokenTotals::default()
+                    },
+                )
+            })
+            .collect::<Vec<_>>();
+        let history = UsageHistory {
+            samples,
+            ..UsageHistory::default()
+        };
+
+        assert!(super::moving_reset_observation_belongs_to_anchor(
+            &history.samples[0],
+            &history.samples[4]
+        ));
+
+        let periods = history.periods(1_788_145_200, None);
+        assert_eq!(periods.len(), 1);
+        let selected = history.samples_for_reset(Some(periods[0].canonical_reset_at));
+        assert_eq!(selected.len(), 6);
+        let references = selected.iter().collect::<Vec<_>>();
+        let graph = graph_paths_for_selection(
+            &references,
+            periods[0].start,
+            periods[0].end,
+            true,
+            false,
+            false,
+            false,
+        );
+        assert!(graph.luna_rising.contains('L'));
+        assert_eq!(graph.current_luna_label, "$0.02");
+    }
+
+    #[test]
+    fn singleton_reset_snapshot_overlapping_a_spend_period_does_not_split_history() {
+        let history = UsageHistory {
+            samples: vec![
+                UsageHistorySample::from_model_history_with_usage(
+                    1_800_000_000,
+                    1_800_604_800,
+                    ModelDollarTotals {
+                        sol: 100.0,
+                        ..ModelDollarTotals::default()
+                    },
+                    ModelTokenTotals::default(),
+                ),
+                UsageHistorySample::from_model_history_with_usage(
+                    1_800_000_120,
+                    1_800_604_800,
+                    ModelDollarTotals {
+                        sol: 420.0,
+                        ..ModelDollarTotals::default()
+                    },
+                    ModelTokenTotals::default(),
+                ),
+                UsageHistorySample::new(
+                    1_800_000_120,
+                    1_800_650_000,
+                    14.0,
+                    ModelDollarTotals::default(),
+                ),
+                UsageHistorySample::from_model_history_with_usage(
+                    1_800_000_240,
+                    1_800_604_800,
+                    ModelDollarTotals {
+                        sol: 420.0,
+                        ..ModelDollarTotals::default()
+                    },
+                    ModelTokenTotals::default(),
+                ),
+            ],
+            ..UsageHistory::default()
+        };
+
+        let periods = history.periods(1_800_700_000, None);
+        assert_eq!(periods.len(), 1);
+        assert_eq!(periods[0].canonical_reset_at, 1_800_604_800);
+        let selected = history.samples_for_reset(Some(1_800_604_800));
+        assert_eq!(selected.len(), 3);
+        assert_eq!(selected[1].remaining_percent, 14.0);
+        assert_eq!(selected[1].sol_dollars, 420.0);
+        let references = selected.iter().collect::<Vec<_>>();
+        let graph = graph_paths_for_selection(
+            &references,
+            periods[0].start,
+            periods[0].end,
+            false,
+            false,
+            true,
+            false,
+        );
+        assert_eq!(graph.current_sol_label, "$420.00");
     }
 
     #[test]

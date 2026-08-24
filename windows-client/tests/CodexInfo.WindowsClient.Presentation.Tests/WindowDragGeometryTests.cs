@@ -150,6 +150,29 @@ public sealed class WindowDragGeometryTests
     }
 
     [Fact]
+    public void Historical_period_keeps_canonicalized_moving_reset_samples()
+    {
+        var period = new ApiHistoryPeriod("1800605040", 1_000, 1_240, false, "historical")
+        {
+            ResetAt = 1_240,
+            Samples =
+            [
+                new ApiHistorySample(1_000, 1_240, 80, 3, 0, 0, 30, 0, 0),
+                new ApiHistorySample(1_120, 1_240, 70, 9, 0, 0, 90, 0, 0),
+                new ApiHistorySample(1_240, 1_240, 60, 12, 0, 0, 120, 0, 0),
+            ],
+        };
+
+        var samples = GraphWindowViewModel.BuildGraphSamples(period, 2_000);
+
+        Assert.Equal([1_000L, 1_080L, 1_200L, 1_240L], samples.Select(sample => sample.Timestamp));
+        Assert.Equal(3, samples[0].SolDollars);
+        Assert.Equal(9, samples[1].SolDollars);
+        Assert.Equal(12, samples[^1].SolDollars);
+        Assert.Equal(120UL, samples[^1].SolTokens);
+    }
+
+    [Fact]
     public void Graph_samples_keep_maximum_cumulative_snapshot_within_a_minute_bucket()
     {
         var period = new ApiHistoryPeriod("2000", 1_000, 2_000, false, "historical")
