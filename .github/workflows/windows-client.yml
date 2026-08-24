@@ -135,7 +135,21 @@ jobs:
           if ($null -ne $basePropsPath) {
             $decisionArguments.BasePropsPath = $basePropsPath
           }
-          & ./windows-client/tools/Get-WindowsReleaseDecision.ps1 @decisionArguments
+          $decisionOutput = @(& ./windows-client/tools/Get-WindowsReleaseDecision.ps1 @decisionArguments)
+          $versionChanged = $decisionOutput -contains 'changed=true'
+          $changedFiles = if ([string]::IsNullOrWhiteSpace($baseCommit)) {
+            @(& git diff --name-only HEAD^ HEAD)
+          }
+          else {
+            @(& git diff --name-only $baseCommit HEAD)
+          }
+          $artifactInputChanged = $changedFiles |
+            Where-Object {
+              $_ -match '^windows-client/(src/|installer/|Directory\.Build\.props$|tools/(Build-WindowsInstaller|New-WindowsUpdateManifest|Collect-ThirdPartyNotices)\.ps1$)'
+            }
+          if ($artifactInputChanged.Count -gt 0 -and -not $versionChanged) {
+            throw "Windows client artifact inputs changed without an upward Directory.Build.props Version change: $($artifactInputChanged -join ', ')"
+          }
 
   core-tests:
     runs-on: ubuntu-latest
