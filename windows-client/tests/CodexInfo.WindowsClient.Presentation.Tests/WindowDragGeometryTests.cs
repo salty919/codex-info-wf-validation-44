@@ -104,7 +104,7 @@ public sealed class WindowDragGeometryTests
 
         var samples = GraphWindowViewModel.BuildGraphSamples(period, 1_500);
 
-        Assert.Equal([1_000L, 1_500L, 2_000L], samples.Select(sample => sample.Timestamp));
+        Assert.Equal([1_000L, 1_500L, 1_980L, 2_000L], samples.Select(sample => sample.Timestamp));
         Assert.Equal(2, samples[0].SolDollars);
         Assert.Equal(3, samples[1].SolDollars);
         Assert.Equal(99, samples[^1].SolDollars);
