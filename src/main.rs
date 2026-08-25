@@ -1888,6 +1888,27 @@ fn history_periods_for_samples(
     periods
 }
 
+fn current_history_period_reset(
+    periods: &[HistoryPeriod],
+    current_reset_at: Option<i64>,
+    now: i64,
+) -> Option<i64> {
+    let current = current_reset_at?;
+    periods
+        .iter()
+        .filter(|period| now < period.canonical_reset_at)
+        .filter(|period| {
+            current.abs_diff(period.canonical_reset_at) <= RESET_AT_TOLERANCE_SECONDS as u64
+        })
+        .min_by(|left, right| {
+            current
+                .abs_diff(left.canonical_reset_at)
+                .cmp(&current.abs_diff(right.canonical_reset_at))
+                .then_with(|| right.canonical_reset_at.cmp(&left.canonical_reset_at))
+        })
+        .map(|period| period.canonical_reset_at)
+}
+
 #[derive(Debug, Default)]
 struct UsageHistory {
     db_path: Option<PathBuf>,
@@ -4818,14 +4839,12 @@ impl CodexInfoState {
             .map(one_month_before_utc)
             .unwrap_or(now);
         let history_periods = if self.authenticated {
-            self.history_periods()
+            let periods = self.history_periods();
+            let current_period_reset = current_history_period_reset(&periods, self.reset_at, now);
+            periods
                 .into_iter()
                 .map(|period| {
-                    let current = self.reset_at.is_some_and(|reset_at| {
-                        reset_at.abs_diff(period.canonical_reset_at)
-                            <= RESET_AT_TOLERANCE_SECONDS as u64
-                            && now < period.canonical_reset_at
-                    });
+                    let current = current_period_reset == Some(period.canonical_reset_at);
                     PublicHistoryPeriod {
                         id: period.canonical_reset_at.to_string(),
                         start_at: period.start,
@@ -5848,11 +5867,9 @@ impl CodexInfoState {
                 && DateTime::<Utc>::from_timestamp(period.end, 0).is_some()
                 && DateTime::<Utc>::from_timestamp(period.canonical_reset_at, 0).is_some()
         });
+        let current_period_reset = current_history_period_reset(&periods, self.reset_at, now);
         for period in &mut periods {
-            let is_current = self.reset_at.is_some_and(|current| {
-                current.abs_diff(period.canonical_reset_at) <= RESET_AT_TOLERANCE_SECONDS as u64
-                    && now < period.canonical_reset_at
-            });
+            let is_current = current_period_reset == Some(period.canonical_reset_at);
             // The visible current period runs through its next reset, while
             // `end` is intentionally clipped to `now` for graph rendering.
             let label_end = if is_current {
@@ -8353,8 +8370,8 @@ mod tests {
         account_refresh_due, account_window_title, active_thread_model_counts,
         active_thread_rows_at, add_recovery_usage, apply_launch_environment,
         automatic_refresh_interval, clamp_graph_preview_size, collapse_remaining_change_points,
-        collect_session_file, complete_rollout_prefix_len, current_label_connector_path,
-        detail_window_title, fetch_active_thread_update_for_paths,
+        collect_session_file, complete_rollout_prefix_len, current_history_period_reset,
+        current_label_connector_path, detail_window_title, fetch_active_thread_update_for_paths,
         fetch_active_thread_update_for_paths_and_state, fixed_resize_decision,
         fixed_resize_decision_for_scale, format_elapsed, format_estimated_cost,
         format_model_usage_columns, format_percent, format_period_label, graph_paths,
@@ -8578,6 +8595,33 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(timestamps, vec![cutoff + 1, now_timestamp]);
+    }
+
+    #[test]
+    fn nearby_future_reset_periods_publish_only_one_current_period() {
+        let now = Utc::now().timestamp();
+        let first_reset = now + 3_600;
+        let second_reset = now + 3_700;
+        let mut state = CodexInfoState::preview("normal");
+        state.reset_at = Some(now + 3_650);
+        state.history.samples = vec![
+            UsageHistorySample::new(now - 100, first_reset, 80.0, ModelDollarTotals::default()),
+            UsageHistorySample::new(now - 200, second_reset, 70.0, ModelDollarTotals::default()),
+        ];
+
+        let periods = state.history_periods();
+        assert_eq!(periods.len(), 2);
+        let current = current_history_period_reset(&periods, state.reset_at, now);
+        assert!(current.is_some());
+        let details = state.public_details();
+        assert_eq!(
+            details
+                .history_periods
+                .iter()
+                .filter(|period| period.current)
+                .count(),
+            1
+        );
     }
 
     #[test]
