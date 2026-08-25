@@ -9,6 +9,17 @@ namespace CodexInfo.WindowsClient.Core.Tests;
 public sealed class ContractsTests
 {
     [Fact]
+    public void ProductVersionIsDerivedFromTheCoreAssemblyVersion()
+    {
+        var assemblyVersion = typeof(ProductInfo).Assembly.GetName().Version;
+
+        Assert.NotNull(assemblyVersion);
+        Assert.Equal(
+            $"v{assemblyVersion!.Major}.{assemblyVersion.Minor}.{assemblyVersion.Build}",
+            ProductInfo.DisplayVersion);
+    }
+
+    [Fact]
     public void DetailsCompatibilityConstructorPreservesCollectionsAndDefaults()
     {
         var models = new[]

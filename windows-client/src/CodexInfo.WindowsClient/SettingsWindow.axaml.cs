@@ -28,8 +28,10 @@ public partial class SettingsWindow : Window
 
     private void OnSave(object? sender, Avalonia.Interactivity.RoutedEventArgs e)
     {
-        (DataContext as SettingsViewModel)?.Save();
-        Close();
+        if (DataContext is SettingsViewModel viewModel && viewModel.Save())
+        {
+            Close();
+        }
     }
 
     private void OnClose(object? sender, Avalonia.Interactivity.RoutedEventArgs e) => Close();

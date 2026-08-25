@@ -190,9 +190,9 @@ public sealed class UpdateViewModelTests
         public void Dispose() => DisposeCount++;
     }
 
-    private sealed class SingleStatusClient(StatusFetchResult result) : ILoopbackStatusClient
+    private sealed class SingleStatusClient(StatusFetchResult result) : HealthyStatusClientBase
     {
-        public Task<StatusFetchResult> FetchAsync(CancellationToken cancellationToken = default) =>
+        public override Task<StatusFetchResult> FetchAsync(CancellationToken cancellationToken = default) =>
             Task.FromResult(result);
     }
 }

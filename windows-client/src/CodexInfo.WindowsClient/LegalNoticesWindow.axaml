@@ -64,18 +64,20 @@
   </Window.Styles>
   <Grid Margin="24" RowDefinitions="Auto,Auto,*,Auto" RowSpacing="12">
     <Grid ColumnDefinitions="*,Auto" Background="Transparent" PointerPressed="OnTitlePointerPressed">
-      <TextBlock FontSize="24" FontWeight="SemiBold" Text="{Binding Texts.Legal}" />
+      <StackPanel><TextBlock FontSize="24" FontWeight="SemiBold" Text="{Binding Texts.Legal}" /><TextBlock Classes="label" AutomationProperties.AutomationId="Legal.ProductVersion" Text="{Binding ProductVersionText}" /></StackPanel>
       <StackPanel Grid.Column="1" Orientation="Horizontal" Spacing="2">
-        <Button Classes="window-control" Click="OnMinimizeWindow" AutomationProperties.Name="{Binding Texts.Minimize}" Content="—" ToolTip.Tip="{Binding Texts.Minimize}" />
-        <Button Classes="window-control" Click="OnCloseWindow" AutomationProperties.Name="{Binding Texts.Close}" Content="×" ToolTip.Tip="{Binding Texts.Close}" />
+        <Button Classes="window-control" Click="OnMinimizeWindow" AutomationProperties.Name="{Binding Texts.Minimize}" AutomationProperties.AutomationId="Legal.Window.Minimize" Content="—" ToolTip.Tip="{Binding Texts.Minimize}" />
+        <Button Classes="window-control" Click="OnCloseWindow" AutomationProperties.Name="{Binding Texts.Close}" AutomationProperties.AutomationId="Legal.Window.Close" Content="×" ToolTip.Tip="{Binding Texts.Close}" />
       </StackPanel>
     </Grid>
     <TextBlock Grid.Row="1" Classes="label" Text="{Binding DetailsStatusText}" />
     <Border Grid.Row="2" Classes="notice-card">
-      <StackPanel Spacing="7" IsVisible="{Binding HasNotices}">
-        <TextBlock FontSize="17" FontWeight="SemiBold" Text="{Binding CurrentNoticeName}" />
-        <TextBlock Classes="label" Text="{Binding CurrentNoticeText}" TextWrapping="Wrap" />
-      </StackPanel>
+      <ScrollViewer IsVisible="{Binding HasNotices}" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
+        <StackPanel Spacing="7">
+          <TextBlock FontSize="17" FontWeight="SemiBold" Text="{Binding CurrentNoticeName}" />
+          <TextBlock Classes="label" Text="{Binding CurrentNoticeText}" TextWrapping="Wrap" />
+        </StackPanel>
+      </ScrollViewer>
     </Border>
     <Grid Grid.Row="3" ColumnDefinitions="*,Auto" ColumnSpacing="12">
       <TextBlock Classes="label" VerticalAlignment="Center" Text="{Binding PagePositionText}" />

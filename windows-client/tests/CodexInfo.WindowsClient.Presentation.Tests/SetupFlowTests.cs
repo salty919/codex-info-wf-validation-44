@@ -24,7 +24,7 @@ public sealed class SetupFlowTests
             [],
             0);
         using var main = new MainWindowViewModel(new SingleStatusClient(StatusFetchResult.Success(status)));
-        var session = new RecordingSettingsSession(ClientSettings.Default);
+        var session = new RecordingSettingsSession(ClientSettings.Default with { SettingsCorrupt = true });
         using var setup = new SetupViewModel(main, session);
         main.Start();
         await EventuallyAsync(() => main.IsAuthenticated);
@@ -33,6 +33,7 @@ public sealed class SetupFlowTests
         Assert.True(setup.IsAuthStep);
         Assert.Single(session.Generations);
         Assert.True(session.Current.ConnectionConfigured);
+        Assert.False(session.Current.SettingsCorrupt);
         Assert.False(session.Current.SetupCompleted);
 
         Assert.Equal(SetupAdvanceOutcome.StayOpen, setup.Advance());
@@ -70,6 +71,37 @@ public sealed class SetupFlowTests
     }
 
     [Fact]
+    public async Task SetupSaveFailureKeepsTheWindowOpenAndDoesNotAdvanceCompletion()
+    {
+        var observedAt = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+        var status = new ApiStatusSnapshot(
+            ApiState.Ready,
+            observedAt,
+            true,
+            "Pro",
+            new ApiQuota(75, observedAt + 604_800, 604_800, false),
+            [],
+            0);
+        using var main = new MainWindowViewModel(new SingleStatusClient(StatusFetchResult.Success(status)));
+        var session = new FailOnSaveNumberSession(ClientSettings.Default, 2);
+        using var setup = new SetupViewModel(main, session);
+        main.Start();
+        await EventuallyAsync(() => main.IsAuthenticated);
+
+        Assert.Equal(SetupAdvanceOutcome.StayOpen, setup.Advance());
+        Assert.True(setup.IsAuthStep);
+        Assert.Equal(1, session.SaveCalls);
+
+        Assert.Equal(SetupAdvanceOutcome.StayOpen, setup.Advance());
+        Assert.True(setup.IsDoneStep);
+
+        Assert.Equal(SetupAdvanceOutcome.StayOpen, setup.Advance());
+        Assert.True(setup.IsDoneStep);
+        Assert.True(setup.SettingsSaveFailed);
+        Assert.Equal(2, session.SaveCalls);
+    }
+
+    [Fact]
     public void ClientSettingsSessionPublishesOnlyAfterDurableSave()
     {
         var root = Directory.CreateTempSubdirectory("codex-info-settings-session-test");
@@ -84,9 +116,13 @@ public sealed class SetupFlowTests
 
             Assert.Equal(valid, current);
             Assert.Equal(valid, store.Load());
+            var recovery = valid with { SettingsCorrupt = true };
+            session.Save(recovery);
+            Assert.False(current.SettingsCorrupt);
+            Assert.False(store.Load().SettingsCorrupt);
             var invalid = valid with { ConnectionProfile = "invalid" };
             Assert.Throws<ArgumentException>(() => session.Save(invalid));
-            Assert.Equal(valid, current);
+            Assert.Equal(valid with { SettingsCorrupt = false }, current);
         }
         finally
         {
@@ -126,9 +162,26 @@ public sealed class SetupFlowTests
         }
     }
 
-    private sealed class SingleStatusClient(StatusFetchResult result) : ILoopbackStatusClient
+    private sealed class FailOnSaveNumberSession(ClientSettings initial, int failingSaveNumber) : IClientSettingsSession
     {
-        public Task<StatusFetchResult> FetchAsync(CancellationToken cancellationToken = default) =>
+        public ClientSettings Current { get; private set; } = initial;
+        public int SaveCalls { get; private set; }
+
+        public void Save(ClientSettings settings)
+        {
+            SaveCalls++;
+            if (SaveCalls == failingSaveNumber)
+            {
+                throw new IOException("test-only durable save failure");
+            }
+
+            Current = settings;
+        }
+    }
+
+    private sealed class SingleStatusClient(StatusFetchResult result) : HealthyStatusClientBase
+    {
+        public override Task<StatusFetchResult> FetchAsync(CancellationToken cancellationToken = default) =>
             Task.FromResult(result);
     }
 }

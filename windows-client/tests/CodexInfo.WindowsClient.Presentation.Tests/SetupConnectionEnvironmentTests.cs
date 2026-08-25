@@ -3,6 +3,7 @@
 
 using System.Diagnostics;
 using CodexInfo.WindowsClient.Core;
+using CodexInfo.WindowsClient.Infrastructure;
 using CodexInfo.WindowsClient.Settings;
 using CodexInfo.WindowsClient.ViewModels;
 using Xunit;
@@ -95,6 +96,21 @@ public sealed class SetupConnectionEnvironmentTests
         Assert.Equal(Localization.LocalizationService.Current.SshLaunchFailedStatus, setup.SshStatusText);
     }
 
+    [Fact]
+    public void ManualSshUsesDirectArgumentListWithoutShellExecution()
+    {
+        var factory = new CapturingConnectionChildProcessFactory();
+        var environment = new WindowsSetupConnectionEnvironment(factory);
+
+        environment.CreateSshProcess("salty@linux.example");
+
+        Assert.NotNull(factory.StartInfo);
+        Assert.False(factory.StartInfo!.UseShellExecute);
+        Assert.False(factory.StartInfo.CreateNoWindow);
+        Assert.Equal("ssh.exe", factory.StartInfo.FileName);
+        Assert.Equal(["-N", "-L", "8787:127.0.0.1:8787", "salty@linux.example"], factory.StartInfo.ArgumentList);
+    }
+
     private static async Task<MainWindowViewModel> ReadyMainAsync()
     {
         var now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
@@ -179,9 +195,20 @@ public sealed class SetupConnectionEnvironmentTests
         public void Save(ClientSettings settings) => Current = settings;
     }
 
-    private sealed class SingleStatusClient(ApiStatusSnapshot snapshot) : ILoopbackStatusClient
+    private sealed class CapturingConnectionChildProcessFactory : IConnectionChildProcessFactory
     {
-        public Task<StatusFetchResult> FetchAsync(CancellationToken cancellationToken = default) =>
+        public ProcessStartInfo? StartInfo { get; private set; }
+
+        public IConnectionChildProcess Create(ProcessStartInfo startInfo)
+        {
+            StartInfo = startInfo;
+            return new FakeConnectionChildProcess();
+        }
+    }
+
+    private sealed class SingleStatusClient(ApiStatusSnapshot snapshot) : HealthyStatusClientBase
+    {
+        public override Task<StatusFetchResult> FetchAsync(CancellationToken cancellationToken = default) =>
             Task.FromResult(StatusFetchResult.Success(snapshot));
     }
 }

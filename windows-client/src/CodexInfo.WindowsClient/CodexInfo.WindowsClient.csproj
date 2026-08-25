@@ -21,6 +21,17 @@
     <AvaloniaResource Include="Assets\NotoSansJP-Medium.ttf" />
     <AvaloniaResource Include="Assets\CodexInfo.ico" />
     <AvaloniaResource Include="..\..\..\assets\NotoSansKR.otf" Link="Assets\NotoSansKR.otf" />
+    <AvaloniaResource Include="..\..\..\LICENSE" Link="Legal\LICENSE" />
+    <AvaloniaResource Include="..\..\..\LICENSE.ja.md" Link="Legal\LICENSE.ja.md" />
+    <AvaloniaResource Include="..\..\..\THIRD_PARTY_NOTICES.md" Link="Legal\THIRD_PARTY_NOTICES.md" />
+    <AvaloniaResource Include="..\..\..\assets\NOTICE.txt" Link="Legal\NOTICE.txt" />
+    <AvaloniaResource Include="..\..\..\windows-client\THIRD_PARTY_NOTICES.md" Link="Legal\Windows-THIRD_PARTY_NOTICES.md" />
+    <AvaloniaResource Include="..\..\..\LICENSES\Apache-2.0.txt" Link="Legal\LICENSES\Apache-2.0.txt" />
+    <AvaloniaResource Include="..\..\..\LICENSES\BSD-3-Clause-ANGLE.txt" Link="Legal\LICENSES\BSD-3-Clause-ANGLE.txt" />
+    <AvaloniaResource Include="..\..\..\LICENSES\Inno-Setup.txt" Link="Legal\LICENSES\Inno-Setup.txt" />
+    <AvaloniaResource Include="..\..\..\LICENSES\MIT.txt" Link="Legal\LICENSES\MIT.txt" />
+    <AvaloniaResource Include="..\..\..\LICENSES\OFL-1.1.txt" Link="Legal\LICENSES\OFL-1.1.txt" />
+    <AvaloniaResource Include="..\..\..\LICENSES\OPENAI-CODEX-NOTICE.txt" Link="Legal\LICENSES\OPENAI-CODEX-NOTICE.txt" />
   </ItemGroup>
 
   <ItemGroup>

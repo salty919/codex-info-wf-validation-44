@@ -22,7 +22,7 @@ use codex_info::usage_store::{self, UsageStore};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use slint::winit_030::{winit, EventResult, WinitWindowAccessor};
-use slint::{CloseRequestResponse, ComponentHandle, Timer, TimerMode};
+use slint::{CloseRequestResponse, ComponentHandle, Model, Timer, TimerMode};
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
@@ -121,6 +121,7 @@ struct TokenSnapshot {
 }
 
 const LOCAL_ESTIMATE_PRICE_VERSION: &str = "LOCAL_ESTIMATE_V1_2026-08-14";
+const PRODUCT_VERSION: &str = env!("CARGO_PKG_VERSION");
 const SOL_PRICE_PER_MILLION: (f64, f64, f64) = (5.0, 0.5, 30.0);
 const TERRA_PRICE_PER_MILLION: (f64, f64, f64) = (2.0, 0.2, 12.0);
 const LUNA_PRICE_PER_MILLION: (f64, f64, f64) = (0.2, 0.02, 1.2);
@@ -2655,8 +2656,7 @@ fn graph_time_endpoints(
     if let Some(last) = points
         .iter()
         .copied()
-        .filter(|point| point.timestamp <= period_end)
-        .next_back()
+        .rfind(|point| point.timestamp <= period_end)
     {
         let endpoint = HourlyModelSpend {
             timestamp: period_end,
@@ -5406,7 +5406,6 @@ impl CodexInfoState {
                 self.local_bridge = LocalUsageBridge::start();
                 if !self.local_bridge.send(command) {
                     self.apply_local_usage_error(self.auth_epoch, reset_at, window_seconds);
-                    return;
                 }
             }
         }
@@ -6598,9 +6597,136 @@ fn sync_threads_window(state: &CodexInfoState, threads_window: &ThreadsWindow) {
     )));
 }
 
+const LEGAL_PAGE_CHUNK_SCALARS: usize = 620;
+
+fn native_legal_pages(i18n: &I18n) -> (Vec<slint::SharedString>, Vec<slint::SharedString>) {
+    static CACHE: OnceLock<
+        Mutex<BTreeMap<&'static str, (Vec<slint::SharedString>, Vec<slint::SharedString>)>>,
+    > = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(BTreeMap::new()));
+    let language_code = i18n.language().code();
+    if let Some((names, pages)) = cache
+        .lock()
+        .expect("native legal page cache lock")
+        .get(language_code)
+    {
+        return (names.clone(), pages.clone());
+    }
+
+    let chapters = [
+        (
+            i18n.text(TextKey::LegalCode),
+            include_str!("../LICENSE.ja.md"),
+        ),
+        (
+            i18n.text(TextKey::LegalWarranty),
+            include_str!("../LICENSE"),
+        ),
+        (i18n.text(TextKey::LegalLicense), include_str!("../LICENSE")),
+        (
+            i18n.text(TextKey::LegalFont),
+            concat!(
+                include_str!("../THIRD_PARTY_NOTICES.md"),
+                "\n\n",
+                include_str!("../LICENSES/OFL-1.1.txt")
+            ),
+        ),
+        (
+            i18n.text(TextKey::LegalProtocol),
+            concat!(
+                include_str!("../THIRD_PARTY_NOTICES.md"),
+                "\n\n",
+                include_str!("../LICENSES/Apache-2.0.txt"),
+                "\n\n",
+                include_str!("../LICENSES/OPENAI-CODEX-NOTICE.txt")
+            ),
+        ),
+        (
+            i18n.text(TextKey::LegalSchema),
+            concat!(
+                include_str!("../LICENSES/Apache-2.0.txt"),
+                "\n\n",
+                include_str!("../LICENSES/OPENAI-CODEX-NOTICE.txt")
+            ),
+        ),
+        (
+            i18n.text(TextKey::LegalThirdParty),
+            concat!(
+                include_str!("../THIRD_PARTY_NOTICES.md"),
+                "\n\n",
+                include_str!("../LICENSES/MIT.txt"),
+                "\n\n",
+                include_str!("../LICENSES/BSD-3-Clause-ANGLE.txt")
+            ),
+        ),
+        (
+            i18n.text(TextKey::LegalDetails),
+            concat!(
+                include_str!("../THIRD_PARTY_NOTICES.md"),
+                "\n\n",
+                include_str!("../assets/NOTICE.txt"),
+                "\n\n",
+                include_str!("../windows-client/THIRD_PARTY_NOTICES.md")
+            ),
+        ),
+        (
+            i18n.text(TextKey::LegalDistribution),
+            concat!(
+                include_str!("../LICENSE.ja.md"),
+                "\n\n",
+                include_str!("../LICENSES/Inno-Setup.txt"),
+                "\n\n",
+                include_str!("../windows-client/THIRD_PARTY_NOTICES.md")
+            ),
+        ),
+    ];
+    let mut names = Vec::new();
+    let mut pages = Vec::new();
+    for (name, source) in chapters {
+        let chars: Vec<char> = source.chars().collect();
+        if chars.is_empty() {
+            names.push(name.into());
+            pages.push(slint::SharedString::default());
+            continue;
+        }
+        for chunk in chars.chunks(LEGAL_PAGE_CHUNK_SCALARS) {
+            names.push(name.into());
+            pages.push(chunk.iter().collect::<String>().into());
+        }
+    }
+    cache
+        .lock()
+        .expect("native legal page cache lock")
+        .insert(language_code, (names.clone(), pages.clone()));
+    (names, pages)
+}
+
+fn native_legal_navigation(i18n: &I18n) -> (&'static str, &'static str, &'static str) {
+    match i18n.language().code() {
+        "ja" => ("戻る", "次へ", "ページ"),
+        "zh-Hans" => ("返回", "下一页", "第"),
+        "ko" => ("뒤로", "다음", "페이지"),
+        "es" => ("Atrás", "Siguiente", "Página"),
+        "fr" => ("Retour", "Suivant", "Page"),
+        "de" => ("Zurück", "Weiter", "Seite"),
+        "pt" => ("Voltar", "Próximo", "Página"),
+        "it" => ("Indietro", "Avanti", "Pagina"),
+        "ru" => ("Назад", "Далее", "Страница"),
+        _ => ("Back", "Next", "Page"),
+    }
+}
+
 fn ui_strings(i18n: &I18n) -> UiStrings {
+    let (legal_page_names, legal_pages) = native_legal_pages(i18n);
+    let (legal_back, legal_next, legal_page_position) = native_legal_navigation(i18n);
     UiStrings {
         font_family: i18n.text(TextKey::FontFamily).into(),
+        product_version: format!("v{PRODUCT_VERSION}").into(),
+        legal_page_names: slint::ModelRc::new(slint::VecModel::from(legal_page_names)),
+        legal_pages: slint::ModelRc::new(slint::VecModel::from(legal_pages)),
+        legal_back: legal_back.into(),
+        legal_next: legal_next.into(),
+        legal_page_position: legal_page_position.into(),
         usage_status: i18n.text(TextKey::UsageStatus).into(),
         graph: i18n.text(TextKey::Graph).into(),
         legal_notices: i18n.text(TextKey::LegalNotices).into(),
@@ -6613,8 +6739,10 @@ fn ui_strings(i18n: &I18n) -> UiStrings {
         legal_warranty: i18n.text(TextKey::LegalWarranty).into(),
         legal_license: i18n.text(TextKey::LegalLicense).into(),
         legal_font: i18n.text(TextKey::LegalFont).into(),
+        legal_protocol: i18n.text(TextKey::LegalProtocol).into(),
         legal_schema: i18n.text(TextKey::LegalSchema).into(),
         legal_dependencies: i18n.text(TextKey::LegalDependencies).into(),
+        legal_third_party: i18n.text(TextKey::LegalThirdParty).into(),
         legal_details: i18n.text(TextKey::LegalDetails).into(),
         legal_distribution: i18n.text(TextKey::LegalDistribution).into(),
         close: i18n.text(TextKey::Close).into(),
@@ -8066,6 +8194,23 @@ fn run_ui() -> Result<(), Box<dyn std::error::Error>> {
                         }
                     });
                     let weak_window = window.as_weak();
+                    window.on_legal_page_back(move || {
+                        if let Some(window) = weak_window.upgrade() {
+                            let index = window.get_legal_page_index();
+                            window.set_legal_page_index(index.saturating_sub(1));
+                        }
+                    });
+                    let weak_window = window.as_weak();
+                    window.on_legal_page_next(move || {
+                        if let Some(window) = weak_window.upgrade() {
+                            let index = window.get_legal_page_index();
+                            let page_count = window.get_strings().legal_pages.row_count();
+                            if index + 1 < i32::try_from(page_count).unwrap_or(i32::MAX) {
+                                window.set_legal_page_index(index.saturating_add(1));
+                            }
+                        }
+                    });
+                    let weak_window = window.as_weak();
                     window.window().on_close_requested(move || {
                         if let Some(window) = weak_window.upgrade() {
                             window.set_reset_close_buttons(true);
@@ -8091,6 +8236,7 @@ fn run_ui() -> Result<(), Box<dyn std::error::Error>> {
                     )
                     .into(),
                 );
+                window.set_legal_page_index(0);
                 window.set_reset_close_buttons(true);
                 window.set_reset_close_buttons(false);
                 let _ = show_and_focus_window(window.window(), x11_monitor.as_ref().as_ref());
@@ -8215,25 +8361,25 @@ mod tests {
         graph_paths_for_selection, graph_period_end, graph_points, graph_time_endpoints,
         is_service_health_response, minute_model_spend, minute_model_spend_for_metric,
         model_usage_timeline_from_events, monthly_window_seconds, native_account_window_title,
-        normal_status_text, one_month_before_utc, open_codex_session_paths, parse_launch_mode,
-        parse_preview_size, parse_rate_limits, parse_resize_direction, period_remaining_text,
-        physical_size_for_logical, plan_type_label, preview_model_row, read_recovery_entries,
-        read_thread_rollout_path, recovery_timed_usage, remaining_graph_points,
-        remaining_graph_points_for_metric, remaining_graph_y, remaining_marker_positions,
-        remaining_marker_positions_on_points, request_with_timeout, same_rollout_identity,
-        separate_current_label_positions, service_is_healthy, session_event_model,
-        session_event_type, session_jsonl_files, session_token_snapshot, smooth_model_spend,
-        smooth_remaining_points, split_metric_line_paths, stacked_area_path,
+        native_legal_pages, normal_status_text, one_month_before_utc, open_codex_session_paths,
+        parse_launch_mode, parse_preview_size, parse_rate_limits, parse_resize_direction,
+        period_remaining_text, physical_size_for_logical, plan_type_label, preview_model_row,
+        read_recovery_entries, read_thread_rollout_path, recovery_timed_usage,
+        remaining_graph_points, remaining_graph_points_for_metric, remaining_graph_y,
+        remaining_marker_positions, remaining_marker_positions_on_points, request_with_timeout,
+        same_rollout_identity, separate_current_label_positions, service_is_healthy,
+        session_event_model, session_event_type, session_jsonl_files, session_token_snapshot,
+        smooth_model_spend, smooth_remaining_points, split_metric_line_paths, stacked_area_path,
         terminate_and_reap_owned_child, thread_presentation_rows, three_months_before_utc,
         unused_interval_positions, week_remaining_text, ActiveThread, ActiveThreadUpdate,
         ApiServer, ApiServerConfig, CodexInfoState, Event, FixedResizeDecision, GraphPaths,
-        GraphWindow, HourlyModelSpend, LaunchMode, LocalUsageResult, ManualX11Geometry,
+        GraphWindow, HourlyModelSpend, I18n, LaunchMode, LocalUsageResult, ManualX11Geometry,
         ManualX11WindowAction, ModelDollarTotals, ModelTokenTotals, ModelUsageRow,
         ModelUsageTotals, RpcReadEvent, SessionTraversalBudget, TokenSnapshot,
         UnusedIntervalPosition, UsageEvent, UsageHistory, UsageHistorySample, UsageStore,
         DEFAULT_SERVICE_ADDRESS, FIXED_WINDOW_HEIGHT, FIXED_WINDOW_WIDTH, GRAPH_METRIC_OPTIONS,
-        GRAPH_WINDOW_PURPOSE, LOCAL_ESTIMATE_PRICE_VERSION, THREADS_WINDOW_PURPOSE,
-        UNAUTHENTICATED_WINDOW_TITLE, WEEK_SECONDS,
+        GRAPH_WINDOW_PURPOSE, LOCAL_ESTIMATE_PRICE_VERSION, PRODUCT_VERSION,
+        THREADS_WINDOW_PURPOSE, UNAUTHENTICATED_WINDOW_TITLE, WEEK_SECONDS,
     };
     use super::{
         claim_manual_x11_action, forbidden_x11_states, manual_resize_geometry,
@@ -11020,6 +11166,77 @@ mod tests {
         assert!(rust_source.contains("winit_window.set_resizable(true)"));
         assert_eq!(rust_source.matches("LegalNoticeWindow::new()").count(), 1);
         assert!(rust_source.contains("ui.on_open_legal_notice"));
+    }
+
+    #[test]
+    fn product_version_is_visible_on_native_detail_surfaces() {
+        assert!(!PRODUCT_VERSION.is_empty());
+        assert!(PRODUCT_VERSION.split('.').all(
+            |component| !component.is_empty() && component.chars().all(|c| c.is_ascii_digit())
+        ));
+
+        let source = include_str!("../ui/components.slint");
+        assert!(source.contains("product-version: string"));
+        for title in [
+            "usage-status",
+            "usage-trend",
+            "active-threads",
+            "legal-notices",
+        ] {
+            let marker = format!("root.strings.{title} + \" · \" + root.strings.product-version");
+            assert!(
+                source.contains(&marker),
+                "missing native version title: {title}"
+            );
+        }
+
+        let main = include_str!("main.rs");
+        assert!(main.contains("product_version: format!(\"v{PRODUCT_VERSION}\").into()"));
+    }
+
+    #[test]
+    fn native_legal_surface_paginates_complete_packaged_documents() {
+        let source = include_str!("../ui/components.slint");
+        for marker in [
+            "legal-page-names: [string]",
+            "legal-pages: [string]",
+            "callback legal-page-back();",
+            "callback legal-page-next();",
+            "root.strings.legal-pages[root.legal-page-index]",
+            "root.strings.legal-page-position",
+        ] {
+            assert!(
+                source.contains(marker),
+                "missing native legal contract: {marker}"
+            );
+        }
+        for document in [
+            include_str!("../LICENSE"),
+            include_str!("../THIRD_PARTY_NOTICES.md"),
+            include_str!("../LICENSES/Apache-2.0.txt"),
+            include_str!("../LICENSES/MIT.txt"),
+            include_str!("../LICENSES/OFL-1.1.txt"),
+            include_str!("../LICENSES/Inno-Setup.txt"),
+        ] {
+            assert!(!document.trim().is_empty());
+        }
+        let (names, pages) = native_legal_pages(&I18n::from_parts(
+            codex_info::i18n::Language::Japanese,
+            chrono_tz::Tz::UTC,
+        ));
+        assert_eq!(names.len(), pages.len());
+        assert!(pages.len() > 9);
+        let mut chapter_names: Vec<&str> = names.iter().map(|name| name.as_str()).collect();
+        chapter_names.dedup();
+        assert_eq!(chapter_names.len(), 9);
+        assert!(chapter_names[4].contains("プロトコル"));
+        assert!(chapter_names[6].contains("第三者"));
+        assert!(pages
+            .iter()
+            .any(|page| page.contains("GNU GENERAL PUBLIC LICENSE")));
+        assert!(pages
+            .iter()
+            .any(|page| page.contains("THIRD_PARTY_NOTICES.md")));
     }
 
     #[test]

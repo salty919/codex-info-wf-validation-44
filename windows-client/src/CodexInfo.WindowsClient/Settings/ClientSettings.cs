@@ -4,6 +4,7 @@
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using System.Text.RegularExpressions;
+using CodexInfo.WindowsClient.Infrastructure;
 using CodexInfo.WindowsClient.Localization;
 
 namespace CodexInfo.WindowsClient.Settings;
@@ -118,6 +119,11 @@ public sealed class ClientSettingsStore
     {
         try
         {
+            if (WindowsPathSafety.ContainsReparsePoint(path))
+            {
+                return ClientSettings.Default with { SettingsCorrupt = true };
+            }
+
             if (!File.Exists(path))
             {
                 return ClientSettings.Default;
@@ -175,16 +181,46 @@ public sealed class ClientSettingsStore
         }
 
         var directory = Path.GetDirectoryName(path)!;
-        Directory.CreateDirectory(directory);
-        var temporary = path + ".tmp";
-        using (var stream = new FileStream(temporary, FileMode.Create, FileAccess.Write, FileShare.None))
-        using (var writer = new StreamWriter(stream))
+        if (!WindowsPathSafety.EnsureDirectoryTreeWithoutReparse(directory) ||
+            !WindowsPathSafety.IsMissingOrRegularFile(path))
         {
-            writer.Write(JsonSerializer.Serialize(normalized, JsonOptions));
-            writer.Flush();
-            stream.Flush(true);
+            throw new IOException("The settings path must contain no reparse points and target a regular file.");
         }
-        File.Move(temporary, path, true);
+
+        var temporary = path + "." + Guid.NewGuid().ToString("N") + ".tmp";
+        try
+        {
+            using (var stream = new FileStream(temporary, FileMode.CreateNew, FileAccess.Write, FileShare.None))
+            using (var writer = new StreamWriter(stream))
+            {
+                writer.Write(JsonSerializer.Serialize(normalized, JsonOptions));
+                writer.Flush();
+                stream.Flush(true);
+            }
+
+            if (!WindowsPathSafety.EnsureDirectoryTreeWithoutReparse(directory) ||
+                !WindowsPathSafety.IsMissingOrRegularFile(path))
+            {
+                throw new IOException("The settings path changed during save.");
+            }
+
+            File.Move(temporary, path, true);
+        }
+        finally
+        {
+            try
+            {
+                if (File.Exists(temporary))
+                {
+                    File.Delete(temporary);
+                }
+            }
+            catch
+            {
+                // A failed cleanup leaves an unreferenced random-name file;
+                // the durable settings target is never replaced by it.
+            }
+        }
     }
 
     private static bool HasExactSettingsShape(string json)
@@ -197,9 +233,6 @@ public sealed class ClientSettingsStore
                 return false;
             }
 
-            var names = document.RootElement.EnumerateObject()
-                .Select(property => property.Name)
-                .ToArray();
             var expected = new HashSet<string>(StringComparer.Ordinal)
             {
                 "language",
@@ -209,7 +242,16 @@ public sealed class ClientSettingsStore
                 "connectionProfile",
                 "connectionSelector",
             };
-            return names.Length == expected.Count && names.All(expected.Contains);
+            var seen = new HashSet<string>(StringComparer.Ordinal);
+            foreach (var property in document.RootElement.EnumerateObject())
+            {
+                if (!seen.Add(property.Name) || !expected.Contains(property.Name))
+                {
+                    return false;
+                }
+            }
+
+            return seen.SetEquals(expected);
         }
         catch (JsonException)
         {

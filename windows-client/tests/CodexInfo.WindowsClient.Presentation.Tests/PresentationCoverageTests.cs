@@ -151,7 +151,8 @@ public sealed class PresentationCoverageTests
             using var client = new PreviewLoopbackClient();
             var status = client.FetchAsync(new CancellationToken(canceled: true)).GetAwaiter().GetResult();
             var details = client.FetchDetailsAsync(new CancellationToken(canceled: true)).GetAwaiter().GetResult();
-            Assert.Equal(2, details.Snapshot!.HistorySamples.Count);
+            Assert.Equal(2, details.Snapshot!.HistoryPeriods.Single(period => period.Current).Samples.Count);
+            Assert.Equal(4, details.Snapshot.HistorySamples.Count);
             Assert.Equal(100, status.Snapshot!.Quota!.RemainingPercent);
         }));
     }
@@ -182,6 +183,28 @@ public sealed class PresentationCoverageTests
             ConnectionSelector = ConnectionSelectors.None,
         }));
         Assert.True(ConnectionSelectors.IsValid(ClientSettings.Default));
+    }
+
+    [Fact]
+    public void SettingsRejectDuplicateKeysInsteadOfApplyingSerializerLastValue()
+    {
+        var root = Directory.CreateTempSubdirectory("codex-info-settings-duplicate");
+        try
+        {
+            var path = Path.Combine(root.FullName, "settings.json");
+            File.WriteAllText(
+                path,
+                "{\"language\":\"ja\",\"setupCompleted\":true,\"connectionConfigured\":true,\"timeZoneId\":\"local\",\"connectionProfile\":\"none\",\"connectionProfile\":\"none\"}");
+
+            var loaded = new ClientSettingsStore(path).Load();
+
+            Assert.True(loaded.SettingsCorrupt);
+            Assert.Equal(ClientSettings.Default, loaded with { SettingsCorrupt = false });
+        }
+        finally
+        {
+            root.Delete(recursive: true);
+        }
     }
 
     [Fact]
@@ -656,7 +679,7 @@ public sealed class PresentationCoverageTests
             using var main = new MainWindowViewModel(new NeverCalledStatusClient());
             using var viewModel = new LegalNoticesWindowViewModel(main);
             Assert.True(viewModel.HasNotices);
-            Assert.Equal(6, viewModel.PageCount);
+            Assert.Equal(9, viewModel.PageCount);
             Assert.Equal(0, viewModel.CurrentPageIndex);
             Assert.Equal(1, viewModel.CurrentPageNumber);
             Assert.Equal(viewModel.CurrentPageNumber, viewModel.CurrentPage);
@@ -707,7 +730,7 @@ public sealed class PresentationCoverageTests
                 Assert.False(string.IsNullOrWhiteSpace(viewModel.NextText));
                 Assert.False(string.IsNullOrWhiteSpace(viewModel.PagePositionText));
                 Assert.Equal(language.LegalCodeName, viewModel.Notices[0].Name);
-                Assert.Equal(6, viewModel.PageCount);
+                Assert.Equal(9, viewModel.PageCount);
             }
         }
         finally
@@ -796,11 +819,11 @@ public sealed class PresentationCoverageTests
         }
     }
 
-    private sealed class SequenceStatusClient(params StatusFetchResult[] results) : ILoopbackStatusClient
+    private sealed class SequenceStatusClient(params StatusFetchResult[] results) : HealthyStatusClientBase
     {
         private int index;
 
-        public Task<StatusFetchResult> FetchAsync(CancellationToken cancellationToken = default)
+        public override Task<StatusFetchResult> FetchAsync(CancellationToken cancellationToken = default)
         {
             var result = results[Math.Min(index, results.Length - 1)];
             index++;
@@ -820,11 +843,11 @@ public sealed class PresentationCoverageTests
         }
     }
 
-    private sealed class DisposableThrowingStatusClient : ILoopbackStatusClient, IDisposable
+    private sealed class DisposableThrowingStatusClient : HealthyStatusClientBase, IDisposable
     {
         public bool Disposed { get; private set; }
 
-        public Task<StatusFetchResult> FetchAsync(CancellationToken cancellationToken = default) =>
+        public override Task<StatusFetchResult> FetchAsync(CancellationToken cancellationToken = default) =>
             throw new InvalidOperationException("status transport failed");
 
         public void Dispose() => Disposed = true;
@@ -836,20 +859,20 @@ public sealed class PresentationCoverageTests
             throw new IOException("details transport failed");
     }
 
-    private sealed class CountingStatusClient(ApiStatusSnapshot snapshot) : ILoopbackStatusClient
+    private sealed class CountingStatusClient(ApiStatusSnapshot snapshot) : HealthyStatusClientBase
     {
         public int CallCount { get; private set; }
 
-        public Task<StatusFetchResult> FetchAsync(CancellationToken cancellationToken = default)
+        public override Task<StatusFetchResult> FetchAsync(CancellationToken cancellationToken = default)
         {
             CallCount++;
             return Task.FromResult(StatusFetchResult.Success(snapshot));
         }
     }
 
-    private sealed class NeverCalledStatusClient : ILoopbackStatusClient
+    private sealed class NeverCalledStatusClient : HealthyStatusClientBase
     {
-        public Task<StatusFetchResult> FetchAsync(CancellationToken cancellationToken = default) =>
+        public override Task<StatusFetchResult> FetchAsync(CancellationToken cancellationToken = default) =>
             throw new InvalidOperationException("No status request expected.");
     }
 

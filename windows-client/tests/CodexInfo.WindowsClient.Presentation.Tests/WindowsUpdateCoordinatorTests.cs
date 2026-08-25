@@ -138,6 +138,105 @@ public sealed class WindowsUpdateCoordinatorTests
     }
 
     [Fact]
+    public async Task SeparateCoordinatorsShareAnExclusiveInstallRootLease()
+    {
+        using var directory = new TemporaryDirectory();
+        var payload = new byte[] { 9, 1, 4 };
+        var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseDownload = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var release = ReleaseFor(payload);
+
+        var firstClient = new FakeUpdateClient(
+            WindowsUpdateCheckResult.Success(release),
+            async (destination, cancellationToken) =>
+            {
+                entered.SetResult();
+                await releaseDownload.Task.WaitAsync(cancellationToken);
+                await destination.WriteAsync(payload, cancellationToken);
+                return WindowsUpdateDownloadResult.Success();
+            });
+        var secondClient = new FakeUpdateClient(WindowsUpdateCheckResult.Success(release));
+        using var first = new WindowsUpdateCoordinator(
+            firstClient,
+            new RecordingLauncher(),
+            new Version(1, 0, 0),
+            directory.Path);
+        using var second = new WindowsUpdateCoordinator(
+            secondClient,
+            new RecordingLauncher(),
+            new Version(1, 0, 0),
+            directory.Path);
+        await first.CheckAsync(CancellationToken.None);
+        await second.CheckAsync(CancellationToken.None);
+
+        var firstStart = first.StartAvailableUpdateAsync(CancellationToken.None);
+        await entered.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        var secondStart = await second.StartAvailableUpdateAsync(CancellationToken.None);
+        releaseDownload.SetResult();
+
+        Assert.Equal(UpdateStartStatus.Busy, secondStart);
+        Assert.Equal(UpdateStartStatus.Started, await firstStart);
+        Assert.Equal(0, secondClient.DownloadCount);
+    }
+
+    [Fact]
+    public async Task ReparseLeaseTargetFailsClosedWithoutDownloading()
+    {
+        using var directory = new TemporaryDirectory();
+        var marker = Path.Combine(directory.Path, "marker");
+        await File.WriteAllTextAsync(marker, "keep");
+        var leasePath = Path.Combine(directory.Path, ".update.lease");
+        try
+        {
+            File.CreateSymbolicLink(leasePath, marker);
+        }
+        catch (UnauthorizedAccessException)
+        {
+            // Some Windows test hosts require Developer Mode or an elevated
+            // token for symlink creation; the physical-host gate covers that
+            // platform-specific branch.
+            return;
+        }
+
+        var release = ReleaseFor([1, 2, 3]);
+        var client = new FakeUpdateClient(WindowsUpdateCheckResult.Success(release));
+        using var coordinator = new WindowsUpdateCoordinator(
+            client, new RecordingLauncher(), new Version(1, 0, 0), directory.Path);
+        await coordinator.CheckAsync(CancellationToken.None);
+
+        Assert.Equal(UpdateStartStatus.Busy, await coordinator.StartAvailableUpdateAsync(CancellationToken.None));
+        Assert.Equal(0, client.DownloadCount);
+        Assert.Equal("keep", await File.ReadAllTextAsync(marker));
+    }
+
+    [Fact]
+    public async Task ReparseParentUpdateRootFailsClosedWithoutDownloading()
+    {
+        using var directory = new TemporaryDirectory();
+        var realRoot = Path.Combine(directory.Path, "real-root");
+        Directory.CreateDirectory(realRoot);
+        var linkedRoot = Path.Combine(directory.Path, "linked-root");
+        try
+        {
+            Directory.CreateSymbolicLink(linkedRoot, realRoot);
+        }
+        catch (UnauthorizedAccessException)
+        {
+            return;
+        }
+
+        var release = ReleaseFor([3, 1, 4]);
+        var client = new FakeUpdateClient(WindowsUpdateCheckResult.Success(release));
+        using var coordinator = new WindowsUpdateCoordinator(
+            client, new RecordingLauncher(), new Version(1, 0, 0), linkedRoot);
+        await coordinator.CheckAsync(CancellationToken.None);
+
+        Assert.Equal(UpdateStartStatus.Busy, await coordinator.StartAvailableUpdateAsync(CancellationToken.None));
+        Assert.Equal(0, client.DownloadCount);
+        Assert.Empty(Directory.EnumerateFileSystemEntries(realRoot));
+    }
+
+    [Fact]
     public async Task LaunchFailureIsTypedAndVerifiedInstallerRemainsForExplicitRetry()
     {
         using var directory = new TemporaryDirectory();

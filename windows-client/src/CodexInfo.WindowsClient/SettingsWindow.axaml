@@ -5,7 +5,7 @@
         xmlns:vm="using:CodexInfo.WindowsClient.ViewModels"
         x:Class="CodexInfo.WindowsClient.SettingsWindow"
         x:DataType="vm:SettingsViewModel"
-        Width="620" Height="620" MinWidth="560" MinHeight="560"
+        Width="900" Height="480" MinWidth="900" MinHeight="480" MaxWidth="900" MaxHeight="480"
         WindowStartupLocation="CenterOwner" CanResize="False"
         WindowDecorations="None" ExtendClientAreaToDecorationsHint="True" ExtendClientAreaTitleBarHeightHint="0"
         Title="Codex Info Settings" FontFamily="{StaticResource JapaneseFont}"
@@ -18,8 +18,8 @@
   </Window.Styles>
   <Grid Margin="24" RowDefinitions="Auto,*,Auto" RowSpacing="18">
     <Grid ColumnDefinitions="*,Auto" Background="Transparent" PointerPressed="OnTitlePointerPressed">
-      <StackPanel Orientation="Horizontal" Spacing="10"><TextBlock FontSize="20" Text="⚙" Foreground="#71C7FF" /><StackPanel><TextBlock FontSize="23" FontWeight="SemiBold" Text="{Binding Texts.Settings}" /><TextBlock Classes="label" Text="{Binding Texts.ConnectionEndpoint}" /></StackPanel></StackPanel>
-      <Button Grid.Column="1" Background="Transparent" BorderBrush="Transparent" Foreground="#A8B7CA" Click="OnClose" AutomationProperties.Name="{Binding Texts.Close}" Content="×" FontSize="22" ToolTip.Tip="{Binding Texts.Close}" />
+      <StackPanel Orientation="Horizontal" Spacing="10"><TextBlock FontSize="20" Text="⚙" Foreground="#71C7FF" /><StackPanel><TextBlock FontSize="23" FontWeight="SemiBold" Text="{Binding Texts.Settings}" /><StackPanel Orientation="Horizontal" Spacing="8"><TextBlock Classes="label" Text="{Binding Texts.ConnectionEndpoint}" /><TextBlock Classes="label" AutomationProperties.AutomationId="Settings.ProductVersion" Text="{Binding ProductVersionText}" /></StackPanel></StackPanel></StackPanel>
+      <Button Grid.Column="1" Background="Transparent" BorderBrush="Transparent" Foreground="#A8B7CA" Click="OnClose" AutomationProperties.Name="{Binding Texts.Close}" AutomationProperties.AutomationId="Settings.Window.Close" Content="×" FontSize="22" ToolTip.Tip="{Binding Texts.Close}" />
     </Grid>
     <ScrollViewer Grid.Row="1" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
       <Border Classes="surface" Padding="22">

@@ -6,6 +6,12 @@ import { ListView } from "std-widgets.slint";
 
 export struct UiStrings {
     font-family: string,
+    product-version: string,
+    legal-page-names: [string],
+    legal-pages: [string],
+    legal-back: string,
+    legal-next: string,
+    legal-page-position: string,
     usage-status: string,
     graph: string,
     legal-notices: string,
@@ -18,8 +24,10 @@ export struct UiStrings {
     legal-warranty: string,
     legal-license: string,
     legal-font: string,
+    legal-protocol: string,
     legal-schema: string,
     legal-dependencies: string,
+    legal-third-party: string,
     legal-details: string,
     legal-distribution: string,
     close: string,
@@ -339,7 +347,7 @@ export component Header inherits Rectangle {
         y: 0px;
         width: parent.width - (root.show-graph ? 260px : 152px) - root.action-reserve;
         height: 24px;
-        text: root.strings.usage-status;
+        text: root.strings.usage-status + " · " + root.strings.product-version;
         color: DesignTokens.text-primary;
         font-size: 18px;
         font-weight: 700;
@@ -397,7 +405,7 @@ export component Header inherits Rectangle {
             x: 8px;
             width: parent.width - 16px;
             height: parent.height;
-            text: root.strings.legal-notices;
+            text: root.strings.legal-notices + " · " + root.strings.product-version;
             color: DesignTokens.text-primary;
             font-size: DesignTokens.text-body;
             font-weight: 700;
@@ -766,6 +774,7 @@ export component LegalNoticeWindow inherits Window {
     // title and controls are rendered inside this frameless surface.
     in-out property <string> window-title;
     in property <UiStrings> strings;
+    in-out property <int> legal-page-index: 0;
     in-out property <bool> reset-close-buttons: false;
     no-frame: true;
     resize-border-width: 0px;
@@ -788,6 +797,8 @@ export component LegalNoticeWindow inherits Window {
     callback begin-window-drag();
     callback minimize-window();
     callback close-window();
+    callback legal-page-back();
+    callback legal-page-next();
 
     Rectangle {
         x: 0px;
@@ -829,109 +840,77 @@ export component LegalNoticeWindow inherits Window {
             y: 16px;
             width: parent.width - 136px;
             height: 30px;
-            text: root.strings.legal-notices;
+            text: root.strings.legal-notices + " · " + root.strings.product-version;
             color: DesignTokens.text-primary;
             font-size: 22px;
             font-weight: 700;
             vertical-alignment: center;
+            overflow: elide;
         }
         Text {
             x: 20px;
             y: 58px;
             width: parent.width - 40px;
-            height: 20px;
-            text: root.strings.legal-code;
+            height: 22px;
+            text: root.strings.legal-page-names.length > 0 && root.legal-page-index >= 0 && root.legal-page-index < root.strings.legal-page-names.length
+                ? root.strings.legal-page-names[root.legal-page-index]
+                : root.strings.legal-details;
             color: DesignTokens.accent-primary;
             font-size: DesignTokens.text-body;
             font-weight: 700;
             vertical-alignment: center;
-        }
-        Text {
-            x: 20px;
-            y: 84px;
-            width: parent.width - 40px;
-            height: 20px;
-            text: "Copyright (C) 2026 salty919";
-            color: DesignTokens.text-secondary;
-            font-size: DesignTokens.text-caption;
-            vertical-alignment: center;
-        }
-        Text {
-            x: 20px;
-            y: 122px;
-            width: parent.width - 40px;
-            height: 20px;
-            text: root.strings.legal-warranty;
-            color: DesignTokens.text-primary;
-            font-size: DesignTokens.text-caption;
-            vertical-alignment: center;
-        }
-        Text {
-            x: 20px;
-            y: 148px;
-            width: parent.width - 40px;
-            height: 20px;
-            text: root.strings.legal-license;
-            color: DesignTokens.text-secondary;
-            font-size: DesignTokens.text-caption;
-            vertical-alignment: center;
+            overflow: elide;
         }
         Rectangle {
             x: 20px;
-            y: 184px;
+            y: 88px;
             width: parent.width - 40px;
-            height: 1px;
-            background: DesignTokens.border-subtle;
+            height: 328px;
+            clip: true;
+            border-width: 1px;
+            border-radius: DesignTokens.radius-control;
+            border-color: DesignTokens.border-subtle;
+            background: DesignTokens.canvas;
+            Text {
+                x: 12px;
+                y: 10px;
+                width: parent.width - 24px;
+                height: parent.height - 20px;
+                text: root.strings.legal-pages.length > 0 && root.legal-page-index >= 0 && root.legal-page-index < root.strings.legal-pages.length
+                    ? root.strings.legal-pages[root.legal-page-index]
+                    : root.strings.legal-details;
+                color: DesignTokens.text-secondary;
+                font-size: DesignTokens.text-caption;
+                vertical-alignment: top;
+                wrap: char-wrap;
+            }
         }
         Text {
             x: 20px;
-            y: 202px;
-            width: parent.width - 40px;
-            height: 20px;
-            text: root.strings.legal-font;
-            color: DesignTokens.text-primary;
-            font-size: DesignTokens.text-caption;
-            vertical-alignment: center;
-        }
-        Text {
-            x: 20px;
-            y: 228px;
-            width: parent.width - 40px;
-            height: 20px;
-            text: root.strings.legal-schema;
-            color: DesignTokens.text-primary;
-            font-size: DesignTokens.text-caption;
-            vertical-alignment: center;
-        }
-        Text {
-            x: 20px;
-            y: 254px;
-            width: parent.width - 40px;
-            height: 20px;
-            text: root.strings.legal-dependencies;
-            color: DesignTokens.text-primary;
-            font-size: DesignTokens.text-caption;
-            vertical-alignment: center;
-        }
-        Text {
-            x: 20px;
-            y: 280px;
-            width: parent.width - 40px;
-            height: 20px;
-            text: root.strings.legal-details;
-            color: DesignTokens.text-secondary;
-            font-size: DesignTokens.text-caption;
-            vertical-alignment: center;
-        }
-        Text {
-            x: 20px;
-            y: 306px;
-            width: parent.width - 40px;
-            height: 20px;
-            text: root.strings.legal-distribution;
+            y: 428px;
+            width: 180px;
+            height: 24px;
+            text: root.strings.legal-page-position + " " + (root.legal-page-index + 1) + " / " + root.strings.legal-pages.length;
             color: DesignTokens.text-muted;
-            font-size: 11px;
+            font-size: DesignTokens.text-caption;
             vertical-alignment: center;
+        }
+        ActionButton {
+            x: parent.width - 252px;
+            y: 424px;
+            width: 92px;
+            text: root.strings.legal-back;
+            enabled: root.legal-page-index > 0;
+            clicked => { root.legal-page-back(); }
+        }
+        ActionButton {
+            x: parent.width - 152px;
+            y: 424px;
+            width: 92px;
+            text: root.strings.legal-next;
+            enabled: root.legal-page-index + 1 < root.strings.legal-pages.length;
+            primary: true;
+            clicked => { root.legal-page-next(); }
         }
         WindowControls {
             x: parent.width - 72px;
@@ -1019,7 +998,7 @@ export component ThreadsWindow inherits Window {
             y: 0px;
             width: parent.width - 188px;
             height: 48px;
-            text: root.strings.active-threads;
+            text: root.strings.active-threads + " · " + root.strings.product-version;
             color: DesignTokens.text-primary;
             font-size: 22px;
             font-weight: 700;
@@ -1691,7 +1670,7 @@ export component GraphWindow inherits Window {
             y: 0px;
             width: parent.width - 252px;
             height: 36px;
-            text: root.strings.usage-trend;
+            text: root.strings.usage-trend + " · " + root.strings.product-version;
             color: DesignTokens.text-primary;
             font-size: 24px;
             font-weight: 700;

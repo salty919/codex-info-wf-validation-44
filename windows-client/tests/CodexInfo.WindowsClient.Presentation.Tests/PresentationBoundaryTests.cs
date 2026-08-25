@@ -115,6 +115,74 @@ public sealed class PresentationBoundaryTests
     }
 
     [Fact]
+    public void SettingsSaveFailureKeepsRecoveryOpenAndDoesNotPublishMemoryState()
+    {
+        var originalSettings = App.CurrentSettings;
+        var originalLanguage = LocalizationService.Current.LanguageCode;
+        var originalTimeZone = LocalizationService.DisplayTimeZone.Id;
+        var root = Directory.CreateTempSubdirectory("codex-info-settings-vm-failure-test");
+        SettingsViewModel? viewModel = null;
+        try
+        {
+            var blocker = Path.Combine(root.FullName, "not-a-directory");
+            File.WriteAllText(blocker, "blocked");
+            var store = new ClientSettingsStore(Path.Combine(blocker, "settings.json"));
+            App.CurrentSettings = new ClientSettings("ja", true);
+            LocalizationService.SetLanguage("ja");
+            LocalizationService.SetTimeZone("local");
+            viewModel = new SettingsViewModel(store);
+
+            Assert.False(viewModel.Save());
+            Assert.True(viewModel.SaveFailed);
+            Assert.Contains("設定", viewModel.StatusDetail, StringComparison.Ordinal);
+            Assert.Equal(new ClientSettings("ja", true), App.CurrentSettings);
+            Assert.Equal("ja", LocalizationService.Current.LanguageCode);
+            Assert.Equal(TimeZoneInfo.Local.Id, LocalizationService.DisplayTimeZone.Id);
+        }
+        finally
+        {
+            viewModel?.Dispose();
+            App.CurrentSettings = originalSettings;
+            LocalizationService.SetLanguage(originalLanguage);
+            LocalizationService.SetTimeZone(string.Equals(originalTimeZone, "UTC", StringComparison.OrdinalIgnoreCase) ? "UTC" : "local");
+            root.Delete(recursive: true);
+        }
+    }
+
+    [Fact]
+    public void SuccessfulSettingsRecoveryClearsTheInMemoryCorruptMarker()
+    {
+        var originalSettings = App.CurrentSettings;
+        var originalLanguage = LocalizationService.Current.LanguageCode;
+        var originalTimeZone = LocalizationService.DisplayTimeZone.Id;
+        var root = Directory.CreateTempSubdirectory("codex-info-settings-recovery-test");
+        SettingsViewModel? viewModel = null;
+        try
+        {
+            var path = Path.Combine(root.FullName, "settings.json");
+            File.WriteAllText(path, "{not-json}");
+            var store = new ClientSettingsStore(path);
+            App.CurrentSettings = store.Load();
+            Assert.True(App.CurrentSettings.SettingsCorrupt);
+            LocalizationService.SetLanguage("ja");
+            LocalizationService.SetTimeZone("local");
+            viewModel = new SettingsViewModel(store);
+
+            Assert.True(viewModel.Save());
+            Assert.False(App.CurrentSettings.SettingsCorrupt);
+            Assert.False(store.Load().SettingsCorrupt);
+        }
+        finally
+        {
+            viewModel?.Dispose();
+            App.CurrentSettings = originalSettings;
+            LocalizationService.SetLanguage(originalLanguage);
+            LocalizationService.SetTimeZone(string.Equals(originalTimeZone, "UTC", StringComparison.OrdinalIgnoreCase) ? "UTC" : "local");
+            root.Delete(recursive: true);
+        }
+    }
+
+    [Fact]
     public async Task SettingsViewModelMirrorsMainAuthenticationCapability()
     {
         var auth = new ApiStatusSnapshot(ApiState.AuthRequired, 1, false, null, null, [], 0);
@@ -263,12 +331,14 @@ public sealed class PresentationBoundaryTests
             .Single(element => element.Name.LocalName == "Style" && element.Attribute("Selector")?.Value == "Border.quota-segment");
 
         var gauge = document.Descendants()
-            .Single(element => element.Name.LocalName == "ItemsControl" && element.Attribute("AutomationProperties.AutomationId")?.Value == "Main.QuotaPeriodGauge");
+            .Single(element => element.Name.LocalName == "TextBlock" && element.Attribute("AutomationProperties.AutomationId")?.Value == "Main.QuotaPeriodGauge");
+        var gaugeItems = document.Descendants()
+            .Single(element => element.Name.LocalName == "ItemsControl" && element.Attribute("ItemsSource")?.Value == "{Binding QuotaSegments}");
         var colors = gaugeStyle.Descendants()
             .Attributes("Value")
             .Select(attribute => attribute.Value)
             .Where(value => value.StartsWith("#", StringComparison.Ordinal))
-            .Concat(gauge.Descendants()
+            .Concat(gaugeItems.Descendants()
                 .Attributes("Background")
                 .Select(attribute => attribute.Value)
                 .Where(value => value.StartsWith("#", StringComparison.Ordinal)))
@@ -281,17 +351,53 @@ public sealed class PresentationBoundaryTests
             [xAccentMuted, xAccentPrimary],
             colors.Select(color => color.ToUpperInvariant()).ToArray());
         Assert.DoesNotContain(gaugeStyle.Descendants(), element => element.Name.LocalName is "Animation" or "Transitions");
-        Assert.DoesNotContain(gauge.Descendants(), element => element.Name.LocalName == "ProgressBar");
+        Assert.DoesNotContain(gaugeItems.Descendants(), element => element.Name.LocalName == "ProgressBar");
 
         Assert.Equal("{Binding QuotaWindowText}", gauge.Attribute("AutomationProperties.Name")?.Value);
         Assert.Equal("{Binding QuotaRemainingText}", gauge.Attribute("AutomationProperties.HelpText")?.Value);
-        Assert.Equal("7", gauge.Descendants().Single(element => element.Name.LocalName == "UniformGrid").Attribute("Columns")?.Value);
+        Assert.Equal("7", gaugeItems.Descendants().Single(element => element.Name.LocalName == "UniformGrid").Attribute("Columns")?.Value);
         Assert.Equal("0,0,4,0", gaugeStyle.Descendants()
             .Single(element => element.Name.LocalName == "Setter" && element.Attribute("Property")?.Value == "Margin")
             .Attribute("Value")?.Value);
-        var scale = gauge.Descendants().Single(element => element.Name.LocalName == "ScaleTransform");
+        var scale = gaugeItems.Descendants().Single(element => element.Name.LocalName == "ScaleTransform");
         Assert.Equal("False", scale.Attribute("{http://schemas.microsoft.com/winfx/2006/xaml}CompileBindings")?.Value);
         Assert.Equal("{Binding DataContext.Fill, ElementName=QuotaSegmentCell}", scale.Attribute("ScaleX")?.Value);
+    }
+
+    [Fact]
+    public void MainRefreshKeepsDetailsNotificationsOnTheUiContext()
+    {
+        var source = LoadRepositoryFile(
+            "windows-client", "src", "CodexInfo.WindowsClient", "ViewModels", "MainWindowViewModel.cs");
+        var start = source.IndexOf("private async Task TryRefreshAsync", StringComparison.Ordinal);
+        var end = source.IndexOf("private static bool HasSamePublicCore", start, StringComparison.Ordinal);
+        Assert.True(start >= 0 && end > start, "Main refresh method boundaries are missing.");
+        var refresh = source[start..end];
+        Assert.DoesNotContain("ConfigureAwait(false)", refresh, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void BorderlessWindowCloseControlsExposeStableAutomationIds()
+    {
+        var expected = new Dictionary<string, string>(StringComparer.Ordinal)
+        {
+            ["MainWindow.axaml"] = "Main.Window.Close",
+            ["GraphWindow.axaml"] = "Graph.Window.Close",
+            ["ThreadsWindow.axaml"] = "Threads.Window.Close",
+            ["LegalNoticesWindow.axaml"] = "Legal.Window.Close",
+            ["SettingsWindow.axaml"] = "Settings.Window.Close",
+            ["SetupWindow.axaml"] = "Setup.Window.Close",
+        };
+
+        foreach (var (fileName, automationId) in expected)
+        {
+            var document = XDocument.Parse(LoadRepositoryFile(
+                "windows-client", "src", "CodexInfo.WindowsClient", fileName));
+            Assert.Contains(
+                document.Descendants().Where(element => element.Name.LocalName == "Button"),
+                button => (button.Attribute("Click")?.Value is "OnCloseWindow" or "OnClose") &&
+                    button.Attribute("AutomationProperties.AutomationId")?.Value == automationId);
+        }
     }
 
     [Fact]
@@ -450,11 +556,11 @@ public sealed class PresentationBoundaryTests
         return line[(colon + 1)..].Trim().TrimEnd(';').ToUpperInvariant();
     }
 
-    private sealed class SequenceStatusClient(params StatusFetchResult[] results) : ILoopbackStatusClient
+    private sealed class SequenceStatusClient(params StatusFetchResult[] results) : HealthyStatusClientBase
     {
         private int index;
 
-        public Task<StatusFetchResult> FetchAsync(CancellationToken cancellationToken = default)
+        public override Task<StatusFetchResult> FetchAsync(CancellationToken cancellationToken = default)
         {
             var result = results[Math.Min(index, results.Length - 1)];
             index++;

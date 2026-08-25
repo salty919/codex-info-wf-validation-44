@@ -36,6 +36,7 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
     private static readonly IBrush ErrorAccent = new SolidColorBrush(Color.Parse("#E06B7A"));
 
     private readonly ILoopbackStatusClient client;
+    private readonly ILoopbackHealthClient healthClient;
     private readonly ILoopbackDetailsClient? detailsClient;
     private readonly ConnectionSupervisor? connectionSupervisor;
     private readonly UpdateViewModel? update;
@@ -62,7 +63,12 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
         ConnectionSupervisor? connectionSupervisor = null,
         IWindowsUpdateCoordinator? updateCoordinator = null)
     {
+        ArgumentNullException.ThrowIfNull(client);
         this.client = client;
+        healthClient = client as ILoopbackHealthClient
+            ?? throw new ArgumentException(
+                "The status client must implement the fixed health boundary.",
+                nameof(client));
         this.detailsClient = detailsClient;
         this.connectionSupervisor = connectionSupervisor;
         update = updateCoordinator is null ? null : new UpdateViewModel(updateCoordinator);
@@ -78,6 +84,8 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
     public event PropertyChangedEventHandler? PropertyChanged;
 
     public UiText Texts => LocalizationService.Current;
+
+    public string ProductVersionText => ProductInfo.DisplayVersion;
 
     public ICommand RefreshCommand => refreshCommand;
 
@@ -429,6 +437,23 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
         SetRefreshing(true);
         try
         {
+            // A client generation is admitted only after the fixed listener
+            // health document has passed its own schema and header boundary.
+            HealthFetchResult health = await healthClient
+                .FetchHealthAsync(cancellationToken);
+            if (cancellationToken.IsCancellationRequested)
+            {
+                return;
+            }
+
+            if (!health.IsSuccess)
+            {
+                ApplyFailure(health.Failure == HealthFetchFailure.Response
+                    ? StatusFetchFailure.Response
+                    : StatusFetchFailure.Transport);
+                return;
+            }
+
             StatusFetchResult result = await client.FetchAsync(cancellationToken);
             if (cancellationToken.IsCancellationRequested)
             {
@@ -481,7 +506,11 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
                 }
                 else
                 {
-                    ApplyFailure(detailsResult.Failure == DetailsFetchFailure.Transport
+                    detailsFailure = detailsResult.Failure == DetailsFetchFailure.Transport
+                        ? DetailsFetchFailure.Transport
+                        : DetailsFetchFailure.Response;
+                    Notify(nameof(DetailsStatusText));
+                    ApplyFailure(detailsFailure == DetailsFetchFailure.Transport
                         ? StatusFetchFailure.Transport
                         : StatusFetchFailure.Response);
                 }

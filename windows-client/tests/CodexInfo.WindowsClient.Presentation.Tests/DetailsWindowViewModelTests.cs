@@ -26,6 +26,7 @@ public sealed class DetailsWindowViewModelTests
             store.Save(expected);
             Assert.Equal(expected, store.Load());
             Assert.False(File.Exists(path + ".tmp"));
+            Assert.Empty(Directory.EnumerateFiles(root.FullName, "*.tmp", SearchOption.TopDirectoryOnly));
 
             File.WriteAllText(path, "{not-json}");
             var corrupt = store.Load();
@@ -83,6 +84,48 @@ public sealed class DetailsWindowViewModelTests
                 ConnectionProfile = ConnectionProfiles.SshConfigAlias,
                 ConnectionSelector = "user@host",
             }));
+        }
+        finally
+        {
+            root.Delete(recursive: true);
+        }
+    }
+
+    [Fact]
+    public void SettingsRejectReparseTargetsAndParentComponentsFailClosed()
+    {
+        var root = Directory.CreateTempSubdirectory("codex-info-settings-reparse-test");
+        try
+        {
+            var real = Path.Combine(root.FullName, "real.json");
+            var realStore = new ClientSettingsStore(real);
+            realStore.Save(new ClientSettings("ja", true));
+
+            var targetLink = Path.Combine(root.FullName, "target-link.json");
+            var parentDirectory = Path.Combine(root.FullName, "real-directory");
+            Directory.CreateDirectory(parentDirectory);
+            var parentLink = Path.Combine(root.FullName, "parent-link");
+            var danglingLink = Path.Combine(root.FullName, "dangling.json");
+            try
+            {
+                File.CreateSymbolicLink(targetLink, real);
+                Directory.CreateSymbolicLink(parentLink, parentDirectory);
+                File.CreateSymbolicLink(danglingLink, Path.Combine(root.FullName, "missing.json"));
+            }
+            catch (UnauthorizedAccessException)
+            {
+                // Some Windows test hosts require Developer Mode or an
+                // elevated token for symlink creation; the physical-host gate
+                // covers that platform-specific branch.
+                return;
+            }
+
+            Assert.True(new ClientSettingsStore(targetLink).Load().SettingsCorrupt);
+            Assert.Throws<IOException>(() => new ClientSettingsStore(targetLink).Save(ClientSettings.Default));
+            Assert.True(new ClientSettingsStore(parentLink + Path.DirectorySeparatorChar + "settings.json").Load().SettingsCorrupt);
+            Assert.Throws<IOException>(() => new ClientSettingsStore(parentLink + Path.DirectorySeparatorChar + "settings.json").Save(ClientSettings.Default));
+            Assert.True(new ClientSettingsStore(danglingLink).Load().SettingsCorrupt);
+            Assert.Throws<IOException>(() => new ClientSettingsStore(danglingLink).Save(ClientSettings.Default));
         }
         finally
         {
@@ -335,9 +378,24 @@ public sealed class DetailsWindowViewModelTests
         using var legal = new LegalNoticesWindowViewModel(main);
 
         Assert.True(legal.PageCount > 1);
+        Assert.Equal(9, legal.PageCount);
         Assert.Equal(legal.Notices.Count, legal.PageCount);
         Assert.Equal(0, legal.CurrentPageIndex);
         Assert.Equal(1, legal.CurrentPageNumber);
+        Assert.Equal(
+            new[]
+            {
+                LocalizationService.Current.LegalCodeName,
+                LocalizationService.Current.LegalWarrantyName,
+                LocalizationService.Current.LegalLicenseName,
+                LocalizationService.Current.LegalFontName,
+                LocalizationService.Current.LegalProtocolName,
+                LocalizationService.Current.LegalSchemaName,
+                LocalizationService.Current.LegalThirdPartyName,
+                LocalizationService.Current.LegalDetailsName,
+                LocalizationService.Current.LegalDistributionName,
+            },
+            legal.Notices.Select(notice => notice.Name));
         Assert.Equal(legal.Notices[0], legal.CurrentNotice);
         Assert.Equal(legal.Notices[0].Name, legal.CurrentNoticeName);
         Assert.Equal(legal.Notices[0].Text, legal.CurrentNoticeText);
@@ -372,6 +430,18 @@ public sealed class DetailsWindowViewModelTests
         Assert.False(legal.BackCommand.CanExecute(null));
         legal.BackCommand.Execute(null);
         Assert.Equal(0, legal.CurrentPageIndex);
+
+        Assert.Contains(legal.Notices, notice => notice.Name == LocalizationService.Current.LegalWarrantyName);
+        Assert.Contains(legal.Notices, notice => notice.Name == LocalizationService.Current.LegalLicenseName);
+        Assert.Contains(legal.Notices, notice => notice.Name == LocalizationService.Current.LegalDetailsName);
+        Assert.Contains(legal.Notices, notice => notice.Text.Contains("LICENSE", StringComparison.Ordinal));
+        Assert.Contains(legal.Notices, notice => notice.Text.Contains("THIRD_PARTY_NOTICES.md", StringComparison.Ordinal));
+        Assert.Contains("GNU GENERAL PUBLIC LICENSE", legal.Notices[1].Text, StringComparison.Ordinal);
+        Assert.Contains("NO WARRANTY", legal.Notices[1].Text, StringComparison.Ordinal);
+        Assert.Contains("SIL OPEN FONT LICENSE", legal.Notices[3].Text, StringComparison.Ordinal);
+        Assert.Contains("Apache License", legal.Notices[4].Text, StringComparison.Ordinal);
+        Assert.Contains("MIT License", legal.Notices[6].Text, StringComparison.Ordinal);
+        Assert.Contains("Inno Setup License", legal.Notices[8].Text, StringComparison.Ordinal);
     }
 
     private static ApiStatusSnapshot ValidStatus(long resetAt) => new(
@@ -404,9 +474,9 @@ public sealed class DetailsWindowViewModelTests
         }
     }
 
-    private sealed class SingleStatusClient(StatusFetchResult result) : ILoopbackStatusClient
+    private sealed class SingleStatusClient(StatusFetchResult result) : HealthyStatusClientBase
     {
-        public Task<StatusFetchResult> FetchAsync(CancellationToken cancellationToken = default) => Task.FromResult(result);
+        public override Task<StatusFetchResult> FetchAsync(CancellationToken cancellationToken = default) => Task.FromResult(result);
     }
 
     private sealed class SingleDetailsClient(DetailsFetchResult result) : ILoopbackDetailsClient
@@ -414,9 +484,9 @@ public sealed class DetailsWindowViewModelTests
         public Task<DetailsFetchResult> FetchDetailsAsync(CancellationToken cancellationToken = default) => Task.FromResult(result);
     }
 
-    private sealed class ToggleStatusClient(StatusFetchResult initial) : ILoopbackStatusClient
+    private sealed class ToggleStatusClient(StatusFetchResult initial) : HealthyStatusClientBase
     {
         public StatusFetchResult Result { get; set; } = initial;
-        public Task<StatusFetchResult> FetchAsync(CancellationToken cancellationToken = default) => Task.FromResult(Result);
+        public override Task<StatusFetchResult> FetchAsync(CancellationToken cancellationToken = default) => Task.FromResult(Result);
     }
 }

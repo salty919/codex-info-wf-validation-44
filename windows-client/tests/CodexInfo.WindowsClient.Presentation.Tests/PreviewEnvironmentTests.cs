@@ -57,10 +57,23 @@ public sealed class PreviewEnvironmentTests
         Assert.Equal(3, status.Snapshot.Models.Count);
 
         Assert.True(details.IsSuccess);
-        Assert.Equal(3, details.Snapshot!.HistoryPeriods.Single().Samples.Count);
+        Assert.Equal(2, details.Snapshot!.HistoryPeriods.Count);
+        Assert.Equal(3, details.Snapshot.HistoryPeriods.Single(period => period.Current).Samples.Count);
+        Assert.Equal(2, details.Snapshot.HistoryPeriods.Single(period => !period.Current).Samples.Count);
         Assert.Equal(6, details.Snapshot.Threads.Count);
         Assert.Contains(details.Snapshot.Threads, thread => thread.IsOrphan);
         Assert.Contains(details.Snapshot.Threads, thread => thread.ParentId == "preview-root");
         Assert.True(details.Snapshot.EstimatedCostLabel.Length > 0);
+    }
+
+    [Fact]
+    public async Task PreviewQuotaGaugeUsesTheExactHalfPeriodAcceptanceBoundary()
+    {
+        using var client = new CodexInfo.WindowsClient.PreviewLoopbackClient();
+        var status = await client.FetchAsync();
+
+        var quota = Assert.IsType<ApiQuota>(status.Snapshot!.Quota);
+        var remainingSeconds = quota.ResetAt - status.Snapshot.ObservedAt;
+        Assert.Equal(quota.WindowSeconds / 2, remainingSeconds);
     }
 }

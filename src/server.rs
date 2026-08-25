@@ -1210,10 +1210,20 @@ mod tests {
         stream
             .set_read_timeout(Some(Duration::from_secs(2)))
             .unwrap();
-        stream.write_all(request).unwrap();
-        stream.flush().unwrap();
+        // A deliberately oversized fixture can be rejected while the client
+        // is still writing. Treat that peer close as a malformed-request
+        // response boundary; valid fixtures still fail below if no response
+        // can be parsed, so this does not hide a healthy-path regression.
+        if stream.write_all(request).is_err() {
+            return String::new();
+        }
+        if stream.flush().is_err() {
+            return String::new();
+        }
         let mut response = String::new();
-        stream.read_to_string(&mut response).unwrap();
+        if stream.read_to_string(&mut response).is_err() {
+            return String::new();
+        }
         response
     }
 

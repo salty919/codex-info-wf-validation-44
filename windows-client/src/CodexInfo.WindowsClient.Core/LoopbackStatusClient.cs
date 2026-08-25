@@ -19,12 +19,14 @@ public interface ILoopbackStatusClient
 /// turn the client into a general-purpose HTTP client.  A handler constructor is
 /// provided solely to make the transport boundary testable.
 /// </remarks>
-public sealed class LoopbackStatusClient : ILoopbackStatusClient, ILoopbackDetailsClient, IDisposable
+public sealed class LoopbackStatusClient : ILoopbackStatusClient, ILoopbackHealthClient, ILoopbackDetailsClient, IDisposable
 {
     private const string Endpoint = "http://127.0.0.1:8787/v1/status";
     private const string DetailsEndpoint = "http://127.0.0.1:8787/v1/details";
+    private const string HealthEndpoint = "http://127.0.0.1:8787/v1/health";
     private const int MaxResponseHeaderBytes = 8 * 1024;
     private const int MaxBodyBytes = 64 * 1024;
+    private const int MaxHealthBodyBytes = 1024;
     // SQLite retains three months, but one details response is bounded to one
     // 31-day month of minute buckets. The byte envelope is independent.
     private const int MaxDetailsBodyBytes = 32 * 1024 * 1024;
@@ -43,6 +45,10 @@ public sealed class LoopbackStatusClient : ILoopbackStatusClient, ILoopbackDetai
         "quota",
         "models",
         "active_thread_count");
+
+    private static readonly HashSet<string> HealthProperties = CreatePropertySet(
+        "api_version",
+        "service");
 
     private static readonly HashSet<string> QuotaProperties = CreatePropertySet(
         "remaining_percent",
@@ -155,7 +161,7 @@ public sealed class LoopbackStatusClient : ILoopbackStatusClient, ILoopbackDetai
 
             // HTTP status failures are transport failures by the public contract;
             // no response body is ever exposed to the caller.
-            if ((int)response.StatusCode is < 200 or > 299)
+            if (response.StatusCode != HttpStatusCode.OK)
             {
                 return Failure(StatusFetchFailure.Transport);
             }
@@ -223,6 +229,86 @@ public sealed class LoopbackStatusClient : ILoopbackStatusClient, ILoopbackDetai
         }
     }
 
+    public async Task<HealthFetchResult> FetchHealthAsync(
+        CancellationToken cancellationToken = default)
+    {
+        try
+        {
+            using var request = new HttpRequestMessage(HttpMethod.Get, HealthEndpoint);
+            request.Headers.Accept.Clear();
+            request.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
+
+            using var response = await _httpClient.SendAsync(
+                    request,
+                    HttpCompletionOption.ResponseHeadersRead,
+                    cancellationToken)
+                .ConfigureAwait(false);
+
+            if (response.StatusCode != HttpStatusCode.OK)
+            {
+                return HealthFetchResult.FromFailure(HealthFetchFailure.Response);
+            }
+
+            if (!HasAcceptableHeaderSize(response) ||
+                !HasRequiredResponseHeaders(response) ||
+                !TryGetContentLength(response.Content, out var contentLength) ||
+                contentLength is not long declaredLength)
+            {
+                return HealthFetchResult.FromFailure(HealthFetchFailure.Response);
+            }
+
+            if (declaredLength > MaxHealthBodyBytes)
+            {
+                return HealthFetchResult.FromFailure(HealthFetchFailure.Response);
+            }
+
+            var bodyStatus = await ReadBodyAsync(
+                    response.Content,
+                    declaredLength,
+                    cancellationToken,
+                    MaxHealthBodyBytes)
+                .ConfigureAwait(false);
+
+            if (bodyStatus.Kind is BodyReadKind.Oversize)
+            {
+                return HealthFetchResult.FromFailure(HealthFetchFailure.Response);
+            }
+
+            if (bodyStatus.Kind is BodyReadKind.Transport || bodyStatus.Body is null)
+            {
+                return HealthFetchResult.FromFailure(HealthFetchFailure.Transport);
+            }
+
+            if (bodyStatus.Body.LongLength != declaredLength)
+            {
+                return HealthFetchResult.FromFailure(HealthFetchFailure.Response);
+            }
+
+            if (!TryParseHealth(bodyStatus.Body, out var snapshot) || snapshot is null)
+            {
+                return HealthFetchResult.FromFailure(HealthFetchFailure.Response);
+            }
+
+            return HealthFetchResult.Success(snapshot);
+        }
+        catch (OperationCanceledException)
+        {
+            return HealthFetchResult.FromFailure(HealthFetchFailure.Transport);
+        }
+        catch (HttpRequestException)
+        {
+            return HealthFetchResult.FromFailure(HealthFetchFailure.Transport);
+        }
+        catch (IOException)
+        {
+            return HealthFetchResult.FromFailure(HealthFetchFailure.Transport);
+        }
+        catch (Exception)
+        {
+            return HealthFetchResult.FromFailure(HealthFetchFailure.Transport);
+        }
+    }
+
     /// <summary>
     /// Reads the independent details document.  This deliberately has a
     /// separate public result type so callers cannot accidentally turn a
@@ -243,7 +329,7 @@ public sealed class LoopbackStatusClient : ILoopbackStatusClient, ILoopbackDetai
                     cancellationToken)
                 .ConfigureAwait(false);
 
-            if ((int)response.StatusCode is < 200 or > 299)
+            if (response.StatusCode != HttpStatusCode.OK)
             {
                 return DetailsFailure(DetailsFetchFailure.Transport);
             }
@@ -533,6 +619,52 @@ public sealed class LoopbackStatusClient : ILoopbackStatusClient, ILoopbackDetai
                 quota,
                 new System.Collections.ObjectModel.ReadOnlyCollection<ApiModelUsage>(models),
                 activeThreadCount);
+            return true;
+        }
+        catch (JsonException)
+        {
+            return false;
+        }
+        catch (ArgumentException)
+        {
+            return false;
+        }
+        catch (InvalidOperationException)
+        {
+            return false;
+        }
+        catch (Exception)
+        {
+            return false;
+        }
+    }
+
+    private static bool TryParseHealth(byte[] body, out ApiHealthSnapshot? snapshot)
+    {
+        snapshot = null;
+
+        try
+        {
+            using var document = JsonDocument.Parse(
+                body,
+                new JsonDocumentOptions
+                {
+                    AllowTrailingCommas = false,
+                    CommentHandling = JsonCommentHandling.Disallow,
+                    MaxDepth = 4,
+                });
+
+            var root = document.RootElement;
+            if (!HasExactlyProperties(root, HealthProperties, 2) ||
+                !TryGetString(root, "api_version", out var apiVersion) ||
+                apiVersion != "v1" ||
+                !TryGetBoundedString(root, "service", 1, 64, out var service) ||
+                service != "codex-info")
+            {
+                return false;
+            }
+
+            snapshot = new ApiHealthSnapshot(apiVersion, service);
             return true;
         }
         catch (JsonException)
