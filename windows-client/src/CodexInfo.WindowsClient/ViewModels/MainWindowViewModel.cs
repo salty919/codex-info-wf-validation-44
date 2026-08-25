@@ -507,7 +507,11 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
                 }
                 else
                 {
-                    ApplyFailure(detailsResult.Failure == DetailsFetchFailure.Transport
+                    detailsFailure = detailsResult.Failure == DetailsFetchFailure.Transport
+                        ? DetailsFetchFailure.Transport
+                        : DetailsFetchFailure.Response;
+                    Notify(nameof(DetailsStatusText));
+                    ApplyFailure(detailsFailure == DetailsFetchFailure.Transport
                         ? StatusFetchFailure.Transport
                         : StatusFetchFailure.Response);
                 }

@@ -42,6 +42,9 @@ public partial class App : Application
             LocalizationService.SetLanguage(settings.Language);
             LocalizationService.SetTimeZone(settings.TimeZoneId);
             ILoopbackStatusClient client = preview ? new PreviewLoopbackClient() : new LoopbackStatusClient();
+            ILoopbackDetailsClient detailsClient = preview
+                ? (ILoopbackDetailsClient)client
+                : new LoopbackStatusClient();
             var supervisor = preview ? null : new ConnectionSupervisor();
             IWindowsUpdateCoordinator updateCoordinator = preview
                 ? new PreviewUpdateCoordinator()
@@ -55,7 +58,7 @@ public partial class App : Application
                         "updates"));
             var viewModel = new MainWindowViewModel(
                 client,
-                client as ILoopbackDetailsClient,
+                detailsClient,
                 supervisor,
                 updateCoordinator);
             desktop.MainWindow = new MainWindow

@@ -331,12 +331,14 @@ public sealed class PresentationBoundaryTests
             .Single(element => element.Name.LocalName == "Style" && element.Attribute("Selector")?.Value == "Border.quota-segment");
 
         var gauge = document.Descendants()
-            .Single(element => element.Name.LocalName == "ItemsControl" && element.Attribute("AutomationProperties.AutomationId")?.Value == "Main.QuotaPeriodGauge");
+            .Single(element => element.Name.LocalName == "TextBlock" && element.Attribute("AutomationProperties.AutomationId")?.Value == "Main.QuotaPeriodGauge");
+        var gaugeItems = document.Descendants()
+            .Single(element => element.Name.LocalName == "ItemsControl" && element.Attribute("ItemsSource")?.Value == "{Binding QuotaSegments}");
         var colors = gaugeStyle.Descendants()
             .Attributes("Value")
             .Select(attribute => attribute.Value)
             .Where(value => value.StartsWith("#", StringComparison.Ordinal))
-            .Concat(gauge.Descendants()
+            .Concat(gaugeItems.Descendants()
                 .Attributes("Background")
                 .Select(attribute => attribute.Value)
                 .Where(value => value.StartsWith("#", StringComparison.Ordinal)))
@@ -349,15 +351,15 @@ public sealed class PresentationBoundaryTests
             [xAccentMuted, xAccentPrimary],
             colors.Select(color => color.ToUpperInvariant()).ToArray());
         Assert.DoesNotContain(gaugeStyle.Descendants(), element => element.Name.LocalName is "Animation" or "Transitions");
-        Assert.DoesNotContain(gauge.Descendants(), element => element.Name.LocalName == "ProgressBar");
+        Assert.DoesNotContain(gaugeItems.Descendants(), element => element.Name.LocalName == "ProgressBar");
 
         Assert.Equal("{Binding QuotaWindowText}", gauge.Attribute("AutomationProperties.Name")?.Value);
         Assert.Equal("{Binding QuotaRemainingText}", gauge.Attribute("AutomationProperties.HelpText")?.Value);
-        Assert.Equal("7", gauge.Descendants().Single(element => element.Name.LocalName == "UniformGrid").Attribute("Columns")?.Value);
+        Assert.Equal("7", gaugeItems.Descendants().Single(element => element.Name.LocalName == "UniformGrid").Attribute("Columns")?.Value);
         Assert.Equal("0,0,4,0", gaugeStyle.Descendants()
             .Single(element => element.Name.LocalName == "Setter" && element.Attribute("Property")?.Value == "Margin")
             .Attribute("Value")?.Value);
-        var scale = gauge.Descendants().Single(element => element.Name.LocalName == "ScaleTransform");
+        var scale = gaugeItems.Descendants().Single(element => element.Name.LocalName == "ScaleTransform");
         Assert.Equal("False", scale.Attribute("{http://schemas.microsoft.com/winfx/2006/xaml}CompileBindings")?.Value);
         Assert.Equal("{Binding DataContext.Fill, ElementName=QuotaSegmentCell}", scale.Attribute("ScaleX")?.Value);
     }

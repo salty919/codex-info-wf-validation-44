@@ -223,6 +223,9 @@ require_text windows-client/tools/Measure-WindowsGraphLatency.ps1 'Graph.MetricS
 require_text windows-client/tools/Measure-WindowsGraphLatency.ps1 'CopyFromScreen'
 require_text windows-client/tools/Measure-WindowsGraphLatency.ps1 'SendInput'
 require_text windows-client/tools/Run-WindowsClientE2E.ps1 'Assert-E2EQuotaGaugePalette'
+require_text windows-client/tools/Run-WindowsClientE2E.ps1 'Main.DetailsStatus'
+require_text windows-client/tools/Run-WindowsClientE2E.ps1 'parts[1] == "/v1/health"'
+require_text windows-client/tools/Run-WindowsClientE2E.ps1 '\"service\":\"codex-info\"'
 require_text windows-client/tools/Run-WindowsClientE2E.ps1 "main-quota-gauge: seven cells, two X-authority surface colors, and half-period boundary PASS"
 require_text windows-client/src/CodexInfo.WindowsClient/GraphWindow.axaml 'AutomationProperties.AutomationId="Graph.Window.Close"'
 require_text windows-client/src/CodexInfo.WindowsClient/ThreadsWindow.axaml 'AutomationProperties.AutomationId="Threads.Window.Close"'

@@ -135,8 +135,8 @@ jobs:
           if ($null -ne $basePropsPath) {
             $decisionArguments.BasePropsPath = $basePropsPath
           }
-          $decisionOutput = @(& ./windows-client/tools/Get-WindowsReleaseDecision.ps1 @decisionArguments)
-          $versionChanged = $decisionOutput -contains 'changed=true'
+          $decisionOutputText = (& ./windows-client/tools/Get-WindowsReleaseDecision.ps1 @decisionArguments | Out-String)
+          $versionChanged = $decisionOutputText -match '(?m)^changed=true\s*$'
           $changedFiles = if ([string]::IsNullOrWhiteSpace($baseCommit)) {
             @(& git diff --name-only HEAD^ HEAD)
           }

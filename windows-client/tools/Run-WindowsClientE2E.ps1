@@ -140,12 +140,18 @@ public static class CodexInfoWindowsE2EFixtureServer {
     private static volatile bool running;
     private static string statusBody;
     private static string detailsBody;
+    private static int healthRequests;
+    private static int statusRequests;
+    private static int detailsRequests;
 
     public static bool Start(string status, string details, int port) {
         if (running) return false;
         try {
             statusBody = status;
             detailsBody = details;
+            healthRequests = 0;
+            statusRequests = 0;
+            detailsRequests = 0;
             listener = new TcpListener(IPAddress.Loopback, port);
             listener.Start();
             running = true;
@@ -162,6 +168,9 @@ public static class CodexInfoWindowsE2EFixtureServer {
     }
 
     public static bool IsRunning() { return running; }
+
+    public static string RequestSummary() => String.Format(
+        "health={0} status={1} details={2}", healthRequests, statusRequests, detailsRequests);
 
     public static void Stop() {
         running = false;
@@ -211,11 +220,19 @@ public static class CodexInfoWindowsE2EFixtureServer {
             var body = "{\"api_version\":\"v1\",\"error\":\"not_found\"}";
             if (parts.Length >= 2 && parts[0] == "GET") {
                 if (parts[1] == "/v1/status") {
+                    Interlocked.Increment(ref statusRequests);
                     code = 200;
                     reason = "OK";
                     body = statusBody;
                 }
+                else if (parts[1] == "/v1/health") {
+                    Interlocked.Increment(ref healthRequests);
+                    code = 200;
+                    reason = "OK";
+                    body = "{\"api_version\":\"v1\",\"service\":\"codex-info\"}";
+                }
                 else if (parts[1] == "/v1/details") {
+                    Interlocked.Increment(ref detailsRequests);
                     code = 200;
                     reason = "OK";
                     body = detailsBody;
@@ -628,59 +645,32 @@ function New-E2EFixtureDocuments {
     $currentReset = $now + 7200
     $pastStart = $now - 25200
     $pastReset = $now - 14400
-    $status = [ordered]@{
-        api_version = 'v1'
-        state = 'ready'
-        observed_at = $now
-        authenticated = $true
-        plan_label = 'Pro'
-        quota = [ordered]@{ remaining_percent = 72.0; reset_at = $currentReset; window_seconds = 14400; monthly = $false }
-        models = @(
-            [ordered]@{ name = 'SOL'; input_tokens = 1200; cached_input_tokens = 200; output_tokens = 400 },
-            [ordered]@{ name = 'TERRA'; input_tokens = 2400; cached_input_tokens = 500; output_tokens = 800 },
-            [ordered]@{ name = 'LUNA'; input_tokens = 3600; cached_input_tokens = 700; output_tokens = 1100 }
-        )
-        active_thread_count = 3
-    }
-    $details = [ordered]@{
-        api_version = 'v1'
-        state = 'ready'
-        observed_at = $now
-        authenticated = $true
-        plan_label = 'Pro'
-        quota = $status.quota
-        models = @(
-            [ordered]@{ name = 'SOL'; input_tokens = 1200; cached_input_tokens = 200; output_tokens = 400; input_dollars = 1.20; cached_input_dollars = 0.20; output_dollars = 0.40 },
-            [ordered]@{ name = 'TERRA'; input_tokens = 2400; cached_input_tokens = 500; output_tokens = 800; input_dollars = 2.40; cached_input_dollars = 0.50; output_dollars = 0.80 },
-            [ordered]@{ name = 'LUNA'; input_tokens = 3600; cached_input_tokens = 700; output_tokens = 1100; input_dollars = 3.60; cached_input_dollars = 0.70; output_dollars = 1.10 }
-        )
-        active_thread_count = 3
-        history_periods = @(
-            [ordered]@{ id = 'e2e-current'; start_at = $currentStart; end_at = $now; reset_at = $currentReset; label = 'Current period'; current = $true },
-            [ordered]@{ id = 'e2e-past'; start_at = $pastStart; end_at = $pastReset; reset_at = $pastReset; label = 'Past period'; current = $false }
-        )
-        history_samples = @(
-            [ordered]@{ timestamp = $currentStart + 60; reset_at = $currentReset; remaining_percent = 92.0; sol_dollars = 0.25; terra_dollars = 0.50; luna_dollars = 0.75; sol_tokens = 100; terra_tokens = 200; luna_tokens = 300 },
-            [ordered]@{ timestamp = $now - 60; reset_at = $currentReset; remaining_percent = 72.0; sol_dollars = 1.20; terra_dollars = 2.40; luna_dollars = 3.60; sol_tokens = 1200; terra_tokens = 2400; luna_tokens = 3600 },
-            [ordered]@{ timestamp = $pastStart + 60; reset_at = $pastReset; remaining_percent = 98.0; sol_dollars = 0.10; terra_dollars = 0.20; luna_dollars = 0.30; sol_tokens = 50; terra_tokens = 100; luna_tokens = 150 },
-            [ordered]@{ timestamp = $pastReset - 60; reset_at = $pastReset; remaining_percent = 84.0; sol_dollars = 0.60; terra_dollars = 1.20; luna_dollars = 1.80; sol_tokens = 600; terra_tokens = 1200; luna_tokens = 1800 }
-        )
-        threads = @(
-            [ordered]@{ id = 'e2e-root'; title = 'E2E root task'; parent_thread_id = $null; model = 'TERRA'; model_label = 'TERRA'; total_tokens = 2400; context_usage_tokens = 800; context_window_tokens = 16000; created_at = $now - 3600; last_user_message_at = $now - 300; is_subagent = $false; depth = 0 },
-            [ordered]@{ id = 'e2e-child'; title = 'E2E child task'; parent_thread_id = 'e2e-root'; model = 'LUNA'; model_label = 'LUNA'; total_tokens = 1200; context_usage_tokens = 400; context_window_tokens = 16000; created_at = $now - 2400; last_user_message_at = $now - 600; is_subagent = $true; depth = 1 },
-            [ordered]@{ id = 'e2e-orphan'; title = 'E2E orphan task'; parent_thread_id = 'missing-parent'; model = 'SOL'; model_label = 'SOL'; total_tokens = 600; context_usage_tokens = $null; context_window_tokens = $null; created_at = $now - 1200; last_user_message_at = $null; is_subagent = $true; depth = $null }
-        )
-        estimated_cost_label = '$12.34'
-    }
+    $status = @"
+{"api_version":"v1","state":"ready","observed_at":$now,"authenticated":true,"plan_label":"Pro","quota":{"remaining_percent":72.0,"reset_at":$currentReset,"window_seconds":14400,"monthly":false},"models":[{"name":"SOL","input_tokens":1200,"cached_input_tokens":200,"output_tokens":400},{"name":"TERRA","input_tokens":2400,"cached_input_tokens":500,"output_tokens":800},{"name":"LUNA","input_tokens":3600,"cached_input_tokens":700,"output_tokens":1100}],"active_thread_count":3}
+"@
+    # Keep this wire fixture as explicit JSON.  The details endpoint is a
+    # strict twelve-field contract; serializing nested PowerShell dictionaries
+    # can silently change null/number kinds between Windows PowerShell builds.
+    $details = @"
+{"api_version":"v1","state":"ready","observed_at":$now,"authenticated":true,"plan_label":"Pro","quota":{"remaining_percent":72.0,"reset_at":$currentReset,"window_seconds":14400,"monthly":false},"models":[{"name":"SOL","input_tokens":1200,"cached_input_tokens":200,"output_tokens":400,"input_dollars":1.20,"cached_input_dollars":0.20,"output_dollars":0.40},{"name":"TERRA","input_tokens":2400,"cached_input_tokens":500,"output_tokens":800,"input_dollars":2.40,"cached_input_dollars":0.50,"output_dollars":0.80},{"name":"LUNA","input_tokens":3600,"cached_input_tokens":700,"output_tokens":1100,"input_dollars":3.60,"cached_input_dollars":0.70,"output_dollars":1.10}],"active_thread_count":3,"history_periods":[{"id":"e2e-current","start_at":$currentStart,"end_at":$now,"reset_at":$currentReset,"label":"Current period","current":true},{"id":"e2e-past","start_at":$pastStart,"end_at":$pastReset,"reset_at":$pastReset,"label":"Past period","current":false}],"history_samples":[{"timestamp":$($currentStart + 60),"reset_at":$currentReset,"remaining_percent":92.0,"sol_dollars":0.25,"terra_dollars":0.50,"luna_dollars":0.75,"sol_tokens":100,"terra_tokens":200,"luna_tokens":300},{"timestamp":$($now - 60),"reset_at":$currentReset,"remaining_percent":72.0,"sol_dollars":1.20,"terra_dollars":2.40,"luna_dollars":3.60,"sol_tokens":1200,"terra_tokens":2400,"luna_tokens":3600},{"timestamp":$($pastStart + 60),"reset_at":$pastReset,"remaining_percent":98.0,"sol_dollars":0.10,"terra_dollars":0.20,"luna_dollars":0.30,"sol_tokens":50,"terra_tokens":100,"luna_tokens":150},{"timestamp":$($pastReset - 60),"reset_at":$pastReset,"remaining_percent":84.0,"sol_dollars":0.60,"terra_dollars":1.20,"luna_dollars":1.80,"sol_tokens":600,"terra_tokens":1200,"luna_tokens":1800}],"threads":[{"id":"e2e-root","title":"E2E root task","parent_thread_id":null,"model":"TERRA","model_label":"TERRA","total_tokens":2400,"context_usage_tokens":800,"context_window_tokens":16000,"created_at":$($now - 3600),"last_user_message_at":$($now - 300),"is_subagent":false,"depth":0},{"id":"e2e-child","title":"E2E child task","parent_thread_id":"e2e-root","model":"LUNA","model_label":"LUNA","total_tokens":1200,"context_usage_tokens":400,"context_window_tokens":16000,"created_at":$($now - 2400),"last_user_message_at":$($now - 600),"is_subagent":true,"depth":1},{"id":"e2e-orphan","title":"E2E orphan task","parent_thread_id":"missing-parent","model":"SOL","model_label":"SOL","total_tokens":600,"context_usage_tokens":null,"context_window_tokens":null,"created_at":$($now - 1200),"last_user_message_at":null,"is_subagent":true,"depth":null}],"estimated_cost_label":"USD 12.34"}
+"@
     return [pscustomobject]@{
-        Status = ($status | ConvertTo-Json -Compress -Depth 12)
-        Details = ($details | ConvertTo-Json -Compress -Depth 12)
+        Status = $status.Trim()
+        Details = $details.Trim()
         Now = $now
     }
 }
 
 function Enter-E2EFixture {
     $documents = New-E2EFixtureDocuments
+    [IO.File]::WriteAllText(
+        (Join-Path $script:e2eOutput 'fixture-status.json'),
+        $documents.Status,
+        [Text.UTF8Encoding]::new($false))
+    [IO.File]::WriteAllText(
+        (Join-Path $script:e2eOutput 'fixture-details.json'),
+        $documents.Details,
+        [Text.UTF8Encoding]::new($false))
     if (Test-Path -LiteralPath $script:e2eSettingsPath -PathType Leaf) {
         $script:e2eSettingsWasPresent = $true
         Copy-Item -LiteralPath $script:e2eSettingsPath -Destination $script:e2eSettingsBackup -Force
@@ -817,6 +807,17 @@ try {
     $mainCapture = Capture-E2EWindow $mainHandle '01-main-ready'
     Assert-E2E ($mainCapture.Hash.Length -eq 64) 'Main screenshot hash is missing.'
     Assert-E2EQuotaGaugePalette -Root $mainRoot -Handle $mainHandle -Capture $mainCapture
+    Write-E2E ("fixture: requests={0}" -f [CodexInfoWindowsE2EFixtureServer]::RequestSummary())
+
+    # Give the bounded initial refresh one UI turn before opening a child
+    # window.  The child-window assertions below inspect the rendered graph,
+    # period options, metrics, and rows directly; a mutable summary TextBlock
+    # peer is deliberately not used as a proxy for those surfaces.
+    Start-Sleep -Seconds 5
+    $detailsStatus = Find-E2EElementByAutomationId $mainRoot 'Main.DetailsStatus'
+    if ($null -ne $detailsStatus) {
+        Write-E2E ("main: details status='{0}' observed" -f $detailsStatus.Current.Name)
+    }
 
     # Finite path: one Graph window, one period round-trip, two metrics, then
     # one OFF/ON cycle for each of four independent series.  No combinations
@@ -1005,6 +1006,16 @@ try {
     $script:e2eSuccess = $true
 }
 catch {
+    if ($null -ne $script:e2eProcess -and $null -ne $mainRoot) {
+        try {
+            $failureStatus = Find-E2EElementByAutomationId $mainRoot 'Main.DetailsStatus'
+            if ($null -ne $failureStatus) {
+                Write-E2E ("main: failure details status='{0}'" -f $failureStatus.Current.Name)
+            }
+            $null = Capture-E2EWindow $mainHandle 'failure-main'
+        }
+        catch { }
+    }
     Write-E2E "windows-client-e2e: FAIL $($_.Exception.Message)"
     throw
 }

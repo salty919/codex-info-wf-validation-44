@@ -232,10 +232,7 @@
           <ItemsControl Grid.Column="1"
                         VerticalAlignment="Center"
                         ItemsSource="{Binding QuotaSegments}"
-                        IsVisible="{Binding HasQuota}"
-                        AutomationProperties.AutomationId="Main.QuotaPeriodGauge"
-                        AutomationProperties.Name="{Binding QuotaWindowText}"
-                        AutomationProperties.HelpText="{Binding QuotaRemainingText}">
+                        IsVisible="{Binding HasQuota}">
             <ItemsControl.ItemsPanel>
               <ItemsPanelTemplate>
                 <UniformGrid Rows="1" Columns="7" />
@@ -257,6 +254,21 @@
               </DataTemplate>
             </ItemsControl.ItemTemplate>
           </ItemsControl>
+          <!-- Avalonia does not publish an ItemsControl automation peer on
+               every supported Windows UIA backend.  This transparent,
+               hit-test-free TextBlock is the real gauge bounds and carries
+               the same semantic name/help text so installed E2E/UIA sees
+               the rendered gauge rather than a source-only attribute. -->
+          <TextBlock Grid.Column="1"
+                     HorizontalAlignment="Stretch"
+                     VerticalAlignment="Stretch"
+                     IsVisible="{Binding HasQuota}"
+                     IsHitTestVisible="False"
+                     Foreground="Transparent"
+                     Text="{Binding QuotaWindowText}"
+                     AutomationProperties.AutomationId="Main.QuotaPeriodGauge"
+                     AutomationProperties.Name="{Binding QuotaWindowText}"
+                     AutomationProperties.HelpText="{Binding QuotaRemainingText}" />
           <TextBlock Grid.Column="2"
                      Classes="value"
                      FontSize="13"
@@ -335,6 +347,7 @@
           <TextBlock Grid.Column="2"
                      Classes="metric-label"
                      HorizontalAlignment="Right"
+                     AutomationProperties.AutomationId="Main.DetailsStatus"
                      Text="{Binding DetailsStatusText}"
                      TextWrapping="NoWrap" />
         </Grid>
