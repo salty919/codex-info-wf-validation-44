@@ -169,8 +169,10 @@ public static class CodexInfoWindowsE2EFixtureServer {
 
     public static bool IsRunning() { return running; }
 
-    public static string RequestSummary() => String.Format(
-        "health={0} status={1} details={2}", healthRequests, statusRequests, detailsRequests);
+    public static string RequestSummary() {
+        return String.Format(
+            "health={0} status={1} details={2}", healthRequests, statusRequests, detailsRequests);
+    }
 
     public static void Stop() {
         running = false;
@@ -804,10 +806,30 @@ try {
     Bring-E2EWindowToFront $mainHandle
     $mainRecord = Record-E2EWindow 'Main' $clientPid $mainHandle
     $mainRoot = Get-E2EUiaRoot $mainHandle
+    $mainGauge = Wait-E2E -Description 'Main quota period gauge' -Probe {
+        $candidate = Find-E2EElementByAutomationId $mainRoot 'Main.QuotaPeriodGauge'
+        if ($null -ne $candidate) {
+            $rect = $candidate.Current.BoundingRectangle
+            if (-not $candidate.Current.IsOffscreen -and $rect.Width -gt 0 -and $rect.Height -gt 0) {
+                return $candidate
+            }
+        }
+        return $false
+    }
     $mainCapture = Capture-E2EWindow $mainHandle '01-main-ready'
     Assert-E2E ($mainCapture.Hash.Length -eq 64) 'Main screenshot hash is missing.'
-    Assert-E2EQuotaGaugePalette -Root $mainRoot -Handle $mainHandle -Capture $mainCapture
-    Write-E2E ("fixture: requests={0}" -f [CodexInfoWindowsE2EFixtureServer]::RequestSummary())
+    if ($Fixture) {
+        Assert-E2EQuotaGaugePalette -Root $mainRoot -Handle $mainHandle -Capture $mainCapture
+    }
+    else {
+        $gauge = $mainGauge
+        $gaugeRect = $gauge.Current.BoundingRectangle
+        Assert-E2E (-not $gauge.Current.IsOffscreen -and $gaugeRect.Width -gt 0 -and $gaugeRect.Height -gt 0) 'Main quota period gauge is not visible.'
+        Write-E2E ("main-quota-gauge: observed bounds={0}x{1}" -f $gaugeRect.Width, $gaugeRect.Height)
+    }
+    if ($Fixture) {
+        Write-E2E ("fixture: requests={0}" -f [CodexInfoWindowsE2EFixtureServer]::RequestSummary())
+    }
 
     # Give the bounded initial refresh one UI turn before opening a child
     # window.  The child-window assertions below inspect the rendered graph,

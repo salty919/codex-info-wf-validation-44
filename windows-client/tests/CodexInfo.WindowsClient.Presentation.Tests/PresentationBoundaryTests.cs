@@ -365,6 +365,18 @@ public sealed class PresentationBoundaryTests
     }
 
     [Fact]
+    public void MainRefreshKeepsDetailsNotificationsOnTheUiContext()
+    {
+        var source = LoadRepositoryFile(
+            "windows-client", "src", "CodexInfo.WindowsClient", "ViewModels", "MainWindowViewModel.cs");
+        var start = source.IndexOf("private async Task TryRefreshAsync", StringComparison.Ordinal);
+        var end = source.IndexOf("private static bool HasSamePublicCore", start, StringComparison.Ordinal);
+        Assert.True(start >= 0 && end > start, "Main refresh method boundaries are missing.");
+        var refresh = source[start..end];
+        Assert.DoesNotContain("ConfigureAwait(false)", refresh, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public void BorderlessWindowCloseControlsExposeStableAutomationIds()
     {
         var expected = new Dictionary<string, string>(StringComparer.Ordinal)

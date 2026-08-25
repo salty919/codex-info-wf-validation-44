@@ -440,8 +440,7 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
             // A client generation is admitted only after the fixed listener
             // health document has passed its own schema and header boundary.
             HealthFetchResult health = await healthClient
-                .FetchHealthAsync(cancellationToken)
-                .ConfigureAwait(false);
+                .FetchHealthAsync(cancellationToken);
             if (cancellationToken.IsCancellationRequested)
             {
                 return;
