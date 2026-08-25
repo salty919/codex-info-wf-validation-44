@@ -38,7 +38,13 @@ public sealed class ClientSettingsSession : IClientSettingsSession
     public void Save(ClientSettings settings)
     {
         ArgumentNullException.ThrowIfNull(settings);
-        store.Save(settings);
-        publish(settings);
+        var published = settings with
+        {
+            // This marker belongs only to the failed-load generation. A
+            // durable rewrite is the session boundary that closes recovery.
+            SettingsCorrupt = false,
+        };
+        store.Save(published);
+        publish(published);
     }
 }

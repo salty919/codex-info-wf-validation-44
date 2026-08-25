@@ -4,6 +4,7 @@
 using System.Collections.ObjectModel;
 using System.ComponentModel;
 using System.Runtime.CompilerServices;
+using CodexInfo.WindowsClient.Core;
 using CodexInfo.WindowsClient.Infrastructure;
 using CodexInfo.WindowsClient.Localization;
 using CodexInfo.WindowsClient.Settings;
@@ -16,6 +17,7 @@ public sealed class SettingsViewModel : INotifyPropertyChanged
     private readonly MainWindowViewModel? main;
     private string selectedLanguageCode;
     private string selectedTimeZoneId;
+    private bool saveFailed;
 
     public SettingsViewModel(ClientSettingsStore store, MainWindowViewModel? main = null)
     {
@@ -33,6 +35,7 @@ public sealed class SettingsViewModel : INotifyPropertyChanged
 
     public ReadOnlyCollection<UiText> LanguageOptions { get; }
     public UiText Texts => LocalizationService.Current;
+    public string ProductVersionText => ProductInfo.DisplayVersion;
     public string SelectedLanguageCode
     {
         get => selectedLanguageCode;
@@ -55,23 +58,48 @@ public sealed class SettingsViewModel : INotifyPropertyChanged
     public string SelectedTimeZone => selectedTimeZoneId == "UTC" ? Texts.UtcTimeZone : Texts.LocalTimeZone;
     public string CurrentEndpoint => Texts.ConnectionEndpoint;
     public string StatusTitle => main?.StatusTitle ?? Texts.Unavailable;
-    public string StatusDetail => main?.StatusDetail ?? Texts.UnavailableDetails;
+    public string StatusDetail => saveFailed ? Texts.SettingsSaveFailed : main?.StatusDetail ?? Texts.UnavailableDetails;
+    public bool SaveFailed => saveFailed;
     public bool CanAuthenticate => main?.IsAuthRequired == true;
     public void Refresh() => main?.RefreshCommand.Execute(null);
     public void StartAuthentication() => main?.AuthCommand.Execute(null);
 
-    public void Save()
+    public bool Save()
     {
-        LocalizationService.SetLanguage(selectedLanguageCode);
-        selectedTimeZoneId = string.Equals(selectedTimeZoneId, "UTC", StringComparison.OrdinalIgnoreCase)
+        var language = LocalizationService.NormalizeLanguageCode(selectedLanguageCode);
+        var timeZone = string.Equals(selectedTimeZoneId, "UTC", StringComparison.OrdinalIgnoreCase)
             ? "UTC"
             : "local";
-        LocalizationService.SetTimeZone(selectedTimeZoneId);
         var current = store.Load();
-        var updated = current with { Language = LocalizationService.Current.LanguageCode, TimeZoneId = selectedTimeZoneId };
-        store.Save(updated);
+        var updated = current with
+        {
+            Language = language,
+            TimeZoneId = timeZone,
+            // SettingsCorrupt is an in-memory recovery marker only. A
+            // successful durable rewrite closes that recovery generation.
+            SettingsCorrupt = false,
+        };
+        try
+        {
+            store.Save(updated);
+        }
+        catch (Exception)
+        {
+            saveFailed = true;
+            Notify(nameof(SaveFailed));
+            Notify(nameof(StatusDetail));
+            return false;
+        }
+
+        selectedTimeZoneId = timeZone;
+        LocalizationService.SetLanguage(language);
+        LocalizationService.SetTimeZone(timeZone);
         App.CurrentSettings = updated;
+        saveFailed = false;
+        Notify(nameof(SaveFailed));
+        Notify(nameof(StatusDetail));
         Saved?.Invoke(this, EventArgs.Empty);
+        return true;
     }
 
     public void Dispose()
@@ -89,6 +117,7 @@ public sealed class SettingsViewModel : INotifyPropertyChanged
         Notify(nameof(StatusTitle));
         Notify(nameof(StatusDetail));
         Notify(nameof(CanAuthenticate));
+        Notify(nameof(SaveFailed));
     }
 
     private void OnMainPropertyChanged(object? sender, PropertyChangedEventArgs eventArgs)
@@ -114,6 +143,7 @@ public sealed class SetupViewModel : INotifyPropertyChanged, IDisposable
     private string sshHost = string.Empty;
     private string? selectedSshConfigAlias;
     private bool sshLaunchFailed;
+    private bool settingsSaveFailed;
     private string selectedConnectionProfile;
     private string selectedConnectionSelector;
     private int step;
@@ -154,6 +184,7 @@ public sealed class SetupViewModel : INotifyPropertyChanged, IDisposable
 
     public event PropertyChangedEventHandler? PropertyChanged;
     public UiText Texts => LocalizationService.Current;
+    public string ProductVersionText => ProductInfo.DisplayVersion;
     public IReadOnlyList<ConnectionProfileOption> ConnectionProfileOptions =>
     [
         new(ConnectionProfiles.None, Texts.ConnectionProfileNone),
@@ -237,6 +268,7 @@ public sealed class SetupViewModel : INotifyPropertyChanged, IDisposable
             : CanStartSsh
                 ? Texts.SshReadyStatus
                 : Texts.SshNotReady;
+    public bool SettingsSaveFailed => settingsSaveFailed;
     public bool CanContinue => Step switch
     {
         0 => IsConnectionSelectionValid && (main.HasQuota || main.IsAuthRequired || main.HasDetails),
@@ -251,7 +283,7 @@ public sealed class SetupViewModel : INotifyPropertyChanged, IDisposable
         : Texts.SshCommand;
     public string ApiCommand => Texts.ApiCommand;
     public string StatusTitle => main.StatusTitle;
-    public string StatusDetail => main.StatusDetail;
+    public string StatusDetail => settingsSaveFailed ? Texts.SettingsSaveFailed : main.StatusDetail;
     public string ContinueText => Step == 2 ? Texts.Close : Texts.Continue;
 
     public void Refresh() => main.RefreshCommand.Execute(null);
@@ -330,13 +362,20 @@ public sealed class SetupViewModel : INotifyPropertyChanged, IDisposable
 
         if (IsDoneStep)
         {
-            PersistSettings(setupCompleted: true);
+            if (!PersistSettings(setupCompleted: true))
+            {
+                return SetupAdvanceOutcome.StayOpen;
+            }
+
             return SetupAdvanceOutcome.CloseRequested;
         }
 
         if (IsConnectionStep)
         {
-            PersistSettings(setupCompleted: false);
+            if (!PersistSettings(setupCompleted: false))
+            {
+                return SetupAdvanceOutcome.StayOpen;
+            }
         }
 
         Continue();
@@ -357,15 +396,33 @@ public sealed class SetupViewModel : INotifyPropertyChanged, IDisposable
         Step = Math.Min(2, Step + 1);
     }
 
-    private void PersistSettings(bool setupCompleted)
+    private bool PersistSettings(bool setupCompleted)
     {
         var current = settingsSession.Current;
         var updated = BuildSettings(current) with
         {
             SetupCompleted = setupCompleted || current.SetupCompleted,
             Language = Texts.LanguageCode,
+            // A successful setup save is the explicit recovery boundary for
+            // a corrupt or partially-written prior settings generation.
+            SettingsCorrupt = false,
         };
-        settingsSession.Save(updated);
+        try
+        {
+            settingsSession.Save(updated);
+        }
+        catch (Exception)
+        {
+            settingsSaveFailed = true;
+            Notify(nameof(SettingsSaveFailed));
+            Notify(nameof(StatusDetail));
+            return false;
+        }
+
+        settingsSaveFailed = false;
+        Notify(nameof(SettingsSaveFailed));
+        Notify(nameof(StatusDetail));
+        return true;
     }
 
     public void Dispose()
@@ -387,6 +444,7 @@ public sealed class SetupViewModel : INotifyPropertyChanged, IDisposable
             Notify(nameof(StatusTitle));
             Notify(nameof(StatusDetail));
             Notify(nameof(CanContinue));
+            Notify(nameof(SettingsSaveFailed));
         }
     }
 
@@ -400,6 +458,10 @@ public sealed class SetupViewModel : INotifyPropertyChanged, IDisposable
         Notify(nameof(ApiCommand));
         Notify(nameof(SshActionText));
         Notify(nameof(ContinueText));
+        Notify(nameof(StatusTitle));
+        Notify(nameof(StatusDetail));
+        Notify(nameof(CanContinue));
+        Notify(nameof(SettingsSaveFailed));
     }
 
     private void OnSshExited(object? sender, EventArgs eventArgs)

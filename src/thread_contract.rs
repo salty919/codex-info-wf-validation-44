@@ -1527,7 +1527,6 @@ where
     };
 
     let mut snapshots = Vec::new();
-    let mut saw_valid_candidate = false;
     for candidate in candidates {
         if !is_current(&candidate) {
             continue;
@@ -1543,7 +1542,6 @@ where
                 continue;
             }
         };
-        saw_valid_candidate = true;
         if !rollout.is_running() {
             continue;
         }
@@ -1572,10 +1570,6 @@ where
         ThreadCycleOutcome::CycleError
     } else if !snapshots.is_empty() {
         ThreadCycleOutcome::Snapshots(snapshots)
-    } else if saw_valid_candidate {
-        ThreadCycleOutcome::NoThread
-    } else if saw_candidate_failure {
-        ThreadCycleOutcome::CycleError
     } else {
         ThreadCycleOutcome::NoThread
     }

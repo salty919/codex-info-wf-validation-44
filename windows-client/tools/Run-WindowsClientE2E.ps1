@@ -756,6 +756,24 @@ function Open-E2EChildWindow {
 function Find-E2ECloseButton {
     param([Parameter(Mandatory = $true)][System.Windows.Automation.AutomationElement]$Root)
 
+    # Stable AutomationIds are locale- and layout-independent.  Prefer them
+    # over the bounded geometry fallback, which can otherwise confuse a
+    # right-aligned selector with the title-bar close command.
+    foreach ($automationId in @(
+            'Main.Window.Close',
+            'Graph.Window.Close',
+            'Threads.Window.Close',
+            'Legal.Window.Close',
+            'Settings.Window.Close',
+            'Setup.Window.Close')) {
+        $candidate = Find-E2EElementByAutomationId $Root $automationId
+        if ($null -ne $candidate -and
+            $candidate.Current.ControlType -eq [System.Windows.Automation.ControlType]::Button -and
+            $candidate.Current.IsEnabled) {
+            return $candidate
+        }
+    }
+
     $named = @('Close')
     $buttons = @(Get-E2EControlElements $Root ([System.Windows.Automation.ControlType]::Button))
     foreach ($button in $buttons) {

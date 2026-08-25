@@ -158,6 +158,35 @@ public sealed class MainWindowViewModelTests
     }
 
     [Fact]
+    public async Task HealthFailureStopsTheCycleBeforeStatusAndKeepsValuesUnavailable()
+    {
+        var client = new HealthAwareClient(
+            HealthFetchResult.FromFailure(HealthFetchFailure.Response),
+            StatusFetchResult.Success(ValidSnapshot()));
+        using var viewModel = new MainWindowViewModel(client);
+
+        viewModel.Start();
+        await EventuallyAsync(() => viewModel.StatusDetail.Contains("有効な応答", StringComparison.Ordinal));
+
+        Assert.Equal(["health"], client.Calls);
+        Assert.Equal("未取得", viewModel.RemainingPercentText);
+    }
+
+    [Fact]
+    public async Task HealthyCycleRequestsHealthBeforeStatus()
+    {
+        var client = new HealthAwareClient(
+            HealthFetchResult.Success(new ApiHealthSnapshot("v1", "codex-info")),
+            StatusFetchResult.Success(ValidSnapshot()));
+        using var viewModel = new MainWindowViewModel(client);
+
+        viewModel.Start();
+        await EventuallyAsync(() => viewModel.StatusTitle == "正常");
+
+        Assert.Equal(["health", "status"], client.Calls);
+    }
+
+    [Fact]
     public async Task ManualRefreshDoesNotQueueBehindAnActiveRequest()
     {
         var client = new BlockingClient();
@@ -331,11 +360,11 @@ public sealed class MainWindowViewModelTests
         }
     }
 
-    private sealed class SequenceClient(params StatusFetchResult[] results) : ILoopbackStatusClient
+    private sealed class SequenceClient(params StatusFetchResult[] results) : HealthyStatusClientBase
     {
         private int index;
 
-        public Task<StatusFetchResult> FetchAsync(CancellationToken cancellationToken = default)
+        public override Task<StatusFetchResult> FetchAsync(CancellationToken cancellationToken = default)
         {
             var result = results[Math.Min(index, results.Length - 1)];
             index++;
@@ -343,14 +372,14 @@ public sealed class MainWindowViewModelTests
         }
     }
 
-    private sealed class BlockingClient : ILoopbackStatusClient
+    private sealed class BlockingClient : HealthyStatusClientBase
     {
         private readonly TaskCompletionSource<StatusFetchResult> completion = new(
             TaskCreationOptions.RunContinuationsAsynchronously);
 
         public int CallCount { get; private set; }
 
-        public Task<StatusFetchResult> FetchAsync(CancellationToken cancellationToken = default)
+        public override Task<StatusFetchResult> FetchAsync(CancellationToken cancellationToken = default)
         {
             CallCount++;
             return completion.Task.WaitAsync(cancellationToken);
@@ -359,6 +388,25 @@ public sealed class MainWindowViewModelTests
         public void Complete(ApiStatusSnapshot snapshot)
         {
             completion.TrySetResult(StatusFetchResult.Success(snapshot));
+        }
+    }
+
+    private sealed class HealthAwareClient(
+        HealthFetchResult healthResult,
+        StatusFetchResult statusResult) : HealthyStatusClientBase
+    {
+        public List<string> Calls { get; } = [];
+
+        public override Task<HealthFetchResult> FetchHealthAsync(CancellationToken cancellationToken = default)
+        {
+            Calls.Add("health");
+            return Task.FromResult(healthResult);
+        }
+
+        public override Task<StatusFetchResult> FetchAsync(CancellationToken cancellationToken = default)
+        {
+            Calls.Add("status");
+            return Task.FromResult(statusResult);
         }
     }
 

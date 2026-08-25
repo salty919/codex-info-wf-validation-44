@@ -436,9 +436,9 @@ public sealed class DetailsPresentationCoverageTests
         }
     }
 
-    private sealed class StaticStatusClient(StatusFetchResult result) : ILoopbackStatusClient
+    private sealed class StaticStatusClient(StatusFetchResult result) : HealthyStatusClientBase
     {
-        public Task<StatusFetchResult> FetchAsync(CancellationToken cancellationToken = default) =>
+        public override Task<StatusFetchResult> FetchAsync(CancellationToken cancellationToken = default) =>
             Task.FromResult(result);
     }
 

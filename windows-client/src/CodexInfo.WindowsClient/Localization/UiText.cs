@@ -119,6 +119,25 @@ public sealed record UiText(
         _ => "Period data could not be updated. The previous graph is retained."
     };
 
+    /// <summary>
+    /// Explicitly identifies a durable settings failure without exposing the
+    /// filesystem path or raw exception. The settings and setup surfaces use
+    /// this message while keeping the window open for recovery.
+    /// </summary>
+    public string SettingsSaveFailed => LanguageCode switch
+    {
+        "ja" => "設定を保存できません。ファイルの権限または保存先を確認して、もう一度お試しください。",
+        "zh-Hans" => "无法保存设置。请检查文件权限或保存位置，然后重试。",
+        "ko" => "설정을 저장할 수 없습니다. 파일 권한이나 저장 위치를 확인한 후 다시 시도하세요.",
+        "es" => "No se pudo guardar la configuración. Comprueba los permisos o la ubicación y vuelve a intentarlo.",
+        "fr" => "Impossible d’enregistrer les paramètres. Vérifiez les droits ou l’emplacement, puis réessayez.",
+        "de" => "Die Einstellungen konnten nicht gespeichert werden. Prüfen Sie Berechtigungen oder Speicherort und versuchen Sie es erneut.",
+        "pt" => "Não foi possível salvar as configurações. Verifique as permissões ou o local e tente novamente.",
+        "it" => "Impossibile salvare le impostazioni. Controlla i permessi o il percorso e riprova.",
+        "ru" => "Не удалось сохранить настройки. Проверьте права или расположение и повторите попытку.",
+        _ => "Settings could not be saved. Check the file permissions or location and try again."
+    };
+
     public string QuotaWaiting => LanguageCode switch
     {
         "ja" => "利用枠の情報を待機しています",
@@ -216,10 +235,13 @@ public sealed record UiText(
     public string GreenTerra => LanguageCode switch { "ja" => "緑: TERRA", "zh-Hans" => "绿：TERRA", "ko" => "초록: TERRA", "es" => "Verde: TERRA", "fr" => "Vert : TERRA", "de" => "Grün: TERRA", "pt" => "Verde: TERRA", "it" => "Verde: TERRA", "ru" => "Зелёный: TERRA", _ => "Green: TERRA" };
     public string OrangeLuna => LanguageCode switch { "ja" => "橙: LUNA", "zh-Hans" => "橙：LUNA", "ko" => "주황: LUNA", "es" => "Naranja: LUNA", "fr" => "Orange : LUNA", "de" => "Orange: LUNA", "pt" => "Laranja: LUNA", "it" => "Arancione: LUNA", "ru" => "Оранжевый: LUNA", _ => "Orange: LUNA" };
     public string LegalCodeName => LanguageCode == "ja" ? "Codex Info" : "Codex Info";
+    public string LegalWarrantyName => LanguageCode == "ja" ? "無保証" : "Warranty";
+    public string LegalLicenseName => LanguageCode == "ja" ? "ライセンス" : "License";
     public string LegalFontName => LanguageCode == "ja" ? "フォント" : "Fonts";
     public string LegalProtocolName => LanguageCode == "ja" ? "プロトコルとAPI" : "Protocol and API";
     public string LegalSchemaName => LanguageCode == "ja" ? "スキーマ" : "Schema";
     public string LegalThirdPartyName => LanguageCode == "ja" ? "第三者ライセンス" : "Third-party licenses";
+    public string LegalDetailsName => LanguageCode == "ja" ? "詳細" : "Details";
     public string LegalDistributionName => LanguageCode == "ja" ? "配布" : "Distribution";
     public string TimeZone => LanguageCode switch { "ja" => "表示タイムゾーン", "zh-Hans" => "显示时区", "ko" => "표시 시간대", "es" => "Zona horaria", "fr" => "Fuseau horaire", "de" => "Zeitzone", "pt" => "Fuso horário", "it" => "Fuso orario", "ru" => "Часовой пояс", _ => "Display time zone" };
     public string LocalTimeZone => LanguageCode switch { "ja" => "Windowsのローカル時刻", "zh-Hans" => "Windows 本地时间", "ko" => "Windows 현지 시간", "es" => "Hora local de Windows", "fr" => "Heure locale Windows", "de" => "Windows-Ortszeit", "pt" => "Hora local do Windows", "it" => "Ora locale di Windows", "ru" => "Местное время Windows", _ => "Windows local time" };

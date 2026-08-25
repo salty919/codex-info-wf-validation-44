@@ -94,7 +94,7 @@ public static class PreviewEnvironment
 }
 
 /// <summary>Stable authenticated data for graph/thread/visual fixture runs.</summary>
-public sealed class PreviewLoopbackClient : ILoopbackStatusClient, ILoopbackDetailsClient, IDisposable
+public sealed class PreviewLoopbackClient : ILoopbackStatusClient, ILoopbackHealthClient, ILoopbackDetailsClient, IDisposable
 {
     private readonly ApiStatusSnapshot status;
     private readonly ApiDetailsSnapshot details;
@@ -122,7 +122,11 @@ public sealed class PreviewLoopbackClient : ILoopbackStatusClient, ILoopbackDeta
             _ => 48d,
         };
         var now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
-        var reset = now + 4 * 86_400;
+        const long windowSeconds = 7 * 86_400;
+        // Keep the preview gauge on the exact half-period boundary used by
+        // Run-WindowsClientE2E. This makes the fractional cell deterministic
+        // instead of accidentally depending on a 4/7 fixture ratio.
+        var reset = now + windowSeconds / 2;
         var graphPointCount = PreviewEnvironment.GraphPointCount;
         var start = graphPointCount == 3
             ? reset - 7 * 86_400
@@ -159,6 +163,26 @@ public sealed class PreviewLoopbackClient : ILoopbackStatusClient, ILoopbackDeta
         {
             Samples = samples,
         };
+        // The physical acceptance path exercises current -> past -> current
+        // period selection. Keep the preview details contract equally rich so
+        // that UIA runs do not silently skip the historical branch.
+        var pastReset = now - 4 * 3_600;
+        var pastStart = pastReset - 3 * 3_600;
+        var pastSamples = new[]
+        {
+            new ApiHistorySample(pastStart + 60, pastReset, 98, 0.10, 0.20, 0.30, 50, 100, 150),
+            new ApiHistorySample(pastReset - 60, pastReset, 84, 0.60, 1.20, 1.80, 600, 1_200, 1_800),
+        };
+        var pastPeriod = new ApiHistoryPeriod(
+            pastReset.ToString(System.Globalization.CultureInfo.InvariantCulture),
+            pastStart,
+            pastReset,
+            false,
+            $"{pastStart} — {pastReset}")
+        {
+            ResetAt = pastReset,
+            Samples = pastSamples,
+        };
         var threads = new[]
         {
             new ApiThreadDetails("preview-root", "Preview root task", null, "gpt-preview-terra", "TERRA", 12_400, 4_000, 16_000, now - 5_400, now - 300, false, 0, false),
@@ -175,7 +199,7 @@ public sealed class PreviewLoopbackClient : ILoopbackStatusClient, ILoopbackDeta
             now,
             authenticated,
             "Pro",
-            new ApiQuota(remainingPercent, reset, 7 * 86_400, false),
+            new ApiQuota(remainingPercent, reset, windowSeconds, false),
             [
                 new ApiModelUsage("SOL", 8_400, 1_500, 900),
                 new ApiModelUsage("TERRA", 4_200, 900, 500),
@@ -194,14 +218,17 @@ public sealed class PreviewLoopbackClient : ILoopbackStatusClient, ILoopbackDeta
                 new ApiDetailsModelUsage("LUNA", 2_100, 600, 240, 2.75, 0.60, 0.90),
             ],
             (ulong)threads.Length,
-            [period],
-            samples,
+            [period, pastPeriod],
+            [.. samples, .. pastSamples],
             threads,
             "概算 $25.20");
     }
 
     public Task<StatusFetchResult> FetchAsync(CancellationToken cancellationToken = default) =>
         Task.FromResult(StatusFetchResult.Success(status));
+
+    public Task<HealthFetchResult> FetchHealthAsync(CancellationToken cancellationToken = default) =>
+        Task.FromResult(HealthFetchResult.Success(new ApiHealthSnapshot("v1", "codex-info")));
 
     public Task<DetailsFetchResult> FetchDetailsAsync(CancellationToken cancellationToken = default) =>
         Task.FromResult(DetailsFetchResult.Success(details));

@@ -124,6 +124,8 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
 
     public UiText Texts => LocalizationService.Current;
 
+    public string ProductVersionText => ProductInfo.DisplayVersion;
+
     public IReadOnlyList<string> MetricOptions => metricOptions;
 
     public string SelectedMetric
@@ -606,6 +608,8 @@ public sealed class ThreadsWindowViewModel : INotifyPropertyChanged, IDisposable
 
     public UiText Texts => LocalizationService.Current;
 
+    public string ProductVersionText => ProductInfo.DisplayVersion;
+
     public bool HasThreads => threads.Count > 0;
 
     public bool HasNoThreads => !HasThreads;
@@ -836,6 +840,8 @@ public sealed class LegalNoticesWindowViewModel : INotifyPropertyChanged, IDispo
 
     public UiText Texts => LocalizationService.Current;
 
+    public string ProductVersionText => ProductInfo.DisplayVersion;
+
     public bool HasNotices => notices.Count > 0;
 
     /// <summary>The zero-based chapter index used by the navigation state.</summary>
@@ -932,30 +938,12 @@ public sealed class LegalNoticesWindowViewModel : INotifyPropertyChanged, IDispo
     private void Rebuild()
     {
         notices.Clear();
-        var japanese = Texts.LanguageCode == "ja";
         // Legal information remains reachable before authentication and when
-        // the auxiliary endpoint is unavailable.  It is intentionally static
-        // and contains no account/backend data.
-        if (notices.Count == 0)
+        // the auxiliary endpoint is unavailable. It contains only packaged
+        // repository documents and never depends on account/backend data.
+        foreach (var notice in LegalNoticeCatalog.Load(Texts))
         {
-            notices.Add(new ApiLegalNotice(
-                Texts.LegalCodeName,
-                japanese ? "Copyright (C) 2026 salty919。Codex Info は GPL-3.0-only で提供されます。無保証です。詳細は GNU General Public License version 3 を参照してください。" : "Copyright (C) 2026 salty919. Codex Info is provided under GPL-3.0-only without warranty. See the GNU General Public License version 3 for details."));
-            notices.Add(new ApiLegalNotice(
-                Texts.LegalFontName,
-                japanese ? "Noto Sans JPおよびNoto Sans CJK KRを埋め込んでいます。Copyright (c) 2014-2021 Adobe。SIL Open Font License 1.1 に基づきます。" : "Noto Sans JP and Noto Sans CJK KR are embedded. Copyright (c) 2014-2021 Adobe. Distributed under SIL Open Font License 1.1."));
-            notices.Add(new ApiLegalNotice(
-                Texts.LegalProtocolName,
-                japanese ? "Windowsクライアントは SSH ローカルポート転送で保護された 127.0.0.1 の読み取り専用 REST v1 だけを使用します。認証情報やアクセストークンは取得・表示しません。" : "The Windows client uses only the read-only REST v1 endpoint on 127.0.0.1 protected by an SSH local forward. Credentials and tokens are never collected or displayed."));
-            notices.Add(new ApiLegalNotice(
-                Texts.LegalSchemaName,
-                japanese ? "REST v1 の status/details JSON スキーマは docs/REST_API_V1.md に固定されています。未知キーや不正値は拒否し、最後に検証できたスナップショットを保持します。" : "The REST v1 status/details JSON schema is fixed in docs/REST_API_V1.md. Unknown keys and invalid values are rejected while the last valid snapshot is retained."));
-            notices.Add(new ApiLegalNotice(
-                Texts.LegalThirdPartyName,
-                japanese ? "Avalonia、Skia、HarfBuzz、ANGLE、.NET ランタイムその他の依存物の通知は THIRD_PARTY_NOTICES.md と LICENSES/ を参照してください。" : "See THIRD_PARTY_NOTICES.md and LICENSES/ for notices covering Avalonia, Skia, HarfBuzz, ANGLE, the .NET runtime, and other dependencies."));
-            notices.Add(new ApiLegalNotice(
-                Texts.LegalDistributionName,
-                japanese ? "配布前に windows-client/tools/Collect-ThirdPartyNotices.ps1 を publish ディレクトリへ実行し、依存物の通知を同梱してください。" : "Before distribution, run windows-client/tools/Collect-ThirdPartyNotices.ps1 against the publish directory and include all dependency notices."));
+            notices.Add(notice);
         }
 
         currentPageIndex = notices.Count == 0 ? 0 : Math.Clamp(currentPageIndex, 0, notices.Count - 1);

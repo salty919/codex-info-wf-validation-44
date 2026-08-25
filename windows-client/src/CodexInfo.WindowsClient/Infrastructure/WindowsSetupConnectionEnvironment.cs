@@ -101,7 +101,12 @@ internal sealed class WindowsSetupConnectionEnvironment : ISetupConnectionEnviro
         var startInfo = new ProcessStartInfo
         {
             FileName = "ssh.exe",
-            UseShellExecute = true,
+            // Keep the explicit one-session recovery path on the same direct
+            // executable + ArgumentList boundary as automatic connections.
+            // `CreateNoWindow=false` still lets OpenSSH own its interactive
+            // host-key/password prompt when the user explicitly starts it.
+            UseShellExecute = false,
+            CreateNoWindow = false,
             WorkingDirectory = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
         };
         startInfo.ArgumentList.Add("-N");

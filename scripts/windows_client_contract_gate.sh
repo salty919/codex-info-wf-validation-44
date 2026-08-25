@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# These single-quoted patterns intentionally match literal PowerShell '$'
+# variables in workflow/source fixtures; they must not be shell-expanded.
+# shellcheck disable=SC2016
 set -euo pipefail
 
 ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -12,12 +15,39 @@ require_text() {
     local file="$1" pattern="$2"
     rg -q --fixed-strings -- "$pattern" "$file" || fail "missing: $file: $pattern"
 }
+require_window_text() {
+    local file="$1" pattern="$2"
+    if ! sed -n '/<Window /,/Background=/p' "$file" | rg -q --fixed-strings -- "$pattern"; then
+        fail "missing top-level Window geometry: $file: $pattern"
+    fi
+}
 
 require_text windows-client/src/CodexInfo.WindowsClient/MainWindow.axaml 'Click="OnOpenGraph"'
 require_text windows-client/src/CodexInfo.WindowsClient/MainWindow.axaml 'Click="OnOpenThreads"'
 require_text windows-client/src/CodexInfo.WindowsClient/MainWindow.axaml 'Click="OnOpenLegal"'
 require_text windows-client/src/CodexInfo.WindowsClient/MainWindow.axaml 'Click="OnOpenSettings"'
 require_text windows-client/src/CodexInfo.WindowsClient/MainWindow.axaml 'AutomationProperties.AutomationId="Main.QuotaPeriodGauge"'
+require_window_text windows-client/src/CodexInfo.WindowsClient/MainWindow.axaml 'Width="900"'
+require_window_text windows-client/src/CodexInfo.WindowsClient/MainWindow.axaml 'Height="480"'
+require_window_text windows-client/src/CodexInfo.WindowsClient/SetupWindow.axaml 'Width="900"'
+require_window_text windows-client/src/CodexInfo.WindowsClient/SetupWindow.axaml 'Height="480"'
+require_window_text windows-client/src/CodexInfo.WindowsClient/SettingsWindow.axaml 'Width="900"'
+require_window_text windows-client/src/CodexInfo.WindowsClient/SettingsWindow.axaml 'Height="480"'
+for fixed_window in MainWindow SetupWindow SettingsWindow ThreadsWindow LegalNoticesWindow; do
+    fixed_path="windows-client/src/CodexInfo.WindowsClient/${fixed_window}.axaml"
+    require_window_text "$fixed_path" 'Width="900"'
+    require_window_text "$fixed_path" 'Height="480"'
+    require_window_text "$fixed_path" 'MinWidth="900"'
+    require_window_text "$fixed_path" 'MinHeight="480"'
+    require_window_text "$fixed_path" 'MaxWidth="900"'
+    require_window_text "$fixed_path" 'MaxHeight="480"'
+    require_window_text "$fixed_path" 'CanResize="False"'
+done
+require_window_text windows-client/src/CodexInfo.WindowsClient/GraphWindow.axaml 'Width="940"'
+require_window_text windows-client/src/CodexInfo.WindowsClient/GraphWindow.axaml 'Height="640"'
+require_window_text windows-client/src/CodexInfo.WindowsClient/GraphWindow.axaml 'MinWidth="700"'
+require_window_text windows-client/src/CodexInfo.WindowsClient/GraphWindow.axaml 'MinHeight="480"'
+require_window_text windows-client/src/CodexInfo.WindowsClient/GraphWindow.axaml 'CanResize="True"'
 require_text windows-client/src/CodexInfo.WindowsClient/MainWindow.axaml 'Classes="quota-segment"'
 require_text windows-client/src/CodexInfo.WindowsClient/GraphWindow.axaml 'IsChecked="{Binding ShowRemaining}"'
 require_text windows-client/src/CodexInfo.WindowsClient/GraphWindow.axaml 'IsChecked="{Binding ShowSol}"'
@@ -33,8 +63,14 @@ require_text windows-client/src/CodexInfo.WindowsClient/GraphWindow.axaml.cs 'me
 require_text windows-client/src/CodexInfo.WindowsClient/ViewModels/DetailsWindowViewModels.cs 'MaxRenderedGraphPoints = 2_048'
 require_text windows-client/src/CodexInfo.WindowsClient/ThreadsWindow.axaml 'ThreadTreeControl'
 require_text windows-client/src/CodexInfo.WindowsClient/LegalNoticesWindow.axaml 'CurrentNoticeText'
+require_text windows-client/src/CodexInfo.WindowsClient/LegalNoticesWindow.axaml 'ScrollViewer'
 require_text windows-client/src/CodexInfo.WindowsClient/LegalNoticesWindow.axaml 'Command="{Binding BackCommand}"'
 require_text windows-client/src/CodexInfo.WindowsClient/LegalNoticesWindow.axaml 'Command="{Binding NextCommand}"'
+require_file windows-client/src/CodexInfo.WindowsClient/LegalNoticeCatalog.cs
+require_text windows-client/src/CodexInfo.WindowsClient/LegalNoticeCatalog.cs 'Legal/LICENSE'
+require_text windows-client/src/CodexInfo.WindowsClient/LegalNoticeCatalog.cs 'Legal/THIRD_PARTY_NOTICES.md'
+require_text windows-client/src/CodexInfo.WindowsClient/CodexInfo.WindowsClient.csproj 'Link="Legal\LICENSE"'
+require_text windows-client/src/CodexInfo.WindowsClient/CodexInfo.WindowsClient.csproj 'Link="Legal\LICENSES\OFL-1.1.txt"'
 require_text windows-client/src/CodexInfo.WindowsClient/SetupWindow.axaml 'SshCommand'
 require_text windows-client/src/CodexInfo.WindowsClient/SetupWindow.axaml 'SshHost'
 require_text windows-client/src/CodexInfo.WindowsClient/SetupWindow.axaml 'SshConfigAliases'
@@ -42,6 +78,26 @@ require_text windows-client/src/CodexInfo.WindowsClient/SetupWindow.axaml 'OnSta
 require_file windows-client/src/CodexInfo.WindowsClient/Infrastructure/WindowsSetupConnectionEnvironment.cs
 require_text windows-client/src/CodexInfo.WindowsClient/Infrastructure/WindowsSetupConnectionEnvironment.cs 'FileName = "ssh.exe"'
 require_text windows-client/src/CodexInfo.WindowsClient/Infrastructure/WindowsSetupConnectionEnvironment.cs 'ArgumentList.Add("-L")'
+require_text windows-client/src/CodexInfo.WindowsClient/Infrastructure/WindowsSetupConnectionEnvironment.cs 'UseShellExecute = false'
+require_file windows-client/src/CodexInfo.WindowsClient.Core/HealthContracts.cs
+require_text windows-client/src/CodexInfo.WindowsClient.Core/HealthContracts.cs 'interface ILoopbackHealthClient'
+require_text windows-client/src/CodexInfo.WindowsClient.Core/LoopbackStatusClient.cs 'HealthEndpoint = "http://127.0.0.1:8787/v1/health"'
+require_text windows-client/src/CodexInfo.WindowsClient.Core/LoopbackStatusClient.cs 'response.StatusCode != HttpStatusCode.OK'
+status_200_count="$(rg -o --fixed-strings 'response.StatusCode != HttpStatusCode.OK' windows-client/src/CodexInfo.WindowsClient.Core/LoopbackStatusClient.cs | wc -l)"
+if [[ "$status_200_count" -ne 3 ]]; then
+    fail 'health, status, and details must each require HTTP 200'
+fi
+require_text windows-client/src/CodexInfo.WindowsClient.Core/LoopbackStatusClient.cs 'contentLength is not long declaredLength'
+require_text windows-client/src/CodexInfo.WindowsClient.Core/LoopbackStatusClient.cs 'bodyStatus.Body.LongLength != declaredLength'
+require_text windows-client/src/CodexInfo.WindowsClient/ViewModels/MainWindowViewModel.cs 'FetchHealthAsync(cancellationToken)'
+require_text windows-client/src/CodexInfo.WindowsClient/Settings/ClientSettings.cs 'seen.SetEquals(expected)'
+require_text windows-client/src/CodexInfo.WindowsClient/Infrastructure/WindowsUpdateCoordinator.cs 'FileShare.None'
+require_text windows-client/src/CodexInfo.WindowsClient/Infrastructure/WindowsUpdateCoordinator.cs 'FileOptions.DeleteOnClose'
+require_file windows-client/src/CodexInfo.WindowsClient/Infrastructure/WindowsPathSafety.cs
+require_text windows-client/src/CodexInfo.WindowsClient/Infrastructure/WindowsPathSafety.cs 'EnsureDirectoryTreeWithoutReparse'
+require_text windows-client/src/CodexInfo.WindowsClient/Infrastructure/WindowsPathSafety.cs 'ContainsReparsePoint'
+require_text windows-client/src/CodexInfo.WindowsClient/Infrastructure/WindowsUpdateCoordinator.cs 'WindowsPathSafety.ContainsReparsePoint'
+require_text windows-client/src/CodexInfo.WindowsClient/Settings/ClientSettings.cs 'WindowsPathSafety.EnsureDirectoryTreeWithoutReparse'
 require_text docs/WINDOWS_CLIENT.md '%USERPROFILE%\.ssh\config'
 require_text windows-client/src/CodexInfo.WindowsClient/SetupWindow.axaml 'AutomationProperties.Name="{Binding Texts.Copy}"'
 require_text windows-client/src/CodexInfo.WindowsClient/SetupWindow.axaml 'Background="Transparent" PointerPressed="OnTitlePointerPressed"'
@@ -71,6 +127,42 @@ require_text windows-client/src/CodexInfo.WindowsClient/ViewModels/MainWindowVie
 require_text windows-client/src/CodexInfo.WindowsClient.Core/WindowsUpdateClient.cs 'https://api.github.com/repos/salty919/codex_info_v2/releases?per_page=20'
 require_text windows-client/src/CodexInfo.WindowsClient/Infrastructure/WindowsUpdateCoordinator.cs 'StartAvailableUpdateAsync'
 require_text windows-client/Directory.Build.props '<Version>'
+require_file windows-client/src/CodexInfo.WindowsClient.Core/ProductInfo.cs
+require_text windows-client/src/CodexInfo.WindowsClient.Core/ProductInfo.cs 'public static string DisplayVersion'
+require_text windows-client/src/CodexInfo.WindowsClient.Core/ProductInfo.cs 'Assembly.GetName().Version'
+for version_surface in Main Setup Settings Graph Threads Legal; do
+    case "$version_surface" in
+        Main) version_path='windows-client/src/CodexInfo.WindowsClient/MainWindow.axaml' ;;
+        Setup) version_path='windows-client/src/CodexInfo.WindowsClient/SetupWindow.axaml' ;;
+        Settings) version_path='windows-client/src/CodexInfo.WindowsClient/SettingsWindow.axaml' ;;
+        Graph) version_path='windows-client/src/CodexInfo.WindowsClient/GraphWindow.axaml' ;;
+        Threads) version_path='windows-client/src/CodexInfo.WindowsClient/ThreadsWindow.axaml' ;;
+        Legal) version_path='windows-client/src/CodexInfo.WindowsClient/LegalNoticesWindow.axaml' ;;
+    esac
+    require_text "$version_path" 'ProductVersionText'
+    require_text "$version_path" "AutomationProperties.AutomationId=\"$version_surface.ProductVersion\""
+done
+native_version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n 1)"
+windows_version="$(sed -n 's/.*<Version>\([^<]*\)<\/Version>.*/\1/p' windows-client/Directory.Build.props | head -n 1)"
+[[ -n "$native_version" && "$native_version" == "$windows_version" ]] ||
+    fail "native and Windows versions differ: native=$native_version windows=$windows_version"
+require_text ui/components.slint 'product-version: string'
+require_text ui/components.slint 'root.strings.usage-status + " · " + root.strings.product-version'
+require_text ui/components.slint 'root.strings.usage-trend + " · " + root.strings.product-version'
+require_text ui/components.slint 'legal-page-names: [string]'
+require_text ui/components.slint 'legal-pages: [string]'
+require_text ui/components.slint 'legal-protocol: string'
+require_text ui/components.slint 'legal-third-party: string'
+require_text ui/components.slint 'callback legal-page-back();'
+require_text ui/components.slint 'callback legal-page-next();'
+require_text ui/components.slint 'root.strings.legal-pages[root.legal-page-index]'
+require_text src/main.rs 'const PRODUCT_VERSION: &str = env!("CARGO_PKG_VERSION");'
+require_text src/main.rs 'product_version: format!("v{PRODUCT_VERSION}").into()'
+require_text src/main.rs 'const LEGAL_PAGE_CHUNK_SCALARS: usize = 620;'
+require_text src/main.rs 'include_str!("../LICENSE")'
+require_text src/main.rs 'include_str!("../THIRD_PARTY_NOTICES.md")'
+require_text src/main.rs 'i18n.text(TextKey::LegalProtocol)'
+require_text src/main.rs 'i18n.text(TextKey::LegalThirdParty)'
 require_text .github/workflows/windows-client.yml 'needs: [version-policy, core-tests, windows-build]'
 require_text .github/workflows/windows-client.yml 'cancel-in-progress: false'
 require_text .github/workflows/windows-client.yml 'Get-GitHubResourceStatus'
@@ -80,11 +172,16 @@ require_text .github/workflows/windows-client.yml '$draftReleaseEndpoint = "repo
 require_text .github/workflows/windows-client.yml 'gh release upload $tag $setup $manifest'
 require_text .github/workflows/windows-client.yml '-F draft=false'
 require_file windows-client/src/CodexInfo.WindowsClient/Settings/ClientSettingsSession.cs
+require_text windows-client/src/CodexInfo.WindowsClient/Settings/ClientSettingsSession.cs 'SettingsCorrupt = false'
 require_file windows-client/src/CodexInfo.WindowsClient/Graphing/GraphPlotProjection.cs
 require_text windows-client/src/CodexInfo.WindowsClient/Controls/GraphPlotControl.cs 'GraphPlotProjection.BuildAxes('
 require_text windows-client/src/CodexInfo.WindowsClient/SettingsWindow.axaml 'AutomationProperties.Name="{Binding Texts.Save}"'
 require_text windows-client/src/CodexInfo.WindowsClient/SettingsWindow.axaml 'LanguageOptions'
 require_text windows-client/src/CodexInfo.WindowsClient/SettingsWindow.axaml 'SelectedValueBinding="{Binding Id}"'
+require_text windows-client/src/CodexInfo.WindowsClient/SettingsWindow.axaml.cs 'if (DataContext is SettingsViewModel viewModel && viewModel.Save())'
+require_text windows-client/src/CodexInfo.WindowsClient/ViewModels/SettingsViewModel.cs 'public bool Save()'
+require_text windows-client/src/CodexInfo.WindowsClient/ViewModels/SettingsViewModel.cs 'public bool SettingsSaveFailed =>'
+require_text windows-client/src/CodexInfo.WindowsClient/ViewModels/SettingsViewModel.cs 'if (!PersistSettings(setupCompleted: true))'
 require_text windows-client/src/CodexInfo.WindowsClient/GraphWindow.axaml 'IsEnabled="{Binding HasPeriods}"'
 require_text windows-client/src/CodexInfo.WindowsClient/App.axaml 'Noto Sans JP Medium'
 require_text windows-client/src/CodexInfo.WindowsClient/App.axaml 'ComboBox:focus'
@@ -127,6 +224,11 @@ require_text windows-client/tools/Measure-WindowsGraphLatency.ps1 'CopyFromScree
 require_text windows-client/tools/Measure-WindowsGraphLatency.ps1 'SendInput'
 require_text windows-client/tools/Run-WindowsClientE2E.ps1 'Assert-E2EQuotaGaugePalette'
 require_text windows-client/tools/Run-WindowsClientE2E.ps1 "main-quota-gauge: seven cells, two X-authority surface colors, and half-period boundary PASS"
+require_text windows-client/src/CodexInfo.WindowsClient/GraphWindow.axaml 'AutomationProperties.AutomationId="Graph.Window.Close"'
+require_text windows-client/src/CodexInfo.WindowsClient/ThreadsWindow.axaml 'AutomationProperties.AutomationId="Threads.Window.Close"'
+require_text windows-client/src/CodexInfo.WindowsClient/LegalNoticesWindow.axaml 'AutomationProperties.AutomationId="Legal.Window.Close"'
+require_text windows-client/src/CodexInfo.WindowsClient/SettingsWindow.axaml 'AutomationProperties.AutomationId="Settings.Window.Close"'
+require_text windows-client/src/CodexInfo.WindowsClient/SetupWindow.axaml 'AutomationProperties.AutomationId="Setup.Window.Close"'
 series_press_count="$(rg -o --fixed-strings 'Classes="series-toggle" ClickMode="Press"' windows-client/src/CodexInfo.WindowsClient/GraphWindow.axaml | wc -l)"
 if [[ "$series_press_count" -ne 4 ]]; then
     fail 'all four graph series toggles must acknowledge pointer press immediately'

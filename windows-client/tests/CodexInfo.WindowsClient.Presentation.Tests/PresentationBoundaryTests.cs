@@ -115,6 +115,74 @@ public sealed class PresentationBoundaryTests
     }
 
     [Fact]
+    public void SettingsSaveFailureKeepsRecoveryOpenAndDoesNotPublishMemoryState()
+    {
+        var originalSettings = App.CurrentSettings;
+        var originalLanguage = LocalizationService.Current.LanguageCode;
+        var originalTimeZone = LocalizationService.DisplayTimeZone.Id;
+        var root = Directory.CreateTempSubdirectory("codex-info-settings-vm-failure-test");
+        SettingsViewModel? viewModel = null;
+        try
+        {
+            var blocker = Path.Combine(root.FullName, "not-a-directory");
+            File.WriteAllText(blocker, "blocked");
+            var store = new ClientSettingsStore(Path.Combine(blocker, "settings.json"));
+            App.CurrentSettings = new ClientSettings("ja", true);
+            LocalizationService.SetLanguage("ja");
+            LocalizationService.SetTimeZone("local");
+            viewModel = new SettingsViewModel(store);
+
+            Assert.False(viewModel.Save());
+            Assert.True(viewModel.SaveFailed);
+            Assert.Contains("設定", viewModel.StatusDetail, StringComparison.Ordinal);
+            Assert.Equal(new ClientSettings("ja", true), App.CurrentSettings);
+            Assert.Equal("ja", LocalizationService.Current.LanguageCode);
+            Assert.Equal(TimeZoneInfo.Local.Id, LocalizationService.DisplayTimeZone.Id);
+        }
+        finally
+        {
+            viewModel?.Dispose();
+            App.CurrentSettings = originalSettings;
+            LocalizationService.SetLanguage(originalLanguage);
+            LocalizationService.SetTimeZone(string.Equals(originalTimeZone, "UTC", StringComparison.OrdinalIgnoreCase) ? "UTC" : "local");
+            root.Delete(recursive: true);
+        }
+    }
+
+    [Fact]
+    public void SuccessfulSettingsRecoveryClearsTheInMemoryCorruptMarker()
+    {
+        var originalSettings = App.CurrentSettings;
+        var originalLanguage = LocalizationService.Current.LanguageCode;
+        var originalTimeZone = LocalizationService.DisplayTimeZone.Id;
+        var root = Directory.CreateTempSubdirectory("codex-info-settings-recovery-test");
+        SettingsViewModel? viewModel = null;
+        try
+        {
+            var path = Path.Combine(root.FullName, "settings.json");
+            File.WriteAllText(path, "{not-json}");
+            var store = new ClientSettingsStore(path);
+            App.CurrentSettings = store.Load();
+            Assert.True(App.CurrentSettings.SettingsCorrupt);
+            LocalizationService.SetLanguage("ja");
+            LocalizationService.SetTimeZone("local");
+            viewModel = new SettingsViewModel(store);
+
+            Assert.True(viewModel.Save());
+            Assert.False(App.CurrentSettings.SettingsCorrupt);
+            Assert.False(store.Load().SettingsCorrupt);
+        }
+        finally
+        {
+            viewModel?.Dispose();
+            App.CurrentSettings = originalSettings;
+            LocalizationService.SetLanguage(originalLanguage);
+            LocalizationService.SetTimeZone(string.Equals(originalTimeZone, "UTC", StringComparison.OrdinalIgnoreCase) ? "UTC" : "local");
+            root.Delete(recursive: true);
+        }
+    }
+
+    [Fact]
     public async Task SettingsViewModelMirrorsMainAuthenticationCapability()
     {
         var auth = new ApiStatusSnapshot(ApiState.AuthRequired, 1, false, null, null, [], 0);
@@ -295,6 +363,30 @@ public sealed class PresentationBoundaryTests
     }
 
     [Fact]
+    public void BorderlessWindowCloseControlsExposeStableAutomationIds()
+    {
+        var expected = new Dictionary<string, string>(StringComparer.Ordinal)
+        {
+            ["MainWindow.axaml"] = "Main.Window.Close",
+            ["GraphWindow.axaml"] = "Graph.Window.Close",
+            ["ThreadsWindow.axaml"] = "Threads.Window.Close",
+            ["LegalNoticesWindow.axaml"] = "Legal.Window.Close",
+            ["SettingsWindow.axaml"] = "Settings.Window.Close",
+            ["SetupWindow.axaml"] = "Setup.Window.Close",
+        };
+
+        foreach (var (fileName, automationId) in expected)
+        {
+            var document = XDocument.Parse(LoadRepositoryFile(
+                "windows-client", "src", "CodexInfo.WindowsClient", fileName));
+            Assert.Contains(
+                document.Descendants().Where(element => element.Name.LocalName == "Button"),
+                button => (button.Attribute("Click")?.Value is "OnCloseWindow" or "OnClose") &&
+                    button.Attribute("AutomationProperties.AutomationId")?.Value == automationId);
+        }
+    }
+
+    [Fact]
     public async Task MainDetailsFailureDoesNotPublishAPartialAccountGeneration()
     {
         var status = ValidStatus(DateTimeOffset.UtcNow.AddHours(2).ToUnixTimeSeconds());
@@ -450,11 +542,11 @@ public sealed class PresentationBoundaryTests
         return line[(colon + 1)..].Trim().TrimEnd(';').ToUpperInvariant();
     }
 
-    private sealed class SequenceStatusClient(params StatusFetchResult[] results) : ILoopbackStatusClient
+    private sealed class SequenceStatusClient(params StatusFetchResult[] results) : HealthyStatusClientBase
     {
         private int index;
 
-        public Task<StatusFetchResult> FetchAsync(CancellationToken cancellationToken = default)
+        public override Task<StatusFetchResult> FetchAsync(CancellationToken cancellationToken = default)
         {
             var result = results[Math.Min(index, results.Length - 1)];
             index++;

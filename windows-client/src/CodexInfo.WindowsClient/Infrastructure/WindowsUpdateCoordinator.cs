@@ -31,8 +31,9 @@ public sealed class WindowsInstallerLauncher : IWindowsInstallerLauncher
         try
         {
             var file = new FileInfo(installerPath);
-            if (!file.Exists || file.Length <= 0 ||
-                (file.Attributes & FileAttributes.ReparsePoint) != 0)
+            if (WindowsPathSafety.ContainsReparsePoint(file.FullName) ||
+                !WindowsPathSafety.IsMissingOrRegularFile(file.FullName) ||
+                !file.Exists || file.Length <= 0)
             {
                 return false;
             }
@@ -60,6 +61,7 @@ public sealed class WindowsInstallerLauncher : IWindowsInstallerLauncher
 public sealed class WindowsUpdateCoordinator : IWindowsUpdateCoordinator
 {
     private const string InstallerName = "CodexInfo.WindowsClient.Setup.exe";
+    private const string LeaseFileName = ".update.lease";
 
     private readonly IWindowsUpdateClient client;
     private readonly IWindowsInstallerLauncher launcher;
@@ -119,6 +121,7 @@ public sealed class WindowsUpdateCoordinator : IWindowsUpdateCoordinator
         }
 
         string? partialPath = null;
+        FileStream? lease = null;
         try
         {
             var release = availableRelease;
@@ -127,8 +130,22 @@ public sealed class WindowsUpdateCoordinator : IWindowsUpdateCoordinator
                 return UpdateStartStatus.NoAvailableUpdate;
             }
 
+            // The in-process gate above prevents duplicate work in one UI, but
+            // the install root is shared by separate client processes too.
+            // An exclusive OS file lease makes that boundary fail closed after
+            // crashes as well: the stale file is reusable once its owner exits.
+            lease = TryAcquireUpdateLease();
+            if (lease is null)
+            {
+                return UpdateStartStatus.Busy;
+            }
+
             var versionDirectory = Path.Combine(updateRoot, FormatVersion(release.Version));
-            Directory.CreateDirectory(versionDirectory);
+            if (!WindowsPathSafety.EnsureDirectoryTreeWithoutReparse(versionDirectory))
+            {
+                return UpdateStartStatus.DownloadFailed;
+            }
+
             var finalPath = Path.Combine(versionDirectory, InstallerName);
             partialPath = finalPath + ".download";
             DeleteIfPresent(partialPath);
@@ -155,6 +172,13 @@ public sealed class WindowsUpdateCoordinator : IWindowsUpdateCoordinator
                     : UpdateStartStatus.DownloadFailed;
             }
 
+            if (!WindowsPathSafety.EnsureDirectoryTreeWithoutReparse(versionDirectory) ||
+                !WindowsPathSafety.IsMissingOrRegularFile(finalPath))
+            {
+                DeleteIfPresent(partialPath);
+                return UpdateStartStatus.DownloadFailed;
+            }
+
             File.Move(partialPath, finalPath, overwrite: true);
             partialPath = null;
             return launcher.TryLaunch(finalPath)
@@ -173,6 +197,7 @@ public sealed class WindowsUpdateCoordinator : IWindowsUpdateCoordinator
         }
         finally
         {
+            lease?.Dispose();
             Volatile.Write(ref startInProgress, 0);
         }
     }
@@ -203,12 +228,51 @@ public sealed class WindowsUpdateCoordinator : IWindowsUpdateCoordinator
 
         try
         {
+            if (!WindowsPathSafety.IsMissingOrRegularFile(path))
+            {
+                return;
+            }
+
             File.Delete(path);
         }
         catch
         {
             // Cleanup is best-effort. A stale CreateNew target still fails
             // closed on the next explicit attempt instead of being executed.
+        }
+    }
+
+    private FileStream? TryAcquireUpdateLease()
+    {
+        try
+        {
+            if (!WindowsPathSafety.EnsureDirectoryTreeWithoutReparse(updateRoot) ||
+                WindowsPathSafety.ContainsReparsePoint(updateRoot))
+            {
+                return null;
+            }
+
+            var leasePath = Path.Combine(updateRoot, LeaseFileName);
+            if (!WindowsPathSafety.IsMissingOrRegularFile(leasePath))
+            {
+                return null;
+            }
+
+            return new FileStream(
+                leasePath,
+                FileMode.OpenOrCreate,
+                FileAccess.ReadWrite,
+                FileShare.None,
+                1,
+                FileOptions.DeleteOnClose);
+        }
+        catch (IOException)
+        {
+            return null;
+        }
+        catch (UnauthorizedAccessException)
+        {
+            return null;
         }
     }
 }

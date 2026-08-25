@@ -30,7 +30,17 @@ CREATE TABLE IF NOT EXISTS usage_history (
 CREATE INDEX IF NOT EXISTS usage_history_timestamp_idx
     ON usage_history (timestamp);
 CREATE INDEX IF NOT EXISTS usage_history_timestamp_reset_idx
-    ON usage_history (timestamp, reset_at);
+    ON usage_history (
+        timestamp,
+        reset_at,
+        remaining_percent,
+        sol_dollars,
+        terra_dollars,
+        luna_dollars,
+        sol_tokens,
+        terra_tokens,
+        luna_tokens
+    );
 
 CREATE TABLE IF NOT EXISTS durable_state (
     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
@@ -41,6 +51,18 @@ CREATE TABLE IF NOT EXISTS durable_state (
 "#;
 
 const RESET_GROUP_TOLERANCE_SECONDS: i128 = 60;
+const HISTORY_TIMESTAMP_RESET_INDEX: &str = "usage_history_timestamp_reset_idx";
+const HISTORY_TIMESTAMP_RESET_INDEX_COLUMNS: &[&str] = &[
+    "timestamp",
+    "reset_at",
+    "remaining_percent",
+    "sol_dollars",
+    "terra_dollars",
+    "luna_dollars",
+    "sol_tokens",
+    "terra_tokens",
+    "luna_tokens",
+];
 /// Maximum minute buckets materialized by a single one-month history read.
 /// Persistent retention is independently three calendar months; callers must
 /// never materialize that whole retention window merely to serve one request.
@@ -602,8 +624,64 @@ impl UsageStore {
                 ));
             }
         }
+        Self::ensure_recent_history_covering_index(&transaction)?;
         transaction.commit()?;
         Ok(Self { connection })
+    }
+
+    /// Keeps the bounded recent-history read covered even for databases that
+    /// were created before the index included the projected value columns.
+    /// Only the index is replaced; rows and the primary-key schema are never
+    /// mutated. The replacement is part of the open transaction, so a failed
+    /// rebuild rolls back without leaving a partially upgraded index.
+    fn ensure_recent_history_covering_index(transaction: &rusqlite::Transaction<'_>) -> Result<()> {
+        let metadata = transaction
+            .query_row(
+                "SELECT \"unique\", origin, partial \
+                 FROM pragma_index_list('usage_history') WHERE name = ?1",
+                [HISTORY_TIMESTAMP_RESET_INDEX],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let mut statement =
+            transaction.prepare("SELECT name FROM pragma_index_info(?1) ORDER BY seqno ASC")?;
+        let actual = statement
+            .query_map([HISTORY_TIMESTAMP_RESET_INDEX], |row| {
+                row.get::<_, String>(0)
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        if metadata == Some((0, "c".to_owned(), 0))
+            && actual
+                == HISTORY_TIMESTAMP_RESET_INDEX_COLUMNS
+                    .iter()
+                    .map(|column| (*column).to_owned())
+                    .collect::<Vec<_>>()
+        {
+            return Ok(());
+        }
+
+        transaction.execute("DROP INDEX IF EXISTS usage_history_timestamp_reset_idx", [])?;
+        transaction.execute(
+            "CREATE INDEX usage_history_timestamp_reset_idx ON usage_history (
+                timestamp,
+                reset_at,
+                remaining_percent,
+                sol_dollars,
+                terra_dollars,
+                luna_dollars,
+                sol_tokens,
+                terra_tokens,
+                luna_tokens
+            )",
+            [],
+        )?;
+        Ok(())
     }
 
     /// Alias for callers that prefer constructor-style naming.
@@ -1389,6 +1467,88 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM usage_history", [], |row| row.get(0))
             .unwrap();
         assert_eq!(after_count, before_count + 1);
+        drop(store);
+        remove_database(&path);
+    }
+
+    #[test]
+    fn reopening_a_legacy_history_index_rebuilds_only_the_covering_index() {
+        let path = database_path("legacy-history-index");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE usage_history (
+                    timestamp INTEGER NOT NULL CHECK (timestamp > 0),
+                    reset_at INTEGER NOT NULL CHECK (reset_at > 0),
+                    remaining_percent REAL,
+                    sol_dollars REAL NOT NULL,
+                    terra_dollars REAL NOT NULL,
+                    luna_dollars REAL NOT NULL,
+                    sol_tokens INTEGER NOT NULL DEFAULT 0,
+                    terra_tokens INTEGER NOT NULL DEFAULT 0,
+                    luna_tokens INTEGER NOT NULL DEFAULT 0,
+                    PRIMARY KEY (reset_at, timestamp)
+                );
+                CREATE INDEX usage_history_timestamp_idx
+                    ON usage_history (timestamp);
+                CREATE INDEX usage_history_timestamp_reset_idx
+                    ON usage_history (timestamp, reset_at) WHERE timestamp > 0;",
+            )
+            .unwrap();
+        drop(connection);
+
+        let store = UsageStore::open(&path).unwrap();
+        let plan = store
+            .connection
+            .prepare(
+                "EXPLAIN QUERY PLAN SELECT timestamp, reset_at, remaining_percent, \
+                 sol_dollars, terra_dollars, luna_dollars, sol_tokens, terra_tokens, luna_tokens \
+                 FROM usage_history WHERE timestamp > ?1 AND timestamp <= ?2 \
+                 ORDER BY timestamp DESC, reset_at DESC LIMIT ?3",
+            )
+            .unwrap()
+            .query_map(params![1_i64, 2_i64, 1_i64], |row| row.get::<_, String>(3))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+            .join(" | ");
+        assert!(plan.contains("USING COVERING INDEX usage_history_timestamp_reset_idx"));
+
+        let columns = store
+            .connection
+            .prepare("SELECT name FROM pragma_index_info(?1) ORDER BY seqno ASC")
+            .unwrap()
+            .query_map([HISTORY_TIMESTAMP_RESET_INDEX], |row| {
+                row.get::<_, String>(0)
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(
+            columns,
+            HISTORY_TIMESTAMP_RESET_INDEX_COLUMNS
+                .iter()
+                .map(|column| (*column).to_owned())
+                .collect::<Vec<_>>()
+        );
+        let index_shape = store
+            .connection
+            .query_row(
+                "SELECT \"unique\", origin, partial FROM pragma_index_list('usage_history') \
+                 WHERE name = ?1",
+                [HISTORY_TIMESTAMP_RESET_INDEX],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(index_shape, (0, "c".to_owned(), 0));
+
         drop(store);
         remove_database(&path);
     }

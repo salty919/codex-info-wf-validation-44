@@ -156,8 +156,10 @@ pub enum TextKey {
     LegalWarranty,
     LegalLicense,
     LegalFont,
+    LegalProtocol,
     LegalSchema,
     LegalDependencies,
+    LegalThirdParty,
     LegalDetails,
     LegalDistribution,
     Close,
@@ -239,8 +241,10 @@ impl TextKey {
         Self::LegalWarranty,
         Self::LegalLicense,
         Self::LegalFont,
+        Self::LegalProtocol,
         Self::LegalSchema,
         Self::LegalDependencies,
+        Self::LegalThirdParty,
         Self::LegalDetails,
         Self::LegalDistribution,
         Self::Close,
@@ -353,8 +357,10 @@ impl I18n {
                 }
                 LegalLicense => "ライセンス本文: LICENSE",
                 LegalFont => "Noto Sans JP / Noto Sans CJK KR: OFL-1.1 / Adobe 2014-2021",
+                LegalProtocol => "プロトコルとAPI: Apache-2.0 / Copyright 2025 OpenAI",
                 LegalSchema => "Codex生成スキーマ: Apache-2.0 / Copyright 2025 OpenAI",
                 LegalDependencies => "Slint と Rust 依存クレートは各上流ライセンスを保持します。",
+                LegalThirdParty => "第三者ライセンス: MIT / BSD-3-Clause / その他",
                 LegalDetails => "詳細: THIRD_PARTY_NOTICES.md と LICENSES/",
                 LegalDistribution => "バイナリ配布時は各依存の LICENSE/NOTICE を同梱してください。",
                 Close => "閉じる",
@@ -975,10 +981,12 @@ fn basic_text(key: TextKey, language: &str) -> &'static str {
         }
         ("en", LegalLicense) => "License text: LICENSE",
         ("en", LegalFont) => "Noto Sans JP / Noto Sans CJK KR: OFL-1.1 / Adobe 2014-2021",
+        ("en", LegalProtocol) => "Protocol and API: Apache-2.0 / Copyright 2025 OpenAI",
         ("en", LegalSchema) => "Codex-generated schema: Apache-2.0 / Copyright 2025 OpenAI",
         ("en", LegalDependencies) => {
             "Slint and Rust dependency crates retain their upstream licenses."
         }
+        ("en", LegalThirdParty) => "Third-party licenses: MIT / BSD-3-Clause / other",
         ("en", LegalDetails) => "Details: THIRD_PARTY_NOTICES.md and LICENSES/",
         ("en", LegalDistribution) => {
             "Include each dependency's LICENSE/NOTICE when distributing binaries."
@@ -1064,8 +1072,10 @@ fn basic_text(key: TextKey, language: &str) -> &'static str {
         ("zh", LegalWarranty) => "本软件不提供保证，可按 GPL-3.0-only 条款再分发。",
         ("zh", LegalLicense) => "许可证文本：LICENSE",
         ("zh", LegalFont) => "Noto Sans JP / Noto Sans CJK KR：OFL-1.1 / Adobe 2014-2021",
+        ("zh", LegalProtocol) => "协议和 API：Apache-2.0 / Copyright 2025 OpenAI",
         ("zh", LegalSchema) => "Codex 生成的架构：Apache-2.0 / Copyright 2025 OpenAI",
         ("zh", LegalDependencies) => "Slint 和 Rust 依赖库保留其上游许可证。",
+        ("zh", LegalThirdParty) => "第三方许可证：MIT / BSD-3-Clause / 其他",
         ("zh", LegalDetails) => "详情：THIRD_PARTY_NOTICES.md 和 LICENSES/",
         ("zh", LegalDistribution) => "分发二进制文件时请附带各依赖的 LICENSE/NOTICE。",
         ("zh", Close) => "关闭",
@@ -1147,7 +1157,7 @@ fn translated_text(language: &str, key: TextKey) -> &'static str {
     catalog[index]
 }
 
-const KO_CATALOG: [&str; 79] = [
+const KO_CATALOG: [&str; 81] = [
     "Noto Sans CJK KR",
     "계정이 연결되지 않음 — 요금제 미설정",
     "요금제 미설정",
@@ -1166,8 +1176,10 @@ const KO_CATALOG: [&str; 79] = [
     "이 소프트웨어는 보증 없이 제공되며 GPL-3.0-only로 재배포할 수 있습니다.",
     "라이선스 본문: LICENSE",
     "Noto Sans JP / Noto Sans CJK KR: OFL-1.1 / Adobe 2014-2021",
+    "프로토콜 및 API: Apache-2.0 / Copyright 2025 OpenAI",
     "Codex 생성 스키마: Apache-2.0 / Copyright 2025 OpenAI",
     "Slint 및 Rust 의존 크레이트는 각 상위 라이선스를 유지합니다.",
+    "타사 라이선스: MIT / BSD-3-Clause / 기타",
     "세부 정보: THIRD_PARTY_NOTICES.md 및 LICENSES/",
     "바이너리 배포 시 각 의존성의 LICENSE/NOTICE를 포함하세요.",
     "닫기",
@@ -1229,7 +1241,7 @@ const KO_CATALOG: [&str; 79] = [
     "토큰",
 ];
 
-const ES_CATALOG: [&str; 79] = [
+const ES_CATALOG: [&str; 81] = [
     "Noto Sans JP",
     "Cuenta no conectada — plan no establecido",
     "Plan no establecido",
@@ -1248,8 +1260,10 @@ const ES_CATALOG: [&str; 79] = [
     "Este software se ofrece sin garantía. Se permite redistribuirlo bajo GPL-3.0-only.",
     "Texto de licencia: LICENSE",
     "Noto Sans JP / Noto Sans CJK KR: OFL-1.1 / Adobe 2014-2021",
+    "Protocolo y API: Apache-2.0 / Copyright 2025 OpenAI",
     "Esquema generado por Codex: Apache-2.0 / Copyright 2025 OpenAI",
     "Slint y las dependencias de Rust conservan sus licencias originales.",
+    "Licencias de terceros: MIT / BSD-3-Clause / otras",
     "Detalles: THIRD_PARTY_NOTICES.md y LICENSES/",
     "Incluye las licencias LICENSE/NOTICE al distribuir binarios.",
     "Cerrar",
@@ -1311,7 +1325,7 @@ const ES_CATALOG: [&str; 79] = [
     "Tokens",
 ];
 
-const FR_CATALOG: [&str; 79] = [
+const FR_CATALOG: [&str; 81] = [
     "Noto Sans JP",
     "Compte non connecté — forfait non défini",
     "Forfait non défini",
@@ -1330,8 +1344,10 @@ const FR_CATALOG: [&str; 79] = [
     "Ce logiciel est fourni sans garantie. La redistribution est autorisée sous GPL-3.0-only.",
     "Texte de licence : LICENSE",
     "Noto Sans JP / Noto Sans CJK KR: OFL-1.1 / Adobe 2014-2021",
+    "Protocole et API : Apache-2.0 / Copyright 2025 OpenAI",
     "Schéma généré par Codex : Apache-2.0 / Copyright 2025 OpenAI",
     "Slint et les dépendances Rust conservent leurs licences amont.",
+    "Licences tierces : MIT / BSD-3-Clause / autres",
     "Détails : THIRD_PARTY_NOTICES.md et LICENSES/",
     "Joignez les fichiers LICENSE/NOTICE des dépendances lors de la distribution.",
     "Fermer",
@@ -1393,11 +1409,11 @@ const FR_CATALOG: [&str; 79] = [
     "Jetons",
 ];
 
-const DE_CATALOG: [&str; 79] = [
-    "Noto Sans JP", "Konto nicht verbunden — Tarif nicht festgelegt", "Tarif nicht festgelegt", "Kostenlos", "Unternehmen", "Bildung", "Nutzung", "Diagramm", "Rechtliche Hinweise", "Läuft", "Threads nach Modell", "Sonstige", "Details", "Keine laufenden Threads", "Codex-Info-Code und Dokumente: GPL-3.0-only", "Diese Software wird ohne Gewährleistung bereitgestellt. Weitergabe unter GPL-3.0-only ist erlaubt.", "Lizenztext: LICENSE", "Noto Sans JP / Noto Sans CJK KR: OFL-1.1 / Adobe 2014-2021", "Von Codex erzeugtes Schema: Apache-2.0 / Copyright 2025 OpenAI", "Slint und Rust-Abhängigkeiten behalten ihre ursprünglichen Lizenzen.", "Details: THIRD_PARTY_NOTICES.md und LICENSES/", "Beim Verteilen von Binärdateien die LICENSE/NOTICE-Dateien beilegen.", "Schließen", "Laufende Threads", "Kontextnutzung", "Anweisung", "Tokens", "Modell", "Eingabe", "Cache", "Ausgabe", "Erneut versuchen", "Nutzungsverlauf", "Verbleibend", "Stündliche Token-Nutzung (nach Modell) / verbleibend %", "Kumulierte stündliche Ausgaben (nach Modell) / verbleibend %", "Keine Aufzeichnungen", "Codex-Konto verbinden", "Schließe die Authentifizierung im Browser ab. Sie wird automatisch geprüft.", "Die Authentifizierung wird von Codex verwaltet; diese App speichert keine Zugangsdaten.", "Authentifizierungsseite öffnen", "Authentifizierung starten", "Wird geprüft…", "Authentifizierung prüfen", "Verwendet den Authentifizierungsstatus der Codex CLI.", "Kein Verlauf", "AN", "AUS", "Verbindung mit Codex app-server…", "Nutzung wird aktualisiert…", "Authentifizierung wird geprüft…", "Authentifiziert. Nutzung wird geladen…", "Nicht authentifiziert. Authentifizierung starten.", "Authentifizierungs-URL erstellt. «Authentifizierungsseite öffnen» wählen.", "Authentifizierungs-URL wird erstellt…", "Authentifizierungs-URL konnte nicht geöffnet werden.", "Nutzung konnte nicht abgerufen werden. Codex-app-server-Verbindung prüfen.", "Status kann nicht angezeigt werden.", "Fast keine Nutzung mehr verfügbar.", "Nutzung wird knapp.", "Weniger als 24 Stunden bis zum Zurücksetzen.", "Zuletzt aktualisiert", "Nutzung aktualisiert. Vorheriger Verlauf und Threads bleiben erhalten.", "Nutzung aktualisiert. Vorheriger Verlauf bleibt erhalten.", "Nutzung aktualisiert. Vorherige Thread-Anzeige bleibt erhalten.", "Haupt", "Unter", "Übergeordneter Thread läuft nicht", "Übergeordnet", " (aktuell)", "Frist", "Schätzung", "Wird bald zurückgesetzt", "Keine feste Grenze", "Verbleibende Nutzung", "Verbleibende Monatsnutzung", "Nutzungsgrenze", "Dollar", "Token",
+const DE_CATALOG: [&str; 81] = [
+    "Noto Sans JP", "Konto nicht verbunden — Tarif nicht festgelegt", "Tarif nicht festgelegt", "Kostenlos", "Unternehmen", "Bildung", "Nutzung", "Diagramm", "Rechtliche Hinweise", "Läuft", "Threads nach Modell", "Sonstige", "Details", "Keine laufenden Threads", "Codex-Info-Code und Dokumente: GPL-3.0-only", "Diese Software wird ohne Gewährleistung bereitgestellt. Weitergabe unter GPL-3.0-only ist erlaubt.", "Lizenztext: LICENSE", "Noto Sans JP / Noto Sans CJK KR: OFL-1.1 / Adobe 2014-2021", "Protokoll und API: Apache-2.0 / Copyright 2025 OpenAI", "Von Codex erzeugtes Schema: Apache-2.0 / Copyright 2025 OpenAI", "Slint und Rust-Abhängigkeiten behalten ihre ursprünglichen Lizenzen.", "Lizenzen Dritter: MIT / BSD-3-Clause / weitere", "Details: THIRD_PARTY_NOTICES.md und LICENSES/", "Beim Verteilen von Binärdateien die LICENSE/NOTICE-Dateien beilegen.", "Schließen", "Laufende Threads", "Kontextnutzung", "Anweisung", "Tokens", "Modell", "Eingabe", "Cache", "Ausgabe", "Erneut versuchen", "Nutzungsverlauf", "Verbleibend", "Stündliche Token-Nutzung (nach Modell) / verbleibend %", "Kumulierte stündliche Ausgaben (nach Modell) / verbleibend %", "Keine Aufzeichnungen", "Codex-Konto verbinden", "Schließe die Authentifizierung im Browser ab. Sie wird automatisch geprüft.", "Die Authentifizierung wird von Codex verwaltet; diese App speichert keine Zugangsdaten.", "Authentifizierungsseite öffnen", "Authentifizierung starten", "Wird geprüft…", "Authentifizierung prüfen", "Verwendet den Authentifizierungsstatus der Codex CLI.", "Kein Verlauf", "AN", "AUS", "Verbindung mit Codex app-server…", "Nutzung wird aktualisiert…", "Authentifizierung wird geprüft…", "Authentifiziert. Nutzung wird geladen…", "Nicht authentifiziert. Authentifizierung starten.", "Authentifizierungs-URL erstellt. «Authentifizierungsseite öffnen» wählen.", "Authentifizierungs-URL wird erstellt…", "Authentifizierungs-URL konnte nicht geöffnet werden.", "Nutzung konnte nicht abgerufen werden. Codex-app-server-Verbindung prüfen.", "Status kann nicht angezeigt werden.", "Fast keine Nutzung mehr verfügbar.", "Nutzung wird knapp.", "Weniger als 24 Stunden bis zum Zurücksetzen.", "Zuletzt aktualisiert", "Nutzung aktualisiert. Vorheriger Verlauf und Threads bleiben erhalten.", "Nutzung aktualisiert. Vorheriger Verlauf bleibt erhalten.", "Nutzung aktualisiert. Vorherige Thread-Anzeige bleibt erhalten.", "Haupt", "Unter", "Übergeordneter Thread läuft nicht", "Übergeordnet", " (aktuell)", "Frist", "Schätzung", "Wird bald zurückgesetzt", "Keine feste Grenze", "Verbleibende Nutzung", "Verbleibende Monatsnutzung", "Nutzungsgrenze", "Dollar", "Token",
 ];
 
-const PT_CATALOG: [&str; 79] = [
+const PT_CATALOG: [&str; 81] = [
     "Noto Sans JP",
     "Conta não conectada — plano não definido",
     "Plano não definido",
@@ -1416,8 +1432,10 @@ const PT_CATALOG: [&str; 79] = [
     "Este software é fornecido sem garantia. A redistribuição sob GPL-3.0-only é permitida.",
     "Texto da licença: LICENSE",
     "Noto Sans JP / Noto Sans CJK KR: OFL-1.1 / Adobe 2014-2021",
+    "Protocolo e API: Apache-2.0 / Copyright 2025 OpenAI",
     "Esquema gerado pelo Codex: Apache-2.0 / Copyright 2025 OpenAI",
     "Slint e as dependências Rust mantêm suas licenças originais.",
+    "Licenças de terceiros: MIT / BSD-3-Clause / outras",
     "Detalhes: THIRD_PARTY_NOTICES.md e LICENSES/",
     "Inclua LICENSE/NOTICE de cada dependência ao distribuir binários.",
     "Fechar",
@@ -1479,7 +1497,7 @@ const PT_CATALOG: [&str; 79] = [
     "Tokens",
 ];
 
-const IT_CATALOG: [&str; 79] = [
+const IT_CATALOG: [&str; 81] = [
     "Noto Sans JP",
     "Account non collegato — piano non impostato",
     "Piano non impostato",
@@ -1498,8 +1516,10 @@ const IT_CATALOG: [&str; 79] = [
     "Questo software è fornito senza garanzia. La ridistribuzione è consentita con GPL-3.0-only.",
     "Testo della licenza: LICENSE",
     "Noto Sans JP / Noto Sans CJK KR: OFL-1.1 / Adobe 2014-2021",
+    "Protocollo e API: Apache-2.0 / Copyright 2025 OpenAI",
     "Schema generato da Codex: Apache-2.0 / Copyright 2025 OpenAI",
     "Slint e le dipendenze Rust mantengono le licenze originali.",
+    "Licenze di terze parti: MIT / BSD-3-Clause / altre",
     "Dettagli: THIRD_PARTY_NOTICES.md e LICENSES/",
     "Includi LICENSE/NOTICE di ogni dipendenza nella distribuzione dei binari.",
     "Chiudi",
@@ -1561,7 +1581,7 @@ const IT_CATALOG: [&str; 79] = [
     "Token",
 ];
 
-const RU_CATALOG: [&str; 79] = [
+const RU_CATALOG: [&str; 81] = [
     "Noto Sans JP",
     "Аккаунт не подключён — тариф не задан",
     "Тариф не задан",
@@ -1580,8 +1600,10 @@ const RU_CATALOG: [&str; 79] = [
     "Программа предоставляется без гарантий. Распространение разрешено по GPL-3.0-only.",
     "Текст лицензии: LICENSE",
     "Noto Sans JP / Noto Sans CJK KR: OFL-1.1 / Adobe 2014-2021",
+    "Протокол и API: Apache-2.0 / Copyright 2025 OpenAI",
     "Схема Codex: Apache-2.0 / Copyright 2025 OpenAI",
     "Slint и зависимости Rust сохраняют исходные лицензии.",
+    "Лицензии третьих сторон: MIT / BSD-3-Clause / другие",
     "Подробнее: THIRD_PARTY_NOTICES.md и LICENSES/",
     "При распространении бинарных файлов приложите LICENSE/NOTICE зависимостей.",
     "Закрыть",

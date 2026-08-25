@@ -138,6 +138,9 @@
                      FontWeight="SemiBold"
                      Foreground="#E9EFF8"
                      Text="{Binding Texts.UsageStatus}" />
+          <TextBlock Classes="label"
+                     AutomationProperties.AutomationId="Main.ProductVersion"
+                     Text="{Binding ProductVersionText}" />
         </StackPanel>
       </StackPanel>
       <StackPanel Grid.Column="1"
@@ -178,11 +181,13 @@
         <Button Classes="window-control"
                 Click="OnMinimizeWindow"
                 AutomationProperties.Name="{Binding Texts.Minimize}"
+                AutomationProperties.AutomationId="Main.Window.Minimize"
                 Content="—"
                 ToolTip.Tip="{Binding Texts.Minimize}" />
         <Button Classes="window-control"
                 Click="OnCloseWindow"
                 AutomationProperties.Name="{Binding Texts.Close}"
+                AutomationProperties.AutomationId="Main.Window.Close"
                 Content="×"
                 ToolTip.Tip="{Binding Texts.Close}" />
       </StackPanel>

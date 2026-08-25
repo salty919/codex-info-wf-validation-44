@@ -69,6 +69,113 @@ public sealed class LoopbackStatusClientTests
     }
 
     [Fact]
+    public async Task HealthEndpointAndMethodAreFixedAndStrictlyParsed()
+    {
+        var handler = new StubHandler(request =>
+        {
+            Assert.Equal(HttpMethod.Get, request.Method);
+            Assert.Equal("http://127.0.0.1:8787/v1/health", request.RequestUri!.AbsoluteUri);
+            return JsonResponse(HealthJson());
+        });
+
+        using var client = new LoopbackStatusClient(handler);
+        var result = await client.FetchHealthAsync(CancellationToken.None);
+
+        Assert.True(result.IsSuccess);
+        Assert.Equal(new ApiHealthSnapshot("v1", "codex-info"), result.Snapshot);
+    }
+
+    [Fact]
+    public async Task HealthRequiresHttp200()
+    {
+        var handler = new StubHandler(_ =>
+        {
+            var response = JsonResponse(HealthJson());
+            response.StatusCode = HttpStatusCode.Created;
+            return response;
+        });
+
+        using var client = new LoopbackStatusClient(handler);
+        var result = await client.FetchHealthAsync(CancellationToken.None);
+
+        Assert.Equal(HealthFetchFailure.Response, result.Failure);
+        Assert.Null(result.Snapshot);
+    }
+
+    [Fact]
+    public async Task HealthRequiresDeclaredContentLength()
+    {
+        var response = new HttpResponseMessage(HttpStatusCode.OK)
+        {
+            Content = new UnknownLengthContent(Encoding.UTF8.GetBytes(HealthJson())),
+        };
+        response.Headers.CacheControl = new CacheControlHeaderValue { NoStore = true };
+
+        using var client = new LoopbackStatusClient(new StubHandler(_ => response));
+        var result = await client.FetchHealthAsync(CancellationToken.None);
+
+        Assert.Equal(HealthFetchFailure.Response, result.Failure);
+        Assert.Null(result.Snapshot);
+    }
+
+    [Fact]
+    public async Task HealthRejectsDeclaredContentLengthMismatch()
+    {
+        var response = new HttpResponseMessage(HttpStatusCode.OK)
+        {
+            Content = new DeclaredLengthContent(HealthJson().Length),
+        };
+        response.Headers.CacheControl = new CacheControlHeaderValue { NoStore = true };
+
+        using var client = new LoopbackStatusClient(new StubHandler(_ => response));
+        var result = await client.FetchHealthAsync(CancellationToken.None);
+
+        Assert.Equal(HealthFetchFailure.Response, result.Failure);
+        Assert.Null(result.Snapshot);
+    }
+
+    [Theory]
+    [InlineData("api_version", "api_version2")]
+    [InlineData("service", "Service")]
+    public async Task HealthRejectsUnknownOrWrongFixedValues(string property, string replacement)
+    {
+        var json = HealthJson().Replace($"\"{property}\":", $"\"{replacement}\":", StringComparison.Ordinal);
+        var result = await FetchHealth(json);
+
+        Assert.Equal(HealthFetchFailure.Response, result.Failure);
+        Assert.Null(result.Snapshot);
+    }
+
+    [Theory]
+    [InlineData("status")]
+    [InlineData("details")]
+    public async Task StatusAndDetailsRequireHttp200(string endpoint)
+    {
+        var handler = new StubHandler(request =>
+        {
+            var response = endpoint == "status"
+                ? JsonResponse(ValidJson("ready"))
+                : JsonResponse(ValidDetailsJson());
+            response.StatusCode = HttpStatusCode.Created;
+            return response;
+        });
+
+        using var client = new LoopbackStatusClient(handler);
+        if (endpoint == "status")
+        {
+            var result = await client.FetchAsync(CancellationToken.None);
+            Assert.Equal(StatusFetchFailure.Transport, result.Failure);
+            Assert.Null(result.Snapshot);
+        }
+        else
+        {
+            var result = await client.FetchDetailsAsync(CancellationToken.None);
+            Assert.Equal(DetailsFetchFailure.Transport, result.Failure);
+            Assert.Null(result.Snapshot);
+        }
+    }
+
+    [Fact]
     public async Task ContentTypeMustBeApplicationJson()
     {
         var handler = new StubHandler(_ => new HttpResponseMessage(HttpStatusCode.OK)
@@ -423,6 +530,12 @@ public sealed class LoopbackStatusClientTests
         return await client.FetchDetailsAsync(CancellationToken.None);
     }
 
+    private static async Task<HealthFetchResult> FetchHealth(string json)
+    {
+        using var client = new LoopbackStatusClient(new StubHandler(_ => JsonResponse(json)));
+        return await client.FetchHealthAsync(CancellationToken.None);
+    }
+
     private static HttpResponseMessage JsonResponse(string json)
     {
         var response = new HttpResponseMessage(HttpStatusCode.OK)
@@ -435,6 +548,9 @@ public sealed class LoopbackStatusClientTests
 
     private static string ValidJson(string state) =>
         $$"""{"api_version":"v1","state":"{{state}}","observed_at":1,"authenticated":true,"plan_label":"Pro","quota":{"remaining_percent":98.5,"reset_at":253402300799,"window_seconds":1,"monthly":false},"models":[{"name":"SOL","input_tokens":1,"cached_input_tokens":2,"output_tokens":3}],"active_thread_count":3}""";
+
+    private static string HealthJson() =>
+        "{\"api_version\":\"v1\",\"service\":\"codex-info\"}";
 
     private static string ValidDetailsJson() =>
         "{\"api_version\":\"v1\",\"state\":\"ready\",\"observed_at\":1,\"authenticated\":true,\"plan_label\":\"Pro\",\"quota\":{\"remaining_percent\":98.5,\"reset_at\":253402300799,\"window_seconds\":604800,\"monthly\":false},\"models\":[{\"name\":\"SOL\",\"input_tokens\":10,\"cached_input_tokens\":2,\"output_tokens\":3,\"input_dollars\":0.5,\"cached_input_dollars\":0.25,\"output_dollars\":0.5}],\"active_thread_count\":1,\"history_periods\":[{\"id\":\"253402300799\",\"start_at\":253341820799,\"end_at\":253402300799,\"reset_at\":253402300799,\"label\":\"2026/08/01 — 2026/08/08\",\"current\":true}],\"history_samples\":[{\"timestamp\":1,\"reset_at\":253402300799,\"remaining_percent\":42.5,\"sol_dollars\":1.25,\"terra_dollars\":0.0,\"luna_dollars\":0.0,\"sol_tokens\":6,\"terra_tokens\":0,\"luna_tokens\":0}],\"threads\":[{\"id\":\"thread-1\",\"title\":\"Task\",\"parent_thread_id\":null,\"model\":\"SOL\",\"model_label\":\"SOL\",\"total_tokens\":20,\"context_usage_tokens\":10,\"context_window_tokens\":80,\"created_at\":1,\"last_user_message_at\":1,\"is_subagent\":false,\"depth\":0}],\"estimated_cost_label\":\"概算 $1\"}";
