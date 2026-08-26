@@ -768,26 +768,35 @@ public sealed class LoopbackStatusClient : ILoopbackStatusClient, ILoopbackHealt
             .OrderBy(sample => sample.Timestamp)
             .ThenBy(sample => sample.ResetAt);
         var merged = new List<ApiHistorySample>();
-        foreach (var sample in selected)
+        foreach (var group in selected.GroupBy(sample => sample.Timestamp))
         {
-            var canonical = sample with { ResetAt = period.ResetAt };
-            if (merged.Count == 0 || merged[^1].Timestamp != canonical.Timestamp)
+            var rows = group.ToList();
+            var canonical = rows[^1] with { ResetAt = period.ResetAt };
+            var remainingValues = rows
+                .Where(sample => sample.RemainingPercent is { } value && double.IsFinite(value))
+                .Select(sample => sample.RemainingPercent!.Value)
+                .ToArray();
+            // Different reset IDs can legitimately be aliases of one
+            // canonical period, but two different quota values at the same
+            // observation timestamp are ambiguous.  Choosing the last row
+            // makes row order manufacture a vertical 88% -> 14% drop.  Keep
+            // the model maxima, but fail closed for the conflicting quota
+            // field so the graph cannot invent a loss of remaining credit.
+            var mergedRemaining = remainingValues.Length == 0
+                ? canonical.RemainingPercent
+                : remainingValues.All(value => Math.Abs(value - remainingValues[0]) <= double.Epsilon)
+                    ? remainingValues[0]
+                    : null;
+            merged.Add(canonical with
             {
-                merged.Add(canonical);
-                continue;
-            }
-
-            var previous = merged[^1];
-            merged[^1] = canonical with
-            {
-                RemainingPercent = canonical.RemainingPercent ?? previous.RemainingPercent,
-                SolDollars = Math.Max(previous.SolDollars, canonical.SolDollars),
-                TerraDollars = Math.Max(previous.TerraDollars, canonical.TerraDollars),
-                LunaDollars = Math.Max(previous.LunaDollars, canonical.LunaDollars),
-                SolTokens = Math.Max(previous.SolTokens, canonical.SolTokens),
-                TerraTokens = Math.Max(previous.TerraTokens, canonical.TerraTokens),
-                LunaTokens = Math.Max(previous.LunaTokens, canonical.LunaTokens),
-            };
+                RemainingPercent = mergedRemaining,
+                SolDollars = rows.Max(sample => sample.SolDollars),
+                TerraDollars = rows.Max(sample => sample.TerraDollars),
+                LunaDollars = rows.Max(sample => sample.LunaDollars),
+                SolTokens = rows.Max(sample => sample.SolTokens),
+                TerraTokens = rows.Max(sample => sample.TerraTokens),
+                LunaTokens = rows.Max(sample => sample.LunaTokens),
+            });
         }
 
         return new System.Collections.ObjectModel.ReadOnlyCollection<ApiHistorySample>(merged);
@@ -890,13 +899,11 @@ public sealed class LoopbackStatusClient : ILoopbackStatusClient, ILoopbackHealt
             return false;
         }
 
-        var samplesSeen = new HashSet<(long ResetAt, long Timestamp)>();
         foreach (var sample in property.EnumerateArray())
         {
             if (!HasExactlyProperties(sample, HistorySampleProperties, 9) ||
                 !TryGetUnixSeconds(sample, "timestamp", out var timestamp) ||
                 !TryGetUnixSeconds(sample, "reset_at", out var resetAt) ||
-                !samplesSeen.Add((resetAt, timestamp)) ||
                 !TryGetNullableRemainingPercent(sample, out var remainingPercent) ||
                 !TryGetNonNegativeFiniteDouble(sample, "sol_dollars", out var solDollars) ||
                 !TryGetNonNegativeFiniteDouble(sample, "terra_dollars", out var terraDollars) ||
@@ -920,7 +927,47 @@ public sealed class LoopbackStatusClient : ILoopbackStatusClient, ILoopbackHealt
                 lunaTokens));
         }
 
+        // The recorder can publish two rows for one (reset_at,timestamp)
+        // identity when separate model observations land in the same minute.
+        // Rejecting the identity as a duplicate makes an otherwise reachable
+        // server appear disconnected on Windows. Coalesce only this bounded
+        // array-record collision: model values use maxima, while conflicting
+        // remaining values become unavailable instead of being chosen by row
+        // order. Duplicate JSON keys inside one object remain rejected above.
+        samples = samples
+            .GroupBy(sample => (sample.ResetAt, sample.Timestamp))
+            .Select(group => MergeHistorySampleIdentity(group))
+            .OrderBy(sample => sample.Timestamp)
+            .ThenBy(sample => sample.ResetAt)
+            .ToList();
+
         return true;
+    }
+
+    private static ApiHistorySample MergeHistorySampleIdentity(
+        IEnumerable<ApiHistorySample> source)
+    {
+        var rows = source.ToList();
+        var canonical = rows[^1];
+        var remainingValues = rows
+            .Where(sample => sample.RemainingPercent is { } value && double.IsFinite(value))
+            .Select(sample => sample.RemainingPercent!.Value)
+            .ToArray();
+        var remaining = remainingValues.Length == 0
+            ? canonical.RemainingPercent
+            : remainingValues.All(value => Math.Abs(value - remainingValues[0]) <= double.Epsilon)
+                ? remainingValues[0]
+                : null;
+        return canonical with
+        {
+            RemainingPercent = remaining,
+            SolDollars = rows.Max(sample => sample.SolDollars),
+            TerraDollars = rows.Max(sample => sample.TerraDollars),
+            LunaDollars = rows.Max(sample => sample.LunaDollars),
+            SolTokens = rows.Max(sample => sample.SolTokens),
+            TerraTokens = rows.Max(sample => sample.TerraTokens),
+            LunaTokens = rows.Max(sample => sample.LunaTokens),
+        };
     }
 
     private static bool TryGetThreads(

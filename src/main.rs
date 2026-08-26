@@ -283,6 +283,11 @@ const MOVING_RESET_GROUP_MAX_DRIFT_SECONDS: i64 = 5 * 60;
 // deadline by one or two poll intervals at once. Allow that bounded step
 // jitter; a real period boundary is still separated by hours or days.
 const MOVING_RESET_STEP_TOLERANCE_SECONDS: i64 = 180;
+// Rows at one exact observation timestamp normally represent the same
+// snapshot.  A reset-id drift of only a few seconds is collector jitter and
+// keeps the latest observed quota; a larger drift is ambiguous and must not
+// let row order manufacture a quota drop.
+const SAME_TIMESTAMP_RESET_JITTER_SECONDS: i64 = 5;
 // A minute bucket is the collector's contiguous observation unit. Beyond this
 // boundary the elapsed interval is not observed, so a cumulative model
 // increase must be shown as an idle horizontal segment followed by a point
@@ -1742,19 +1747,7 @@ fn legacy_moving_reset_artifact(
 }
 
 fn display_history_samples(samples: &[UsageHistorySample]) -> Vec<&UsageHistorySample> {
-    let valid_samples = samples
-        .iter()
-        .filter(|sample| sample.is_valid())
-        .collect::<Vec<_>>();
-    let mut exact_reset_counts = BTreeMap::new();
-    for sample in &valid_samples {
-        *exact_reset_counts.entry(sample.reset_at).or_insert(0) += 1;
-    }
-    valid_samples
-        .iter()
-        .copied()
-        .filter(|sample| !legacy_moving_reset_artifact(sample, &valid_samples, &exact_reset_counts))
-        .collect()
+    samples.iter().filter(|sample| sample.is_valid()).collect()
 }
 
 #[derive(Clone, Debug)]
@@ -1892,6 +1885,61 @@ fn reset_sample_groups(samples: &[UsageHistorySample]) -> Vec<ResetSampleGroup> 
             same_reset_merged.push(group);
         }
     }
+    // Group first, then discard only groups made entirely of identified
+    // legacy moving-reset artifacts. Filtering rows before grouping breaks a
+    // continuous rolling chain at every singleton and manufactures an empty
+    // 100% period. A group containing any real model snapshot or any
+    // non-artifact quota snapshot remains visible.
+    let valid_refs = samples
+        .iter()
+        .filter(|sample| sample.is_valid())
+        .collect::<Vec<_>>();
+    let mut exact_reset_counts = BTreeMap::new();
+    for sample in &valid_refs {
+        *exact_reset_counts.entry(sample.reset_at).or_insert(0) += 1;
+    }
+    let same_reset_merged = same_reset_merged
+        .into_iter()
+        .filter(|group| {
+            !group.samples.iter().all(|sample| {
+                legacy_moving_reset_artifact(sample, &valid_refs, &exact_reset_counts)
+            })
+        })
+        .collect::<Vec<_>>();
+    let has_model_usage = |sample: &UsageHistorySample| {
+        sample.sol_dollars > 0.0
+            || sample.terra_dollars > 0.0
+            || sample.luna_dollars > 0.0
+            || sample.sol_tokens > 0
+            || sample.terra_tokens > 0
+            || sample.luna_tokens > 0
+    };
+    let model_timestamps = same_reset_merged
+        .iter()
+        .flat_map(|group| group.samples.iter())
+        .filter(|sample| has_model_usage(sample))
+        .map(|sample| sample.timestamp)
+        .collect::<BTreeSet<_>>();
+    let drop_ambiguous_quota_groups = same_reset_merged
+        .iter()
+        .map(|group| {
+            let only_missing_quota = group
+                .samples
+                .iter()
+                .all(|sample| !has_model_usage(sample) && sample.remaining_percent < 0.0);
+            only_missing_quota
+                && group
+                    .samples
+                    .iter()
+                    .any(|sample| model_timestamps.contains(&sample.timestamp))
+        })
+        .collect::<Vec<_>>();
+    let same_reset_merged = same_reset_merged
+        .into_iter()
+        .enumerate()
+        .filter(|(index, _)| !drop_ambiguous_quota_groups[*index])
+        .map(|(_, group)| group)
+        .collect::<Vec<_>>();
     let mut merged: Vec<ResetSampleGroup> = Vec::with_capacity(same_reset_merged.len());
     let mut rolling_artifact_chain = false;
     for mut group in same_reset_merged {
@@ -2139,6 +2187,16 @@ struct UsageHistory {
     startup_maintenance_done: bool,
 }
 
+#[derive(Default)]
+struct SameTimestampRemainingState {
+    first_remaining: Option<f64>,
+    values_differ: bool,
+    min_reset_at: Option<i64>,
+    max_reset_at: Option<i64>,
+    quota_only: bool,
+    reset_values: BTreeMap<i64, f64>,
+}
+
 impl UsageHistory {
     fn load() -> Self {
         let now = Utc::now();
@@ -2172,6 +2230,7 @@ impl UsageHistory {
             startup_maintenance_done: false,
         };
         history.normalize();
+        history.mark_existing_ambiguous_same_timestamp_remaining();
         history
     }
 
@@ -2276,6 +2335,7 @@ impl UsageHistory {
         self.samples
             .retain(|sample| sample.timestamp >= cutoff && sample.timestamp <= now.timestamp());
         self.normalize();
+        self.mark_existing_ambiguous_same_timestamp_remaining();
     }
 
     fn record(&mut self, sample: UsageHistorySample) {
@@ -2283,6 +2343,7 @@ impl UsageHistory {
             return;
         }
         let mut sample = sample;
+        self.mark_ambiguous_same_timestamp_remaining(&mut sample);
         let acquisition_end = sample.timestamp;
         sample.reset_at = self.canonical_reset_at(sample.reset_at);
         merge_exact_sample(&mut self.samples, sample);
@@ -2305,6 +2366,7 @@ impl UsageHistory {
             if !sample.is_valid() {
                 continue;
             }
+            self.mark_ambiguous_same_timestamp_remaining(&mut sample);
             sample.reset_at = storage_reset_at;
             merge_exact_sample(&mut self.samples, sample);
         }
@@ -2313,6 +2375,118 @@ impl UsageHistory {
             self.retain_acquisition_window(acquisition_end);
         }
         self.save();
+    }
+
+    fn mark_ambiguous_same_timestamp_remaining(&mut self, incoming: &mut UsageHistorySample) {
+        let incoming_remaining = incoming.remaining_percent;
+        if incoming_remaining < 0.0 {
+            return;
+        }
+        let incoming_quota_only = incoming.sol_dollars == 0.0
+            && incoming.terra_dollars == 0.0
+            && incoming.luna_dollars == 0.0
+            && incoming.sol_tokens == 0
+            && incoming.terra_tokens == 0
+            && incoming.luna_tokens == 0;
+        let mut conflict = false;
+        for existing in &self.samples {
+            if existing.timestamp != incoming.timestamp
+                || existing.reset_at == incoming.reset_at
+                || existing.remaining_percent < 0.0
+                || (existing.remaining_percent - incoming_remaining).abs() <= f64::EPSILON
+            {
+                continue;
+            }
+            let reset_span = existing.reset_at.abs_diff(incoming.reset_at);
+            let existing_quota_only = existing.sol_dollars == 0.0
+                && existing.terra_dollars == 0.0
+                && existing.luna_dollars == 0.0
+                && existing.sol_tokens == 0
+                && existing.terra_tokens == 0
+                && existing.luna_tokens == 0;
+            if reset_span == 0
+                || reset_span > SAME_TIMESTAMP_RESET_JITTER_SECONDS as u64
+                || existing_quota_only
+                || incoming_quota_only
+            {
+                conflict = true;
+                break;
+            }
+        }
+        if conflict {
+            for existing in &mut self.samples {
+                if existing.timestamp == incoming.timestamp {
+                    existing.remaining_percent = -1.0;
+                }
+            }
+            incoming.remaining_percent = -1.0;
+        }
+    }
+
+    /// Sanitize legacy rows already present in SQLite before any consumer can
+    /// observe them.  New writes call `mark_ambiguous_same_timestamp_remaining`
+    /// before merging; startup must apply the identical rule to pre-existing
+    /// rows so `canonical_samples`, period lists, and graph payloads share one
+    /// fail-closed boundary.  This only changes the in-memory view; the raw
+    /// retention database remains untouched until a normal write occurs.
+    fn mark_existing_ambiguous_same_timestamp_remaining(&mut self) {
+        // Aggregate by timestamp/reset instead of comparing every pair. A
+        // malformed database may contain the full bounded month at one
+        // timestamp; startup must remain O(n log n), not O(n²).
+        let mut states = BTreeMap::<i64, SameTimestampRemainingState>::new();
+        for sample in &self.samples {
+            if sample.remaining_percent < 0.0 {
+                continue;
+            }
+            let state = states.entry(sample.timestamp).or_default();
+            if let Some(first) = state.first_remaining {
+                state.values_differ |= (first - sample.remaining_percent).abs() > f64::EPSILON;
+            } else {
+                state.first_remaining = Some(sample.remaining_percent);
+            }
+            state.min_reset_at = Some(
+                state
+                    .min_reset_at
+                    .map_or(sample.reset_at, |value| value.min(sample.reset_at)),
+            );
+            state.max_reset_at = Some(
+                state
+                    .max_reset_at
+                    .map_or(sample.reset_at, |value| value.max(sample.reset_at)),
+            );
+            state.quota_only |= sample.sol_dollars == 0.0
+                && sample.terra_dollars == 0.0
+                && sample.luna_dollars == 0.0
+                && sample.sol_tokens == 0
+                && sample.terra_tokens == 0
+                && sample.luna_tokens == 0;
+            if let Some(previous) = state
+                .reset_values
+                .insert(sample.reset_at, sample.remaining_percent)
+            {
+                state.values_differ |= (previous - sample.remaining_percent).abs() > f64::EPSILON;
+            }
+        }
+        let mut ambiguous_timestamps = BTreeSet::new();
+        for (timestamp, state) in states {
+            let reset_span = state
+                .min_reset_at
+                .zip(state.max_reset_at)
+                .map(|(minimum, maximum)| minimum.abs_diff(maximum))
+                .unwrap_or(0);
+            if state.values_differ
+                && (reset_span == 0
+                    || reset_span > SAME_TIMESTAMP_RESET_JITTER_SECONDS as u64
+                    || state.quota_only)
+            {
+                ambiguous_timestamps.insert(timestamp);
+            }
+        }
+        for sample in &mut self.samples {
+            if ambiguous_timestamps.contains(&sample.timestamp) {
+                sample.remaining_percent = -1.0;
+            }
+        }
     }
 
     fn canonical_reset_at(&self, reset_at: i64) -> i64 {
@@ -2404,15 +2578,64 @@ impl UsageHistory {
             .unwrap_or_default();
         selected.sort_by_key(|sample| (sample.timestamp, sample.reset_at));
         let mut merged: Vec<UsageHistorySample> = Vec::with_capacity(selected.len());
-        for mut sample in selected {
-            sample.reset_at = canonical_reset_at;
-            if let Some(existing) = merged.last_mut() {
-                if existing.timestamp == sample.timestamp {
-                    merge_sample_values(existing, sample);
-                    existing.reset_at = canonical_reset_at;
-                    continue;
-                }
+        let mut index = 0;
+        while index < selected.len() {
+            let timestamp = selected[index].timestamp;
+            let mut rows = Vec::new();
+            while index < selected.len() && selected[index].timestamp == timestamp {
+                rows.push(selected[index].clone());
+                index += 1;
             }
+            let mut sample = rows.last().cloned().expect("timestamp group is non-empty");
+            let remaining_values = rows
+                .iter()
+                .filter(|row| row.remaining_percent >= 0.0)
+                .map(|row| row.remaining_percent)
+                .collect::<Vec<_>>();
+            let conflicting_remaining = remaining_values
+                .windows(2)
+                .any(|values| (values[0] - values[1]).abs() > f64::EPSILON);
+            let reset_span = rows
+                .iter()
+                .map(|row| row.reset_at)
+                .min()
+                .unwrap_or(sample.reset_at)
+                .abs_diff(
+                    rows.iter()
+                        .map(|row| row.reset_at)
+                        .max()
+                        .unwrap_or(sample.reset_at),
+                );
+            // Preserve the historical jitter contract (a few-second drift
+            // keeps the latest value), but fail closed for a same-ID conflict,
+            // a real reset-id disagreement, or any quota-only collision.  In
+            // particular this prevents a 30/60-second moving-reset row with
+            // no model usage from overwriting an 88% spend observation with
+            // 14%.
+            let has_quota_only_row = rows.iter().any(|row| {
+                row.sol_dollars == 0.0
+                    && row.terra_dollars == 0.0
+                    && row.luna_dollars == 0.0
+                    && row.sol_tokens == 0
+                    && row.terra_tokens == 0
+                    && row.luna_tokens == 0
+            });
+            if conflicting_remaining
+                && (reset_span == 0
+                    || reset_span > SAME_TIMESTAMP_RESET_JITTER_SECONDS as u64
+                    || has_quota_only_row)
+            {
+                sample.remaining_percent = -1.0;
+            } else if let Some(remaining) = remaining_values.last().copied() {
+                sample.remaining_percent = remaining;
+            }
+            sample.reset_at = canonical_reset_at;
+            sample.sol_dollars = rows.iter().map(|row| row.sol_dollars).fold(0.0, f64::max);
+            sample.terra_dollars = rows.iter().map(|row| row.terra_dollars).fold(0.0, f64::max);
+            sample.luna_dollars = rows.iter().map(|row| row.luna_dollars).fold(0.0, f64::max);
+            sample.sol_tokens = rows.iter().map(|row| row.sol_tokens).max().unwrap_or(0);
+            sample.terra_tokens = rows.iter().map(|row| row.terra_tokens).max().unwrap_or(0);
+            sample.luna_tokens = rows.iter().map(|row| row.luna_tokens).max().unwrap_or(0);
             merged.push(sample);
         }
         merged
@@ -3200,7 +3423,20 @@ fn unused_interval_positions(
             && [current.sol, current.terra, current.luna]
                 .into_iter()
                 .any(|value| value.is_finite() && value > 0.0);
-        if !unchanged && !synthetic_zero_gap {
+        // A long observation gap ending at a later cumulative value contains
+        // no evidence of when usage occurred. Render the whole unobserved
+        // interval as idle, then let the model line make the vertical change
+        // at the observed endpoint; never leave daytime gaps unmarked.
+        let unobserved_active_gap = current.timestamp.saturating_sub(previous.timestamp)
+            > MODEL_CONTIGUOUS_SAMPLE_MAX_GAP_SECONDS
+            && [
+                (previous.sol, current.sol),
+                (previous.terra, current.terra),
+                (previous.luna, current.luna),
+            ]
+            .into_iter()
+            .any(|(before, after)| after > before);
+        if !unchanged && !synthetic_zero_gap && !unobserved_active_gap {
             continue;
         }
         let start = to_x(interval_start);
@@ -3212,6 +3448,7 @@ fn unused_interval_positions(
             let last_end = last.start + last.width;
             if !last.preserve_boundary
                 && !synthetic_zero_gap
+                && !unobserved_active_gap
                 && (last_end - start).abs() <= f64::EPSILON
             {
                 last.width = end - last.start;
@@ -3221,7 +3458,7 @@ fn unused_interval_positions(
         intervals.push(UnusedIntervalPosition {
             start,
             width: end - start,
-            preserve_boundary: synthetic_zero_gap,
+            preserve_boundary: synthetic_zero_gap || unobserved_active_gap,
         });
     }
     intervals
@@ -3350,6 +3587,7 @@ fn graph_points(
     )))
 }
 
+#[cfg(test)]
 fn raw_graph_points(
     samples: &[&UsageHistorySample],
     period_start: i64,
@@ -11784,6 +12022,21 @@ mod tests {
         assert!(
             !source.contains("root.strings.legal-notices + \" · \" + root.strings.product-version")
         );
+        for component in [
+            "export component GraphWindow inherits Window {",
+            "export component ThreadsWindow inherits Window {",
+            "export component LegalNoticeWindow inherits Window {",
+        ] {
+            let body = source.split(component).nth(1).expect(component);
+            let body = body
+                .split("export component ")
+                .next()
+                .expect("component body");
+            assert!(
+                !body.contains("product-version"),
+                "child component directly references the product version: {component}"
+            );
+        }
 
         let main = include_str!("main.rs");
         assert!(main.contains("product_version: format!(\"v{PRODUCT_VERSION}\").into()"));
@@ -12844,6 +13097,133 @@ mod tests {
     }
 
     #[test]
+    fn record_rejects_alias_quota_collision_before_canonical_merge() {
+        let mut history = UsageHistory::default();
+        let base_reset = 2_000_000_i64;
+        history.record(UsageHistorySample::new(
+            960_000,
+            base_reset,
+            88.0,
+            ModelDollarTotals {
+                sol: 1.0,
+                ..ModelDollarTotals::default()
+            },
+        ));
+        history.record(UsageHistorySample::new(
+            960_000,
+            base_reset + 30,
+            14.0,
+            ModelDollarTotals::default(),
+        ));
+
+        let selected = history.samples_for_reset(Some(base_reset));
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].remaining_percent, -1.0);
+        assert_eq!(selected[0].sol_dollars, 1.0);
+        assert!(!selected
+            .iter()
+            .any(|sample| (sample.remaining_percent - 14.0).abs() < f64::EPSILON));
+    }
+
+    #[test]
+    fn same_timestamp_reset_drift_above_jitter_fails_closed() {
+        let reset_at = 2_000_000_i64;
+        let history = UsageHistory {
+            samples: vec![
+                UsageHistorySample::new(
+                    960_000,
+                    reset_at,
+                    97.0,
+                    ModelDollarTotals {
+                        luna: 7.6,
+                        ..ModelDollarTotals::default()
+                    },
+                ),
+                // This mirrors the live history's 12-second reset drift: both
+                // rows have model usage, but they cannot be ordered into a
+                // fabricated 97% -> 98% quota transition.
+                UsageHistorySample::new(
+                    960_000,
+                    reset_at + 12,
+                    98.0,
+                    ModelDollarTotals {
+                        luna: 7.6,
+                        ..ModelDollarTotals::default()
+                    },
+                ),
+            ],
+            ..UsageHistory::default()
+        };
+
+        let selected = history.samples_for_reset(Some(reset_at));
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].remaining_percent, -1.0);
+        assert_eq!(selected[0].luna_dollars, 7.6);
+    }
+
+    #[test]
+    fn startup_load_sanitizes_legacy_same_timestamp_quota_collision() {
+        let db_path = test_history_path("startup-same-timestamp-collision");
+        let timestamp = 1_999_999_940;
+        let rows = [
+            UsageHistorySample {
+                timestamp,
+                reset_at: 2_000_000_500,
+                remaining_percent: 88.0,
+                sol_dollars: 1.0,
+                terra_dollars: 0.0,
+                luna_dollars: 0.0,
+                sol_tokens: 0,
+                terra_tokens: 0,
+                luna_tokens: 0,
+            },
+            UsageHistorySample {
+                timestamp,
+                reset_at: 2_000_000_530,
+                remaining_percent: 14.0,
+                sol_dollars: 0.0,
+                terra_dollars: 0.0,
+                luna_dollars: 0.0,
+                sol_tokens: 0,
+                terra_tokens: 0,
+                luna_tokens: 0,
+            },
+        ];
+        let mut store = UsageStore::open(&db_path).unwrap();
+        store
+            .upsert_samples(
+                &rows
+                    .iter()
+                    .map(UsageHistorySample::to_store)
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap();
+        drop(store);
+
+        let now = Utc.timestamp_opt(2_000_001_000, 0).single().unwrap();
+        let history = UsageHistory::load_from_db_path_at(Some(db_path.clone()), now);
+        assert_eq!(
+            history
+                .samples
+                .iter()
+                .filter(|sample| sample.timestamp == timestamp)
+                .count(),
+            2
+        );
+        assert!(history
+            .samples
+            .iter()
+            .filter(|sample| sample.timestamp == timestamp)
+            .all(|sample| sample.remaining_percent < 0.0));
+        assert!(history
+            .canonical_samples()
+            .iter()
+            .filter(|sample| sample.timestamp == timestamp)
+            .all(|sample| sample.remaining_percent < 0.0));
+        let _ = fs::remove_dir_all(db_path.parent().unwrap());
+    }
+
+    #[test]
     fn startup_maintenance_prunes_before_the_calendar_cutoff_only_once() {
         let db_path = test_history_path("startup-maintenance");
         let now = Utc.with_ymd_and_hms(2024, 5, 31, 12, 34, 56).unwrap();
@@ -13496,6 +13876,45 @@ mod tests {
     }
 
     #[test]
+    fn ambiguous_missing_quota_row_at_a_spend_timestamp_is_not_a_period() {
+        // A legacy quota-only row at the same minute as a model snapshot can
+        // be invalidated to remaining=-1 during startup. It must not survive
+        // as a separate zero-usage history period.
+        let timestamp = 1_787_350_620;
+        let spend_reset = 1_787_835_664;
+        let ambiguous_reset = 1_787_919_479;
+        let history = UsageHistory {
+            samples: vec![
+                UsageHistorySample::new(
+                    timestamp,
+                    spend_reset,
+                    88.0,
+                    ModelDollarTotals {
+                        terra: 30.5,
+                        luna: 6.3,
+                        ..ModelDollarTotals::default()
+                    },
+                ),
+                UsageHistorySample {
+                    timestamp,
+                    reset_at: ambiguous_reset,
+                    remaining_percent: -1.0,
+                    sol_dollars: 0.0,
+                    terra_dollars: 0.0,
+                    luna_dollars: 0.0,
+                    sol_tokens: 0,
+                    terra_tokens: 0,
+                    luna_tokens: 0,
+                },
+            ],
+            ..UsageHistory::default()
+        };
+
+        assert_eq!(history.periods(timestamp + 60, None).len(), 1);
+        assert!(history.samples_for_reset(Some(ambiguous_reset)).is_empty());
+    }
+
+    #[test]
     fn observed_moving_reset_sequence_keeps_the_spend_in_the_selected_graph() {
         // This is the shape found in the affected database: reset_at advances
         // with each observation, while the first few snapshots are idle and
@@ -13863,6 +14282,60 @@ mod tests {
         assert_eq!(selected.len(), 5);
         assert_eq!(selected.last().unwrap().luna_dollars, 4.0);
         assert_eq!(selected.last().unwrap().luna_tokens, 40);
+        assert!(selected
+            .iter()
+            .any(|sample| sample.remaining_percent == 100.0));
+    }
+
+    #[test]
+    fn live_rolling_quota_chain_does_not_expose_an_empty_past_period() {
+        // Production SQLite rows can contain two quota snapshots in the first
+        // minute and then one moving-reset row per minute until the next model
+        // snapshot.  Filtering those singleton links before grouping used to
+        // expose a false period whose graph was flat at 100% with no usage.
+        let base = 1_787_683_320; // 2026-08-26 03:42 JST
+        let rolling_reset = base + WEEK_SECONDS + 54;
+        let mut samples = vec![
+            UsageHistorySample::new(base, rolling_reset, 100.0, ModelDollarTotals::default()),
+            UsageHistorySample::new(
+                base + 60,
+                rolling_reset,
+                100.0,
+                ModelDollarTotals::default(),
+            ),
+        ];
+        for index in 1..47 {
+            let timestamp = base + index * 60;
+            samples.push(UsageHistorySample::new(
+                timestamp,
+                rolling_reset + index * 60,
+                100.0,
+                ModelDollarTotals::default(),
+            ));
+        }
+        let spend_timestamp = base + 47 * 60;
+        samples.push(UsageHistorySample::from_model_history_with_usage(
+            spend_timestamp,
+            rolling_reset + 47 * 60,
+            ModelDollarTotals {
+                luna: 0.03,
+                ..ModelDollarTotals::default()
+            },
+            ModelTokenTotals {
+                luna: 269_934,
+                ..ModelTokenTotals::default()
+            },
+        ));
+        let history = UsageHistory {
+            samples,
+            ..UsageHistory::default()
+        };
+
+        let periods = history.periods(spend_timestamp + 60, None);
+        assert_eq!(periods.len(), 1, "rolling chain must remain one period");
+        let period = periods.first().expect("rolling spend period");
+        let selected = history.samples_for_reset(Some(period.canonical_reset_at));
+        assert!(selected.iter().any(|sample| sample.luna_dollars > 0.0));
         assert!(selected
             .iter()
             .any(|sample| sample.remaining_percent == 100.0));
@@ -14455,6 +14928,60 @@ mod tests {
         assert!(!points
             .iter()
             .any(|(_, value)| (*value - 14.0).abs() < f64::EPSILON));
+    }
+
+    #[test]
+    fn moving_reset_collision_at_30_and_60_seconds_fails_closed() {
+        for drift in [30_i64, 60_i64] {
+            let base_reset = 2_000_000_i64;
+            let history = UsageHistory {
+                samples: vec![
+                    UsageHistorySample::new(
+                        960_000,
+                        base_reset,
+                        88.0,
+                        ModelDollarTotals {
+                            sol: 1.0,
+                            ..ModelDollarTotals::default()
+                        },
+                    ),
+                    // Same timestamp, moving reset alias, and no model
+                    // usage: this row must never overwrite the spend row.
+                    UsageHistorySample::new(
+                        960_000,
+                        base_reset + drift,
+                        14.0,
+                        ModelDollarTotals::default(),
+                    ),
+                    // A later moving-reset observation keeps the aliases in
+                    // one rolling group, covering the previously untested
+                    // "subsequent moving-reset row" path.
+                    UsageHistorySample::new(
+                        960_060,
+                        base_reset + drift + 30,
+                        87.0,
+                        ModelDollarTotals {
+                            sol: 2.0,
+                            ..ModelDollarTotals::default()
+                        },
+                    ),
+                ],
+                ..UsageHistory::default()
+            };
+            let selected = history.samples_for_reset(Some(base_reset + drift + 30));
+            assert_eq!(selected.len(), 2, "drift={drift}");
+            assert_eq!(selected[0].remaining_percent, -1.0, "drift={drift}");
+            assert_eq!(selected[1].remaining_percent, 87.0, "drift={drift}");
+            let references = selected.iter().collect::<Vec<_>>();
+            let points = remaining_graph_points(&references, 960_000, 960_120);
+            assert!(
+                points.iter().all(|(_, value)| *value >= 87.0),
+                "drift={drift}"
+            );
+            assert!(!points
+                .iter()
+                .any(|(_, value)| (*value - 14.0).abs() < f64::EPSILON));
+        }
     }
 
     #[test]
@@ -15583,6 +16110,30 @@ mod tests {
     }
 
     #[test]
+    fn unused_intervals_mark_long_gap_before_observed_spend() {
+        let points = [
+            HourlyModelSpend {
+                timestamp: 0,
+                sol: 1.0,
+                ..HourlyModelSpend::default()
+            },
+            HourlyModelSpend {
+                timestamp: 3_600,
+                sol: 2.0,
+                ..HourlyModelSpend::default()
+            },
+        ];
+        assert_eq!(
+            unused_interval_positions(&points, 0, 3_600),
+            vec![UnusedIntervalPosition {
+                start: 0.0,
+                width: 100.0,
+                preserve_boundary: true,
+            }]
+        );
+    }
+
+    #[test]
     fn unused_intervals_merge_adjacent_flat_segments() {
         let points = [
             HourlyModelSpend {
@@ -15972,6 +16523,16 @@ mod tests {
         assert_eq!(points.first().map(|(_, value)| *value), Some(88.0));
         assert_eq!(points.last().map(|(_, value)| *value), Some(87.0));
         assert!(points.iter().all(|(_, value)| *value >= 87.0));
+
+        // Exercise the same serialized graph payload that `sync_graph_window`
+        // publishes to Slint. The unrelated 14% singleton must not cross the
+        // selected-period boundary into the rendered graph.
+        let payload: Vec<UsageHistorySample> =
+            serde_json::from_str(&state.graph_data()).expect("graph payload serializes");
+        assert!(!payload
+            .iter()
+            .any(|sample| (sample.remaining_percent - 14.0).abs() < f64::EPSILON));
+        assert!(payload.iter().all(|sample| sample.reset_at == reset));
     }
 
     #[test]

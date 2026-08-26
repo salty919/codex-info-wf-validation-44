@@ -39,4 +39,4 @@ jobs:
     - name: Enforce data protection policy
       run: bash scripts/data_protection_gate.sh
     - name: Enforce cross-client regression checks
-      run: bash scripts/regression_guard.sh
+      run: xvfb-run --auto-servernum --server-args='-screen 0 1280x800x24' bash scripts/regression_guard.sh

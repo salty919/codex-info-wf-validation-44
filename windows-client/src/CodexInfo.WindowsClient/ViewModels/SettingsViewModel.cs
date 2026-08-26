@@ -420,6 +420,13 @@ public sealed class SetupViewModel : INotifyPropertyChanged, IDisposable
         settingsSaveFailed = false;
         Notify(nameof(SettingsSaveFailed));
         Notify(nameof(StatusDetail));
+        if (!setupCompleted)
+        {
+            // The main window starts before Setup has a selector.  Apply the
+            // newly saved profile now so WSL/SSH is actually started during
+            // first-run setup instead of waiting for a process restart.
+            main.ApplyConnectionSettings(updated);
+        }
         return true;
     }
 

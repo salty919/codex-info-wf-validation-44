@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
 using System.Collections.ObjectModel;
+using System.Collections.Specialized;
 using System.ComponentModel;
 using System.Diagnostics;
 using System.Globalization;
@@ -45,8 +46,8 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
     private readonly AsyncCommand refreshCommand;
     private readonly AsyncCommand authCommand;
     private readonly AsyncCommand checkAuthCommand;
-    private readonly ObservableCollection<ModelUsageViewModel> models = [];
-    private readonly ObservableCollection<QuotaSegmentViewModel> quotaSegments = [];
+    private readonly SnapshotCollection<ModelUsageViewModel> models = [];
+    private readonly SnapshotCollection<QuotaSegmentViewModel> quotaSegments = [];
     private ApiStatusSnapshot? snapshot;
     private ApiDetailsSnapshot? detailsSnapshot;
     private DetailsFetchFailure? detailsFailure;
@@ -307,6 +308,28 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
         connectionSupervisor?.EnsureStarted(App.CurrentSettings);
         update?.Start();
         _ = RunPollingAsync(lifetime.Token);
+    }
+
+    /// <summary>
+    /// Applies a newly saved connection profile and performs one explicit
+    /// health/status refresh. Setup uses this boundary after saving its
+    /// selector; without it the supervisor would retain the pre-setup
+    /// <c>none</c> profile for the lifetime of the process.
+    /// </summary>
+    internal bool ApplyConnectionSettings(ClientSettings settings)
+    {
+        if (disposed || connectionSupervisor is null)
+        {
+            return false;
+        }
+
+        var started = connectionSupervisor.EnsureStarted(settings);
+        if (started)
+        {
+            _ = TryRefreshAsync(lifetime.Token);
+        }
+
+        return started;
     }
 
     public void Dispose()
@@ -598,11 +621,7 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
         }
         else if (detailsSnapshot is null)
         {
-            ClearModels();
-            foreach (ApiModelUsage model in validatedSnapshot.Models.OrderBy(ModelOrder))
-            {
-                models.Add(new ModelUsageViewModel(model));
-            }
+            ReplaceStatusModels(validatedSnapshot.Models.OrderBy(ModelOrder));
         }
 
         NotifySnapshotProperties();
@@ -629,11 +648,7 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
         // Details are the only source for dollar columns.  Keep the existing
         // status model rows until a valid details snapshot arrives; once it
         // does, replace the entire collection so rows never mix generations.
-        ClearModels();
-        foreach (ApiDetailsModelUsage model in validatedDetails.Models.OrderBy(ModelOrder))
-        {
-            models.Add(new ModelUsageViewModel(model));
-        }
+        ReplaceModels(validatedDetails.Models.OrderBy(ModelOrder));
 
         Notify(nameof(HasDetails));
         Notify(nameof(DetailsSnapshot));
@@ -687,15 +702,12 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
 
     private void RebuildQuotaSegments()
     {
-        quotaSegments.Clear();
         var fraction = snapshot?.Quota is { } quota
             ? Math.Clamp((quota.ResetAt - DateTimeOffset.UtcNow.ToUnixTimeSeconds()) /
                          (double)Math.Max(1, quota.WindowSeconds), 0, 1)
             : 0;
-        for (var index = 0; index < 7; index++)
-        {
-            quotaSegments.Add(new QuotaSegmentViewModel(Math.Clamp(fraction * 7 - index, 0, 1)));
-        }
+        quotaSegments.ReplaceAll(Enumerable.Range(0, 7)
+            .Select(index => new QuotaSegmentViewModel(Math.Clamp(fraction * 7 - index, 0, 1))));
 
         Notify(nameof(QuotaSegments));
     }
@@ -724,12 +736,59 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
 
     private void ClearModels()
     {
-        foreach (var model in models)
+        var previous = models.ToArray();
+        models.ReplaceAll([]);
+        foreach (var model in previous)
         {
             model.Dispose();
         }
+    }
 
-        models.Clear();
+    private void ReplaceModels(IEnumerable<ApiDetailsModelUsage> source)
+    {
+        var next = source.Select(static model => new ModelUsageViewModel(model)).ToArray();
+        var previous = models.ToArray();
+        models.ReplaceAll(next);
+        foreach (var model in previous)
+        {
+            model.Dispose();
+        }
+    }
+
+    private void ReplaceStatusModels(IEnumerable<ApiModelUsage> source)
+    {
+        var next = source.Select(static model => new ModelUsageViewModel(model)).ToArray();
+        var previous = models.ToArray();
+        models.ReplaceAll(next);
+        foreach (var model in previous)
+        {
+            model.Dispose();
+        }
+    }
+
+    /// <summary>
+    /// Publishes a complete snapshot as one collection reset.  Clearing and
+    /// re-adding rows individually makes Avalonia remove and recreate the
+    /// whole model table during every poll, which is visible as a full-screen
+    /// flicker.  Items is mutated silently and one Reset is sent after the
+    /// new immutable row set is ready.
+    /// </summary>
+    private sealed class SnapshotCollection<T> : ObservableCollection<T>
+    {
+        public void ReplaceAll(IEnumerable<T> values)
+        {
+            ArgumentNullException.ThrowIfNull(values);
+            CheckReentrancy();
+            Items.Clear();
+            foreach (var value in values)
+            {
+                Items.Add(value);
+            }
+
+            OnPropertyChanged(new PropertyChangedEventArgs(nameof(Count)));
+            OnPropertyChanged(new PropertyChangedEventArgs("Item[]"));
+            OnCollectionChanged(new NotifyCollectionChangedEventArgs(NotifyCollectionChangedAction.Reset));
+        }
     }
 
     private int CountThreads(string model)

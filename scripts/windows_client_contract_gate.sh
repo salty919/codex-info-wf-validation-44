@@ -133,6 +133,20 @@ require_text windows-client/src/CodexInfo.WindowsClient.Core/ProductInfo.cs 'pub
 require_text windows-client/src/CodexInfo.WindowsClient.Core/ProductInfo.cs 'Assembly.GetName().Version'
 require_text windows-client/src/CodexInfo.WindowsClient/MainWindow.axaml 'ProductVersionText'
 require_text windows-client/src/CodexInfo.WindowsClient/MainWindow.axaml 'AutomationProperties.AutomationId="Main.ProductVersion"'
+require_text windows-client/src/CodexInfo.WindowsClient/Settings/ConnectionProcessFactory.cs 'codex_info'
+require_text windows-client/src/CodexInfo.WindowsClient/Settings/ConnectionProcessFactory.cs '--service'
+main_version_marker_count="$(rg -o --fixed-strings 'AutomationProperties.AutomationId="Main.ProductVersion"' windows-client/src/CodexInfo.WindowsClient/MainWindow.axaml | wc -l)"
+[[ "$main_version_marker_count" -eq 1 ]] ||
+    fail "main version automation marker must appear exactly once: count=$main_version_marker_count"
+main_version_binding_count="$(rg -o --fixed-strings 'Text="{Binding ProductVersionText}"' windows-client/src/CodexInfo.WindowsClient/MainWindow.axaml | wc -l)"
+[[ "$main_version_binding_count" -eq 1 ]] ||
+    fail "main version binding must appear exactly once: count=$main_version_binding_count"
+for child_window in SetupWindow SettingsWindow GraphWindow ThreadsWindow LegalNoticesWindow; do
+    child_path="windows-client/src/CodexInfo.WindowsClient/${child_window}.axaml"
+    if rg -q --fixed-strings 'ProductVersion' "$child_path"; then
+        fail "child window must not render a product version: $child_path"
+    fi
+done
 for redundant_version_marker in \
     'Setup.ProductVersion' \
     'Settings.ProductVersion' \
@@ -171,13 +185,16 @@ require_text src/main.rs 'i18n.text(TextKey::LegalThirdParty)'
 require_text .github/workflows/windows-client.yml 'needs: [version-policy, core-tests, windows-build, acceptance]'
 require_text .github/workflows/windows-client.yml 'Run final acceptance gate before merge'
 require_text .github/workflows/windows-client.yml 'windows_window_move_smoke.ps1 -ClientPath $exe -AllowPhysicalInput'
-require_text .github/workflows/windows-client.yml 'Windows test summary is missing or unparseable.'
+require_text .github/workflows/windows-client.yml "--logger 'trx;LogFilePrefix=windows-client'"
+require_text .github/workflows/windows-client.yml 'Expected exactly two Windows TRX reports'
+require_text .github/workflows/windows-client.yml 'TRX counters are missing'
 require_text .github/workflows/windows-client.yml 'Windows test counts are not release-safe:'
 require_text .github/workflows/windows-client.yml 'bash scripts/final_acceptance_gate.sh artifacts/windows-ui-e2e'
 require_text .github/workflows/windows-client.yml '-SourceSha $env:GITHUB_SHA'
 require_text .github/workflows/windows-client.yml 'EXPECTED_E2E_SOURCE_SHA: ${{ github.sha }}'
 require_file scripts/final_acceptance_gate.sh
 require_text scripts/final_acceptance_gate.sh 'expected E2E source SHA is required'
+require_text scripts/final_acceptance_gate.sh 'source tree is dirty; release evidence must match a clean committed revision'
 require_text scripts/final_acceptance_gate.sh 'source-sha: $expected_sha'
 require_text scripts/final_acceptance_gate.sh 'capture: name=$capture_name '
 require_text scripts/final_acceptance_gate.sh 'sha256sum "$capture_path"'
@@ -198,20 +215,31 @@ require_text scripts/regression_guard.sh 'cargo test --locked --all-targets'
 require_text scripts/regression_guard.sh 'cargo build --release --locked'
 require_text scripts/regression_guard.sh '--exact --nocapture'
 require_text scripts/regression_guard.sh 'Rust all-target test set contains a zero-test target'
+require_text scripts/regression_guard.sh 'X11 graph visual gate unverified (DISPLAY unavailable)'
+require_text .github/workflows/rust.yml 'xvfb-run --auto-servernum'
+require_text .github/workflows/windows-client.yml 'xvfb-run --auto-servernum'
 for required_history_test in \
     historical_week_fixture_preserves_each_period_and_graph_samples \
     observed_moving_reset_sequence_keeps_the_spend_in_the_selected_graph \
     long_rolling_reset_sequence_stays_in_one_period_after_a_real_boundary \
     quota_only_reset_fragments_stay_with_the_adjacent_spend_period \
+    live_rolling_quota_chain_does_not_expose_an_empty_past_period \
     affected_period_keeps_sol_spend_and_unobserved_quota_distinct \
     shared_graph_fixture_is_the_x_history_oracle \
     model_graph_does_not_invent_spend_during_an_unobserved_gap \
+    unused_intervals_mark_long_gap_before_observed_spend \
     graph_controls_use_one_visual_boundary_and_show_short_histories \
     remaining_graph_does_not_infer_quota_loss_from_model_spend \
     affected_timestamp_does_not_mix_a_singleton_reset_period_into_history \
+    ambiguous_missing_quota_row_at_a_spend_timestamp_is_not_a_period \
     singleton_reset_snapshot_overlapping_a_spend_period_stays_separate \
     graph_collision_preview_matches_the_historical_singleton_oracle \
-    periodic_quota_refresh_retains_last_good_main_snapshot; do
+    moving_reset_collision_at_30_and_60_seconds_fails_closed \
+    record_rejects_alias_quota_collision_before_canonical_merge \
+    same_timestamp_reset_drift_above_jitter_fails_closed \
+    startup_load_sanitizes_legacy_same_timestamp_quota_collision \
+    periodic_quota_refresh_retains_last_good_main_snapshot \
+    product_version_is_visible_once_on_native_main_surface; do
     require_text scripts/regression_guard.sh "run_required_rust_test $required_history_test"
 done
 require_text .github/workflows/windows-client.yml 'Get-GitHubResourceStatus'
@@ -289,6 +317,11 @@ require_text windows-client/tools/Run-WindowsClientE2E.ps1 'Main.DetailsStatus'
 require_text windows-client/tools/Run-WindowsClientE2E.ps1 'parts[1] == "/v1/health"'
 require_text windows-client/tools/Run-WindowsClientE2E.ps1 '\"service\":\"codex-info\"'
 require_text windows-client/tools/Run-WindowsClientE2E.ps1 "main-quota-gauge: seven cells, two X-authority surface colors, and half-period boundary PASS"
+require_text windows-client/tools/Run-WindowsClientE2E.ps1 'Assert-E2EMainProductVersion'
+require_text windows-client/tools/Run-WindowsClientE2E.ps1 'Assert-E2ENoChildProductVersion'
+require_text scripts/final_acceptance_gate.sh 'main-product-version: PASS'
+require_text scripts/final_acceptance_gate.sh 'child-product-version: PASS role=Graph count=0'
+require_text scripts/final_acceptance_gate.sh 'child-product-version: PASS role=Threads count=0'
 require_text windows-client/tools/Run-WindowsClientE2E.ps1 'graph-past-model-data: PASS'
 require_text windows-client/tools/Run-WindowsClientE2E.ps1 'Assert-E2EGraphHasIdleBand $plot $graph.Handle $graphPast'
 require_text windows-client/tools/Run-WindowsClientE2E.ps1 'graph-past-idle-band: PASS'
@@ -330,6 +363,7 @@ require_text docs/WINDOWS_CLIENT_REQUIREMENTS.md 'WIN-INSTALL-01'
 require_text docs/REGRESSION_PREVENTION_POLICY.md 'windows_window_move_smoke.ps1 -AllowPhysicalInput'
 require_file scripts/x11_graph_visual_gate.sh
 require_text scripts/x11_graph_visual_gate.sh 'dedicated idle-band pixels are missing'
+require_text scripts/x11_graph_visual_gate.sh 'implausible vertical stroke'
 require_text docs/PRODUCT_REQUIREMENTS.md '# Codex Info 製品要件'
 require_file windows-client/CodeCoverage.runsettings
 
@@ -343,28 +377,66 @@ if command -v dotnet >/dev/null 2>&1; then
         --settings windows-client/CodeCoverage.runsettings \
         --collect 'Code Coverage' \
         --results-directory "$coverage_results" \
+        --logger 'trx;LogFilePrefix=windows-client' \
         --logger 'console;verbosity=normal' 2>&1)" || {
         printf '%s\n' "$dotnet_test_output" >&2
         fail 'Windows Core/Presentation tests failed'
     }
     printf '%s\n' "$dotnet_test_output"
-    test_total="$(sed -n 's/.*Total: \([0-9][0-9]*\).*/\1/p' <<<"$dotnet_test_output" | tail -n 1)"
-    [[ "$test_total" =~ ^[1-9][0-9]*$ ]] ||
-        fail "Windows tests executed zero or unparseable tests: total=${test_total:-missing}"
-    passed_total="$(sed -n 's/.*Passed: \([0-9][0-9]*\).*/\1/p' <<<"$dotnet_test_output" | tail -n 1)"
-    [[ "$passed_total" =~ ^[1-9][0-9]*$ ]] ||
-        fail "Windows tests passed zero or unparseable tests: passed=${passed_total:-missing}"
-    skipped_total="$(sed -n 's/.*Skipped: \([0-9][0-9]*\).*/\1/p' <<<"$dotnet_test_output" | tail -n 1)"
-    [[ "$skipped_total" == "0" ]] ||
-        fail "Windows test run contains skipped tests: skipped=${skipped_total:-missing}"
+    mapfile -t trx_reports < <(find "$coverage_results" -type f -name '*.trx' -print | sort)
+    [[ "${#trx_reports[@]}" -eq 2 ]] ||
+        fail "expected exactly two Windows test result reports, found ${#trx_reports[@]}"
+    test_total=0
+    passed_total=0
+    failed_total=0
+    not_executed_total=0
+    for trx_report in "${trx_reports[@]}"; do
+        counters_line="$(rg -o '<Counters[^>]+' "$trx_report" | tail -n 1 || true)"
+        [[ -n "$counters_line" ]] || fail "TRX counters are missing: $trx_report"
+        trx_attr() {
+            local name="$1"
+            sed -n "s/.* $name=\"\([0-9][0-9]*\)\".*/\1/p" <<<"$counters_line"
+        }
+        total="$(trx_attr total)"
+        executed="$(trx_attr executed)"
+        passed="$(trx_attr passed)"
+        failed="$(trx_attr failed)"
+        not_executed="$(trx_attr notExecuted)"
+        [[ "$total" =~ ^[1-9][0-9]*$ && "$executed" == "$total" &&
+            "$passed" == "$total" && "$failed" == "0" && "$not_executed" == "0" ]] ||
+            fail "Windows TRX result is not release-safe: $trx_report total=${total:-missing} executed=${executed:-missing} passed=${passed:-missing} failed=${failed:-missing} notExecuted=${not_executed:-missing}"
+        test_total=$((test_total + total))
+        passed_total=$((passed_total + passed))
+        failed_total=$((failed_total + failed))
+        not_executed_total=$((not_executed_total + not_executed))
+    done
+    minimum_expected_tests=310
+    [[ "$test_total" -ge "$minimum_expected_tests" && "$passed_total" -eq "$test_total" &&
+        "$failed_total" -eq 0 && "$not_executed_total" -eq 0 ]] ||
+        fail "Windows aggregate test counts are not release-safe: total=$test_total minimum=$minimum_expected_tests passed=$passed_total failed=$failed_total notExecuted=$not_executed_total"
     echo "windows-client-contract-gate: Windows tests executed: $test_total"
     mapfile -t coverage_reports < <(find "$coverage_results" -type f -name '*.cobertura.xml' -print)
-    [[ "${#coverage_reports[@]}" -eq 1 ]] || fail "expected one Cobertura report, found ${#coverage_reports[@]}"
-    coverage_rate="$(sed -n 's/.*<coverage line-rate="\([^"]*\)".*/\1/p' "${coverage_reports[0]}" | head -n 1)"
-    [[ -n "$coverage_rate" ]] || fail 'Cobertura report has no line-rate'
-    awk -v rate="$coverage_rate" 'BEGIN { exit !((rate + 0) >= 0.90) }' ||
-        fail "unit-testable product logic line coverage is below 90%: $coverage_rate"
-    awk -v rate="$coverage_rate" 'BEGIN { printf "windows-client-contract-gate: unit coverage %.2f%%\n", rate * 100 }'
+    [[ "${#coverage_reports[@]}" -gt 0 ]] || fail 'Cobertura report is missing'
+    # The coverage collector may emit per-test-process reports as well as a
+    # merged report.  Accept only a fresh report that covers both production
+    # assemblies; never use a high-rate partial report as a substitute.
+    coverage_rate=''
+    coverage_source=''
+    for coverage_report in "${coverage_reports[@]}"; do
+        if ! rg -q --fixed-strings 'name="CodexInfo.WindowsClient.Core"' "$coverage_report" ||
+           ! rg -q --fixed-strings 'name="CodexInfo.WindowsClient"' "$coverage_report"; then
+            continue
+        fi
+        candidate_rate="$(sed -n 's/.*<coverage line-rate="\([^"]*\)".*/\1/p' "$coverage_report" | head -n 1)"
+        if [[ -n "$candidate_rate" ]] && awk -v rate="$candidate_rate" 'BEGIN { exit !((rate + 0) >= 0.92) }'; then
+            coverage_rate="$candidate_rate"
+            coverage_source="$coverage_report"
+            break
+        fi
+    done
+    [[ -n "$coverage_rate" ]] ||
+        fail 'no merged Cobertura report covers both production assemblies at >=92% line coverage'
+    awk -v rate="$coverage_rate" -v source="$coverage_source" 'BEGIN { printf "windows-client-contract-gate: unit coverage %.2f%% (%s)\n", rate * 100, source }'
 else
     echo 'windows-client-contract-gate: UNVERIFIED: dotnet unavailable; Windows tests were not executed' >&2
     exit 2

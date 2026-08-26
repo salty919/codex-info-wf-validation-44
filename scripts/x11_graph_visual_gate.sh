@@ -68,6 +68,11 @@ done
     fail 'graph preview window did not render'
 }
 
+graph_name="$(xprop -id "$graph_id" WM_NAME 2>/dev/null || true)"
+if [[ "$graph_name" =~ v[0-9]+\.[0-9]+\.[0-9]+ ]]; then
+    fail "graph child window title redundantly exposes product version: $graph_name"
+fi
+
 # Keep the graph and its main owner from overlapping on multi-monitor X11
 # sessions. This is test-only window arrangement; the product never moves a
 # user's cursor or other application window.
@@ -142,9 +147,29 @@ for name, expected in (
     ('TERRA', (93, 201, 138)),
     ('LUNA', (230, 162, 60)),
 ):
-    count = sum(near(rgb(x, y), expected) for x, y in plot)
-    if count < 3:
-        raise SystemExit(f'{name} model line pixels are missing: {count}')
+    # Flat model paths intentionally render at 50% opacity.  Check both the
+    # full-opacity endpoint/leader color and the composited flat-stroke color;
+    # matching only the former would see labels but miss a missing path.
+    plot_background = (18, 28, 44)
+    composited = tuple(round((background + color) / 2) for background, color in zip(plot_background, expected))
+    coordinates = []
+    column_counts = {}
+    for x, y in plot:
+        if near(rgb(x, y), expected, 15) or near(rgb(x, y), composited, 40):
+            coordinates.append((x, y))
+            column_counts[x] = column_counts.get(x, 0) + 1
+    if len(coordinates) < 20:
+        raise SystemExit(f'{name} model line pixels are insufficient: {len(coordinates)}')
+    if max(x for x, _ in coordinates) - min(x for x, _ in coordinates) < 200:
+        raise SystemExit(f'{name} model line does not span the observed plot interval')
+    # Model spend can legitimately jump at an observed reset boundary.  Only
+    # a near-full-height single-column stroke is treated as a renderer leak;
+    # the remaining-quota line above has the strict flatness assertion.
+    max_column_pixels = max(column_counts.values())
+    if max_column_pixels > max(8, int((590 - 230) * 0.80)):
+        raise SystemExit(
+            f'{name} model line contains an implausible vertical stroke: '
+            f'max-column-pixels={max_column_pixels}')
 
 print('x11-graph-visual-gate: PASS (940x640 image, remaining 88->87 without 14% drop, idle band, SOL/TERRA/LUNA pixels present)')
 PY

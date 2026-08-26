@@ -145,7 +145,7 @@ public sealed class DetailsWindowViewModelTests
         var wsl = ConnectionProcessFactory.BuildAutomaticWsl("Ubuntu-24.04");
         Assert.Equal("wsl.exe", wsl.FileName);
         Assert.False(wsl.UseShellExecute);
-        Assert.Equal(["--distribution", "Ubuntu-24.04", "--", "env", "CODEX_INFO_API_LISTEN=127.0.0.1:8787", "./run.sh"], wsl.ArgumentList);
+        Assert.Equal(["--distribution", "Ubuntu-24.04", "--", "codex_info", "--service", "--listen", "127.0.0.1:8787"], wsl.ArgumentList);
         Assert.Throws<ArgumentException>(() => ConnectionProcessFactory.BuildAutomaticSsh("user@host"));
     }
 

@@ -23,6 +23,9 @@ move_log="$evidence_dir/window-move-smoke.log"
 [[ -f "$move_log" ]] || hold "physical window move smoke log is missing"
 expected_sha="${EXPECTED_E2E_SOURCE_SHA:-${GITHUB_SHA:-}}"
 [[ "$expected_sha" =~ ^[0-9a-f]{40}$ ]] || hold "expected E2E source SHA is required"
+if [[ -n "$(git status --porcelain=v1 --untracked-files=all)" ]]; then
+    hold "source tree is dirty; release evidence must match a clean committed revision"
+fi
 rg -q --fixed-strings "source-sha: $expected_sha" "$log_file" \
     || hold "Windows UI E2E evidence was not produced from expected source SHA: $expected_sha"
 rg -q --fixed-strings "source-sha: $expected_sha" "$move_log" \
@@ -36,6 +39,12 @@ rg -q --fixed-strings 'fixture: PASS periods=2 threads=3 endpoint=http://127.0.0
     || hold "Windows fixture PASS marker is missing"
 rg -q --fixed-strings 'main-quota-gauge: seven cells, two X-authority surface colors, and half-period boundary PASS' "$log_file" \
     || hold "Windows quota gauge evidence is missing"
+rg -q --fixed-strings 'main-product-version: PASS' "$log_file" \
+    || hold "Windows main product-version evidence is missing"
+rg -q --fixed-strings 'child-product-version: PASS role=Graph count=0' "$log_file" \
+    || hold "Windows Graph child product-version evidence is missing"
+rg -q --fixed-strings 'child-product-version: PASS role=Threads count=0' "$log_file" \
+    || hold "Windows Threads child product-version evidence is missing"
 rg -q --fixed-strings 'graph-past-model-data: PASS' "$log_file" \
     || hold "Windows past-period graph model-data evidence is missing"
 rg -q --fixed-strings 'graph-past-idle-band: PASS' "$log_file" \

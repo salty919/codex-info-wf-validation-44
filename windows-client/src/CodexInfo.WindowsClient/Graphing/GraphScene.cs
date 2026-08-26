@@ -305,22 +305,31 @@ public sealed class GraphScene
             }
 
             var syntheticGap = IsSyntheticRemainingGap(points, index, periodStart);
-            if (!ModelsEqual(before, after) && !syntheticGap)
+            var unobservedGap = after.Timestamp - before.Timestamp > 60;
+            var modelChanged = !ModelsEqual(before, after);
+            if (modelChanged && !syntheticGap && !unobservedGap)
             {
                 continue;
             }
 
+            // A long interval between observations is not evidence of a
+            // continuous spend rate.  The native graph marks that interval
+            // as unused/unobserved and draws any cumulative increase at the
+            // observed endpoint.  Preserve the boundary so the remaining
+            // line does not turn the unknown interval into a diagonal.
+            var preserveBoundary = syntheticGap || (unobservedGap && modelChanged);
+
             if (intervals.Count > 0)
             {
                 var previous = intervals[^1];
-                if (!previous.PreserveBoundary && !syntheticGap && previous.EndAt == intervalStart)
+                if (!previous.PreserveBoundary && !preserveBoundary && previous.EndAt == intervalStart)
                 {
                     intervals[^1] = previous with { EndAt = intervalEnd };
                     continue;
                 }
             }
 
-            intervals.Add(new GraphIdleInterval(intervalStart, intervalEnd, syntheticGap));
+            intervals.Add(new GraphIdleInterval(intervalStart, intervalEnd, preserveBoundary));
         }
 
         return intervals;

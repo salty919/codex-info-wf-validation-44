@@ -2,7 +2,9 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
 using System.Diagnostics;
+using System.Collections.Specialized;
 using CodexInfo.WindowsClient.Core;
+using CodexInfo.WindowsClient.Settings;
 using CodexInfo.WindowsClient.ViewModels;
 using Xunit;
 
@@ -10,6 +12,28 @@ namespace CodexInfo.WindowsClient.Presentation.Tests;
 
 public sealed class MainWindowViewModelTests
 {
+    [Fact]
+    public void ApplyingSavedConnectionStartsTheSelectedWslService()
+    {
+        var child = new TestConnectionChildProcess();
+        var factory = new TestConnectionChildProcessFactory(child);
+        using var supervisor = new ConnectionSupervisor(factory);
+        using var viewModel = new MainWindowViewModel(new NeverCalledClient(), null, supervisor);
+
+        var settings = new ClientSettings("ja", false)
+        {
+            ConnectionConfigured = true,
+            ConnectionProfile = ConnectionProfiles.Wsl,
+            ConnectionSelector = "Ubuntu-24.04",
+        };
+
+        Assert.True(viewModel.ApplyConnectionSettings(settings));
+        Assert.Single(factory.StartInfos);
+        Assert.Equal(
+            ["--distribution", "Ubuntu-24.04", "--", "codex_info", "--service", "--listen", "127.0.0.1:8787"],
+            factory.StartInfos[0].ArgumentList);
+    }
+
     [Fact]
     public async Task NullableValuesAndEmptyModelsHaveExplicitPresentation()
     {
@@ -205,6 +229,38 @@ public sealed class MainWindowViewModelTests
     }
 
     [Fact]
+    public async Task RefreshPublishesModelAndQuotaCollectionsAsOneAtomicReset()
+    {
+        var firstDetails = DetailsSnapshot(1.25);
+        var secondDetails = DetailsSnapshot(2.5);
+        using var viewModel = new MainWindowViewModel(
+            new SequenceClient(
+                StatusFetchResult.Success(ValidSnapshot()),
+                StatusFetchResult.Success(ValidSnapshot())),
+            new SequenceDetailsClient(
+                DetailsFetchResult.Success(firstDetails),
+                DetailsFetchResult.Success(secondDetails)));
+
+        viewModel.Start();
+        await EventuallyAsync(() => viewModel.HasDetails);
+
+        var modelChanges = 0;
+        var quotaChanges = 0;
+        NotifyCollectionChangedEventHandler modelHandler = (_, _) => modelChanges++;
+        NotifyCollectionChangedEventHandler quotaHandler = (_, _) => quotaChanges++;
+        ((INotifyCollectionChanged)viewModel.Models).CollectionChanged += modelHandler;
+        ((INotifyCollectionChanged)viewModel.QuotaSegments).CollectionChanged += quotaHandler;
+
+        viewModel.RefreshCommand.Execute(null);
+        await EventuallyAsync(() => viewModel.Models[0].InputDollarsText == "$2.50");
+
+        ((INotifyCollectionChanged)viewModel.Models).CollectionChanged -= modelHandler;
+        ((INotifyCollectionChanged)viewModel.QuotaSegments).CollectionChanged -= quotaHandler;
+        Assert.Equal(1, modelChanges);
+        Assert.Equal(1, quotaChanges);
+    }
+
+    [Fact]
     public async Task DetailsFailureKeepsTheLastDetailsAndHasIndependentStatus()
     {
         var details = new ApiDetailsSnapshot(
@@ -346,6 +402,19 @@ public sealed class MainWindowViewModelTests
             3);
     }
 
+    private static ApiDetailsSnapshot DetailsSnapshot(double inputDollars) => new(
+        ApiState.Ready,
+        1,
+        true,
+        "Pro",
+        new ApiQuota(98.5, 2, 604800, false),
+        [new ApiDetailsModelUsage("SOL", 1, 2, 3, inputDollars, 0, 0)],
+        3,
+        [],
+        [],
+        [],
+        "概算 —");
+
     private static async Task EventuallyAsync(Func<bool> condition)
     {
         var stopwatch = Stopwatch.StartNew();
@@ -420,5 +489,38 @@ public sealed class MainWindowViewModelTests
             index++;
             return Task.FromResult(result);
         }
+    }
+
+    private sealed class NeverCalledClient : HealthyStatusClientBase
+    {
+        public override Task<StatusFetchResult> FetchAsync(CancellationToken cancellationToken = default) =>
+            throw new InvalidOperationException("The connection start test must not depend on HTTP.");
+    }
+
+    private sealed class TestConnectionChildProcessFactory(TestConnectionChildProcess child)
+        : IConnectionChildProcessFactory
+    {
+        public List<ProcessStartInfo> StartInfos { get; } = [];
+
+        public IConnectionChildProcess Create(ProcessStartInfo startInfo)
+        {
+            StartInfos.Add(startInfo);
+            return child;
+        }
+    }
+
+    private sealed class TestConnectionChildProcess : IConnectionChildProcess
+    {
+        public event EventHandler? Exited
+        {
+            add { }
+            remove { }
+        }
+        public bool HasExited { get; private set; }
+
+        public bool Start() => true;
+        public void Kill() => HasExited = true;
+        public void WaitForExit(int milliseconds) { }
+        public void Dispose() { }
     }
 }

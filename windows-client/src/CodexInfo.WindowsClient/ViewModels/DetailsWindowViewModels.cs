@@ -221,15 +221,40 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
             .Select(group =>
             {
                 var rows = group.ToList();
-                var latestRemaining = rows
+                // The model series is bucketed by minute, but quota values
+                // remain observations at their original timestamp.  A
+                // different value at an earlier timestamp in the same minute
+                // is a legitimate progression; only conflicting values at
+                // the latest exact timestamp are ambiguous and must fail
+                // closed.
+                var latestRemainingTimestamp = rows
                     .Where(sample => sample.RemainingPercent is { } value && double.IsFinite(value))
-                    .Select(sample => sample.RemainingPercent)
-                    .LastOrDefault();
+                    .Select(sample => sample.Timestamp)
+                    .DefaultIfEmpty(long.MinValue)
+                    .Max();
+                var latestRows = rows
+                    .Where(sample => sample.Timestamp == latestRemainingTimestamp)
+                    .ToList();
+                var remainingValues = latestRows
+                    .Where(sample => sample.RemainingPercent is { } value && double.IsFinite(value))
+                    .Select(sample => sample.RemainingPercent!.Value)
+                    .ToArray();
+                // A period payload should already be canonical, but legacy
+                // servers can still provide two reset aliases at one exact
+                // observation timestamp.
+                // Do not let their row order turn an ambiguous quota into a
+                // fabricated vertical drop; preserve model maxima and leave
+                // the conflicting remaining value unavailable for the graph.
+                var mergedRemaining = remainingValues.Length == 0
+                    ? (double?)null
+                    : remainingValues.All(value => Math.Abs(value - remainingValues[0]) <= double.Epsilon)
+                        ? remainingValues[0]
+                        : null;
                 var latest = rows[^1];
                 return new ApiHistorySample(
                     group.Key,
                     latest.ResetAt,
-                    latestRemaining,
+                    mergedRemaining,
                     rows.Max(sample => sample.SolDollars),
                     rows.Max(sample => sample.TerraDollars),
                     rows.Max(sample => sample.LunaDollars),

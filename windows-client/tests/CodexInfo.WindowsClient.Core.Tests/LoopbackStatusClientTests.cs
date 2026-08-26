@@ -431,6 +431,89 @@ public sealed class LoopbackStatusClientTests
         Assert.Equal(14UL, sample.LunaTokens);
     }
 
+    [Fact]
+    public async Task ConflictingRemainingValuesAtOneTimestampAreUnavailableInsteadOfLastRowWins()
+    {
+        const string original = "{\"timestamp\":1,\"reset_at\":253402300799,\"remaining_percent\":42.5,\"sol_dollars\":1.25,\"terra_dollars\":0.0,\"luna_dollars\":0.0,\"sol_tokens\":6,\"terra_tokens\":0,\"luna_tokens\":0}";
+        const string conflicting = "{\"timestamp\":1,\"reset_at\":253402300739,\"remaining_percent\":14.0,\"sol_dollars\":9.0,\"terra_dollars\":0.0,\"luna_dollars\":0.0,\"sol_tokens\":9,\"terra_tokens\":0,\"luna_tokens\":0}";
+        var json = ValidDetailsJson().Replace(
+            original,
+            original + "," + conflicting,
+            StringComparison.Ordinal);
+
+        var result = await FetchDetails(json);
+
+        Assert.True(result.IsSuccess);
+        var sample = Assert.Single(result.Snapshot!.HistoryPeriods[0].Samples);
+        Assert.Null(sample.RemainingPercent);
+        Assert.Equal(9.0, sample.SolDollars);
+        Assert.Equal(9UL, sample.SolTokens);
+    }
+
+    [Fact]
+    public async Task DuplicateHistorySampleIdentitiesAreCoalescedWithoutRejectingTheServer()
+    {
+        const string original = "{\"timestamp\":1,\"reset_at\":253402300799,\"remaining_percent\":42.5,\"sol_dollars\":1.25,\"terra_dollars\":0.0,\"luna_dollars\":0.0,\"sol_tokens\":6,\"terra_tokens\":0,\"luna_tokens\":0}";
+        const string secondObservation = "{\"timestamp\":1,\"reset_at\":253402300799,\"remaining_percent\":42.5,\"sol_dollars\":0.0,\"terra_dollars\":0.0,\"luna_dollars\":2.0,\"sol_tokens\":0,\"terra_tokens\":0,\"luna_tokens\":9}";
+        var json = ValidDetailsJson().Replace(
+            original,
+            original + "," + secondObservation,
+            StringComparison.Ordinal);
+
+        var result = await FetchDetails(json);
+
+        Assert.True(result.IsSuccess);
+        var sample = Assert.Single(result.Snapshot!.HistoryPeriods[0].Samples);
+        Assert.Equal(42.5, sample.RemainingPercent);
+        Assert.Equal(1.25, sample.SolDollars);
+        Assert.Equal(2.0, sample.LunaDollars);
+        Assert.Equal(6UL, sample.SolTokens);
+        Assert.Equal(9UL, sample.LunaTokens);
+    }
+
+    [Fact]
+    public async Task DuplicateIdentityWithQuotaOnlyConflictCannotInventHistoricalDrop()
+    {
+        const string original = "{\"timestamp\":1,\"reset_at\":253402300799,\"remaining_percent\":42.5,\"sol_dollars\":1.25,\"terra_dollars\":0.0,\"luna_dollars\":0.0,\"sol_tokens\":6,\"terra_tokens\":0,\"luna_tokens\":0}";
+        const string quotaOnlyConflict = "{\"timestamp\":1,\"reset_at\":253402300799,\"remaining_percent\":14.0,\"sol_dollars\":0.0,\"terra_dollars\":0.0,\"luna_dollars\":0.0,\"sol_tokens\":0,\"terra_tokens\":0,\"luna_tokens\":0}";
+        var json = ValidDetailsJson().Replace(
+            original,
+            original + "," + quotaOnlyConflict,
+            StringComparison.Ordinal);
+
+        var result = await FetchDetails(json);
+
+        Assert.True(result.IsSuccess);
+        var sample = Assert.Single(result.Snapshot!.HistoryPeriods[0].Samples);
+        Assert.Null(sample.RemainingPercent);
+        Assert.Equal(1.25, sample.SolDollars);
+        Assert.Equal(6UL, sample.SolTokens);
+    }
+
+    [Theory]
+    [InlineData(30)]
+    [InlineData(60)]
+    public async Task MovingResetCollisionWithLaterObservationFailsClosed(int driftSeconds)
+    {
+        const string original = "{\"timestamp\":1,\"reset_at\":253402300799,\"remaining_percent\":42.5,\"sol_dollars\":1.25,\"terra_dollars\":0.0,\"luna_dollars\":0.0,\"sol_tokens\":6,\"terra_tokens\":0,\"luna_tokens\":0}";
+        const string spend = "{\"timestamp\":1,\"reset_at\":253402300799,\"remaining_percent\":88.0,\"sol_dollars\":1.0,\"terra_dollars\":0.0,\"luna_dollars\":0.0,\"sol_tokens\":6,\"terra_tokens\":0,\"luna_tokens\":0}";
+        var collision = $"{{\"timestamp\":1,\"reset_at\":{253402300799L - driftSeconds},\"remaining_percent\":14.0,\"sol_dollars\":0.0,\"terra_dollars\":0.0,\"luna_dollars\":0.0,\"sol_tokens\":0,\"terra_tokens\":0,\"luna_tokens\":0}}";
+        var later = $"{{\"timestamp\":2,\"reset_at\":{253402300799L - driftSeconds + 30},\"remaining_percent\":87.0,\"sol_dollars\":2.0,\"terra_dollars\":0.0,\"luna_dollars\":0.0,\"sol_tokens\":7,\"terra_tokens\":0,\"luna_tokens\":0}}";
+        var json = ValidDetailsJson().Replace(
+            original,
+            spend + "," + collision + "," + later,
+            StringComparison.Ordinal);
+
+        var result = await FetchDetails(json);
+
+        Assert.True(result.IsSuccess);
+        var samples = result.Snapshot!.HistoryPeriods[0].Samples;
+        Assert.Equal(2, samples.Count);
+        Assert.Null(samples[0].RemainingPercent);
+        Assert.Equal(87.0, samples[1].RemainingPercent);
+        Assert.DoesNotContain(samples, sample => sample.RemainingPercent == 14.0);
+    }
+
     [Theory]
     [InlineData("unknown")]
     [InlineData("models")]

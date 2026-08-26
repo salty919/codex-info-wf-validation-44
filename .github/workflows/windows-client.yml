@@ -190,7 +190,7 @@ jobs:
         with:
           fetch-depth: 0
       - name: Install required test tools
-        run: sudo apt-get update && sudo apt-get install --no-install-recommends --yes ripgrep sqlite3
+        run: sudo apt-get update && sudo apt-get install --no-install-recommends --yes ripgrep sqlite3 xvfb xauth x11-utils libxkbcommon-x11-0
       - name: Enforce data protection policy
         run: bash scripts/data_protection_gate.sh
       - uses: actions/setup-dotnet@v4
@@ -201,7 +201,7 @@ jobs:
       - name: Install Rust toolchain for native regression gate
         uses: dtolnay/rust-toolchain@stable
       - name: Enforce regression checks
-        run: bash scripts/regression_guard.sh
+        run: xvfb-run --auto-servernum --server-args='-screen 0 1280x800x24' bash scripts/regression_guard.sh
 
   windows-build:
     runs-on: windows-latest
@@ -219,21 +219,42 @@ jobs:
       - name: Test REST client and presentation contract
         shell: pwsh
         run: |
-          $testOutput = (& dotnet test windows-client/CodexInfo.WindowsClient.sln --no-restore --configuration Release --logger 'console;verbosity=normal' 2>&1 | Out-String)
+          $resultsDirectory = Join-Path $env:RUNNER_TEMP 'codex-info-windows-test-results'
+          if (Test-Path -LiteralPath $resultsDirectory) {
+            Remove-Item -LiteralPath $resultsDirectory -Recurse -Force
+          }
+          New-Item -ItemType Directory -Path $resultsDirectory -Force | Out-Null
+          $testOutput = (& dotnet test windows-client/CodexInfo.WindowsClient.sln --no-restore --configuration Release --results-directory $resultsDirectory --logger 'trx;LogFilePrefix=windows-client' --logger 'console;verbosity=normal' 2>&1 | Out-String)
           $exitCode = $LASTEXITCODE
           $testOutput
           if ($exitCode -ne 0) { throw "Windows tests failed with exit code $exitCode." }
-          $summaries = [regex]::Matches($testOutput, 'Total:\s*(\d+),\s*Passed:\s*(\d+),\s*Failed:\s*(\d+),\s*Skipped:\s*(\d+)')
-          if ($summaries.Count -eq 0) { throw 'Windows test summary is missing or unparseable.' }
-          foreach ($summary in $summaries) {
-            $total = [int]$summary.Groups[1].Value
-            $passed = [int]$summary.Groups[2].Value
-            $failed = [int]$summary.Groups[3].Value
-            $skipped = [int]$summary.Groups[4].Value
-            if ($total -le 0 -or $passed -le 0 -or $failed -ne 0 -or $skipped -ne 0) {
-              throw "Windows test counts are not release-safe: total=$total passed=$passed failed=$failed skipped=$skipped"
+          $trxFiles = @(Get-ChildItem -LiteralPath $resultsDirectory -Filter '*.trx' -Recurse -File)
+          if ($trxFiles.Count -ne 2) { throw "Expected exactly two Windows TRX reports, found $($trxFiles.Count)." }
+          $totalTests = 0
+          $passedTests = 0
+          $failedTests = 0
+          $notExecutedTests = 0
+          foreach ($trxFile in $trxFiles) {
+            [xml]$trx = Get-Content -LiteralPath $trxFile.FullName -Raw
+            $counters = $trx.SelectSingleNode('/*[local-name()="TestRun"]/*[local-name()="ResultSummary"]/*[local-name()="Counters"]')
+            if ($null -eq $counters) { throw "TRX counters are missing: $($trxFile.FullName)" }
+            $total = [int]$counters.total
+            $executed = [int]$counters.executed
+            $passed = [int]$counters.passed
+            $failed = [int]$counters.failed
+            $notExecuted = [int]$counters.notExecuted
+            if ($total -le 0 -or $executed -ne $total -or $passed -ne $total -or $failed -ne 0 -or $notExecuted -ne 0) {
+              throw "Windows test counts are not release-safe: file=$($trxFile.Name) total=$total executed=$executed passed=$passed failed=$failed notExecuted=$notExecuted"
             }
+            $totalTests += $total
+            $passedTests += $passed
+            $failedTests += $failed
+            $notExecutedTests += $notExecuted
           }
+          if ($totalTests -le 0 -or $passedTests -ne $totalTests -or $failedTests -ne 0 -or $notExecutedTests -ne 0) {
+            throw "Windows aggregate test counts are not release-safe: total=$totalTests passed=$passedTests failed=$failedTests notExecuted=$notExecutedTests"
+          }
+          "Windows TRX tests executed: total=$totalTests passed=$passedTests"
       - name: Install locked Inno Setup compiler
         shell: pwsh
         run: |
@@ -352,13 +373,13 @@ jobs:
           name: windows-ui-e2e
           path: artifacts/windows-ui-e2e
       - name: Install final gate tools
-        run: sudo apt-get update && sudo apt-get install --no-install-recommends --yes ripgrep
+        run: sudo apt-get update && sudo apt-get install --no-install-recommends --yes ripgrep xvfb xauth x11-utils libxkbcommon-x11-0
       - name: Install Rust toolchain for final native gate
         uses: dtolnay/rust-toolchain@stable
       - name: Run final acceptance gate before merge
         env:
           EXPECTED_E2E_SOURCE_SHA: ${{ github.sha }}
-        run: bash scripts/final_acceptance_gate.sh artifacts/windows-ui-e2e
+        run: xvfb-run --auto-servernum --server-args='-screen 0 1280x800x24' bash scripts/final_acceptance_gate.sh artifacts/windows-ui-e2e
 
   release:
     if: github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.version-policy.outputs.release == 'true'
@@ -381,13 +402,13 @@ jobs:
           name: windows-ui-e2e
           path: artifacts/windows-ui-e2e
       - name: Install final gate tools
-        run: sudo apt-get update && sudo apt-get install --no-install-recommends --yes ripgrep
+        run: sudo apt-get update && sudo apt-get install --no-install-recommends --yes ripgrep xvfb xauth x11-utils libxkbcommon-x11-0
       - name: Install Rust toolchain for final native gate
         uses: dtolnay/rust-toolchain@stable
       - name: Run final acceptance gate
         env:
           EXPECTED_E2E_SOURCE_SHA: ${{ github.sha }}
-        run: bash scripts/final_acceptance_gate.sh artifacts/windows-ui-e2e
+        run: xvfb-run --auto-servernum --server-args='-screen 0 1280x800x24' bash scripts/final_acceptance_gate.sh artifacts/windows-ui-e2e
       - name: Create deterministic update manifest
         shell: pwsh
         env:

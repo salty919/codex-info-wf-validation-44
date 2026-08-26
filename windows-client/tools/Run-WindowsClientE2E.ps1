@@ -380,6 +380,39 @@ function Find-E2EElementByAutomationId {
     return $Root.FindFirst([System.Windows.Automation.TreeScope]::Descendants, $condition)
 }
 
+function Get-E2EElementsByAutomationId {
+    param(
+        [Parameter(Mandatory = $true)][System.Windows.Automation.AutomationElement]$Root,
+        [Parameter(Mandatory = $true)][string]$AutomationId
+    )
+
+    $condition = [System.Windows.Automation.PropertyCondition]::new(
+        [System.Windows.Automation.AutomationElement]::AutomationIdProperty,
+        $AutomationId)
+    return @($Root.FindAll([System.Windows.Automation.TreeScope]::Descendants, $condition))
+}
+
+function Assert-E2EMainProductVersion {
+    param([Parameter(Mandatory = $true)][System.Windows.Automation.AutomationElement]$Root)
+
+    $versions = @(Get-E2EElementsByAutomationId $Root 'Main.ProductVersion')
+    Assert-E2E ($versions.Count -eq 1) "Main product version must have exactly one UIA element, found $($versions.Count)."
+    $value = [string]$versions[0].Current.Name
+    Assert-E2E ($value -match '^v[0-9]+\.[0-9]+\.[0-9]+$') "Main product version is malformed: '$value'."
+    Write-E2E "main-product-version: PASS value=$value count=$($versions.Count)"
+}
+
+function Assert-E2ENoChildProductVersion {
+    param(
+        [Parameter(Mandatory = $true)][System.Windows.Automation.AutomationElement]$Root,
+        [Parameter(Mandatory = $true)][string]$Role
+    )
+
+    $versions = @(Get-E2EElementsByAutomationId $Root 'Main.ProductVersion')
+    Assert-E2E ($versions.Count -eq 0) "$Role child window must not expose Main.ProductVersion, found $($versions.Count)."
+    Write-E2E "child-product-version: PASS role=$Role count=$($versions.Count)"
+}
+
 function Find-E2EButtonByName {
     param(
         [Parameter(Mandatory = $true)][System.Windows.Automation.AutomationElement]$Root,
@@ -620,7 +653,12 @@ function Assert-E2EGraphHasModelData {
         @{ Name = 'SOL'; Color = [System.Drawing.ColorTranslator]::FromHtml('#A88CF5') }
     )
     $hits = @{}
-    foreach ($item in $series) { $hits[$item.Name] = 0 }
+    $columns = @{}
+    $spans = @{}
+    foreach ($item in $series) {
+        $hits[$item.Name] = 0
+        $columns[$item.Name] = @{}
+    }
     try {
         $left = [Math]::Max(0, [int]($plotBounds.Left - $window.Left))
         $top = [Math]::Max(0, [int]($plotBounds.Top - $window.Top))
@@ -636,6 +674,10 @@ function Assert-E2EGraphHasModelData {
                     $db = $pixel.B - $item.Color.B
                     if (($dr * $dr) + ($dg * $dg) + ($db * $db) -le 24 * 24) {
                         $hits[$item.Name]++
+                        if (-not $columns[$item.Name].ContainsKey($x)) {
+                            $columns[$item.Name][$x] = 0
+                        }
+                        $columns[$item.Name][$x]++
                     }
                 }
             }
@@ -645,9 +687,24 @@ function Assert-E2EGraphHasModelData {
         $bitmap.Dispose()
     }
     foreach ($item in $series) {
+        $seriesColumns = @($columns[$item.Name].Keys | ForEach-Object { [int]$_ } | Sort-Object)
         Assert-E2E ($hits[$item.Name] -gt 0) "Past graph has no rendered $($item.Name) model series pixels."
+        # The fixture's three cumulative observations span the period.  A
+        # single endpoint label or an accidental vertical stroke must not be
+        # sufficient evidence that the historical model line rendered.
+        $minimumColumns = [Math]::Max(20, [int][Math]::Ceiling(($right - $left) * 0.15))
+        Assert-E2E ($seriesColumns.Count -ge $minimumColumns) `
+            "Past graph $($item.Name) model series has too little horizontal span: columns=$($seriesColumns.Count), expected>=$minimumColumns."
+        $span = $seriesColumns[-1] - $seriesColumns[0]
+        $spans[$item.Name] = $span
+        Assert-E2E ($span -ge [int][Math]::Ceiling(($right - $left) * 0.15)) `
+            "Past graph $($item.Name) model series is concentrated at one x position: span=$span."
+        $maxColumnPixels = @($columns[$item.Name].Values | Measure-Object -Maximum).Maximum
+        Assert-E2E ($maxColumnPixels -le [int][Math]::Ceiling(($bottom - $top) * 0.20)) `
+            "Past graph $($item.Name) model series contains an implausible vertical stroke: max-column-pixels=$maxColumnPixels."
     }
-    Write-E2E ("graph-past-model-data: PASS LUNA={0} TERRA={1} SOL={2}" -f $hits['LUNA'], $hits['TERRA'], $hits['SOL'])
+    Write-E2E ("graph-past-model-data: PASS LUNA={0}({1}px span) TERRA={2}({3}px span) SOL={4}({5}px span)" -f `
+        $hits['LUNA'], $spans['LUNA'], $hits['TERRA'], $spans['TERRA'], $hits['SOL'], $spans['SOL'])
 }
 
 function Assert-E2EGraphHasIdleBand {
@@ -930,6 +987,7 @@ try {
     }
     $mainCapture = Capture-E2EWindow $mainHandle '01-main-ready'
     Assert-E2E ($mainCapture.Hash.Length -eq 64) 'Main screenshot hash is missing.'
+    Assert-E2EMainProductVersion $mainRoot
     if ($Fixture) {
         Assert-E2EQuotaGaugePalette -Root $mainRoot -Handle $mainHandle -Capture $mainCapture
     }
@@ -959,6 +1017,7 @@ try {
     Write-E2E 'case-1: open Graph'
     $graph = Open-E2EChildWindow -MainRoot $mainRoot -ButtonName 'Graph' -ButtonAutomationId 'Main.OpenGraph' -Title 'Codex Info Graph' -Role 'Graph' -ProcessId $clientPid
     $graphRoot = $graph.Root
+    Assert-E2ENoChildProductVersion $graphRoot 'Graph'
     $plot = Wait-E2E -Description 'Graph plot' -Probe {
         $candidate = Find-E2EElementByAutomationId $graphRoot 'Graph.Plot'
         if ($null -eq $candidate) { return $false }
@@ -1086,6 +1145,7 @@ try {
     Write-E2E 'case-5: open Threads and assert root/child/orphan rows and columns'
     $threads = Open-E2EChildWindow -MainRoot $mainRoot -ButtonName 'Threads' -ButtonAutomationId 'Main.OpenThreads' -Title 'Codex Info Threads' -Role 'Threads' -ProcessId $clientPid
     $threadsRoot = $threads.Root
+    Assert-E2ENoChildProductVersion $threadsRoot 'Threads'
     $threadTexts = Wait-E2E -Description 'Threads rows' -Probe {
         $values = @(Get-E2ETextValues $threadsRoot)
         if ($values.Count -ge 8) { return $values }

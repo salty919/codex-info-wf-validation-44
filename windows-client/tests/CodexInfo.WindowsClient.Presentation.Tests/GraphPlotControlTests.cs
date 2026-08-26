@@ -252,8 +252,10 @@ public sealed class GraphPlotControlTests
 
         var visible = GraphPlotProjection.BuildVisibleIdleIntervals(scene);
 
-        var retained = Assert.Single(visible);
-        Assert.Equal((2_000L, 7_000L), (retained.StartAt, retained.EndAt));
+        Assert.Equal(2, visible.Count);
+        Assert.Equal((1_060L, 2_000L), (visible[0].StartAt, visible[0].EndAt));
+        Assert.True(visible[0].PreserveBoundary);
+        Assert.Equal((2_000L, 7_000L), (visible[1].StartAt, visible[1].EndAt));
 
         var boundaryScene = Scene(
             [
@@ -347,6 +349,33 @@ public sealed class GraphPlotControlTests
         Assert.Equal(3, samples[2].SolDollars);
         Assert.Equal(3, samples[2].TerraDollars);
         Assert.Equal(80, samples[^1].RemainingPercent);
+    }
+
+    [Fact]
+    public void Graph_samples_do_not_choose_a_conflicting_quota_row_by_order()
+    {
+        var period = new ApiHistoryPeriod("2000", 1_000, 1_500, false, "history")
+        {
+            Samples =
+            [
+                new ApiHistorySample(1_000, 2_000, 88, 1, 0, 0, 10, 0, 0),
+                // Same display minute, reset alias, and a contradictory
+                // quota value.  The graph must not render 88 -> 14 from row
+                // order; model maxima remain useful and deterministic.
+                new ApiHistorySample(1_000, 2_050, 14, 2, 0, 0, 20, 0, 0),
+                new ApiHistorySample(1_060, 2_050, 87, 3, 0, 0, 30, 0, 0),
+            ],
+        };
+
+        var samples = GraphWindowViewModel.BuildGraphSamples(period, 1_400);
+        var scene = GraphScene.Create(samples, GraphMetric.Dollars, 1_000, 1_500);
+
+        Assert.Equal(100, samples[0].RemainingPercent);
+        Assert.DoesNotContain(samples, sample => sample.RemainingPercent == 14);
+        Assert.Equal(2, samples[0].SolDollars);
+        Assert.Equal(20UL, samples[0].SolTokens);
+        Assert.Equal(100d, scene.Remaining[0]);
+        Assert.True(scene.Remaining.All(value => !double.IsFinite(value) || value >= 87));
     }
 
     [Fact]
@@ -473,7 +502,7 @@ public sealed class GraphPlotControlTests
             ResetAt = root.GetProperty("reset_at").GetInt64(),
             Samples = samples,
         };
-        var graphSamples = DetailsWindowViewModels.BuildGraphSamples(period, periodEnd);
+        var graphSamples = GraphWindowViewModel.BuildGraphSamples(period, periodEnd);
         var scene = GraphScene.Create(graphSamples, GraphMetric.Dollars, periodStart, periodEnd);
         var expected = root.GetProperty("expected_remaining")
             .EnumerateArray()
@@ -585,6 +614,24 @@ public sealed class GraphPlotControlTests
             Point(1_060, 90, 1, 0, 0),
         };
         Assert.DoesNotContain(Scene(shortGap).IdleIntervals, interval => interval.PreserveBoundary);
+    }
+
+    [Fact]
+    public void Idle_band_preserves_every_long_unobserved_spend_gap_not_just_the_first_one()
+    {
+        var points = new[]
+        {
+            Point(1_000, 100, 1, 0, 0),
+            Point(1_060, 100, 1, 0, 0),
+            // No observations for two minutes; the cumulative increase is
+            // only known at the endpoint and must not be rendered as usage
+            // throughout the unobserved interval.
+            Point(1_180, 90, 2, 0, 0),
+        };
+
+        var interval = Assert.Single(Scene(points).IdleIntervals, candidate =>
+            candidate.StartAt == 1_060 && candidate.EndAt == 1_180);
+        Assert.True(interval.PreserveBoundary);
     }
 
     private static ApiHistorySample Point(long timestamp, double? remaining, double sol, double terra, double luna) =>
