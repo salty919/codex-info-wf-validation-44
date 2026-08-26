@@ -6,6 +6,7 @@ cd "$repo_root"
 
 fail() { echo "regression-guard: FAIL: $*" >&2; exit 1; }
 require_text() { rg -q --fixed-strings -- "$2" "$1" || fail "missing $1: $2"; }
+require_file() { [[ -f "$1" ]] || fail "missing file: $1"; }
 
 run_checked() {
     local description="$1"
@@ -33,6 +34,7 @@ require_text docs/PRODUCT_REQUIREMENTS.md '全直積、N倍、N二乗、N階乗�
 require_text docs/PRODUCT_REQUIREMENTS.md '製品バージョンはメイン画面に一度だけ表示し'
 require_text docs/REGRESSION_PREVENTION_POLICY.md 'REG-WIN-DRAG'
 require_text docs/REGRESSION_PREVENTION_POLICY.md 'windows_window_move_smoke.ps1 -AllowPhysicalInput'
+require_file scripts/x11_graph_visual_gate.sh
 require_text windows-client/src/CodexInfo.WindowsClient/WindowDragBehavior.cs 'window.BeginMoveDrag(eventArgs)'
 require_text windows-client/src/CodexInfo.WindowsClient/ViewModels/DetailsWindowViewModels.cs 'EffectiveGraphEnd'
 require_text windows-client/src/CodexInfo.WindowsClient/Graphing/GraphPlotProjection.cs 'IsSyntheticFirstObservation'
@@ -88,6 +90,15 @@ run_required_rust_test affected_timestamp_does_not_mix_a_singleton_reset_period_
 run_required_rust_test singleton_reset_snapshot_overlapping_a_spend_period_stays_separate
 run_required_rust_test graph_collision_preview_matches_the_historical_singleton_oracle
 run_required_rust_test periodic_quota_refresh_retains_last_good_main_snapshot
+
+# When a local X11 display is available, require a fresh rendered graph image
+# as part of the same delivery check. Headless runners cannot satisfy this
+# visual requirement and therefore do not claim X11 image PASS.
+if [[ -n "${DISPLAY:-}" ]]; then
+    run_checked 'X11 graph visual gate' bash scripts/x11_graph_visual_gate.sh
+else
+    echo 'regression-guard: X11 graph visual gate UNVERIFIED (DISPLAY unavailable)'
+fi
 
 if rg -q 'SetCursorPos|mouse_event|SendInput' windows-client/src; then
     fail 'product source contains physical cursor or synthetic mouse API'

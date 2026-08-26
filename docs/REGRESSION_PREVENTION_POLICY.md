@@ -21,7 +21,7 @@
 4. 独立サブエージェントが、実装者のPASS結論を見ずに上表を再評価する。1項目でもFAIL/INCONCLUSIVEなら`RELEASE HOLD`とする。
 5. `docs/INDEPENDENT_AUDIT_LATEST.md`を`status: PASS`へ変更できるのは独立評価担当だけとし、主担当が手動でPASSへ書き換えてはならない。
 
-6. `scripts/regression_guard.sh`は静的な文字列検査だけでPASSしてはならない。履歴・グラフの必須Rust回帰テスト（複数期間の境界、通常のmoving-reset、累積ドリフトする長時間moving-reset、使用量0の残量100% reset断片が前後の使用量期間を分割しないこと、観測されていない長時間を累積使用量の斜め線として描かないこと、モデル使用後の遅延した低残量観測を捨てないこと）を`--exact`で実際に実行し、対象テストが0件、未実行、失敗の場合は必ずFAILにする。さらにworking tree/index/current commitのdiff、format、全target check、全target test（実行件数>0）、release buildを同じゲートで検査する。履歴・グラフの変更は、この実行結果なしに完了判定してはならない。これはデグレード防止だけでなく、実行していない検証をPASS扱いする評価漏れの防止を目的とする。
+6. `scripts/regression_guard.sh`は静的な文字列検査だけでPASSしてはならない。履歴・グラフの必須Rust回帰テスト（複数期間の境界、通常のmoving-reset、累積ドリフトする長時間moving-reset、使用量0の残量100% reset断片が前後の使用量期間を分割しないこと、観測されていない長時間を累積使用量の斜め線として描かないこと、モデル使用後の遅延した低残量観測を捨てないこと）を`--exact`で実際に実行し、対象テストが0件、未実行、失敗の場合は必ずFAILにする。さらにworking tree/index/current commitのdiff、format、全target check、全target test（実行件数>0）、release buildを同じゲートで検査する。`DISPLAY`が利用できる実行では`bash scripts/x11_graph_visual_gate.sh`を同じ実行で起動し、現行バイナリの940x640グラフ画像から残量線の連続性とLUNA/TERRA/SOLの色画素を機械判定する。履歴・グラフの変更は、この実行結果なしに完了判定してはならない。これはデグレード防止だけでなく、実行していない検証をPASS扱いする評価漏れの防止を目的とする。
 
 7. PRのmerge前およびRelease jobは`bash scripts/final_acceptance_gate.sh <Windows UI E2E evidence>`を通過しなければならない。同ゲートはRustのformat/check/test/release build、必須回帰テスト、Windows UI AutomationのPASSログ、quota gauge証拠、過去期間グラフでLUNA/TERRA/SOLのモデル線と未使用期間の専用帯が既知の区間に実描画された証拠、E2Eが定義する19枚の名前付き画面キャプチャ（各PNG署名・非空）を検証する。さらに同じWindows実行で`windows_window_move_smoke.ps1 -AllowPhysicalInput`を実行し、source SHA付き`window-move-smoke: PASS`を必須とする。E2Eログの実行元SHAは対象SHAと一致し、各画像のSHA-256は同じ実行のcapture行と一致しなければならない。E2E出力は実行開始時に消去し、追記・前回証跡の再利用を許可しない。証拠ディレクトリ、ログ、対象マーカー、SHA、画面のいずれかが欠ける場合は`HOLD`とし、未確認をPASSへ変換しない。
 
