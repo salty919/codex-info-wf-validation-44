@@ -49,6 +49,8 @@ rg -q --fixed-strings 'graph-past-model-data: PASS' "$log_file" \
     || hold "Windows past-period graph model-data evidence is missing"
 rg -q --fixed-strings 'graph-past-idle-band: PASS' "$log_file" \
     || hold "Windows past-period idle-band color evidence is missing"
+rg -q --fixed-strings 'main-details-status: PASS (matching status/details generation accepted)' "$log_file" \
+    || hold "Windows main status/details generation evidence is missing"
 rg -q --fixed-strings 'windows-client-e2e: PASS' "$log_file" \
     || hold "Windows UI Automation PASS marker is missing"
 

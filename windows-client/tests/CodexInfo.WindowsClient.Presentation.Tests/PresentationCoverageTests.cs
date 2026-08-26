@@ -465,6 +465,7 @@ public sealed class PresentationCoverageTests
         Assert.Equal(LocalizationService.Current.Connected, main.AuthenticationText);
         Assert.Equal("current", main.ModelUsagePeriodText);
         Assert.Equal("概算 $9", main.EstimatedCostText);
+        Assert.Contains("最新", main.DetailsStatusText, StringComparison.Ordinal);
         Assert.Equal(3, main.Models.Count);
         Assert.Equal("SOL", main.Models[0].Name);
         Assert.Equal("TERRA", main.Models[1].Name);

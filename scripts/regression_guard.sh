@@ -46,6 +46,7 @@ require_text windows-client/src/CodexInfo.WindowsClient/ViewModels/DetailsWindow
 require_text windows-client/src/CodexInfo.WindowsClient/Graphing/GraphPlotProjection.cs 'IsSyntheticFirstObservation'
 require_text windows-client/src/CodexInfo.WindowsClient/Settings/ConnectionProcessFactory.cs 'codex_info'
 require_text windows-client/src/CodexInfo.WindowsClient/Settings/ConnectionProcessFactory.cs '--service'
+require_text windows-client/tools/Run-WindowsClientE2E.ps1 'main-details-status: PASS (matching status/details generation accepted)'
 require_text windows-client/tests/CodexInfo.WindowsClient.Presentation.Tests/GraphPlotControlTests.cs 'PlotProjectionStartsAtFirstObservationWithoutSyntheticVerticalJump'
 require_text windows-client/tests/CodexInfo.WindowsClient.Presentation.Tests/GraphPlotControlTests.cs 'IdleBandsUseTheDedicatedVisibleNeutralColor'
 require_text src/main.rs 'remaining_graph_does_not_infer_quota_loss_from_model_spend'

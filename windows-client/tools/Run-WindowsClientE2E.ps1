@@ -1007,9 +1007,17 @@ try {
     # peer is deliberately not used as a proxy for those surfaces.
     Start-Sleep -Seconds 5
     $detailsStatus = Find-E2EElementByAutomationId $mainRoot 'Main.DetailsStatus'
-    if ($null -ne $detailsStatus) {
-        Write-E2E ("main: details status='{0}' observed" -f $detailsStatus.Current.Name)
-    }
+    Assert-E2E ($null -ne $detailsStatus) 'Main details status is missing.'
+    $detailsStatusText = [string]$detailsStatus.Current.Name
+    Write-E2E ("main: details status='{0}' observed" -f $detailsStatusText)
+    # A screenshot or a successful status request is not sufficient evidence:
+    # the main surface must have accepted the matching details generation.
+    # Fail closed on both locales and on every known unavailable/error wording.
+    $detailsIsLatest = $detailsStatusText -match '最新|Latest'
+    $detailsHasFailure = $detailsStatusText -match '未取得|Unavailable|失敗|error|Error'
+    Assert-E2E ($detailsIsLatest -and -not $detailsHasFailure) `
+        "Main details status is not a complete accepted generation: '$detailsStatusText'"
+    Write-E2E 'main-details-status: PASS (matching status/details generation accepted)'
 
     # Finite path: one Graph window, one period round-trip, two metrics, then
     # one OFF/ON cycle for each of four independent series.  No combinations
