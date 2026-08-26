@@ -279,8 +279,19 @@ const RESET_AT_TOLERANCE_SECONDS: i64 = 60;
 // sixty-second authority boundary, but admit this bounded moving-reset shape
 // when both timestamps advance by the same amount.
 const MOVING_RESET_GROUP_MAX_DRIFT_SECONDS: i64 = 5 * 60;
-const MOVING_RESET_STEP_TOLERANCE_SECONDS: i64 = 30;
+// Polls are nominally minute-spaced, but the quota service can advance the
+// deadline by one or two poll intervals at once. Allow that bounded step
+// jitter; a real period boundary is still separated by hours or days.
+const MOVING_RESET_STEP_TOLERANCE_SECONDS: i64 = 180;
+// A minute bucket is the collector's contiguous observation unit. Beyond this
+// boundary the elapsed interval is not observed, so a cumulative model
+// increase must be shown as an idle horizontal segment followed by a point
+// change, never as an invented diagonal rate.
+const MODEL_CONTIGUOUS_SAMPLE_MAX_GAP_SECONDS: i64 = 60;
 const MOVING_RESET_MIN_HORIZON_SECONDS: i64 = 86_400;
+const ROLLING_RESET_ARTIFACT_MAX_JUMP_SECONDS: i64 = 2 * 86_400;
+const ROLLING_RESET_ARTIFACT_MIN_PREVIOUS_REMAINING_PERCENT: f64 = 95.0;
+const ROLLING_RESET_ARTIFACT_MAX_OBSERVATION_GAP_SECONDS: i64 = 2 * 3_600;
 const LEGACY_MOVING_RESET_HORIZON_TOLERANCE_SECONDS: i64 = 120;
 const LEGACY_MOVING_RESET_PAIR_GAP_SECONDS: i64 = 3_600;
 const LEGACY_MOVING_RESET_PAIR_HORIZON_TOLERANCE_SECONDS: i64 = 60;
@@ -1613,6 +1624,48 @@ fn same_reset_period(left: i64, right: i64) -> bool {
     left.abs_diff(right) <= RESET_AT_TOLERANCE_SECONDS as u64
 }
 
+/// Decide whether a newly reported reset timestamp is a real period boundary
+/// or merely the service's rolling `now + window` value moving between polls.
+/// The latter is common in the live response and must never make the main
+/// screen throw away a complete model/history snapshot.
+fn reset_transition_is_boundary(
+    previous_reset: Option<i64>,
+    previous_remaining: Option<f64>,
+    next_reset: i64,
+    next_remaining: Option<f64>,
+    previous_observed_at: Option<i64>,
+    now: i64,
+    window_seconds: i64,
+) -> bool {
+    let Some(previous_reset) = previous_reset else {
+        return next_reset > 0;
+    };
+    if next_reset <= 0 || same_reset_period(previous_reset, next_reset) {
+        return false;
+    }
+
+    // A real reset is accompanied by a material quota refill.  A one-point
+    // rounding fluctuation is not enough to change period identity.
+    if let (Some(previous), Some(next)) = (previous_remaining, next_remaining) {
+        if next.is_finite() && previous.is_finite() && next >= previous + 5.0 {
+            return true;
+        }
+    }
+
+    // If the prior observation was close to its boundary and the new one is
+    // a full window ahead, this is a genuine rollover even when the quota
+    // percentage is unavailable. Otherwise, two full-window horizons are the
+    // same rolling period regardless of their absolute reset timestamps.
+    let previous_at = previous_observed_at.unwrap_or(now);
+    let previous_horizon = previous_reset.saturating_sub(previous_at);
+    let next_horizon = next_reset.saturating_sub(now);
+    let boundary_proximity = window_seconds.max(60).min(3_600);
+    if previous_horizon <= boundary_proximity && next_horizon >= window_seconds / 2 {
+        return true;
+    }
+    false
+}
+
 fn merge_sample_values(existing: &mut UsageHistorySample, incoming: UsageHistorySample) {
     // Session backfill has no remaining-quota observation. Keep an existing
     // observed value while allowing a later API observation to replace it.
@@ -1715,11 +1768,35 @@ fn moving_reset_observation_belongs_to_anchor(
     anchor: &UsageHistorySample,
     candidate: &UsageHistorySample,
 ) -> bool {
-    let reset_delta = candidate.reset_at.saturating_sub(anchor.reset_at);
+    // History is evaluated in observation order. A reset timestamp that jumps
+    // forward without the observation moving by the same amount is a new
+    // period (the boundary seen in the affected database), not a jittered
+    // member of the previous period. Do not use saturating subtraction here:
+    // accepting a backwards reset would silently merge unrelated periods.
+    if candidate.timestamp < anchor.timestamp {
+        return false;
+    }
+    let signed_reset_delta = candidate.reset_at - anchor.reset_at;
+    // A moving quota response can wobble by a few seconds between adjacent
+    // polls. Keep that same-period jitter, but never allow a large backwards
+    // jump to cross a real reset boundary.
+    if signed_reset_delta < 0
+        && signed_reset_delta.unsigned_abs() > MOVING_RESET_STEP_TOLERANCE_SECONDS as u64
+    {
+        return false;
+    }
+    let reset_delta = signed_reset_delta.max(0);
     if candidate.reset_at == anchor.reset_at || reset_delta <= RESET_AT_TOLERANCE_SECONDS {
         return true;
     }
     let timestamp_delta = candidate.timestamp.saturating_sub(anchor.timestamp);
+    // The collector can emit two quota snapshots for the same minute while
+    // the server advances reset_at between them. Treat that as one moving
+    // observation as long as the jump is still bounded; a real boundary is
+    // orders of magnitude larger and remains isolated.
+    if timestamp_delta == 0 && reset_delta <= MOVING_RESET_GROUP_MAX_DRIFT_SECONDS {
+        return true;
+    }
     let anchor_horizon = anchor.reset_at.saturating_sub(anchor.timestamp);
     let candidate_horizon = candidate.reset_at.saturating_sub(candidate.timestamp);
     reset_delta <= MOVING_RESET_GROUP_MAX_DRIFT_SECONDS
@@ -1735,21 +1812,56 @@ fn reset_sample_groups(samples: &[UsageHistorySample]) -> Vec<ResetSampleGroup> 
         .into_iter()
         .cloned()
         .collect::<Vec<_>>();
-    sorted.sort_by_key(|sample| (sample.reset_at, sample.timestamp));
+    // The wire payload is an observation timeline. Sort by observation first
+    // so a rolling reset can be joined one step at a time even when its
+    // cumulative drift is hours. A true period boundary has a large reset
+    // jump at essentially the same observation timestamp and starts a new
+    // group. Equal-reset fragments are coalesced below so legacy singleton
+    // quota rows cannot split a spend period.
+    sorted.sort_by_key(|sample| (sample.timestamp, sample.reset_at));
 
     let mut groups = Vec::new();
     let mut index = 0;
     while let Some(anchor) = sorted.get(index).cloned() {
         let mut members = Vec::new();
         let mut canonical_reset_at = anchor.reset_at;
+        let mut moving_started = false;
         while let Some(candidate) = sorted.get(index) {
-            let same_reset_as_last = members
-                .last()
-                .is_some_and(|last: &UsageHistorySample| last.reset_at == candidate.reset_at);
-            if !same_reset_as_last
-                && !moving_reset_observation_belongs_to_anchor(&anchor, candidate)
+            let previous = members.last().unwrap_or(&anchor);
+            // Several reset values at one exact observation timestamp are
+            // legitimate only after the sequence has already demonstrated a
+            // forward-moving timeline. Without this guard, unrelated
+            // same-timestamp reset IDs would chain into one period.
+            if !moving_started
+                && candidate.timestamp == anchor.timestamp
+                && candidate.reset_at.abs_diff(anchor.reset_at) > RESET_AT_TOLERANCE_SECONDS as u64
+            {
+                let has_forward_observation = sorted.get(index + 1..).is_some_and(|remaining| {
+                    remaining.iter().any(|future| {
+                        future.timestamp > anchor.timestamp
+                            && future.reset_at >= candidate.reset_at
+                            && future.reset_at - candidate.reset_at
+                                <= MOVING_RESET_GROUP_MAX_DRIFT_SECONDS
+                    })
+                });
+                if !has_forward_observation {
+                    break;
+                }
+            }
+            if !moving_started
+                && candidate.reset_at < anchor.reset_at
+                && candidate.reset_at.abs_diff(anchor.reset_at) > RESET_AT_TOLERANCE_SECONDS as u64
             {
                 break;
+            }
+            if !moving_reset_observation_belongs_to_anchor(
+                if moving_started { previous } else { &anchor },
+                candidate,
+            ) {
+                break;
+            }
+            if candidate.timestamp > anchor.timestamp && candidate.reset_at > anchor.reset_at {
+                moving_started = true;
             }
             canonical_reset_at = canonical_reset_at.max(candidate.reset_at);
             members.push(candidate.clone());
@@ -1765,8 +1877,100 @@ fn reset_sample_groups(samples: &[UsageHistorySample]) -> Vec<ResetSampleGroup> 
             samples: members,
         });
     }
-    let mut merged = Vec::with_capacity(groups.len());
+    let mut same_reset_merged = Vec::with_capacity(groups.len());
     for mut group in groups {
+        if let Some(existing) =
+            same_reset_merged
+                .iter_mut()
+                .find(|existing: &&mut ResetSampleGroup| {
+                    existing.canonical_reset_at == group.canonical_reset_at
+                })
+        {
+            existing.start = existing.start.min(group.start);
+            existing.samples.append(&mut group.samples);
+        } else {
+            same_reset_merged.push(group);
+        }
+    }
+    let mut merged: Vec<ResetSampleGroup> = Vec::with_capacity(same_reset_merged.len());
+    let mut rolling_artifact_chain = false;
+    for mut group in same_reset_merged {
+        let group_end = group
+            .samples
+            .iter()
+            .map(|sample| sample.timestamp)
+            .max()
+            .unwrap_or(group.start);
+        let group_is_full_quota = group
+            .samples
+            .iter()
+            .filter(|sample| sample.timestamp == group_end)
+            .any(|sample| sample.remaining_percent >= 100.0)
+            && group
+                .samples
+                .iter()
+                .filter(|sample| sample.timestamp == group_end)
+                .all(|sample| sample.remaining_percent < 0.0 || sample.remaining_percent >= 100.0);
+        // The live service can emit a chain of quota-only rows while it
+        // advances reset_at every poll. These rows are not independent
+        // periods: they sit directly between the last spend observation and
+        // the next spend observation. Keep the chain attached to the spend
+        // period, but require a real spend anchor and a bounded timeline
+        // so a genuine full-quota reset remains a separate period. A bounded
+        // observation gap is allowed because the collector can be offline
+        // for several polls while the service keeps advancing reset_at.
+        let should_attach_rolling_artifact = merged.last().is_some_and(|previous| {
+            let previous_end = previous
+                .samples
+                .iter()
+                .map(|sample| sample.timestamp)
+                .max()
+                .unwrap_or(previous.start);
+            let previous_has_model_usage = previous.samples.iter().any(|sample| {
+                sample.sol_dollars > 0.0
+                    || sample.terra_dollars > 0.0
+                    || sample.luna_dollars > 0.0
+                    || sample.sol_tokens > 0
+                    || sample.terra_tokens > 0
+                    || sample.luna_tokens > 0
+            });
+            let previous_end_has_observed_quota = previous
+                .samples
+                .iter()
+                .filter(|sample| sample.timestamp == previous_end)
+                .any(|sample| sample.remaining_percent >= 0.0);
+            let previous_end_is_near_full = previous_end_has_observed_quota
+                && previous
+                    .samples
+                    .iter()
+                    .filter(|sample| {
+                        sample.timestamp == previous_end && sample.remaining_percent >= 0.0
+                    })
+                    .all(|sample| {
+                        sample.remaining_percent
+                            >= ROLLING_RESET_ARTIFACT_MIN_PREVIOUS_REMAINING_PERCENT
+                    });
+            group_is_full_quota
+                && group.start.saturating_sub(previous_end)
+                    <= ROLLING_RESET_ARTIFACT_MAX_OBSERVATION_GAP_SECONDS
+                && group
+                    .canonical_reset_at
+                    .saturating_sub(previous.canonical_reset_at)
+                    <= ROLLING_RESET_ARTIFACT_MAX_JUMP_SECONDS
+                && previous_end_is_near_full
+                && (rolling_artifact_chain || previous_has_model_usage)
+        });
+        if should_attach_rolling_artifact {
+            if let Some(previous) = merged.last_mut() {
+                previous.canonical_reset_at =
+                    previous.canonical_reset_at.max(group.canonical_reset_at);
+                previous.start = previous.start.min(group.start);
+                previous.samples.append(&mut group.samples);
+            }
+            rolling_artifact_chain = true;
+            continue;
+        }
+        rolling_artifact_chain = false;
         let should_attach_to_previous = group.samples.len() == 1
             && group.samples[0].sol_dollars == 0.0
             && group.samples[0].terra_dollars == 0.0
@@ -2856,20 +3060,14 @@ fn metric_line_path(
     let mut previous = first;
     for point in iter {
         let (x, y) = coordinate(point.timestamp, value(point));
-        // The reset anchor is synthetic when the first real measurement is
-        // later than the period start.  Keep that unobserved interval flat at
-        // zero, then make the first observed cumulative value explicit.  A
-        // diagonal from the anchor would falsely imply spend before the first
-        // record existed.
-        if previous.timestamp == period_start
-            && point.timestamp - previous.timestamp > 60
-            && value(previous) <= 0.0
-            && value(point) > 0.0
-        {
+        let unobserved_gap = point.timestamp.saturating_sub(previous.timestamp)
+            > MODEL_CONTIGUOUS_SAMPLE_MAX_GAP_SECONDS;
+        if unobserved_gap && value(point) > value(previous) {
             let (_, previous_y) = coordinate(point.timestamp, value(previous));
-            commands.push_str(&format!(" L{x:.2} {previous_y:.2}"));
+            commands.push_str(&format!(" L{x:.2} {previous_y:.2} L{x:.2} {y:.2}"));
+        } else {
+            commands.push_str(&format!(" L{x:.2} {y:.2}"));
         }
-        commands.push_str(&format!(" L{x:.2} {y:.2}"));
         previous = point;
     }
     commands
@@ -2908,6 +3106,19 @@ fn split_metric_line_paths(
             && previous == 0.0
             && current > 0.0
         {
+            if !flat.is_empty() {
+                flat.push(' ');
+            }
+            flat.push_str(&format!("M{x1:.2} {y1:.2} L{x2:.2} {y1:.2}"));
+            if !rising.is_empty() {
+                rising.push(' ');
+            }
+            rising.push_str(&format!("M{x2:.2} {y1:.2} L{x2:.2} {y2:.2}"));
+            continue;
+        }
+        let unobserved_gap = pair[1].timestamp.saturating_sub(pair[0].timestamp)
+            > MODEL_CONTIGUOUS_SAMPLE_MAX_GAP_SECONDS;
+        if unobserved_gap && current > previous {
             if !flat.is_empty() {
                 flat.push(' ');
             }
@@ -3171,8 +3382,10 @@ fn raw_graph_points(
 /// usage advances while a quota reread repeats, the repeated value is treated
 /// as a stale/missed sample and interpolated between the surrounding changes;
 /// a `1 -> 1 -> 3` sequence therefore becomes `1 -> 2 -> 3`, not a false
-/// horizontal-then-drop corner. This prevents sampling folds from appearing
-/// as real instantaneous quota changes.
+/// horizontal-then-drop corner. A first lower quota observation arriving
+/// after an unobserved active interval closes that interval even when the
+/// model snapshot has already stopped changing; a genuinely idle period that
+/// never had model usage remains horizontal.
 fn remaining_graph_points(
     samples: &[&UsageHistorySample],
     period_start: i64,
@@ -3223,6 +3436,14 @@ fn remaining_graph_points_for_metric(
     let mut previous_remaining = initial_remaining;
     let mut previous_model = model_points[0];
     let mut previous_timestamp = period_start;
+    // A quota value can arrive after the last model snapshot (the recorder
+    // and quota poll are independent). Keep track of whether a real quota
+    // endpoint has already been observed since the latest model change; only
+    // the first lower value after an unobserved active interval may close that
+    // interval. This preserves genuinely idle flat segments while ensuring a
+    // delayed 1% quota response is not discarded merely because model totals
+    // have stopped changing.
+    let mut quota_observed_since_model_change = true;
     for current_model in model_points.iter().copied().skip(1) {
         let timestamp = current_model.timestamp;
         if timestamp <= previous_timestamp {
@@ -3239,18 +3460,38 @@ fn remaining_graph_points_for_metric(
             && previous_model.luna == 0.0
             && model_changed;
         let active = model_changed && !synthetic_zero_gap;
-        let next_remaining = if model_changed {
+        let matched_remaining = if model_changed {
             latest_remaining_for_model_change(
                 &remaining_by_timestamp,
                 timestamp,
                 Some(previous_timestamp),
             )
             .filter(|value| value.is_finite())
-            .map(|value| previous_remaining.min(value.clamp(0.0, 100.0)))
-            .unwrap_or(previous_remaining)
+            .map(|value| value.clamp(0.0, 100.0))
         } else {
-            previous_remaining
+            None
         };
+        let delayed_quota = if !model_changed && !quota_observed_since_model_change {
+            remaining_by_timestamp
+                .range((previous_timestamp + 1)..=timestamp)
+                .next_back()
+                .map(|(_, value)| *value)
+                .filter(|value| value.is_finite() && *value < previous_remaining)
+                .map(|value| value.clamp(0.0, 100.0))
+        } else {
+            None
+        };
+        let matched_quota = matched_remaining.is_some();
+        let delayed_quota_applied = delayed_quota.is_some();
+        let next_remaining = matched_remaining
+            .or(delayed_quota)
+            .map(|value| previous_remaining.min(value))
+            .unwrap_or(previous_remaining);
+        if model_changed {
+            quota_observed_since_model_change = matched_quota;
+        } else if delayed_quota_applied {
+            quota_observed_since_model_change = true;
+        }
 
         if synthetic_zero_gap {
             // Keep an unobserved reset-to-first-use gap horizontal, then make
@@ -3539,6 +3780,19 @@ fn smooth_model_spend(points: &[HourlyModelSpend]) -> Vec<HourlyModelSpend> {
         let previous = *smoothed.last().expect("zero anchor exists");
         let current = points[index];
         let next = points[index + 1];
+        let previous_gap = current.timestamp.saturating_sub(previous.timestamp)
+            > MODEL_CONTIGUOUS_SAMPLE_MAX_GAP_SECONDS;
+        let next_gap = next.timestamp.saturating_sub(current.timestamp)
+            > MODEL_CONTIGUOUS_SAMPLE_MAX_GAP_SECONDS;
+        if previous_gap || next_gap {
+            smoothed.push(HourlyModelSpend {
+                timestamp: current.timestamp,
+                sol: current.sol.max(previous.sol),
+                terra: current.terra.max(previous.terra),
+                luna: current.luna.max(previous.luna),
+            });
+            continue;
+        }
         let smooth = |before: f64, value: f64, after: f64, floor: f64| {
             ((before + 2.0 * value + after) / 4.0).max(floor)
         };
@@ -4730,6 +4984,15 @@ struct CodexInfoState {
     thread_checking: bool,
     thread_error: bool,
     local_usage_error: bool,
+    /// A quota event is not a complete usage snapshot.  On the first load the
+    /// public/native views stay loading until the independent local collector
+    /// commits; after that, the last committed snapshot remains visible while
+    /// a periodic refresh is pending.
+    local_usage_pending: bool,
+    /// A completed snapshot remains visible while a later quota-only refresh
+    /// collects the next local payload. This is cleared only with account
+    /// identity, never at each periodic refresh or reset timestamp update.
+    usage_snapshot_committed: bool,
     last_thread_poll: Instant,
     /// The last persisted reset period is enough to backfill local session
     /// usage while app-server/REST is unavailable. It is never exposed until
@@ -4739,6 +5002,14 @@ struct CodexInfoState {
 }
 
 impl CodexInfoState {
+    fn usage_ready(&self) -> bool {
+        self.has_usage && !self.local_usage_pending
+    }
+
+    fn has_visible_usage(&self) -> bool {
+        self.usage_ready() || self.usage_snapshot_committed
+    }
+
     /// Build the only data shape allowed to cross into the loopback API.
     ///
     /// This intentionally does not include email, auth URL, local paths,
@@ -4753,7 +5024,7 @@ impl CodexInfoState {
             } else {
                 PublicState::AuthRequired
             }
-        } else if self.has_usage {
+        } else if self.has_visible_usage() {
             PublicState::Ready
         } else {
             PublicState::Initializing
@@ -4771,7 +5042,7 @@ impl CodexInfoState {
         let models = self
             .authenticated
             .then_some(())
-            .filter(|_| self.has_usage)
+            .filter(|_| self.has_visible_usage())
             .map(|_| {
                 self.model_usage
                     .iter()
@@ -4787,7 +5058,7 @@ impl CodexInfoState {
             .unwrap_or_default();
         PublicSnapshot {
             state,
-            observed_at: if self.authenticated && self.has_usage {
+            observed_at: if self.authenticated && self.has_visible_usage() {
                 self.last_success_at.filter(|timestamp| *timestamp > 0)
             } else {
                 None
@@ -4800,7 +5071,7 @@ impl CodexInfoState {
                 .map(str::to_owned),
             quota,
             models,
-            active_thread_count: if self.authenticated {
+            active_thread_count: if self.authenticated && self.has_visible_usage() {
                 u64::try_from(self.active_threads.len()).unwrap_or(u64::MAX)
             } else {
                 0
@@ -4813,7 +5084,7 @@ impl CodexInfoState {
     /// so status and details are published atomically as one generation.
     fn public_details(&self) -> PublicDetails {
         let mut snapshot = self.public_snapshot();
-        let models = if self.authenticated && self.has_usage {
+        let models = if self.authenticated && self.has_visible_usage() {
             self.model_usage
                 .iter()
                 .filter(|row| matches!(row.name.as_str(), "SOL" | "TERRA" | "LUNA"))
@@ -4838,7 +5109,7 @@ impl CodexInfoState {
         let history_cutoff = DateTime::<Utc>::from_timestamp(now, 0)
             .map(one_month_before_utc)
             .unwrap_or(now);
-        let history_periods = if self.authenticated {
+        let history_periods = if self.authenticated && self.has_visible_usage() {
             let periods = self.history_periods();
             let current_period_reset = current_history_period_reset(&periods, self.reset_at, now);
             periods
@@ -4866,7 +5137,7 @@ impl CodexInfoState {
             Vec::new()
         };
 
-        let mut history_samples = if self.authenticated {
+        let mut history_samples = if self.authenticated && self.has_visible_usage() {
             self.history
                 .canonical_samples()
                 .into_iter()
@@ -4897,7 +5168,7 @@ impl CodexInfoState {
         // publisher validates the complete candidate and keeps the previous
         // atomic status/details generation when the public limit is exceeded.
 
-        let mut threads = if self.authenticated {
+        let mut threads = if self.authenticated && self.has_visible_usage() {
             self.active_threads
                 .iter()
                 .take(MAX_PUBLIC_THREADS)
@@ -5007,6 +5278,8 @@ impl CodexInfoState {
             thread_checking: false,
             thread_error: false,
             local_usage_error: false,
+            local_usage_pending: false,
+            usage_snapshot_committed: false,
             last_thread_poll: Instant::now(),
             recovery_period,
             recovery_requested: false,
@@ -5074,6 +5347,11 @@ impl CodexInfoState {
             thread_checking: false,
             thread_error: false,
             local_usage_error: false,
+            local_usage_pending: false,
+            // Preview starts with a complete in-memory payload, so
+            // `usage_ready()` is sufficient. Keep this false to exercise the
+            // first-load (not-yet-committed) pending contract in tests.
+            usage_snapshot_committed: false,
             last_thread_poll: Instant::now(),
             recovery_period: None,
             recovery_requested: false,
@@ -5454,6 +5732,8 @@ impl CodexInfoState {
         self.thread_checking = false;
         self.thread_error = false;
         self.local_usage_error = false;
+        self.local_usage_pending = false;
+        self.usage_snapshot_committed = false;
         self.recovery_requested = false;
         self.history = UsageHistory::default();
         self.selected_reset_at = None;
@@ -5485,10 +5765,19 @@ impl CodexInfoState {
             monthly,
         } = event;
         let previous_reset_at = self.reset_at;
-        let reset_changed =
-            !previous_reset_at.is_some_and(|previous| same_reset_period(previous, reset_at));
+        let now = Utc::now().timestamp();
+        let reset_changed = reset_transition_is_boundary(
+            previous_reset_at,
+            self.remaining_percent,
+            reset_at,
+            remaining_percent,
+            self.last_success_at,
+            now,
+            self.window_seconds,
+        );
         self.has_quota_percent = remaining_percent.is_some();
         self.has_usage = true;
+        self.local_usage_pending = !self.preview;
         self.remaining_percent = remaining_percent.map(|value| value.clamp(0.0, 100.0));
         self.reset_at = (reset_at > 0).then_some(reset_at);
         self.window_seconds = window_seconds;
@@ -5506,14 +5795,25 @@ impl CodexInfoState {
         self.monthly = monthly;
         self.account_error = None;
         if reset_changed {
-            self.model_usage.clear();
-            self.estimated_cost_label = "概算 —".into();
+            // A graph that was following the previously current period must
+            // follow the newly announced period as soon as its local payload
+            // arrives. Preserve an explicitly selected older period. The
+            // previous complete model snapshot remains visible until the
+            // matching local collector commits; reset_at can legitimately
+            // drift while the service reports a rolling boundary.
+            let follows_current = self.selected_reset_at.is_none()
+                || previous_reset_at
+                    .is_some_and(|previous| self.selected_reset_at == Some(previous));
+            if follows_current {
+                self.selected_reset_at = self.reset_at;
+                self.selected_history_period.clear();
+            }
         }
         if self.selected_reset_at.is_none() {
             self.selected_reset_at = self.reset_at;
         }
         self.checking = false;
-        self.last_success_at = Some(Utc::now().timestamp());
+        self.last_success_at = Some(now);
         debug_runtime(format!(
             "state usage applied authenticated={} reset_at={} window_seconds={} auth_epoch={}",
             self.authenticated, reset_at, window_seconds, self.auth_epoch
@@ -5630,6 +5930,7 @@ impl CodexInfoState {
         let model_tokens = result.model_usage.token_totals();
         let history_sample_count = result.history_samples.len();
         self.local_usage_error = false;
+        self.local_usage_pending = false;
         // A recovery result closes the one-shot backfill, but it must remain
         // marked as attempted until a fresh authenticated quota event arrives.
         // Otherwise an app-server restart loop would launch the same full
@@ -5646,6 +5947,7 @@ impl CodexInfoState {
         if self.authenticated {
             self.model_usage = result.model_usage.rows();
             self.estimated_cost_label = format_estimated_cost(model_costs);
+            self.usage_snapshot_committed = true;
         }
         if !self.preview {
             self.history
@@ -5677,6 +5979,7 @@ impl CodexInfoState {
             return;
         }
         self.local_usage_error = true;
+        self.local_usage_pending = false;
         self.recovery_requested = false;
         self.refresh_partial_failure_status();
     }
@@ -5714,6 +6017,11 @@ impl CodexInfoState {
             self.error = Some(account_error);
             self.status =
                 "利用状況を取得できません。Codex app-serverへの接続を確認してください。".into();
+            return;
+        }
+        if self.local_usage_pending {
+            self.error = None;
+            self.status = "利用量と履歴を取得しています…".into();
             return;
         }
         match (self.local_usage_error, self.thread_error) {
@@ -6984,7 +7292,7 @@ impl CodexInfoState {
             .unwrap_or(self.window_seconds.max(WEEK_SECONDS));
         ui.set_authenticated(self.authenticated);
         ui.set_strings(ui_strings(&self.i18n));
-        ui.set_has_usage(self.has_usage);
+        ui.set_has_usage(self.has_visible_usage());
         ui.set_has_auth_url(self.auth_url.is_some());
         ui.set_checking(self.checking);
         ui.set_has_error(self.error.is_some());
@@ -8384,20 +8692,42 @@ mod tests {
         read_recovery_entries, read_thread_rollout_path, recovery_timed_usage,
         remaining_graph_points, remaining_graph_points_for_metric, remaining_graph_y,
         remaining_marker_positions, remaining_marker_positions_on_points, request_with_timeout,
-        same_rollout_identity, separate_current_label_positions, service_is_healthy,
-        session_event_model, session_event_type, session_jsonl_files, session_token_snapshot,
-        smooth_model_spend, smooth_remaining_points, split_metric_line_paths, stacked_area_path,
-        terminate_and_reap_owned_child, thread_presentation_rows, three_months_before_utc,
-        unused_interval_positions, week_remaining_text, ActiveThread, ActiveThreadUpdate,
-        ApiServer, ApiServerConfig, CodexInfoState, Event, FixedResizeDecision, GraphPaths,
-        GraphWindow, HourlyModelSpend, I18n, LaunchMode, LocalUsageResult, ManualX11Geometry,
-        ManualX11WindowAction, ModelDollarTotals, ModelTokenTotals, ModelUsageRow,
-        ModelUsageTotals, RpcReadEvent, SessionTraversalBudget, TokenSnapshot,
-        UnusedIntervalPosition, UsageEvent, UsageHistory, UsageHistorySample, UsageStore,
-        DEFAULT_SERVICE_ADDRESS, FIXED_WINDOW_HEIGHT, FIXED_WINDOW_WIDTH, GRAPH_METRIC_OPTIONS,
-        GRAPH_WINDOW_PURPOSE, LOCAL_ESTIMATE_PRICE_VERSION, PRODUCT_VERSION,
-        THREADS_WINDOW_PURPOSE, UNAUTHENTICATED_WINDOW_TITLE, WEEK_SECONDS,
+        reset_transition_is_boundary, same_rollout_identity, separate_current_label_positions,
+        service_is_healthy, session_event_model, session_event_type, session_jsonl_files,
+        session_token_snapshot, smooth_model_spend, smooth_remaining_points,
+        split_metric_line_paths, stacked_area_path, terminate_and_reap_owned_child,
+        thread_presentation_rows, three_months_before_utc, unused_interval_positions,
+        week_remaining_text, ActiveThread, ActiveThreadUpdate, ApiServer, ApiServerConfig,
+        CodexInfoState, Event, FixedResizeDecision, GraphPaths, GraphWindow, HourlyModelSpend,
+        I18n, LaunchMode, LocalUsageResult, ManualX11Geometry, ManualX11WindowAction,
+        ModelDollarTotals, ModelTokenTotals, ModelUsageRow, ModelUsageTotals, RpcReadEvent,
+        SessionTraversalBudget, TokenSnapshot, UnusedIntervalPosition, UsageEvent, UsageHistory,
+        UsageHistorySample, UsageStore, DEFAULT_SERVICE_ADDRESS, FIXED_WINDOW_HEIGHT,
+        FIXED_WINDOW_WIDTH, GRAPH_METRIC_OPTIONS, GRAPH_WINDOW_PURPOSE,
+        LOCAL_ESTIMATE_PRICE_VERSION, PRODUCT_VERSION, THREADS_WINDOW_PURPOSE,
+        UNAUTHENTICATED_WINDOW_TITLE, WEEK_SECONDS,
     };
+    use serde::Deserialize;
+
+    #[derive(Deserialize)]
+    struct GraphFixture {
+        period_start: i64,
+        period_end: i64,
+        reset_at: i64,
+        samples: Vec<GraphFixtureSample>,
+        expected_remaining: Vec<f64>,
+        expected_sol_max: f64,
+        expected_period_count: usize,
+    }
+
+    #[derive(Deserialize)]
+    struct GraphFixtureSample {
+        timestamp: i64,
+        remaining_percent: Option<f64>,
+        sol_dollars: f64,
+        terra_dollars: f64,
+        luna_dollars: f64,
+    }
     use super::{
         claim_manual_x11_action, forbidden_x11_states, manual_resize_geometry,
         manual_window_geometry, motif_wm_functions, motif_wm_resizable_functions, X11StateAtoms,
@@ -8997,6 +9327,73 @@ mod tests {
     }
 
     #[test]
+    fn periodic_quota_refresh_retains_last_good_main_snapshot() {
+        let mut state = CodexInfoState::preview("normal");
+        let previous_models = state.model_usage.clone();
+        let previous_threads = state.active_threads.len();
+        let previous_reset = state.reset_at.expect("preview reset");
+
+        // A moving reset timestamp must not be treated as an account change or
+        // as proof that the current model table is invalid.  This is the
+        // exact failure mode that made the main screen blink every cycle.
+        state.apply_usage_event(usage_event(Some(14.0), previous_reset + 120));
+        assert_eq!(state.model_usage, previous_models);
+
+        // A periodic quota response is intentionally incomplete.  Simulate
+        // the interval after that response and before the local collector's
+        // matching commit; the previously committed values must remain
+        // visible instead of reverting to an empty/initial screen.
+        state.local_usage_pending = true;
+        state.usage_snapshot_committed = true;
+
+        // A single successful assertion is not enough: the production bug
+        // appeared only after several timer-driven refreshes. Exercise a
+        // finite sequence of rolling reset values and verify that every
+        // intermediate publish keeps the same last-good snapshot.
+        for cycle in 0..8 {
+            state.apply_usage_event(usage_event(
+                Some(14.0 - f64::from(cycle) * 0.25),
+                previous_reset + 120 + i64::from(cycle + 1) * 120,
+            ));
+            state.local_usage_pending = true;
+            state.usage_snapshot_committed = true;
+
+            let snapshot = state.public_snapshot();
+            assert_eq!(snapshot.state, PublicState::Ready);
+            assert_eq!(snapshot.models.len(), previous_models.len());
+            assert_eq!(snapshot.active_thread_count as usize, previous_threads);
+            let details = state.public_details();
+            assert_eq!(details.models.len(), previous_models.len());
+            assert_eq!(details.threads.len(), previous_threads);
+            assert!(state.has_visible_usage());
+        }
+    }
+
+    #[test]
+    fn rolling_reset_timestamp_drift_is_not_a_new_period() {
+        let now = 2_000_000_000;
+        let window = WEEK_SECONDS;
+        assert!(!reset_transition_is_boundary(
+            Some(now + window - 60),
+            Some(87.0),
+            now + window + 60,
+            Some(86.0),
+            Some(now),
+            now + 60,
+            window,
+        ));
+        assert!(reset_transition_is_boundary(
+            Some(now + 60),
+            Some(1.0),
+            now + window + 60,
+            Some(100.0),
+            Some(now),
+            now + 60,
+            window,
+        ));
+    }
+
+    #[test]
     fn local_usage_failure_keeps_valid_quota_and_never_invents_zero_history() {
         let mut state = CodexInfoState::preview("normal");
         let reset_at = state.reset_at.expect("preview quota has reset");
@@ -9341,6 +9738,15 @@ mod tests {
             },
         );
         state.apply_usage_event(usage_event(Some(23.0), reset_at));
+        // A quota response alone is not a graph-ready snapshot.  The REST
+        // pair and native view must remain loading until local usage commits.
+        state.local_usage_pending = true;
+        let pending = state.public_snapshot();
+        assert_eq!(pending.state, PublicState::Initializing);
+        assert!(pending.models.is_empty());
+        assert_eq!(pending.active_thread_count, 0);
+        assert!(state.public_details().history_periods.is_empty());
+
         state.apply_local_usage_success(LocalUsageResult {
             auth_epoch: state.auth_epoch,
             reset_at,
@@ -9362,7 +9768,36 @@ mod tests {
             .samples
             .iter()
             .any(|sample| sample.remaining_percent == 23.0));
+        assert!(!state.local_usage_pending);
+        assert_eq!(state.public_snapshot().state, PublicState::Ready);
         assert!(!state.local_usage_error);
+    }
+
+    #[test]
+    fn quota_reset_moves_an_auto_selected_graph_to_the_new_period() {
+        let mut state = CodexInfoState::preview("normal");
+        let previous_reset = state.reset_at.expect("preview reset");
+        state.select_latest_history();
+        assert_eq!(state.selected_reset_at, Some(previous_reset));
+
+        let next_reset = previous_reset + WEEK_SECONDS;
+        state.apply_usage_event(usage_event(Some(22.0), next_reset));
+        assert_eq!(state.selected_reset_at, Some(next_reset));
+        assert!(state.selected_history_period.is_empty());
+
+        state.apply_local_usage_success(LocalUsageResult {
+            auth_epoch: state.auth_epoch,
+            reset_at: next_reset,
+            window_seconds: WEEK_SECONDS,
+            model_usage: ModelUsageTotals::default(),
+            history_samples: vec![UsageHistorySample::new(
+                Utc::now().timestamp(),
+                next_reset,
+                22.0,
+                ModelDollarTotals::default(),
+            )],
+        });
+        assert_eq!(state.selected_history_reset(), Some(next_reset));
     }
 
     #[test]
@@ -12764,6 +13199,99 @@ mod tests {
     }
 
     #[test]
+    fn historical_week_fixture_preserves_each_period_and_graph_samples() {
+        // Regression fixture for the real failure class: multiple weekly
+        // periods are present in one acquisition window and reset boundaries
+        // are far apart, so a moving-reset matcher must not drop or mix rows.
+        let first_reset = 1_700_604_800;
+        let second_reset = first_reset + WEEK_SECONDS;
+        let third_reset = second_reset + WEEK_SECONDS;
+        let samples = vec![
+            UsageHistorySample::new_with_usage(
+                1_700_000_000,
+                first_reset,
+                80.0,
+                ModelDollarTotals {
+                    sol: 10.0,
+                    ..ModelDollarTotals::default()
+                },
+                ModelTokenTotals {
+                    sol: 100,
+                    ..ModelTokenTotals::default()
+                },
+            ),
+            UsageHistorySample::new_with_usage(
+                first_reset - 60,
+                first_reset,
+                70.0,
+                ModelDollarTotals {
+                    sol: 20.0,
+                    ..ModelDollarTotals::default()
+                },
+                ModelTokenTotals {
+                    sol: 200,
+                    ..ModelTokenTotals::default()
+                },
+            ),
+            UsageHistorySample::new_with_usage(
+                first_reset,
+                second_reset,
+                100.0,
+                ModelDollarTotals::default(),
+                ModelTokenTotals::default(),
+            ),
+            UsageHistorySample::new_with_usage(
+                second_reset - 60,
+                second_reset,
+                60.0,
+                ModelDollarTotals {
+                    luna: 30.0,
+                    ..ModelDollarTotals::default()
+                },
+                ModelTokenTotals {
+                    luna: 300,
+                    ..ModelTokenTotals::default()
+                },
+            ),
+            UsageHistorySample::new_with_usage(
+                second_reset,
+                third_reset,
+                100.0,
+                ModelDollarTotals::default(),
+                ModelTokenTotals::default(),
+            ),
+        ];
+        let history = UsageHistory {
+            samples: samples.clone(),
+            ..UsageHistory::default()
+        };
+        let periods = history.periods(third_reset + 60, None);
+        assert_eq!(
+            periods
+                .iter()
+                .map(|period| period.canonical_reset_at)
+                .collect::<Vec<_>>(),
+            vec![third_reset, second_reset, first_reset]
+        );
+
+        let grouped_count = periods
+            .iter()
+            .map(|period| {
+                history
+                    .samples_for_reset(Some(period.canonical_reset_at))
+                    .len()
+            })
+            .sum::<usize>();
+        assert_eq!(grouped_count, samples.len());
+        for period in periods {
+            let selected = history.samples_for_reset(Some(period.canonical_reset_at));
+            assert!(selected
+                .iter()
+                .all(|sample| sample.reset_at == period.canonical_reset_at));
+        }
+    }
+
+    #[test]
     fn observed_moving_reset_sequence_keeps_the_spend_in_the_selected_graph() {
         // This is the shape found in the affected database: reset_at advances
         // with each observation, while the first few snapshots are idle and
@@ -12825,6 +13353,315 @@ mod tests {
         );
         assert!(graph.luna_rising.contains('L'));
         assert_eq!(graph.current_luna_label, "$0.02");
+    }
+
+    #[test]
+    fn affected_period_keeps_sol_spend_and_unobserved_quota_distinct() {
+        // Regression fixture for the 8/20-8/24 history: the reset deadline
+        // moves by a few seconds, session backfill contributes SOL totals
+        // without a quota observation, and only the final quota poll reports
+        // the 1% balance. The period must stay a single selection, while the
+        // missing quota interval must not be turned into a fabricated slope.
+        let base = 1_999_999_980;
+        let reset = base + 10_000;
+        let samples = vec![
+            UsageHistorySample::new_with_usage(
+                base,
+                reset,
+                87.0,
+                ModelDollarTotals {
+                    terra: 30.50,
+                    ..ModelDollarTotals::default()
+                },
+                ModelTokenTotals::default(),
+            ),
+            UsageHistorySample::from_model_history(
+                base + 60,
+                reset + 47,
+                ModelDollarTotals {
+                    sol: 140.97,
+                    ..ModelDollarTotals::default()
+                },
+            ),
+            UsageHistorySample::from_model_history(
+                base + 120,
+                reset + 48,
+                ModelDollarTotals {
+                    sol: 420.40,
+                    ..ModelDollarTotals::default()
+                },
+            ),
+            UsageHistorySample::new_with_usage(
+                base + 240,
+                reset + 50,
+                1.0,
+                ModelDollarTotals {
+                    sol: 420.40,
+                    ..ModelDollarTotals::default()
+                },
+                ModelTokenTotals::default(),
+            ),
+        ];
+        let history = UsageHistory {
+            samples,
+            ..UsageHistory::default()
+        };
+
+        let periods = history.periods(base + 600, None);
+        assert_eq!(periods.len(), 1);
+        assert_eq!(periods[0].canonical_reset_at, reset + 50);
+        let selected = history.samples_for_reset(Some(reset + 50));
+        assert_eq!(selected.len(), 4);
+        assert_eq!(
+            selected
+                .iter()
+                .map(|sample| sample.sol_dollars)
+                .fold(0.0, f64::max),
+            420.40
+        );
+        assert_eq!(selected.last().unwrap().remaining_percent, 1.0);
+
+        let references = selected.iter().collect::<Vec<_>>();
+        let remaining = remaining_graph_points(&references, base, base + 300);
+        assert_eq!(
+            remaining,
+            vec![
+                (base, 87.0),
+                (base + 60, 44.0),
+                (base + 120, 1.0),
+                (base + 240, 1.0),
+                (base + 300, 1.0)
+            ]
+        );
+    }
+
+    #[test]
+    fn shared_graph_fixture_is_the_x_history_oracle() {
+        const SPEC_REMAINING: [f64; 5] = [87.0, 44.0, 1.0, 1.0, 1.0];
+        const SPEC_SOL_MAX: f64 = 420.40;
+        const SPEC_PERIOD_COUNT: usize = 1;
+        let fixture: GraphFixture =
+            serde_json::from_str(include_str!("../tests/fixtures/graph_delayed_quota.json"))
+                .expect("valid shared graph fixture");
+        // These literals are the reviewed acceptance oracle.  The fixture is
+        // test input, not an implementation-generated expected-value source.
+        assert_eq!(fixture.expected_remaining, SPEC_REMAINING);
+        assert_eq!(fixture.expected_sol_max, SPEC_SOL_MAX);
+        assert_eq!(fixture.expected_period_count, SPEC_PERIOD_COUNT);
+        let samples = fixture
+            .samples
+            .iter()
+            .map(|sample| match sample.remaining_percent {
+                Some(remaining) => UsageHistorySample::new_with_usage(
+                    sample.timestamp,
+                    fixture.reset_at,
+                    remaining,
+                    ModelDollarTotals {
+                        sol: sample.sol_dollars,
+                        terra: sample.terra_dollars,
+                        luna: sample.luna_dollars,
+                    },
+                    ModelTokenTotals::default(),
+                ),
+                None => UsageHistorySample::from_model_history(
+                    sample.timestamp,
+                    fixture.reset_at,
+                    ModelDollarTotals {
+                        sol: sample.sol_dollars,
+                        terra: sample.terra_dollars,
+                        luna: sample.luna_dollars,
+                    },
+                ),
+            })
+            .collect::<Vec<_>>();
+        let history = UsageHistory {
+            samples,
+            ..UsageHistory::default()
+        };
+        let periods = history.periods(fixture.period_end, Some(fixture.reset_at));
+        assert_eq!(periods.len(), SPEC_PERIOD_COUNT);
+        assert_eq!(periods[0].start, fixture.period_start);
+        assert_eq!(periods[0].end, fixture.period_end);
+        let selected = history.samples_for_reset(Some(fixture.reset_at));
+        let references = selected.iter().collect::<Vec<_>>();
+        let remaining =
+            remaining_graph_points(&references, fixture.period_start, fixture.period_end);
+        assert_eq!(remaining.len(), SPEC_REMAINING.len());
+        for (point, expected) in remaining.iter().zip(SPEC_REMAINING) {
+            assert!((point.1 - expected).abs() < 0.000_001);
+        }
+        assert_eq!(
+            selected
+                .iter()
+                .map(|sample| sample.sol_dollars)
+                .fold(0.0, f64::max),
+            SPEC_SOL_MAX
+        );
+    }
+
+    #[test]
+    fn long_rolling_reset_sequence_stays_in_one_period_after_a_real_boundary() {
+        // The affected local history contains a genuine boundary followed by
+        // hundreds of quota observations whose reset_at advances every
+        // minute. The cumulative drift is hours, so a group-wide five-minute
+        // cap incorrectly turned the current graph into many tiny periods.
+        let base = 1_800_000_000;
+        let stable_reset = base + WEEK_SECONDS;
+        let rolling_start = base + 120;
+        let rolling_reset = stable_reset + 10_000;
+        let mut samples = vec![
+            UsageHistorySample::new_with_usage(
+                base,
+                stable_reset,
+                72.0,
+                ModelDollarTotals {
+                    luna: 1.0,
+                    ..ModelDollarTotals::default()
+                },
+                ModelTokenTotals {
+                    luna: 10,
+                    ..ModelTokenTotals::default()
+                },
+            ),
+            UsageHistorySample::new_with_usage(
+                base + 60,
+                stable_reset,
+                71.0,
+                ModelDollarTotals {
+                    luna: 2.0,
+                    ..ModelDollarTotals::default()
+                },
+                ModelTokenTotals {
+                    luna: 20,
+                    ..ModelTokenTotals::default()
+                },
+            ),
+        ];
+        for index in 0..12 {
+            let timestamp = rolling_start + index * 60;
+            samples.push(UsageHistorySample::new_with_usage(
+                timestamp,
+                rolling_reset + index * 60,
+                100.0,
+                ModelDollarTotals {
+                    luna: if index == 11 { 4.0 } else { 0.0 },
+                    ..ModelDollarTotals::default()
+                },
+                ModelTokenTotals {
+                    luna: if index == 11 { 40 } else { 0 },
+                    ..ModelTokenTotals::default()
+                },
+            ));
+        }
+        let history = UsageHistory {
+            samples,
+            ..UsageHistory::default()
+        };
+
+        let periods = history.periods(rolling_start + 12 * 60 + 1, None);
+        assert_eq!(periods.len(), 2);
+        let rolling_period = periods
+            .iter()
+            .find(|period| period.start == rolling_start)
+            .expect("rolling period");
+        assert_eq!(rolling_period.canonical_reset_at, rolling_reset + 11 * 60);
+        let selected = history.samples_for_reset(Some(rolling_period.canonical_reset_at));
+        assert_eq!(selected.len(), 12);
+        assert_eq!(selected.last().unwrap().luna_dollars, 4.0);
+        assert!(selected
+            .iter()
+            .all(|sample| sample.reset_at == rolling_period.canonical_reset_at));
+    }
+
+    #[test]
+    fn quota_only_reset_fragments_stay_with_the_adjacent_spend_period() {
+        // The production failure was not a single moving sequence: the
+        // service emitted several independent full-quota/zero-usage reset
+        // rows between a spend row and the next spend row. Selecting one of
+        // those fragments produced a flat 100% graph with no model data.
+        let base = 1_810_000_000;
+        let stable_reset = base + WEEK_SECONDS;
+        let samples = vec![
+            UsageHistorySample::new(
+                base - 600,
+                stable_reset - 50_000,
+                48.0,
+                ModelDollarTotals {
+                    luna: 0.5,
+                    ..ModelDollarTotals::default()
+                },
+            ),
+            UsageHistorySample::new_with_usage(
+                base,
+                stable_reset,
+                98.0,
+                ModelDollarTotals {
+                    luna: 1.0,
+                    ..ModelDollarTotals::default()
+                },
+                ModelTokenTotals {
+                    luna: 10,
+                    ..ModelTokenTotals::default()
+                },
+            ),
+            UsageHistorySample::new_with_usage(
+                base + 60,
+                stable_reset,
+                97.0,
+                ModelDollarTotals {
+                    luna: 2.0,
+                    ..ModelDollarTotals::default()
+                },
+                ModelTokenTotals {
+                    luna: 20,
+                    ..ModelTokenTotals::default()
+                },
+            ),
+            UsageHistorySample::new(
+                base + 120,
+                stable_reset + 10_000,
+                100.0,
+                ModelDollarTotals::default(),
+            ),
+            UsageHistorySample::new(
+                base + 180,
+                stable_reset + 11_000,
+                100.0,
+                ModelDollarTotals::default(),
+            ),
+            UsageHistorySample::new_with_usage(
+                base + 240,
+                stable_reset + 12_000,
+                100.0,
+                ModelDollarTotals {
+                    luna: 4.0,
+                    ..ModelDollarTotals::default()
+                },
+                ModelTokenTotals {
+                    luna: 40,
+                    ..ModelTokenTotals::default()
+                },
+            ),
+        ];
+        let history = UsageHistory {
+            samples,
+            ..UsageHistory::default()
+        };
+
+        let periods = history.periods(base + 300, None);
+        assert_eq!(periods.len(), 2);
+        let rolling_start = base.div_euclid(60) * 60;
+        let rolling_period = periods
+            .iter()
+            .find(|period| period.start == rolling_start)
+            .expect("rolling spend period");
+        let selected = history.samples_for_reset(Some(rolling_period.canonical_reset_at));
+        assert_eq!(selected.len(), 5);
+        assert_eq!(selected.last().unwrap().luna_dollars, 4.0);
+        assert_eq!(selected.last().unwrap().luna_tokens, 40);
+        assert!(selected
+            .iter()
+            .any(|sample| sample.remaining_percent == 100.0));
     }
 
     #[test]
@@ -13320,6 +14157,39 @@ mod tests {
         );
         let path = graph_paths(&references, 0, 240).remaining;
         assert_eq!(path, "M0.00 1.00 L100.00 1.00");
+    }
+
+    #[test]
+    fn remaining_graph_does_not_infer_quota_loss_from_model_spend() {
+        let samples = [
+            UsageHistorySample::new(0, 1_000, 100.0, ModelDollarTotals::default()),
+            UsageHistorySample::from_model_history(
+                60,
+                1_000,
+                ModelDollarTotals {
+                    sol: 10.0,
+                    ..ModelDollarTotals::default()
+                },
+            ),
+            UsageHistorySample::from_model_history(
+                120,
+                1_000,
+                ModelDollarTotals {
+                    sol: 20.0,
+                    ..ModelDollarTotals::default()
+                },
+            ),
+        ];
+        let references = samples.iter().collect::<Vec<_>>();
+
+        // Session-derived model costs have no quota observation. A flat
+        // remaining line is intentionally retained; deriving a percentage
+        // from pricing would fabricate a credit balance and make a valid
+        // historical graph look like an account deduction oracle.
+        assert_eq!(
+            remaining_graph_points(&references, 0, 180),
+            vec![(0, 100.0), (60, 100.0), (120, 100.0), (180, 100.0)]
+        );
     }
 
     #[test]
@@ -14282,6 +15152,41 @@ mod tests {
     }
 
     #[test]
+    fn model_graph_does_not_invent_spend_during_an_unobserved_gap() {
+        let points = [
+            HourlyModelSpend {
+                timestamp: 0,
+                luna: 1.0,
+                ..HourlyModelSpend::default()
+            },
+            HourlyModelSpend {
+                timestamp: 60,
+                luna: 1.0,
+                ..HourlyModelSpend::default()
+            },
+            HourlyModelSpend {
+                timestamp: 3_600,
+                luna: 2.0,
+                ..HourlyModelSpend::default()
+            },
+            HourlyModelSpend {
+                timestamp: 3_660,
+                luna: 2.0,
+                ..HourlyModelSpend::default()
+            },
+        ];
+        let smoothed = smooth_model_spend(&points);
+        assert_eq!(smoothed[1].luna, 1.0);
+        assert_eq!(smoothed[2].luna, 2.0);
+        let (flat, rising) = split_metric_line_paths(&smoothed, 0, 3_660, 2.0, |point| point.luna);
+        // The 60..3600 interval is unobserved: stay at $1.00, then rise at
+        // the observed 3600-second point. A diagonal here falsely claims
+        // daytime consumption.
+        assert!(flat.contains("M1.64 50.00 L98.36 50.00"));
+        assert!(rising.contains("M98.36 50.00 L98.36 1.00"));
+    }
+
+    #[test]
     fn graph_selection_uses_one_monotonic_series_for_lines_and_current_values() {
         let reset_at = 1_000;
         let sample = |timestamp, dollars, tokens| {
@@ -14722,7 +15627,10 @@ mod tests {
         assert!(graph.contains("opacity: 0.72;"));
         assert!(graph.contains("in-out property <[GraphUnusedInterval]> unused-intervals;"));
         assert!(graph.contains("for interval in root.unused-intervals: Rectangle"));
-        assert!(graph.contains("background: DesignTokens.text-muted;"));
+        assert!(graph.contains("background: DesignTokens.graph-idle-band;"));
+        assert!(graph.contains("opacity: 0.22;"));
+        let theme = include_str!("../ui/theme.slint");
+        assert!(theme.contains("graph-idle-band: #3f5d7c;"));
         let toggle = source
             .split("component GraphToggle inherits Rectangle {")
             .nth(1)

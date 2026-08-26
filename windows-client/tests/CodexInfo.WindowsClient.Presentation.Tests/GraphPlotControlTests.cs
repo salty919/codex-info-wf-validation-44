@@ -2,7 +2,9 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
 using System.Globalization;
+using System.Text.Json;
 using CodexInfo.WindowsClient.Core;
+using CodexInfo.WindowsClient.Controls;
 using CodexInfo.WindowsClient.Graphing;
 using CodexInfo.WindowsClient.ViewModels;
 using Xunit;
@@ -187,6 +189,25 @@ public sealed class GraphPlotControlTests
     }
 
     [Fact]
+    public void PlotProjectionDoesNotInventSpendDuringAnUnobservedGap()
+    {
+        var scene = Scene(
+            [
+                Point(1_000, 100, 0, 0, 0),
+                Point(1_060, 99, 0, 0, 1),
+                Point(3_600, 98, 0, 0, 2),
+                Point(3_660, 97, 0, 0, 2),
+            ]);
+
+        var lines = GraphPlotProjection.BuildModelLines(scene, scene.Luna);
+
+        Assert.Equal([1_060d, 3_600d, double.NaN, 3_600d, 3_660d], lines.Flat.X);
+        Assert.Equal([1d, 1d, double.NaN, 2d, 2d], lines.Flat.Y);
+        Assert.Equal([1_000d, 1_060d, double.NaN, 3_600d, 3_600d], lines.Rising.X);
+        Assert.Equal([0d, 1d, double.NaN, 1d, 2d], lines.Rising.Y);
+    }
+
+    [Fact]
     public void PlotProjectionStartsAtFirstObservationWithoutSyntheticVerticalJump()
     {
         var scene = Scene(
@@ -242,6 +263,13 @@ public sealed class GraphPlotControlTests
             1_000,
             87_400);
         Assert.True(Assert.Single(GraphPlotProjection.BuildVisibleIdleIntervals(boundaryScene)).PreserveBoundary);
+    }
+
+    [Fact]
+    public void IdleBandsUseTheDedicatedVisibleNeutralColor()
+    {
+        Assert.Equal("#3F5D7C", GraphPlotControl.IdleBandColorHex);
+        Assert.Equal(0.22, GraphPlotControl.IdleBandOpacity);
     }
 
     [Fact]
@@ -389,6 +417,82 @@ public sealed class GraphPlotControlTests
         Assert.Equal(90d, effective[1]);
         Assert.Equal(85d, effective[2]);
         Assert.Equal(80d, effective[3]);
+    }
+
+    [Fact]
+    public void Remaining_accepts_a_delayed_lower_quota_after_unobserved_sol_usage()
+    {
+        var points = new[]
+        {
+            Point(1_000, 87, 0, 0, 0),
+            Point(1_060, null, 140, 0, 0),
+            Point(1_120, null, 420, 0, 0),
+            Point(1_240, 1, 420, 0, 0),
+        };
+
+        var effective = Scene(points).Remaining;
+
+        Assert.Equal(87d, effective[0]);
+        Assert.True(effective[1] < 87d);
+        Assert.Equal(1d, effective[2]);
+        Assert.Equal(1d, effective[3]);
+    }
+
+    [Fact]
+    public void Shared_graph_fixture_matches_the_native_history_oracle()
+    {
+        var specRemaining = new[] { 87d, 44d, 1d, 1d, 1d };
+        const double specSolMax = 420.40d;
+        const int specPeriodCount = 1;
+        var fixturePath = Path.Combine(
+            AppContext.BaseDirectory,
+            "Fixtures",
+            "graph_delayed_quota.json");
+        using var document = JsonDocument.Parse(File.ReadAllText(fixturePath));
+        var root = document.RootElement;
+        var periodStart = root.GetProperty("period_start").GetInt64();
+        var periodEnd = root.GetProperty("period_end").GetInt64();
+        var samples = root.GetProperty("samples")
+            .EnumerateArray()
+            .Select(sample => new ApiHistorySample(
+                sample.GetProperty("timestamp").GetInt64(),
+                root.GetProperty("reset_at").GetInt64(),
+                sample.GetProperty("remaining_percent").ValueKind == JsonValueKind.Null
+                    ? null
+                    : sample.GetProperty("remaining_percent").GetDouble(),
+                sample.GetProperty("sol_dollars").GetDouble(),
+                sample.GetProperty("terra_dollars").GetDouble(),
+                sample.GetProperty("luna_dollars").GetDouble(),
+                0,
+                0,
+                0))
+            .ToArray();
+
+        var period = new ApiHistoryPeriod("shared", periodStart, periodEnd, false, "shared")
+        {
+            ResetAt = root.GetProperty("reset_at").GetInt64(),
+            Samples = samples,
+        };
+        var graphSamples = DetailsWindowViewModels.BuildGraphSamples(period, periodEnd);
+        var scene = GraphScene.Create(graphSamples, GraphMetric.Dollars, periodStart, periodEnd);
+        var expected = root.GetProperty("expected_remaining")
+            .EnumerateArray()
+            .Select(value => value.GetDouble())
+            .ToArray();
+
+        // Reviewed literals are the acceptance oracle; do not derive these
+        // expected values from GraphScene/BuildGraphSamples.
+        Assert.Equal(specPeriodCount, root.GetProperty("expected_period_count").GetInt32());
+        Assert.Equal(specRemaining, expected);
+        Assert.Equal(specSolMax, root.GetProperty("expected_sol_max").GetDouble(), precision: 6);
+        Assert.Equal(periodStart, scene.PeriodStartAt);
+        Assert.Equal(periodEnd, scene.PeriodEndAt);
+        Assert.Equal(specRemaining.Length, scene.Remaining.Count);
+        for (var index = 0; index < specRemaining.Length; index++)
+        {
+            Assert.Equal(specRemaining[index], scene.Remaining[index], precision: 6);
+        }
+        Assert.Equal(specSolMax, scene.ModelMaximum, precision: 6);
     }
 
     [Fact]

@@ -20,8 +20,24 @@ on:
       - "scripts/data_protection_gate.sh"
       - "scripts/windows_client_contract_gate.sh"
       - "scripts/regression_guard.sh"
+      - "scripts/final_acceptance_gate.sh"
       - "docs/REGRESSION_PREVENTION_POLICY.md"
       - "docs/PRODUCT_REQUIREMENTS.md"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "build.rs"
+      - "run.sh"
+      - "src/**"
+      - "protocol/**"
+      - "tests/**"
+      - "ui/**"
+      - "assets/**"
+      - "LICENSE"
+      - "LICENSE.ja.md"
+      - "deny.toml"
+      - ".cargo/config.toml"
+      - "scripts/**"
+      - "docs/**"
       - ".github/workflows/windows-client.yml"
   pull_request:
     branches: ["main"]
@@ -39,8 +55,24 @@ on:
       - "scripts/data_protection_gate.sh"
       - "scripts/windows_client_contract_gate.sh"
       - "scripts/regression_guard.sh"
+      - "scripts/final_acceptance_gate.sh"
       - "docs/REGRESSION_PREVENTION_POLICY.md"
       - "docs/PRODUCT_REQUIREMENTS.md"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "build.rs"
+      - "run.sh"
+      - "src/**"
+      - "protocol/**"
+      - "tests/**"
+      - "ui/**"
+      - "assets/**"
+      - "LICENSE"
+      - "LICENSE.ja.md"
+      - "deny.toml"
+      - ".cargo/config.toml"
+      - "scripts/**"
+      - "docs/**"
       - ".github/workflows/windows-client.yml"
 
 permissions:
@@ -155,6 +187,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - name: Install required test tools
         run: sudo apt-get update && sudo apt-get install --no-install-recommends --yes ripgrep sqlite3
       - name: Enforce data protection policy
@@ -162,12 +196,10 @@ jobs:
       - uses: actions/setup-dotnet@v4
         with:
           dotnet-version: "10.0.x"
-      - name: Restore locked dependencies
-        run: dotnet restore windows-client/CodexInfo.WindowsClient.sln --locked-mode
-      - name: Build desktop client
-        run: dotnet build windows-client/CodexInfo.WindowsClient.sln --no-restore --configuration Release
       - name: Enforce Windows feature contract
         run: bash scripts/windows_client_contract_gate.sh
+      - name: Install Rust toolchain for native regression gate
+        uses: dtolnay/rust-toolchain@stable
       - name: Enforce regression checks
         run: bash scripts/regression_guard.sh
 
@@ -175,6 +207,8 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: actions/setup-dotnet@v4
         with:
           dotnet-version: "10.0.x"
@@ -257,7 +291,7 @@ jobs:
           if (-not (Test-Path $exe -PathType Leaf)) { throw 'Installed client executable is missing for UI E2E.' }
           $e2eOutput = Join-Path $env:RUNNER_TEMP 'codex-info-windows-e2e'
           try {
-            & ./windows-client/tools/Run-WindowsClientE2E.ps1 -ClientPath $exe -OutputDirectory $e2eOutput -Fixture
+            & ./windows-client/tools/Run-WindowsClientE2E.ps1 -ClientPath $exe -OutputDirectory $e2eOutput -Fixture -SourceSha $env:GITHUB_SHA
             if (-not $?) { throw 'Windows UI Automation E2E failed.' }
           }
           finally {
@@ -282,19 +316,56 @@ jobs:
           path: artifacts/windows-installer/CodexInfo.WindowsClient.Setup.exe
           if-no-files-found: warn
 
+  acceptance:
+    if: needs.core-tests.result == 'success' && needs.windows-build.result == 'success'
+    needs: [core-tests, windows-build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Download Windows UI E2E evidence
+        uses: actions/download-artifact@v4
+        with:
+          name: windows-ui-e2e
+          path: artifacts/windows-ui-e2e
+      - name: Install final gate tools
+        run: sudo apt-get update && sudo apt-get install --no-install-recommends --yes ripgrep
+      - name: Install Rust toolchain for final native gate
+        uses: dtolnay/rust-toolchain@stable
+      - name: Run final acceptance gate before merge
+        env:
+          EXPECTED_E2E_SOURCE_SHA: ${{ github.sha }}
+        run: bash scripts/final_acceptance_gate.sh artifacts/windows-ui-e2e
+
   release:
     if: github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.version-policy.outputs.release == 'true'
-    needs: [version-policy, core-tests, windows-build]
+    needs: [version-policy, core-tests, windows-build, acceptance]
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - name: Download CI installer artifact
         uses: actions/download-artifact@v4
         with:
           name: windows-client-installer
           path: artifacts/windows-installer
+      - name: Download Windows UI E2E evidence
+        uses: actions/download-artifact@v4
+        with:
+          name: windows-ui-e2e
+          path: artifacts/windows-ui-e2e
+      - name: Install final gate tools
+        run: sudo apt-get update && sudo apt-get install --no-install-recommends --yes ripgrep
+      - name: Install Rust toolchain for final native gate
+        uses: dtolnay/rust-toolchain@stable
+      - name: Run final acceptance gate
+        env:
+          EXPECTED_E2E_SOURCE_SHA: ${{ github.sha }}
+        run: bash scripts/final_acceptance_gate.sh artifacts/windows-ui-e2e
       - name: Create deterministic update manifest
         shell: pwsh
         env:

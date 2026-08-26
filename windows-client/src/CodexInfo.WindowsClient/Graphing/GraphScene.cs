@@ -154,15 +154,35 @@ public sealed class GraphScene
         values[0] = rawValues[0] is { } first && double.IsFinite(first)
             ? Math.Clamp(first, 0, 100)
             : 100;
+        var quotaObservedSinceModelChange = true;
         for (var index = 1; index < points.Count; index++)
         {
             var previous = values[index - 1] ?? 100;
             var modelAdvanced = ModelAdvanced(points[index - 1], points[index]);
             var syntheticGap = IsSyntheticRemainingGap(points, index, points[0].Timestamp);
             activeSegments[index - 1] = modelAdvanced && !syntheticGap;
-            values[index] = modelAdvanced && rawValues[index] is { } raw && double.IsFinite(raw)
-                ? Math.Min(previous, Math.Clamp(raw, 0, 100))
-                : previous;
+            var observed = rawValues[index] is { } raw && double.IsFinite(raw)
+                ? Math.Clamp(raw, 0, 100)
+                : (double?)null;
+            if (modelAdvanced)
+            {
+                values[index] = observed is { } activeRaw
+                    ? Math.Min(previous, activeRaw)
+                    : previous;
+                quotaObservedSinceModelChange = observed is not null;
+            }
+            else if (!quotaObservedSinceModelChange && observed is { } delayedRaw && delayedRaw < previous)
+            {
+                // The quota poll can lag behind session usage. Accept the
+                // first lower endpoint after that unobserved active interval,
+                // but keep a genuinely idle period horizontal.
+                values[index] = Math.Min(previous, delayedRaw);
+                quotaObservedSinceModelChange = true;
+            }
+            else
+            {
+                values[index] = previous;
+            }
         }
 
         var source = values.ToArray();

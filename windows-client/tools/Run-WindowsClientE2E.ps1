@@ -7,7 +7,8 @@
 param(
     [string]$ClientPath = '',
     [string]$OutputDirectory = '',
-    [switch]$Fixture
+    [switch]$Fixture,
+    [string]$SourceSha = ''
 )
 
 $ErrorActionPreference = 'Stop'
@@ -40,8 +41,15 @@ if ($script:e2eOutput.Equals($script:e2eRepositoryRoot, [StringComparison]::Ordi
     $script:e2eOutput.StartsWith($script:e2eRepositoryRoot + [IO.Path]::DirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase)) {
     throw 'E2E artifacts must be written outside the repository.'
 }
+if (Test-Path -LiteralPath $script:e2eOutput -PathType Container) {
+    # Evidence must belong to this invocation.  Never append to or reuse a
+    # prior run's log/screenshots, even when a hosted runner reuses its temp
+    # directory after a retry.
+    Remove-Item -LiteralPath $script:e2eOutput -Recurse -Force
+}
 New-Item -ItemType Directory -Path $script:e2eOutput -Force | Out-Null
 $script:e2eLogPath = Join-Path $script:e2eOutput 'windows-client-e2e.log'
+$script:e2eSourceSha = if (-not [string]::IsNullOrWhiteSpace($SourceSha)) { $SourceSha } elseif (-not [string]::IsNullOrWhiteSpace($env:GITHUB_SHA)) { $env:GITHUB_SHA } else { 'unknown' }
 $script:e2eWindowRecords = [System.Collections.Generic.List[object]]::new()
 $script:e2eProcess = $null
 $script:e2eFixtureRunning = $false
@@ -596,6 +604,109 @@ function Assert-E2EImageChanged {
     Assert-E2E ($Before.Hash -ne $After.Hash) "$Description did not change the rendered window."
 }
 
+function Assert-E2EGraphHasModelData {
+    param(
+        [Parameter(Mandatory = $true)][System.Windows.Automation.AutomationElement]$Plot,
+        [Parameter(Mandatory = $true)][IntPtr]$Handle,
+        [Parameter(Mandatory = $true)][psobject]$Capture
+    )
+
+    $window = Get-E2EWindowBounds $Handle
+    $plotBounds = $Plot.Current.BoundingRectangle
+    $bitmap = [System.Drawing.Bitmap]::FromFile($Capture.Path)
+    $series = @(
+        @{ Name = 'LUNA'; Color = [System.Drawing.ColorTranslator]::FromHtml('#E6A23C') },
+        @{ Name = 'TERRA'; Color = [System.Drawing.ColorTranslator]::FromHtml('#5DC98A') },
+        @{ Name = 'SOL'; Color = [System.Drawing.ColorTranslator]::FromHtml('#A88CF5') }
+    )
+    $hits = @{}
+    foreach ($item in $series) { $hits[$item.Name] = 0 }
+    try {
+        $left = [Math]::Max(0, [int]($plotBounds.Left - $window.Left))
+        $top = [Math]::Max(0, [int]($plotBounds.Top - $window.Top))
+        $right = [Math]::Min($bitmap.Width, [int]($plotBounds.Right - $window.Left))
+        $bottom = [Math]::Min($bitmap.Height, [int]($plotBounds.Bottom - $window.Top))
+        Assert-E2E ($right -gt $left -and $bottom -gt $top) 'Graph plot bounds are outside the captured window.'
+        for ($x = $left; $x -lt $right; $x++) {
+            for ($y = $top; $y -lt $bottom; $y++) {
+                $pixel = $bitmap.GetPixel($x, $y)
+                foreach ($item in $series) {
+                    $dr = $pixel.R - $item.Color.R
+                    $dg = $pixel.G - $item.Color.G
+                    $db = $pixel.B - $item.Color.B
+                    if (($dr * $dr) + ($dg * $dg) + ($db * $db) -le 24 * 24) {
+                        $hits[$item.Name]++
+                    }
+                }
+            }
+        }
+    }
+    finally {
+        $bitmap.Dispose()
+    }
+    foreach ($item in $series) {
+        Assert-E2E ($hits[$item.Name] -gt 0) "Past graph has no rendered $($item.Name) model series pixels."
+    }
+    Write-E2E ("graph-past-model-data: PASS LUNA={0} TERRA={1} SOL={2}" -f $hits['LUNA'], $hits['TERRA'], $hits['SOL'])
+}
+
+function Assert-E2EGraphHasIdleBand {
+    param(
+        [Parameter(Mandatory = $true)][System.Windows.Automation.AutomationElement]$Plot,
+        [Parameter(Mandatory = $true)][IntPtr]$Handle,
+        [Parameter(Mandatory = $true)][psobject]$Capture,
+        [double]$ExpectedStartFraction = 0.01,
+        [double]$ExpectedEndFraction = 0.35
+    )
+
+    $window = Get-E2EWindowBounds $Handle
+    $plotBounds = $Plot.Current.BoundingRectangle
+    $bitmap = [System.Drawing.Bitmap]::FromFile($Capture.Path)
+    $hits = 0
+    $columnHits = @{}
+    try {
+        $left = [Math]::Max(0, [int]($plotBounds.Left - $window.Left))
+        $top = [Math]::Max(0, [int]($plotBounds.Top - $window.Top))
+        $right = [Math]::Min($bitmap.Width, [int]($plotBounds.Right - $window.Left))
+        $bottom = [Math]::Min($bitmap.Height, [int]($plotBounds.Bottom - $window.Top))
+        Assert-E2E ($right -gt $left -and $bottom -gt $top) 'Graph plot bounds are outside the captured window.'
+        Assert-E2E ($ExpectedStartFraction -ge 0 -and $ExpectedEndFraction -le 1 -and
+            $ExpectedEndFraction -gt $ExpectedStartFraction) 'Idle-band expected range is invalid.'
+        $expectedLeft = $left + [int](($right - $left) * $ExpectedStartFraction)
+        $expectedRight = $left + [int](($right - $left) * $ExpectedEndFraction)
+        Assert-E2E ($expectedRight -gt $expectedLeft) 'Idle-band expected range is sub-pixel.'
+        # #3F5D7C at opacity .22 over #101925 composites near #1A2838.
+        # The bounded tolerance accepts compositor rounding while excluding
+        # the plot surface (#101925) and grid (#263548).
+        for ($x = $expectedLeft; $x -lt $expectedRight; $x++) {
+            $columnHits[$x] = 0
+            for ($y = $top + 20; $y -lt ($bottom - 20); $y++) {
+                $pixel = $bitmap.GetPixel($x, $y)
+                if ($pixel.R -ge 20 -and $pixel.R -le 34 -and
+                    $pixel.G -ge 32 -and $pixel.G -le 48 -and
+                    $pixel.B -ge 48 -and $pixel.B -le 64) {
+                    $hits++
+                    $columnHits[$x]++
+                }
+            }
+        }
+    }
+    finally {
+        $bitmap.Dispose()
+    }
+    $sampleColumns = @(
+        $expectedLeft + [int](($expectedRight - $expectedLeft) * 0.25),
+        $expectedLeft + [int](($expectedRight - $expectedLeft) * 0.50),
+        $expectedLeft + [int](($expectedRight - $expectedLeft) * 0.75)
+    ) | Select-Object -Unique
+    foreach ($column in $sampleColumns) {
+        $columnHitCount = [int]($columnHits[$column])
+        Assert-E2E ($columnHitCount -ge 20) "Past graph idle-band color is missing at expected x=$column (hits=$columnHitCount)."
+    }
+    Assert-E2E ($hits -ge 100) "Past graph has no visible idle-band color pixels in the expected interval (hits=$hits)."
+    Write-E2E "graph-past-idle-band: PASS pixels=$hits range=$ExpectedStartFraction-$ExpectedEndFraction color=#3F5D7C opacity=0.22"
+}
+
 function Assert-E2EQuotaGaugePalette {
     param(
         [Parameter(Mandatory = $true)][System.Windows.Automation.AutomationElement]$Root,
@@ -654,7 +765,7 @@ function New-E2EFixtureDocuments {
     # strict twelve-field contract; serializing nested PowerShell dictionaries
     # can silently change null/number kinds between Windows PowerShell builds.
     $details = @"
-{"api_version":"v1","state":"ready","observed_at":$now,"authenticated":true,"plan_label":"Pro","quota":{"remaining_percent":72.0,"reset_at":$currentReset,"window_seconds":14400,"monthly":false},"models":[{"name":"SOL","input_tokens":1200,"cached_input_tokens":200,"output_tokens":400,"input_dollars":1.20,"cached_input_dollars":0.20,"output_dollars":0.40},{"name":"TERRA","input_tokens":2400,"cached_input_tokens":500,"output_tokens":800,"input_dollars":2.40,"cached_input_dollars":0.50,"output_dollars":0.80},{"name":"LUNA","input_tokens":3600,"cached_input_tokens":700,"output_tokens":1100,"input_dollars":3.60,"cached_input_dollars":0.70,"output_dollars":1.10}],"active_thread_count":3,"history_periods":[{"id":"e2e-current","start_at":$currentStart,"end_at":$now,"reset_at":$currentReset,"label":"Current period","current":true},{"id":"e2e-past","start_at":$pastStart,"end_at":$pastReset,"reset_at":$pastReset,"label":"Past period","current":false}],"history_samples":[{"timestamp":$($currentStart + 60),"reset_at":$currentReset,"remaining_percent":92.0,"sol_dollars":0.25,"terra_dollars":0.50,"luna_dollars":0.75,"sol_tokens":100,"terra_tokens":200,"luna_tokens":300},{"timestamp":$($now - 60),"reset_at":$currentReset,"remaining_percent":72.0,"sol_dollars":1.20,"terra_dollars":2.40,"luna_dollars":3.60,"sol_tokens":1200,"terra_tokens":2400,"luna_tokens":3600},{"timestamp":$($pastStart + 60),"reset_at":$pastReset,"remaining_percent":98.0,"sol_dollars":0.10,"terra_dollars":0.20,"luna_dollars":0.30,"sol_tokens":50,"terra_tokens":100,"luna_tokens":150},{"timestamp":$($pastReset - 60),"reset_at":$pastReset,"remaining_percent":84.0,"sol_dollars":0.60,"terra_dollars":1.20,"luna_dollars":1.80,"sol_tokens":600,"terra_tokens":1200,"luna_tokens":1800}],"threads":[{"id":"e2e-root","title":"E2E root task","parent_thread_id":null,"model":"TERRA","model_label":"TERRA","total_tokens":2400,"context_usage_tokens":800,"context_window_tokens":16000,"created_at":$($now - 3600),"last_user_message_at":$($now - 300),"is_subagent":false,"depth":0},{"id":"e2e-child","title":"E2E child task","parent_thread_id":"e2e-root","model":"LUNA","model_label":"LUNA","total_tokens":1200,"context_usage_tokens":400,"context_window_tokens":16000,"created_at":$($now - 2400),"last_user_message_at":$($now - 600),"is_subagent":true,"depth":1},{"id":"e2e-orphan","title":"E2E orphan task","parent_thread_id":"missing-parent","model":"SOL","model_label":"SOL","total_tokens":600,"context_usage_tokens":null,"context_window_tokens":null,"created_at":$($now - 1200),"last_user_message_at":null,"is_subagent":true,"depth":null}],"estimated_cost_label":"USD 12.34"}
+{"api_version":"v1","state":"ready","observed_at":$now,"authenticated":true,"plan_label":"Pro","quota":{"remaining_percent":72.0,"reset_at":$currentReset,"window_seconds":14400,"monthly":false},"models":[{"name":"SOL","input_tokens":1200,"cached_input_tokens":200,"output_tokens":400,"input_dollars":1.20,"cached_input_dollars":0.20,"output_dollars":0.40},{"name":"TERRA","input_tokens":2400,"cached_input_tokens":500,"output_tokens":800,"input_dollars":2.40,"cached_input_dollars":0.50,"output_dollars":0.80},{"name":"LUNA","input_tokens":3600,"cached_input_tokens":700,"output_tokens":1100,"input_dollars":3.60,"cached_input_dollars":0.70,"output_dollars":1.10}],"active_thread_count":3,"history_periods":[{"id":"e2e-current","start_at":$currentStart,"end_at":$now,"reset_at":$currentReset,"label":"Current period","current":true},{"id":"e2e-past","start_at":$pastStart,"end_at":$pastReset,"reset_at":$pastReset,"label":"Past period","current":false}],"history_samples":[{"timestamp":$($currentStart + 60),"reset_at":$currentReset,"remaining_percent":92.0,"sol_dollars":0.25,"terra_dollars":0.50,"luna_dollars":0.75,"sol_tokens":100,"terra_tokens":200,"luna_tokens":300},{"timestamp":$($now - 60),"reset_at":$currentReset,"remaining_percent":72.0,"sol_dollars":1.20,"terra_dollars":2.40,"luna_dollars":3.60,"sol_tokens":1200,"terra_tokens":2400,"luna_tokens":3600},{"timestamp":$($pastStart + 60),"reset_at":$pastReset,"remaining_percent":98.0,"sol_dollars":0.10,"terra_dollars":0.20,"luna_dollars":0.30,"sol_tokens":50,"terra_tokens":100,"luna_tokens":150},{"timestamp":$($pastStart + 3600),"reset_at":$pastReset,"remaining_percent":98.0,"sol_dollars":0.10,"terra_dollars":0.20,"luna_dollars":0.30,"sol_tokens":50,"terra_tokens":100,"luna_tokens":150},{"timestamp":$($pastReset - 60),"reset_at":$pastReset,"remaining_percent":84.0,"sol_dollars":0.60,"terra_dollars":1.20,"luna_dollars":1.80,"sol_tokens":600,"terra_tokens":1200,"luna_tokens":1800}],"threads":[{"id":"e2e-root","title":"E2E root task","parent_thread_id":null,"model":"TERRA","model_label":"TERRA","total_tokens":2400,"context_usage_tokens":800,"context_window_tokens":16000,"created_at":$($now - 3600),"last_user_message_at":$($now - 300),"is_subagent":false,"depth":0},{"id":"e2e-child","title":"E2E child task","parent_thread_id":"e2e-root","model":"LUNA","model_label":"LUNA","total_tokens":1200,"context_usage_tokens":400,"context_window_tokens":16000,"created_at":$($now - 2400),"last_user_message_at":$($now - 600),"is_subagent":true,"depth":1},{"id":"e2e-orphan","title":"E2E orphan task","parent_thread_id":"missing-parent","model":"SOL","model_label":"SOL","total_tokens":600,"context_usage_tokens":null,"context_window_tokens":null,"created_at":$($now - 1200),"last_user_message_at":null,"is_subagent":true,"depth":null}],"estimated_cost_label":"USD 12.34"}
 "@
     return [pscustomobject]@{
         Status = $status.Trim()
@@ -792,6 +903,7 @@ try {
     else { [IO.Path]::GetFullPath($ClientPath) }
     Assert-E2E (Test-Path -LiteralPath $resolvedClientPath -PathType Leaf) "Installed client not found: $resolvedClientPath"
     Write-E2E "start: client=$resolvedClientPath fixture=$Fixture output=$script:e2eOutput"
+    Write-E2E "source-sha: $script:e2eSourceSha"
 
     if ($Fixture) { Enter-E2EFixture }
     $script:e2eProcess = Start-Process -FilePath $resolvedClientPath -PassThru
@@ -883,6 +995,10 @@ try {
     Wait-E2ESelectorLabel $graphRoot 'Graph.PeriodSelector' $pastLabel
     $graphPast = Capture-E2EWindow $graph.Handle '03-graph-past'
     Assert-E2EImageChanged $graphCurrent $graphPast 'Current-to-past period selection'
+    if ($Fixture) {
+        Assert-E2EGraphHasModelData $plot $graph.Handle $graphPast
+        Assert-E2EGraphHasIdleBand $plot $graph.Handle $graphPast
+    }
 
     $periodSelector = Find-E2EElementByAutomationId $graphRoot 'Graph.PeriodSelector'
     Toggle-E2EElement $periodSelector
@@ -1024,7 +1140,7 @@ try {
     $script:e2eWindowRecords | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $windowRecordPath -Encoding utf8
     Write-E2E "windows: PASS records=$($script:e2eWindowRecords.Count) pid=$clientPid records_path=$windowRecordPath"
 
-    Write-E2E 'windows-client-e2e: PASS (Graph open, period current/past/current, 2 metrics, 4 toggle OFF/ON cycles, Threads rows/columns, PID/HWND records)'
+    Write-E2E 'windows-client-e2e: PASS (Graph open, past-period model and idle-band pixels, period current/past/current, 2 metrics, 4 toggle OFF/ON cycles, Threads rows/columns, PID/HWND records)'
     $script:e2eSuccess = $true
 }
 catch {

@@ -68,6 +68,7 @@ internal static class GraphPlotProjection
     private const double DollarLabelGutterRatio = 0.20;
     private const double TokenLabelGutterRatio = 0.27;
     private const double LabelGapRatio = 0.018;
+    private const long ModelContiguousSampleMaxGapSeconds = 60;
 
     public static GraphAxisProjection BuildAxes(
         GraphScene scene,
@@ -186,6 +187,15 @@ internal static class GraphPlotProjection
             else if (after == before)
             {
                 AppendSegment(flatX, flatY, startAt, before, endAt, after);
+            }
+            else if (endAt - startAt > ModelContiguousSampleMaxGapSeconds)
+            {
+                // The elapsed interval is not observed. Keep the cumulative
+                // value horizontal during that gap, then show the increase at
+                // the actual next observation instead of inventing a spend
+                // rate across idle time.
+                AppendSegment(flatX, flatY, startAt, before, endAt, before);
+                AppendSegment(risingX, risingY, endAt, before, endAt, after);
             }
             else
             {

@@ -163,8 +163,45 @@ require_text src/main.rs 'include_str!("../LICENSE")'
 require_text src/main.rs 'include_str!("../THIRD_PARTY_NOTICES.md")'
 require_text src/main.rs 'i18n.text(TextKey::LegalProtocol)'
 require_text src/main.rs 'i18n.text(TextKey::LegalThirdParty)'
-require_text .github/workflows/windows-client.yml 'needs: [version-policy, core-tests, windows-build]'
+require_text .github/workflows/windows-client.yml 'needs: [version-policy, core-tests, windows-build, acceptance]'
+require_text .github/workflows/windows-client.yml 'Run final acceptance gate before merge'
+require_text .github/workflows/windows-client.yml 'bash scripts/final_acceptance_gate.sh artifacts/windows-ui-e2e'
+require_text .github/workflows/windows-client.yml '-SourceSha $env:GITHUB_SHA'
+require_text .github/workflows/windows-client.yml 'EXPECTED_E2E_SOURCE_SHA: ${{ github.sha }}'
+require_file scripts/final_acceptance_gate.sh
+require_text scripts/final_acceptance_gate.sh 'expected E2E source SHA is required'
+require_text scripts/final_acceptance_gate.sh 'source-sha: $expected_sha'
+require_text scripts/final_acceptance_gate.sh 'capture: name=$capture_name '
+require_text scripts/final_acceptance_gate.sh 'sha256sum "$capture_path"'
 require_text .github/workflows/windows-client.yml 'cancel-in-progress: false'
+for native_trigger in 'Cargo.toml' 'Cargo.lock' 'build.rs' 'run.sh' 'src/**' 'protocol/**' 'tests/**' 'ui/**' 'assets/**' 'LICENSE' 'LICENSE.ja.md' 'deny.toml' '.cargo/config.toml' 'scripts/**' 'docs/**'; do
+    require_text .github/workflows/windows-client.yml "      - \"$native_trigger\""
+done
+require_text .github/workflows/windows-client.yml 'dtolnay/rust-toolchain@stable'
+final_gate_line="$(rg -n 'bash scripts/final_acceptance_gate.sh artifacts/windows-ui-e2e' .github/workflows/windows-client.yml | cut -d: -f1 | tail -n 1)"
+[[ -n "$final_gate_line" ]] || fail 'final acceptance gate invocation is missing'
+if ! sed -n "$((final_gate_line - 4)),${final_gate_line}p" .github/workflows/windows-client.yml |
+    rg -q --fixed-strings 'dtolnay/rust-toolchain@stable'; then
+    fail 'final acceptance gate must install the pinned Rust toolchain before running'
+fi
+require_text scripts/regression_guard.sh 'cargo check --locked --all-targets'
+require_text scripts/regression_guard.sh 'cargo test --locked --all-targets'
+require_text scripts/regression_guard.sh 'cargo build --release --locked'
+require_text scripts/regression_guard.sh '--exact --nocapture'
+require_text scripts/regression_guard.sh 'Rust all-target test set contains a zero-test target'
+for required_history_test in \
+    historical_week_fixture_preserves_each_period_and_graph_samples \
+    observed_moving_reset_sequence_keeps_the_spend_in_the_selected_graph \
+    long_rolling_reset_sequence_stays_in_one_period_after_a_real_boundary \
+    quota_only_reset_fragments_stay_with_the_adjacent_spend_period \
+    affected_period_keeps_sol_spend_and_unobserved_quota_distinct \
+    shared_graph_fixture_is_the_x_history_oracle \
+    model_graph_does_not_invent_spend_during_an_unobserved_gap \
+    graph_controls_use_one_visual_boundary_and_show_short_histories \
+    remaining_graph_does_not_infer_quota_loss_from_model_spend \
+    periodic_quota_refresh_retains_last_good_main_snapshot; do
+    require_text scripts/regression_guard.sh "run_required_rust_test $required_history_test"
+done
 require_text .github/workflows/windows-client.yml 'Get-GitHubResourceStatus'
 require_text .github/workflows/windows-client.yml 'gh api --method POST "repos/$repository/git/refs"'
 require_text .github/workflows/windows-client.yml 'gh api --method POST "repos/$repository/releases"'
@@ -174,7 +211,18 @@ require_text .github/workflows/windows-client.yml '-F draft=false'
 require_file windows-client/src/CodexInfo.WindowsClient/Settings/ClientSettingsSession.cs
 require_text windows-client/src/CodexInfo.WindowsClient/Settings/ClientSettingsSession.cs 'SettingsCorrupt = false'
 require_file windows-client/src/CodexInfo.WindowsClient/Graphing/GraphPlotProjection.cs
+require_text src/main.rs 'const MODEL_CONTIGUOUS_SAMPLE_MAX_GAP_SECONDS: i64 = 60;'
+require_text windows-client/src/CodexInfo.WindowsClient/Graphing/GraphPlotProjection.cs 'private const long ModelContiguousSampleMaxGapSeconds = 60;'
 require_text windows-client/src/CodexInfo.WindowsClient/Controls/GraphPlotControl.cs 'GraphPlotProjection.BuildAxes('
+require_text windows-client/src/CodexInfo.WindowsClient/Controls/GraphPlotControl.cs 'internal const string IdleBandColorHex = "#3F5D7C";'
+require_text windows-client/src/CodexInfo.WindowsClient/Controls/GraphPlotControl.cs 'internal const double IdleBandOpacity = 0.22;'
+require_text windows-client/src/CodexInfo.WindowsClient/Controls/GraphPlotControl.cs 'IdleBandColor.WithOpacity(IdleBandOpacity)'
+require_text windows-client/tests/CodexInfo.WindowsClient.Presentation.Tests/GraphPlotControlTests.cs 'PlotProjectionDoesNotInventSpendDuringAnUnobservedGap'
+require_text windows-client/tests/CodexInfo.WindowsClient.Presentation.Tests/GraphPlotControlTests.cs 'Remaining_accepts_a_delayed_lower_quota_after_unobserved_sol_usage'
+require_text windows-client/tests/CodexInfo.WindowsClient.Presentation.Tests/GraphPlotControlTests.cs 'Shared_graph_fixture_matches_the_native_history_oracle'
+require_file tests/fixtures/graph_delayed_quota.json
+require_text windows-client/tests/CodexInfo.WindowsClient.Presentation.Tests/CodexInfo.WindowsClient.Presentation.Tests.csproj 'graph_delayed_quota.json'
+require_text windows-client/tests/CodexInfo.WindowsClient.Presentation.Tests/GraphPlotControlTests.cs 'IdleBandsUseTheDedicatedVisibleNeutralColor'
 require_text windows-client/src/CodexInfo.WindowsClient/SettingsWindow.axaml 'AutomationProperties.Name="{Binding Texts.Save}"'
 require_text windows-client/src/CodexInfo.WindowsClient/SettingsWindow.axaml 'LanguageOptions'
 require_text windows-client/src/CodexInfo.WindowsClient/SettingsWindow.axaml 'SelectedValueBinding="{Binding Id}"'
@@ -223,10 +271,18 @@ require_text windows-client/tools/Measure-WindowsGraphLatency.ps1 'Graph.MetricS
 require_text windows-client/tools/Measure-WindowsGraphLatency.ps1 'CopyFromScreen'
 require_text windows-client/tools/Measure-WindowsGraphLatency.ps1 'SendInput'
 require_text windows-client/tools/Run-WindowsClientE2E.ps1 'Assert-E2EQuotaGaugePalette'
+require_text windows-client/tools/Run-WindowsClientE2E.ps1 'Assert-E2EGraphHasModelData'
+require_text windows-client/tools/Run-WindowsClientE2E.ps1 'Assert-E2EGraphHasModelData $plot $graph.Handle $graphPast'
 require_text windows-client/tools/Run-WindowsClientE2E.ps1 'Main.DetailsStatus'
 require_text windows-client/tools/Run-WindowsClientE2E.ps1 'parts[1] == "/v1/health"'
 require_text windows-client/tools/Run-WindowsClientE2E.ps1 '\"service\":\"codex-info\"'
 require_text windows-client/tools/Run-WindowsClientE2E.ps1 "main-quota-gauge: seven cells, two X-authority surface colors, and half-period boundary PASS"
+require_text windows-client/tools/Run-WindowsClientE2E.ps1 'graph-past-model-data: PASS'
+require_text windows-client/tools/Run-WindowsClientE2E.ps1 'Assert-E2EGraphHasIdleBand $plot $graph.Handle $graphPast'
+require_text windows-client/tools/Run-WindowsClientE2E.ps1 'graph-past-idle-band: PASS'
+require_text windows-client/tools/Run-WindowsClientE2E.ps1 'ExpectedStartFraction = 0.01'
+require_text windows-client/tools/Run-WindowsClientE2E.ps1 'ExpectedEndFraction = 0.35'
+require_text windows-client/tools/Run-WindowsClientE2E.ps1 '"timestamp":$($pastStart + 3600)'
 require_text windows-client/src/CodexInfo.WindowsClient/GraphWindow.axaml 'AutomationProperties.AutomationId="Graph.Window.Close"'
 require_text windows-client/src/CodexInfo.WindowsClient/ThreadsWindow.axaml 'AutomationProperties.AutomationId="Threads.Window.Close"'
 require_text windows-client/src/CodexInfo.WindowsClient/LegalNoticesWindow.axaml 'AutomationProperties.AutomationId="Legal.Window.Close"'
@@ -266,12 +322,27 @@ if command -v dotnet >/dev/null 2>&1; then
     coverage_results="$(mktemp -d "${TMPDIR:-/tmp}/codex-info-windows-coverage.XXXXXX")"
     trap 'rm -rf -- "$coverage_results"' EXIT
     dotnet restore windows-client/CodexInfo.WindowsClient.sln --locked-mode
-    dotnet test windows-client/CodexInfo.WindowsClient.sln \
+    dotnet_test_output="$(dotnet test windows-client/CodexInfo.WindowsClient.sln \
         --no-restore \
         --configuration Release \
         --settings windows-client/CodeCoverage.runsettings \
         --collect 'Code Coverage' \
-        --results-directory "$coverage_results"
+        --results-directory "$coverage_results" \
+        --logger 'console;verbosity=normal' 2>&1)" || {
+        printf '%s\n' "$dotnet_test_output" >&2
+        fail 'Windows Core/Presentation tests failed'
+    }
+    printf '%s\n' "$dotnet_test_output"
+    test_total="$(sed -n 's/.*Total: \([0-9][0-9]*\).*/\1/p' <<<"$dotnet_test_output" | tail -n 1)"
+    [[ "$test_total" =~ ^[1-9][0-9]*$ ]] ||
+        fail "Windows tests executed zero or unparseable tests: total=${test_total:-missing}"
+    passed_total="$(sed -n 's/.*Passed: \([0-9][0-9]*\).*/\1/p' <<<"$dotnet_test_output" | tail -n 1)"
+    [[ "$passed_total" =~ ^[1-9][0-9]*$ ]] ||
+        fail "Windows tests passed zero or unparseable tests: passed=${passed_total:-missing}"
+    skipped_total="$(sed -n 's/.*Skipped: \([0-9][0-9]*\).*/\1/p' <<<"$dotnet_test_output" | tail -n 1)"
+    [[ "$skipped_total" == "0" ]] ||
+        fail "Windows test run contains skipped tests: skipped=${skipped_total:-missing}"
+    echo "windows-client-contract-gate: Windows tests executed: $test_total"
     mapfile -t coverage_reports < <(find "$coverage_results" -type f -name '*.cobertura.xml' -print)
     [[ "${#coverage_reports[@]}" -eq 1 ]] || fail "expected one Cobertura report, found ${#coverage_reports[@]}"
     coverage_rate="$(sed -n 's/.*<coverage line-rate="\([^"]*\)".*/\1/p' "${coverage_reports[0]}" | head -n 1)"
