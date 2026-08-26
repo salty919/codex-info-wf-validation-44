@@ -217,7 +217,23 @@ jobs:
       - name: Build Windows client
         run: dotnet build windows-client/CodexInfo.WindowsClient.sln --no-restore --configuration Release
       - name: Test REST client and presentation contract
-        run: dotnet test windows-client/CodexInfo.WindowsClient.sln --no-restore --configuration Release
+        shell: pwsh
+        run: |
+          $testOutput = (& dotnet test windows-client/CodexInfo.WindowsClient.sln --no-restore --configuration Release --logger 'console;verbosity=normal' 2>&1 | Out-String)
+          $exitCode = $LASTEXITCODE
+          $testOutput
+          if ($exitCode -ne 0) { throw "Windows tests failed with exit code $exitCode." }
+          $summaries = [regex]::Matches($testOutput, 'Total:\s*(\d+),\s*Passed:\s*(\d+),\s*Failed:\s*(\d+),\s*Skipped:\s*(\d+)')
+          if ($summaries.Count -eq 0) { throw 'Windows test summary is missing or unparseable.' }
+          foreach ($summary in $summaries) {
+            $total = [int]$summary.Groups[1].Value
+            $passed = [int]$summary.Groups[2].Value
+            $failed = [int]$summary.Groups[3].Value
+            $skipped = [int]$summary.Groups[4].Value
+            if ($total -le 0 -or $passed -le 0 -or $failed -ne 0 -or $skipped -ne 0) {
+              throw "Windows test counts are not release-safe: total=$total passed=$passed failed=$failed skipped=$skipped"
+            }
+          }
       - name: Install locked Inno Setup compiler
         shell: pwsh
         run: |

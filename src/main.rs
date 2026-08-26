@@ -5631,19 +5631,10 @@ impl CodexInfoState {
                             selected_reset,
                             88.0,
                             ModelDollarTotals {
-                                terra: cumulative.terra,
-                                luna: cumulative.luna * 0.45,
-                                ..ModelDollarTotals::default()
-                            },
-                            ModelTokenTotals::default(),
-                        ),
-                        UsageHistorySample::from_model_history_with_usage(
-                            period_start,
-                            selected_reset,
-                            ModelDollarTotals {
                                 sol: cumulative.sol * 0.35,
                                 terra: cumulative.terra,
                                 luna: cumulative.luna * 0.45,
+                                ..ModelDollarTotals::default()
                             },
                             ModelTokenTotals::default(),
                         ),
