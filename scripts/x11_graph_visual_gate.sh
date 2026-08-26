@@ -122,6 +122,12 @@ def near(actual, expected, tolerance=15):
     return sqrt(sum((actual[i] - expected[i]) ** 2 for i in range(3))) <= tolerance
 
 plot = [(x, y) for y in range(230, 590) for x in range(90, 830)]
+idle_band = [(x, y) for x, y in plot if near(rgb(x, y), (27, 41, 61), 4)]
+if len(idle_band) < 1000:
+    raise SystemExit(f'dedicated idle-band pixels are missing: {len(idle_band)}')
+if max(x for x, _ in idle_band) - min(x for x, _ in idle_band) < 200:
+    raise SystemExit('dedicated idle band does not span an observed quiet interval')
+
 remaining = [(x, y) for x, y in plot if near(rgb(x, y), (86, 178, 245))]
 if len(remaining) < 300:
     raise SystemExit(f'remaining line pixels are insufficient: {len(remaining)}')
@@ -140,5 +146,5 @@ for name, expected in (
     if count < 3:
         raise SystemExit(f'{name} model line pixels are missing: {count}')
 
-print('x11-graph-visual-gate: PASS (940x640 image, remaining 88->87 without 14% drop, SOL/TERRA/LUNA pixels present)')
+print('x11-graph-visual-gate: PASS (940x640 image, remaining 88->87 without 14% drop, idle band, SOL/TERRA/LUNA pixels present)')
 PY

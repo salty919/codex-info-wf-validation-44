@@ -329,6 +329,7 @@ require_text docs/WINDOWS_CLIENT_REQUIREMENTS.md 'WIN-PAR-13'
 require_text docs/WINDOWS_CLIENT_REQUIREMENTS.md 'WIN-INSTALL-01'
 require_text docs/REGRESSION_PREVENTION_POLICY.md 'windows_window_move_smoke.ps1 -AllowPhysicalInput'
 require_file scripts/x11_graph_visual_gate.sh
+require_text scripts/x11_graph_visual_gate.sh 'dedicated idle-band pixels are missing'
 require_text docs/PRODUCT_REQUIREMENTS.md '# Codex Info 製品要件'
 require_file windows-client/CodeCoverage.runsettings
 
