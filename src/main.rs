@@ -9444,6 +9444,8 @@ mod tests {
         let mut state = CodexInfoState::preview("normal");
         let previous_models = state.model_usage.clone();
         let previous_threads = state.active_threads.len();
+        let previous_history = state.history.samples.clone();
+        let previous_estimate = state.estimated_cost_label.clone();
         let previous_reset = state.reset_at.expect("preview reset");
 
         // A moving reset timestamp must not be treated as an account change or
@@ -9475,6 +9477,9 @@ mod tests {
             assert_eq!(snapshot.state, PublicState::Ready);
             assert_eq!(snapshot.models.len(), previous_models.len());
             assert_eq!(snapshot.active_thread_count as usize, previous_threads);
+            assert_eq!(state.history.samples, previous_history);
+            assert_eq!(state.estimated_cost_label, previous_estimate);
+            assert_eq!(state.selected_reset_at, Some(previous_reset));
             let details = state.public_details();
             assert_eq!(details.models.len(), previous_models.len());
             assert_eq!(details.threads.len(), previous_threads);
