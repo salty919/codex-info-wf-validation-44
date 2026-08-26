@@ -291,8 +291,14 @@ jobs:
           if (-not (Test-Path $exe -PathType Leaf)) { throw 'Installed client executable is missing for UI E2E.' }
           $e2eOutput = Join-Path $env:RUNNER_TEMP 'codex-info-windows-e2e'
           try {
+            New-Item -ItemType Directory -Path $e2eOutput -Force | Out-Null
+            $moveSmokeLog = Join-Path $e2eOutput 'window-move-smoke.log'
             & ./windows-client/tools/Run-WindowsClientE2E.ps1 -ClientPath $exe -OutputDirectory $e2eOutput -Fixture -SourceSha $env:GITHUB_SHA
             if (-not $?) { throw 'Windows UI Automation E2E failed.' }
+            "source-sha: $env:GITHUB_SHA" | Set-Content -LiteralPath $moveSmokeLog -Encoding utf8
+            & ./scripts/windows_window_move_smoke.ps1 -ClientPath $exe -AllowPhysicalInput *>&1 |
+              Tee-Object -FilePath $moveSmokeLog -Append
+            if ($LASTEXITCODE -ne 0) { throw 'Physical window move smoke failed.' }
           }
           finally {
             $uninstaller = Get-ChildItem -LiteralPath $install -Filter 'unins*.exe' -File -ErrorAction SilentlyContinue | Select-Object -First 1

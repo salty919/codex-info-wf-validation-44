@@ -170,6 +170,7 @@ require_text src/main.rs 'i18n.text(TextKey::LegalProtocol)'
 require_text src/main.rs 'i18n.text(TextKey::LegalThirdParty)'
 require_text .github/workflows/windows-client.yml 'needs: [version-policy, core-tests, windows-build, acceptance]'
 require_text .github/workflows/windows-client.yml 'Run final acceptance gate before merge'
+require_text .github/workflows/windows-client.yml 'windows_window_move_smoke.ps1 -ClientPath $exe -AllowPhysicalInput'
 require_text .github/workflows/windows-client.yml 'bash scripts/final_acceptance_gate.sh artifacts/windows-ui-e2e'
 require_text .github/workflows/windows-client.yml '-SourceSha $env:GITHUB_SHA'
 require_text .github/workflows/windows-client.yml 'EXPECTED_E2E_SOURCE_SHA: ${{ github.sha }}'
@@ -178,6 +179,7 @@ require_text scripts/final_acceptance_gate.sh 'expected E2E source SHA is requir
 require_text scripts/final_acceptance_gate.sh 'source-sha: $expected_sha'
 require_text scripts/final_acceptance_gate.sh 'capture: name=$capture_name '
 require_text scripts/final_acceptance_gate.sh 'sha256sum "$capture_path"'
+require_text scripts/final_acceptance_gate.sh 'window-move-smoke: PASS'
 require_text .github/workflows/windows-client.yml 'cancel-in-progress: false'
 for native_trigger in 'Cargo.toml' 'Cargo.lock' 'build.rs' 'run.sh' 'src/**' 'protocol/**' 'tests/**' 'ui/**' 'assets/**' 'LICENSE' 'LICENSE.ja.md' 'deny.toml' '.cargo/config.toml' 'scripts/**' 'docs/**'; do
     require_text .github/workflows/windows-client.yml "      - \"$native_trigger\""
@@ -323,6 +325,7 @@ if rg -q --fixed-strings 'Start-Sleep' windows-client/tools/Measure-WindowsGraph
 fi
 require_text docs/WINDOWS_CLIENT_REQUIREMENTS.md 'WIN-PAR-13'
 require_text docs/WINDOWS_CLIENT_REQUIREMENTS.md 'WIN-INSTALL-01'
+require_text docs/REGRESSION_PREVENTION_POLICY.md 'windows_window_move_smoke.ps1 -AllowPhysicalInput'
 require_text docs/PRODUCT_REQUIREMENTS.md '# Codex Info 製品要件'
 require_file windows-client/CodeCoverage.runsettings
 

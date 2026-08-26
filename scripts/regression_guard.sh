@@ -32,6 +32,7 @@ run_checked 'Rust all-target check' cargo check --locked --all-targets
 require_text docs/PRODUCT_REQUIREMENTS.md '全直積、N倍、N二乗、N階乗のcase生成を行わない'
 require_text docs/PRODUCT_REQUIREMENTS.md '製品バージョンはメイン画面に一度だけ表示し'
 require_text docs/REGRESSION_PREVENTION_POLICY.md 'REG-WIN-DRAG'
+require_text docs/REGRESSION_PREVENTION_POLICY.md 'windows_window_move_smoke.ps1 -AllowPhysicalInput'
 require_text windows-client/src/CodexInfo.WindowsClient/WindowDragBehavior.cs 'window.BeginMoveDrag(eventArgs)'
 require_text windows-client/src/CodexInfo.WindowsClient/ViewModels/DetailsWindowViewModels.cs 'EffectiveGraphEnd'
 require_text windows-client/src/CodexInfo.WindowsClient/Graphing/GraphPlotProjection.cs 'IsSyntheticFirstObservation'

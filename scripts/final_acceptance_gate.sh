@@ -19,10 +19,19 @@ evidence_dir="${1:-${WINDOWS_E2E_EVIDENCE_DIR:-}}"
 
 log_file="$evidence_dir/windows-client-e2e.log"
 [[ -f "$log_file" ]] || hold "Windows UI E2E log is missing"
+move_log="$evidence_dir/window-move-smoke.log"
+[[ -f "$move_log" ]] || hold "physical window move smoke log is missing"
 expected_sha="${EXPECTED_E2E_SOURCE_SHA:-${GITHUB_SHA:-}}"
 [[ "$expected_sha" =~ ^[0-9a-f]{40}$ ]] || hold "expected E2E source SHA is required"
 rg -q --fixed-strings "source-sha: $expected_sha" "$log_file" \
     || hold "Windows UI E2E evidence was not produced from expected source SHA: $expected_sha"
+rg -q --fixed-strings "source-sha: $expected_sha" "$move_log" \
+    || hold "physical window move smoke evidence was not produced from expected source SHA: $expected_sha"
+rg -q --fixed-strings 'window-move-smoke: PASS' "$move_log" \
+    || hold "physical window move smoke PASS marker is missing"
+if rg -q --fixed-strings 'window-move-smoke: SKIP' "$move_log"; then
+    hold "physical window move smoke was skipped"
+fi
 rg -q --fixed-strings 'fixture: PASS periods=2 threads=3 endpoint=http://127.0.0.1:8787' "$log_file" \
     || hold "Windows fixture PASS marker is missing"
 rg -q --fixed-strings 'main-quota-gauge: seven cells, two X-authority surface colors, and half-period boundary PASS' "$log_file" \
@@ -80,4 +89,4 @@ command -v cargo >/dev/null || hold "cargo is unavailable; Rust acceptance was n
 # those expensive operations here.
 bash scripts/regression_guard.sh || hold "regression guard failed"
 
-echo "final-acceptance-gate: PASS (Rust checks, mandatory history/graph tests, Windows UI E2E log including idle-band pixels, and screenshots)"
+echo "final-acceptance-gate: PASS (Rust checks, mandatory history/graph tests, Windows UI E2E, physical window-move smoke, and source-matched screenshots)"
