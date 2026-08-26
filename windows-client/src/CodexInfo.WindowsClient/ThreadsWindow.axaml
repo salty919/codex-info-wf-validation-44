@@ -50,7 +50,7 @@
   </Window.Styles>
   <Grid Margin="20" RowDefinitions="Auto,Auto,*" RowSpacing="6">
     <Grid ColumnDefinitions="*,Auto" Background="Transparent" PointerPressed="OnTitlePointerPressed">
-      <StackPanel VerticalAlignment="Center"><TextBlock FontSize="22" FontWeight="SemiBold" Text="{Binding Texts.RunningThreads}" /><TextBlock Classes="label" AutomationProperties.AutomationId="Threads.ProductVersion" Text="{Binding ProductVersionText}" /></StackPanel>
+      <StackPanel VerticalAlignment="Center"><TextBlock FontSize="22" FontWeight="SemiBold" Text="{Binding Texts.RunningThreads}" /></StackPanel>
       <StackPanel Grid.Column="1" Orientation="Horizontal" Spacing="2">
         <Button Classes="window-control" Click="OnMinimizeWindow" AutomationProperties.Name="{Binding Texts.Minimize}" AutomationProperties.AutomationId="Threads.Window.Minimize" Content="—" ToolTip.Tip="{Binding Texts.Minimize}" />
         <Button Classes="window-control" Click="OnCloseWindow" AutomationProperties.Name="{Binding Texts.Close}" AutomationProperties.AutomationId="Threads.Window.Close" Content="×" ToolTip.Tip="{Binding Texts.Close}" />

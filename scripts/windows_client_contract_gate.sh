@@ -99,6 +99,7 @@ require_text windows-client/src/CodexInfo.WindowsClient/Infrastructure/WindowsPa
 require_text windows-client/src/CodexInfo.WindowsClient/Infrastructure/WindowsUpdateCoordinator.cs 'WindowsPathSafety.ContainsReparsePoint'
 require_text windows-client/src/CodexInfo.WindowsClient/Settings/ClientSettings.cs 'WindowsPathSafety.EnsureDirectoryTreeWithoutReparse'
 require_text docs/WINDOWS_CLIENT.md '%USERPROFILE%\.ssh\config'
+require_text docs/PRODUCT_REQUIREMENTS.md '製品バージョンはメイン画面に一度だけ表示し'
 require_text windows-client/src/CodexInfo.WindowsClient/SetupWindow.axaml 'AutomationProperties.Name="{Binding Texts.Copy}"'
 require_text windows-client/src/CodexInfo.WindowsClient/SetupWindow.axaml 'Background="Transparent" PointerPressed="OnTitlePointerPressed"'
 require_text windows-client/src/CodexInfo.WindowsClient/SetupWindow.axaml.cs 'WindowDragBehavior.Begin(this, e)'
@@ -130,17 +131,17 @@ require_text windows-client/Directory.Build.props '<Version>'
 require_file windows-client/src/CodexInfo.WindowsClient.Core/ProductInfo.cs
 require_text windows-client/src/CodexInfo.WindowsClient.Core/ProductInfo.cs 'public static string DisplayVersion'
 require_text windows-client/src/CodexInfo.WindowsClient.Core/ProductInfo.cs 'Assembly.GetName().Version'
-for version_surface in Main Setup Settings Graph Threads Legal; do
-    case "$version_surface" in
-        Main) version_path='windows-client/src/CodexInfo.WindowsClient/MainWindow.axaml' ;;
-        Setup) version_path='windows-client/src/CodexInfo.WindowsClient/SetupWindow.axaml' ;;
-        Settings) version_path='windows-client/src/CodexInfo.WindowsClient/SettingsWindow.axaml' ;;
-        Graph) version_path='windows-client/src/CodexInfo.WindowsClient/GraphWindow.axaml' ;;
-        Threads) version_path='windows-client/src/CodexInfo.WindowsClient/ThreadsWindow.axaml' ;;
-        Legal) version_path='windows-client/src/CodexInfo.WindowsClient/LegalNoticesWindow.axaml' ;;
-    esac
-    require_text "$version_path" 'ProductVersionText'
-    require_text "$version_path" "AutomationProperties.AutomationId=\"$version_surface.ProductVersion\""
+require_text windows-client/src/CodexInfo.WindowsClient/MainWindow.axaml 'ProductVersionText'
+require_text windows-client/src/CodexInfo.WindowsClient/MainWindow.axaml 'AutomationProperties.AutomationId="Main.ProductVersion"'
+for redundant_version_marker in \
+    'Setup.ProductVersion' \
+    'Settings.ProductVersion' \
+    'Graph.ProductVersion' \
+    'Threads.ProductVersion' \
+    'Legal.ProductVersion'; do
+    if rg -q --fixed-strings -- "$redundant_version_marker" windows-client/src/CodexInfo.WindowsClient; then
+        fail "redundant child-window version marker remains: $redundant_version_marker"
+    fi
 done
 native_version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n 1)"
 windows_version="$(sed -n 's/.*<Version>\([^<]*\)<\/Version>.*/\1/p' windows-client/Directory.Build.props | head -n 1)"
@@ -148,7 +149,11 @@ windows_version="$(sed -n 's/.*<Version>\([^<]*\)<\/Version>.*/\1/p' windows-cli
     fail "native and Windows versions differ: native=$native_version windows=$windows_version"
 require_text ui/components.slint 'product-version: string'
 require_text ui/components.slint 'root.strings.usage-status + " · " + root.strings.product-version'
-require_text ui/components.slint 'root.strings.usage-trend + " · " + root.strings.product-version'
+if rg -q --fixed-strings -- 'root.strings.usage-trend + " · " + root.strings.product-version' ui/components.slint ||
+   rg -q --fixed-strings -- 'root.strings.active-threads + " · " + root.strings.product-version' ui/components.slint ||
+   rg -q --fixed-strings -- 'root.strings.legal-notices + " · " + root.strings.product-version' ui/components.slint; then
+    fail 'redundant native child-window version title remains'
+fi
 require_text ui/components.slint 'legal-page-names: [string]'
 require_text ui/components.slint 'legal-pages: [string]'
 require_text ui/components.slint 'legal-protocol: string'
@@ -199,6 +204,9 @@ for required_history_test in \
     model_graph_does_not_invent_spend_during_an_unobserved_gap \
     graph_controls_use_one_visual_boundary_and_show_short_histories \
     remaining_graph_does_not_infer_quota_loss_from_model_spend \
+    affected_timestamp_does_not_mix_a_singleton_reset_period_into_history \
+    singleton_reset_snapshot_overlapping_a_spend_period_stays_separate \
+    graph_collision_preview_matches_the_historical_singleton_oracle \
     periodic_quota_refresh_retains_last_good_main_snapshot; do
     require_text scripts/regression_guard.sh "run_required_rust_test $required_history_test"
 done

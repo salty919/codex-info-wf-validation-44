@@ -1978,6 +1978,11 @@ fn reset_sample_groups(samples: &[UsageHistorySample]) -> Vec<ResetSampleGroup> 
             && group.samples[0].sol_tokens == 0
             && group.samples[0].terra_tokens == 0
             && group.samples[0].luna_tokens == 0
+            // Only a full-quota singleton is a known rolling-reset artifact.
+            // A lower remaining value at the same timestamp can be a real
+            // separate period; attaching it would overwrite the spend
+            // period's quota observation (the observed 88% -> 14% failure).
+            && group.samples[0].remaining_percent >= 100.0
             && merged.last().is_some_and(|previous: &ResetSampleGroup| {
                 previous.samples.iter().any(|sample| {
                     sample.timestamp == group.samples[0].timestamp
@@ -2023,7 +2028,16 @@ fn history_periods_for_samples(
         .iter()
         .enumerate()
         .map(|(index, group)| {
-            let next_start = groups.get(index + 1).map(|next| next.start);
+            // A legacy database can contain an unrelated singleton at the
+            // exact same observation minute. It is its own period, but it is
+            // not a boundary for the selected spend period; use the next
+            // strictly later observation as the visual end instead of
+            // collapsing the graph to a zero-width interval.
+            let next_start = groups
+                .iter()
+                .skip(index + 1)
+                .map(|next| next.start)
+                .find(|start| *start > group.start);
             let period_end = next_start.map_or(group.canonical_reset_at, |next| {
                 group.canonical_reset_at.min(next)
             });
@@ -2068,11 +2082,16 @@ fn history_periods_for_samples(
             .map(|period| period.label.clone())
             .collect::<Vec<_>>();
         for index in 0..periods.len() {
+            let same_start_count = periods
+                .iter()
+                .filter(|candidate| candidate.start == periods[index].start)
+                .count();
             if base_labels
                 .iter()
                 .filter(|label| **label == base_labels[index])
                 .count()
                 > 1
+                || same_start_count > 1
             {
                 let canonical_reset_at = periods[index].canonical_reset_at;
                 let reset_label = format_period_timestamp(canonical_reset_at)
@@ -3400,9 +3419,53 @@ fn remaining_graph_points_for_metric(
     period_end: i64,
     show_tokens: bool,
 ) -> Vec<(i64, f64)> {
-    let raw_remaining = raw_graph_points(samples, period_start, period_end, 100.0, |sample| {
-        sample.remaining_percent
-    });
+    // A history read is normally period-scoped before it reaches this
+    // function. Keep a second, fail-closed boundary here as well: legacy
+    // databases can contain two different reset periods at the same minute.
+    // If those rows disagree, choosing the last row would manufacture a
+    // vertical quota drop (for example 88% -> 14% with no model usage).
+    // Ignore the conflicting timestamp until a period-scoped observation is
+    // available instead of inventing a value from row order.
+    let mut remaining_candidates = BTreeMap::<i64, Vec<f64>>::new();
+    for sample in samples {
+        let value = sample.remaining_percent;
+        if value.is_finite() && value >= 0.0 {
+            let timestamp = sample.timestamp.clamp(period_start, period_end);
+            remaining_candidates
+                .entry(timestamp)
+                .or_default()
+                .push(value);
+        }
+    }
+    let scoped_remaining = remaining_candidates
+        .into_iter()
+        .filter_map(|(timestamp, values)| {
+            let first = values.first().copied()?;
+            let conflicting = values
+                .iter()
+                .any(|value| (value - first).abs() > f64::EPSILON);
+            (!conflicting).then_some((timestamp, first.clamp(0.0, 100.0)))
+        })
+        .collect::<BTreeMap<_, _>>();
+    let mut raw_remaining = vec![(period_start, 100.0)];
+    for (timestamp, value) in scoped_remaining.iter() {
+        if *timestamp == period_start {
+            raw_remaining[0].1 = *value;
+        } else {
+            raw_remaining.push((*timestamp, *value));
+        }
+    }
+    if scoped_remaining
+        .keys()
+        .next_back()
+        .is_some_and(|timestamp| *timestamp < period_end)
+    {
+        let last_value = raw_remaining
+            .last()
+            .map(|(_, value)| *value)
+            .unwrap_or(100.0);
+        raw_remaining.push((period_end, last_value));
+    }
     if raw_remaining.len() < 2 {
         return raw_remaining;
     }
@@ -5545,6 +5608,65 @@ impl CodexInfoState {
                 }
                 state.history.samples = samples;
                 state.selected_reset_at = Some(reset_at);
+                state.status = state.normal_status();
+            }
+            "graph-collision" => {
+                // Visual regression fixture for the affected history: an
+                // unrelated 14% singleton shares a minute with the selected
+                // period's 88% observation. The rendered graph must keep the
+                // quota line monotone (88% -> 87%) and must not draw a
+                // fabricated vertical 14% drop.
+                let period_start = now.saturating_sub(4 * 86_400);
+                let selected_reset = now + 3 * 86_400;
+                let conflicting_reset = selected_reset + 80_000;
+                let cumulative = ModelDollarTotals {
+                    sol: preview_costs.sol,
+                    terra: preview_costs.terra,
+                    luna: preview_costs.luna,
+                };
+                state.history = UsageHistory {
+                    samples: vec![
+                        UsageHistorySample::new_with_usage(
+                            period_start,
+                            selected_reset,
+                            88.0,
+                            ModelDollarTotals {
+                                terra: cumulative.terra,
+                                luna: cumulative.luna * 0.45,
+                                ..ModelDollarTotals::default()
+                            },
+                            ModelTokenTotals::default(),
+                        ),
+                        UsageHistorySample::from_model_history_with_usage(
+                            period_start,
+                            selected_reset,
+                            ModelDollarTotals {
+                                sol: cumulative.sol * 0.35,
+                                terra: cumulative.terra,
+                                luna: cumulative.luna * 0.45,
+                            },
+                            ModelTokenTotals::default(),
+                        ),
+                        UsageHistorySample::new_with_usage(
+                            period_start,
+                            conflicting_reset,
+                            14.0,
+                            ModelDollarTotals::default(),
+                            ModelTokenTotals::default(),
+                        ),
+                        UsageHistorySample::new_with_usage(
+                            period_start + 2 * 86_400,
+                            selected_reset,
+                            87.0,
+                            cumulative,
+                            ModelTokenTotals::default(),
+                        ),
+                    ],
+                    ..UsageHistory::default()
+                };
+                state.remaining_percent = Some(87.0);
+                state.reset_at = Some(selected_reset);
+                state.selected_reset_at = Some(selected_reset);
                 state.status = state.normal_status();
             }
             "history-empty" => {
@@ -8571,7 +8693,7 @@ fn run_ui() -> Result<(), Box<dyn std::error::Error>> {
 
     if matches!(
         preview_kind.as_deref(),
-        Some("graph" | "graph-old" | "graph-many" | "graph-period")
+        Some("graph" | "graph-old" | "graph-many" | "graph-period" | "graph-collision")
     ) {
         if preview_kind.as_deref() == Some("graph-old") {
             state.borrow_mut().select_latest_history();
@@ -11648,7 +11770,7 @@ mod tests {
     }
 
     #[test]
-    fn product_version_is_visible_on_native_detail_surfaces() {
+    fn product_version_is_visible_once_on_native_main_surface() {
         assert!(!PRODUCT_VERSION.is_empty());
         assert!(PRODUCT_VERSION.split('.').all(
             |component| !component.is_empty() && component.chars().all(|c| c.is_ascii_digit())
@@ -11656,18 +11778,16 @@ mod tests {
 
         let source = include_str!("../ui/components.slint");
         assert!(source.contains("product-version: string"));
-        for title in [
-            "usage-status",
-            "usage-trend",
-            "active-threads",
-            "legal-notices",
-        ] {
-            let marker = format!("root.strings.{title} + \" · \" + root.strings.product-version");
-            assert!(
-                source.contains(&marker),
-                "missing native version title: {title}"
-            );
-        }
+        let marker = "root.strings.usage-status + \" · \" + root.strings.product-version";
+        assert_eq!(source.matches(marker).count(), 1);
+        assert!(
+            !source.contains("root.strings.usage-trend + \" · \" + root.strings.product-version")
+        );
+        assert!(!source
+            .contains("root.strings.active-threads + \" · \" + root.strings.product-version"));
+        assert!(
+            !source.contains("root.strings.legal-notices + \" · \" + root.strings.product-version")
+        );
 
         let main = include_str!("main.rs");
         assert!(main.contains("product_version: format!(\"v{PRODUCT_VERSION}\").into()"));
@@ -13292,6 +13412,94 @@ mod tests {
     }
 
     #[test]
+    fn affected_timestamp_does_not_mix_a_singleton_reset_period_into_history() {
+        // Exact collision shape observed in the user's 2026-08-22 07:17 JST
+        // history: the primary period reported 88%, while an unrelated
+        // singleton reset period reported 14% at the same minute.  Selecting
+        // the spend period must retain 88% and exclude the singleton entirely.
+        let timestamp = 1_787_350_620;
+        let primary_reset = 1_787_835_664;
+        let samples = vec![
+            UsageHistorySample::new(
+                timestamp,
+                1_787_835_614,
+                88.0,
+                ModelDollarTotals {
+                    terra: 30.5047316,
+                    luna: 6.38893528,
+                    ..ModelDollarTotals::default()
+                },
+            ),
+            UsageHistorySample::from_model_history(
+                timestamp,
+                1_787_835_661,
+                ModelDollarTotals {
+                    terra: 30.5047316,
+                    luna: 6.38893528,
+                    ..ModelDollarTotals::default()
+                },
+            ),
+            UsageHistorySample::from_model_history(
+                timestamp,
+                1_787_835_662,
+                ModelDollarTotals {
+                    sol: 140.97,
+                    terra: 30.5047316,
+                    luna: 6.38893528,
+                },
+            ),
+            UsageHistorySample::from_model_history(
+                timestamp,
+                1_787_835_663,
+                ModelDollarTotals {
+                    sol: 420.405,
+                    terra: 30.5047316,
+                    luna: 6.38893528,
+                },
+            ),
+            UsageHistorySample::from_model_history(
+                timestamp,
+                primary_reset,
+                ModelDollarTotals {
+                    sol: 420.405,
+                    terra: 30.5047316,
+                    luna: 6.38893528,
+                },
+            ),
+            UsageHistorySample::new(timestamp, 1_787_919_479, 14.0, ModelDollarTotals::default()),
+            UsageHistorySample::new(
+                timestamp + 60,
+                primary_reset,
+                87.0,
+                ModelDollarTotals {
+                    sol: 420.405,
+                    terra: 30.5047316,
+                    luna: 6.38893528,
+                },
+            ),
+        ];
+        let history = UsageHistory {
+            samples,
+            ..UsageHistory::default()
+        };
+
+        let periods = history.periods(timestamp + 60, None);
+        let selected = history.samples_for_reset(Some(primary_reset));
+        assert!(periods.iter().any(|period| {
+            period.canonical_reset_at == primary_reset && period.start == timestamp
+        }));
+        assert!(selected.iter().any(|sample| {
+            sample.timestamp == timestamp && (sample.remaining_percent - 88.0).abs() < f64::EPSILON
+        }));
+        assert!(selected
+            .iter()
+            .all(|sample| (sample.remaining_percent - 14.0).abs() > f64::EPSILON));
+        assert!(selected
+            .iter()
+            .all(|sample| sample.reset_at == primary_reset));
+    }
+
+    #[test]
     fn observed_moving_reset_sequence_keeps_the_spend_in_the_selected_graph() {
         // This is the shape found in the affected database: reset_at advances
         // with each observation, while the first few snapshots are idle and
@@ -13665,7 +13873,7 @@ mod tests {
     }
 
     #[test]
-    fn singleton_reset_snapshot_overlapping_a_spend_period_does_not_split_history() {
+    fn singleton_reset_snapshot_overlapping_a_spend_period_stays_separate() {
         let history = UsageHistory {
             samples: vec![
                 UsageHistorySample::from_model_history_with_usage(
@@ -13706,17 +13914,28 @@ mod tests {
         };
 
         let periods = history.periods(1_800_700_000, None);
-        assert_eq!(periods.len(), 1);
-        assert_eq!(periods[0].canonical_reset_at, 1_800_604_800);
-        let selected = history.samples_for_reset(Some(1_800_604_800));
+        assert_eq!(periods.len(), 2);
+        let spend_period = periods
+            .iter()
+            .find(|period| period.canonical_reset_at == 1_800_604_800)
+            .expect("spend period");
+        let selected = history.samples_for_reset(Some(spend_period.canonical_reset_at));
         assert_eq!(selected.len(), 3);
-        assert_eq!(selected[1].remaining_percent, 14.0);
-        assert_eq!(selected[1].sol_dollars, 420.0);
+        assert!(selected
+            .iter()
+            .all(|sample| (sample.remaining_percent - 14.0).abs() > f64::EPSILON));
+        assert_eq!(
+            history
+                .samples_for_reset(Some(1_800_650_000))
+                .first()
+                .map(|sample| sample.remaining_percent),
+            Some(14.0)
+        );
         let references = selected.iter().collect::<Vec<_>>();
         let graph = graph_paths_for_selection(
             &references,
-            periods[0].start,
-            periods[0].end,
+            spend_period.start,
+            spend_period.end,
             false,
             false,
             true,
@@ -14190,6 +14409,56 @@ mod tests {
             remaining_graph_points(&references, 0, 180),
             vec![(0, 100.0), (60, 100.0), (120, 100.0), (180, 100.0)]
         );
+    }
+
+    #[test]
+    fn remaining_graph_rejects_conflicting_reset_rows_at_one_timestamp() {
+        let samples = [
+            UsageHistorySample::new(
+                0,
+                1_000,
+                88.0,
+                ModelDollarTotals {
+                    terra: 30.5,
+                    luna: 6.3,
+                    ..ModelDollarTotals::default()
+                },
+            ),
+            UsageHistorySample::new(
+                60,
+                1_000,
+                88.0,
+                ModelDollarTotals {
+                    terra: 30.5,
+                    luna: 6.4,
+                    ..ModelDollarTotals::default()
+                },
+            ),
+            // This mirrors the observed 2026-08-22 07:17 collision: a
+            // different reset period reports 14% at the same timestamp but
+            // carries no model usage. It must never overwrite the 88% row.
+            UsageHistorySample::new(60, 2_000, 14.0, ModelDollarTotals::default()),
+            UsageHistorySample::new(
+                120,
+                1_000,
+                87.0,
+                ModelDollarTotals {
+                    terra: 30.5,
+                    luna: 6.5,
+                    ..ModelDollarTotals::default()
+                },
+            ),
+        ];
+        let references = samples.iter().collect::<Vec<_>>();
+        let points = remaining_graph_points(&references, 0, 180);
+
+        assert!(points.iter().all(|(_, value)| *value >= 87.0));
+        assert!(points
+            .iter()
+            .any(|(timestamp, value)| *timestamp == 120 && (*value - 87.0).abs() < f64::EPSILON));
+        assert!(!points
+            .iter()
+            .any(|(_, value)| (*value - 14.0).abs() < f64::EPSILON));
     }
 
     #[test]
@@ -15689,6 +15958,27 @@ mod tests {
     }
 
     #[test]
+    fn graph_collision_preview_matches_the_historical_singleton_oracle() {
+        let state = CodexInfoState::preview("graph-collision");
+        let reset = state
+            .selected_history_reset()
+            .expect("selected preview period");
+        let period = state
+            .history
+            .period_for_id(reset, Utc::now().timestamp(), state.reset_at)
+            .expect("preview period");
+        let selected = state.history.samples_for_reset(Some(reset));
+        assert!(selected
+            .iter()
+            .all(|sample| (sample.remaining_percent - 14.0).abs() > f64::EPSILON));
+        let references = selected.iter().collect::<Vec<_>>();
+        let points = remaining_graph_points(&references, period.start, period.end);
+        assert_eq!(points.first().map(|(_, value)| *value), Some(88.0));
+        assert_eq!(points.last().map(|(_, value)| *value), Some(87.0));
+        assert!(points.iter().all(|(_, value)| *value >= 87.0));
+    }
+
+    #[test]
     fn graph_period_preview_opens_the_history_selector_for_visual_review() {
         let source = include_str!("../ui/components.slint");
         assert!(source.contains("in property <bool> open-on-start: false;"));
@@ -15696,7 +15986,9 @@ mod tests {
         assert!(source.contains("interval: 100ms;"));
         let main = include_str!("main.rs");
         assert!(
-            main.contains("Some(\"graph\" | \"graph-old\" | \"graph-many\" | \"graph-period\")")
+            main.contains(
+                "Some(\"graph\" | \"graph-old\" | \"graph-many\" | \"graph-period\" | \"graph-collision\")"
+            )
         );
         assert!(main.contains("graph.set_open_history_on_start(graph_period_preview);"));
     }

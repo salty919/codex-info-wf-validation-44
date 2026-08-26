@@ -124,8 +124,6 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
 
     public UiText Texts => LocalizationService.Current;
 
-    public string ProductVersionText => ProductInfo.DisplayVersion;
-
     public IReadOnlyList<string> MetricOptions => metricOptions;
 
     public string SelectedMetric
@@ -608,8 +606,6 @@ public sealed class ThreadsWindowViewModel : INotifyPropertyChanged, IDisposable
 
     public UiText Texts => LocalizationService.Current;
 
-    public string ProductVersionText => ProductInfo.DisplayVersion;
-
     public bool HasThreads => threads.Count > 0;
 
     public bool HasNoThreads => !HasThreads;
@@ -839,8 +835,6 @@ public sealed class LegalNoticesWindowViewModel : INotifyPropertyChanged, IDispo
     public ReadOnlyObservableCollection<ApiLegalNotice> Notices { get; }
 
     public UiText Texts => LocalizationService.Current;
-
-    public string ProductVersionText => ProductInfo.DisplayVersion;
 
     public bool HasNotices => notices.Count > 0;
 

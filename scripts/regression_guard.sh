@@ -30,6 +30,7 @@ run_checked 'Rust format check' cargo fmt --check
 run_checked 'Rust all-target check' cargo check --locked --all-targets
 
 require_text docs/PRODUCT_REQUIREMENTS.md '全直積、N倍、N二乗、N階乗のcase生成を行わない'
+require_text docs/PRODUCT_REQUIREMENTS.md '製品バージョンはメイン画面に一度だけ表示し'
 require_text docs/REGRESSION_PREVENTION_POLICY.md 'REG-WIN-DRAG'
 require_text windows-client/src/CodexInfo.WindowsClient/WindowDragBehavior.cs 'window.BeginMoveDrag(eventArgs)'
 require_text windows-client/src/CodexInfo.WindowsClient/ViewModels/DetailsWindowViewModels.cs 'EffectiveGraphEnd'
@@ -82,6 +83,9 @@ run_required_rust_test shared_graph_fixture_is_the_x_history_oracle
 run_required_rust_test model_graph_does_not_invent_spend_during_an_unobserved_gap
 run_required_rust_test graph_controls_use_one_visual_boundary_and_show_short_histories
 run_required_rust_test remaining_graph_does_not_infer_quota_loss_from_model_spend
+run_required_rust_test affected_timestamp_does_not_mix_a_singleton_reset_period_into_history
+run_required_rust_test singleton_reset_snapshot_overlapping_a_spend_period_stays_separate
+run_required_rust_test graph_collision_preview_matches_the_historical_singleton_oracle
 run_required_rust_test periodic_quota_refresh_retains_last_good_main_snapshot
 
 if rg -q 'SetCursorPos|mouse_event|SendInput' windows-client/src; then

@@ -35,7 +35,6 @@ public sealed class SettingsViewModel : INotifyPropertyChanged
 
     public ReadOnlyCollection<UiText> LanguageOptions { get; }
     public UiText Texts => LocalizationService.Current;
-    public string ProductVersionText => ProductInfo.DisplayVersion;
     public string SelectedLanguageCode
     {
         get => selectedLanguageCode;
@@ -184,7 +183,6 @@ public sealed class SetupViewModel : INotifyPropertyChanged, IDisposable
 
     public event PropertyChangedEventHandler? PropertyChanged;
     public UiText Texts => LocalizationService.Current;
-    public string ProductVersionText => ProductInfo.DisplayVersion;
     public IReadOnlyList<ConnectionProfileOption> ConnectionProfileOptions =>
     [
         new(ConnectionProfiles.None, Texts.ConnectionProfileNone),
