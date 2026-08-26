@@ -51,7 +51,8 @@ for _ in $(seq 1 80); do
     while read -r window_id; do
         [[ -n "$window_id" ]] || continue
         pid_line="$(xprop -id "$window_id" _NET_WM_PID 2>/dev/null || true)"
-        [[ "$pid_line" == *"= $preview_pid" ]] || continue
+        window_pid="$(awk -F'= ' '{print $2}' <<<"$pid_line" | tr -d '[:space:]')"
+        [[ "$window_pid" == "$preview_pid" ]] || continue
         name_line="$(xprop -id "$window_id" WM_NAME 2>/dev/null || true)"
         if [[ "$name_line" == *Graph* ]]; then
             graph_id="$window_id"
