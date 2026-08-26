@@ -767,6 +767,16 @@ impl RecorderWorker {
                     return;
                 };
 
+                // Signal ownership before the first bounded scan.  The scan
+                // can legitimately take longer than the service readiness
+                // window when a large session history is present (especially
+                // immediately after WSL boot).  Readiness means the lock and
+                // worker are alive; it must not depend on the first backfill
+                // finishing within two seconds.
+                if started.send(Ok(true)).is_err() {
+                    return;
+                }
+
                 match run_cycle(&database, &mut previous) {
                     Ok(rows) if rows > 0 => {
                         eprintln!("codex-info: recorder committed {rows} samples")
@@ -777,10 +787,6 @@ impl RecorderWorker {
                         eprintln!("codex-info: recorder skipped an unsafe input cycle");
                     }
                 }
-                if started.send(Ok(true)).is_err() {
-                    return;
-                }
-
                 let interval = daemon_interval_from_environment();
                 loop {
                     match shutdown_receiver.recv_timeout(interval) {
