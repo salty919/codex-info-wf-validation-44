@@ -59,9 +59,10 @@ Codex app-server / session JSONL / thread rollout
 7. 同一障害中にlocal JSONL全走査やapp-server再起動を無限反復しない。通常の全走査はquota cycle、明示更新、または一度だけの障害復旧に限定する。
    fingerprint不変ならscan/writeは0、変化時も1 cycleにつき1 scan・1 transactionだけとする。
 8. collector全停止中の未取得データは後から捏造しない。常駐daemonとloopback RESTは
-   `codex_info --service --listen 127.0.0.1:8787`の同一processが所有し、同じcanonical DB profileの
-   `UsageStore`とsingleton recorder leaseを使う。`--ui-only`はdaemon、REST、recorder leaseを生成せず、
-   終了後にそれらを残さない。`--all`はhealthyな既存serviceを再利用し、存在しない場合だけserviceを開始する。
+   引数なしまたは`codex_info --port PORT`の同一processが所有し、同じcanonical DB profileの
+   `UsageStore`とsingleton recorder leaseを使う。引数なし/`--port PORT`はdaemon+RESTのみを起動する。
+   `--ui`はhealthyな既存serviceを再利用し、存在しない場合だけserviceを開始してX UIを追加する。
+   `--ui`は既存serviceを利用し、無ければserviceを開始してX UIを追加する。
    systemd自動起動の解除はunitだけを停止・削除し、DB、backup、hint、source JSONL、binaryを保持する。
 9. canonical DB profileごとに`MaintenanceOwner`を1つだけ許可する。起動時pruneの前に、writer admissionを止めた同一排他境界で
    SQLite online backupを3世代作成・検証する。backup失敗時はpruneを実行しない。検証失敗・writer競合時もpruneを実行しない。バックアップは`0600`、DBディレクトリは`0700`とする。
@@ -117,8 +118,9 @@ Codex app-server / session JSONL / thread rollout
   unexpected exitはsupervisorが2秒以内に検知し、同一supervisor epochでは5秒backoff後の自動restartを1回だけ許可する。
   2回目のunexpected exitまたはrestart失敗後は`Failed`へlatchし、無限restartを行わない。明示startまたはsystemdの新activationだけが新epochを開始する。
 - `codex-info.service`がinstalledならsystemdがdaemon+RESTのsupervisorである。service processは
-  `codex_info --service --listen 127.0.0.1:8787`でrecorder leaseとREST listenerを同時に所有する。
-  `--ui-only`はlease/listenerを取得せず、`--all`はhealthyな既存serviceへ重複起動せずX UIだけを追加する。
+  `codex_info --port 8787`でrecorder leaseとREST listenerを同時に所有する。
+  引数なし/`--port PORT`はlease/listenerだけを取得し、`--ui`はhealthyな既存serviceへ
+  重複起動せずX UIを追加する（無ければ一つだけserviceを開始する）。
   serviceへのexplicit stopだけがTERM、worker停止、listener停止、lease解放を順に行う。
 - singletonのscopeは正規化canonical DB pathとprofileの組である。lease schemaは最大4KiBのUTF-8 JSON
   `recorder-lease-v1`（`pid`、`process_start`、`owner_nonce`、`canonical_db_path`、`device_or_volume_serial`、`file_index_or_inode`）とし、

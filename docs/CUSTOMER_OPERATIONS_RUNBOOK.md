@@ -5,25 +5,28 @@
 
 ## 起動構成
 
-同一release binary `codex_info`は、次の3モードだけを提供する。
+同一release binary `codex_info`は、次の公開操作だけを提供する。
 
 | モード | command | 常駐所有者 |
 | --- | --- | --- |
-| daemon+REST | `codex_info --service --listen 127.0.0.1:8787` | 1 processがrecorder workerとloopback RESTを所有 |
-| X UIのみ | `codex_info --ui-only` | なし。daemon/RESTを起動せず、終了後にも残さない |
-| 全体起動 | `codex_info --all` または引数なし | healthyな既存serviceを再利用。なければserviceを1つ起動してX UIを追加 |
+| daemon+REST | `codex_info` または `codex_info --port PORT` | Windowを生成せず、1 processがrecorder workerとloopback RESTを所有 |
+| daemon+REST+X UI | `codex_info --ui` | healthyな既存serviceを再利用。なければserviceを1つ起動してX UIを追加 |
+| 停止 | `codex_info --stop` | 同じprofileの検証済みlock ownerだけへTERMを送り、lock解放を待つ |
+| ヘルプ | `codex_info --help` | daemon/REST/UIを起動せず、locale別の契約を表示 |
 
-`--listen`はnumeric loopback addressだけを受理する。`0.0.0.0`、`::`、LAN address、hostnameは拒否する。
-`--ui-only`は`CODEX_INFO_API_LISTEN`を継承していてもservice modeへ変化しない。
-後方互換のため、引数なしで`CODEX_INFO_API_LISTEN`だけを指定した起動はWindowを生成しないservice modeになる。
-同じ環境変数のaddressで全体起動するときは`--all`を明示し、X UIを必ず追加する。
+`--port`はnumeric portだけを受理し、待受アドレスは`127.0.0.1`に固定する。
+引数なしは常にWindowを生成しないdaemon+REST modeである。待受addressは指定できず、常に`127.0.0.1`である。
+`--help`/`--h`/`-h`は起動せず、環境のロケールに応じたモード一覧を表示する。
 
 repositoryから起動する場合は同じ引数を`run.sh`へ渡す。
 
 ```bash
-./run.sh --service
-./run.sh --ui-only
-./run.sh --all
+./run.sh
+./run.sh --port 9876
+./run.sh --ui
+./run.sh --ui --port 9876
+./run.sh --stop
+./run.sh --help
 ```
 
 ## WSL / Ubuntu user-systemd自動起動
@@ -59,6 +62,7 @@ bash scripts/install_systemd_recorder.sh --remove
 ## 停止と確認
 
 ```bash
+./run.sh --stop
 systemctl --user stop codex-info.service
 systemctl --user is-active codex-info.service
 curl --max-time 1 http://127.0.0.1:8787/v1/health
@@ -70,6 +74,6 @@ curl --max-time 1 http://127.0.0.1:8787/v1/health
 ## Windowsクライアント
 
 WindowsクライアントはWSL/Ubuntu側のserviceへSSH local port forwarding経由で接続する。
-X UIを併用する場合もserviceを増やさず、`--ui-only`を追加起動する。
+X UIを併用する場合もserviceを増やさず、`--ui`を起動する。
 保持期間、1回の取得上限、REST SLOは[REST API v1](REST_API_V1.md)と
 [データ保護規約](DATA_PROTECTION_POLICY.md)を正本とする。

@@ -41,9 +41,8 @@ public static class ConnectionProcessFactory
         startInfo.ArgumentList.Add(selector);
         startInfo.ArgumentList.Add("--");
         startInfo.ArgumentList.Add("codex_info");
-        startInfo.ArgumentList.Add("--service");
-        startInfo.ArgumentList.Add("--listen");
-        startInfo.ArgumentList.Add("127.0.0.1:8787");
+        startInfo.ArgumentList.Add("--port");
+        startInfo.ArgumentList.Add("8787");
         return startInfo;
     }
 

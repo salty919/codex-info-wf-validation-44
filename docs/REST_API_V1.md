@@ -6,7 +6,7 @@
 ## 目的と境界
 
 Linux / WSL 上で起動する Codex Info のdaemonと、Windows クライアント向け読み取り専用 APIを、
-`codex_info --service`の1プロセスで所有する。このservice modeはSlint WindowやX event loopを生成せず、
+`codex_info`の1プロセスで所有する。このdaemon modeはSlint WindowやX event loopを生成せず、
 X UIを表示しない。`RecorderDaemon`はservice process内のbounded workerとしてsource JSONLを検証しSQLiteへ書く。
 `SnapshotPublisher`がcommit済みの完全な`DataGeneration/DataHash`と現行 admission tuple
 `(ProfileScopeId, AccountScopeId, StorageEpoch, SupervisorLeaseIdentity, CollectorEpoch, CycleSeq)`からimmutableなstatus/details
@@ -26,27 +26,27 @@ saved selectorのauto reconnectは`ArgumentList`＋`BatchMode=yes`で起動し�
 
 | 要望 | v1での対応 |
 | --- | --- |
-| Linux / WSL をサーバー化する | `codex_info --service --listen 127.0.0.1:8787`でdaemon+RESTを1プロセスとして起動する。Windowは生成しない。 |
+| Linux / WSL をサーバー化する | 引数なしまたは`codex_info --port 8787`でdaemon+RESTを1プロセスとして起動する。Windowは生成しない。 |
 | Windowsから監視する | SSHローカルポート転送先の固定JSONを、`windows-client/` の Windows 監視クライアントが表示する。 |
-| Linuxネイティブ環境を残す | `--ui-only`はX UIだけを起動し、daemon/RESTを生成・残留させない。`--all`は既存serviceを再利用する。 |
+| Linuxネイティブ環境を残す | 引数なし/`--port PORT`はdaemon+RESTのみ、`--ui`はdaemon+REST+X UI、`--ui --port PORT`は指定portで起動する。 |
 | イントラネットだけを対象にする | loopbackだけへ束縛し、SSHを暗号化・認証境界にする。 |
 | インターネット経由は別設定にする | v1の設定や認証を再利用せず、今回の対象外として分離する。 |
 
 ## 起動と SSH トンネル
 
 user-systemdを使うprofileでは`codex-info.service`が
-`codex_info --service --listen 127.0.0.1:8787`を開始する。手動時も同じcommandを使う。`0.0.0.0`、`::`、LAN アドレス、
-ホスト名は受け付けない。
+`codex_info --port 8787`を開始する。手動時も同じcommandを使う。待受アドレスは`127.0.0.1`に固定する。
 
 ```bash
-codex_info --service --listen 127.0.0.1:8787
-codex_info --ui-only
-codex_info --all
+codex_info --port 8787
+codex_info
+codex_info --ui
+codex_info --ui --port 9876
 ```
 
-`--service`はWindowを表示せず、recorder lockとREST listenerを同じprocess lifetimeで所有する。
-`--ui-only`は環境変数`CODEX_INFO_API_LISTEN`を継承していてもserviceへ変化しない。
-引数なしで`CODEX_INFO_API_LISTEN`だけを指定した後方互換起動はservice modeになり、明示的な`--all`は同じ環境変数のaddressでもX UIを保持する。`--all`は`/v1/health`で既存loopback serviceを確認し、存在しない場合だけ同一実行ファイルの`--service`を開始する。
+引数なしまたは`--port`はWindowを表示せず、recorder lockとREST listenerを同じprocess lifetimeで所有する。
+`--ui`は既存serviceを再利用し、無ければ同じloopback addressのserviceを一つだけ開始する。
+引数なしはdaemon+RESTのみであり、UIを追加する場合は`--ui`を明示する。待受addressは指定できず、`--port PORT`でloopbackのportだけを変更できる。
 systemd自動起動の解除は`bash scripts/install_systemd_recorder.sh --remove`で行い、DB/historyを保持する。
 
 Windows からは SSH のローカルポート転送を使う。
@@ -266,7 +266,7 @@ write lockにより同じ`PublishedPair`からatomic publishする。Windowsが�
 
 ## 段階的な移行
 
-v1 は Linux ネイティブ UI と別プロセスの`codex_info --service --listen 127.0.0.1:8787`で起動する監視 API である。
+v1 は Linux ネイティブ UI と別プロセスの、引数なしまたは`codex_info --port 8787`で起動する監視 API である。
 Windows 側には `windows-client/` の Avalonia / .NET 10 クライアントを用意し、Visual
 Studio Community から solution を開いて、この固定 JSON 契約を表示できる。詳細な
 接続・検証・表示仕様は[Windows クライアント](WINDOWS_CLIENT.md)を参照する。

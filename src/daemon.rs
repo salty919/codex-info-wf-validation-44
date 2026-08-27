@@ -61,6 +61,24 @@ pub(crate) fn daemon_lock_path() -> Option<PathBuf> {
     crate::usage_data_root().map(|root| root.join("history").join(DAEMON_LOCK_FILE_NAME))
 }
 
+/// Resolve the profile lock for `--stop` without creating a missing data
+/// directory. Service startup intentionally prepares its root, but an
+/// idempotent stop of a profile that was never started must remain read-only.
+fn stop_lock_path() -> Option<PathBuf> {
+    let root = std::env::var_os("CODEX_INFO_DATA_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(crate::default_codex_root);
+    if !root.is_absolute() {
+        return None;
+    }
+    if !root.exists() {
+        return Some(root.join("history").join(DAEMON_LOCK_FILE_NAME));
+    }
+    security::validate_absolute_root(&root)
+        .ok()
+        .map(|root| root.join("history").join(DAEMON_LOCK_FILE_NAME))
+}
+
 /// Read a bounded, private reset hint.  Any malformed, replaced, symlinked,
 /// or oversized metadata is ignored; the next authenticated quota response
 /// can safely replace it.
@@ -264,17 +282,13 @@ fn input_fingerprint(hint: Option<ResetHint>) -> Result<InputFingerprint, Daemon
     })
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 struct LockRecord {
     pid: u32,
     started_at: i64,
-    #[serde(default)]
     starttime_ticks: u64,
-    #[serde(default)]
     executable_device: u64,
-    #[serde(default)]
     executable_inode: u64,
-    #[serde(default)]
     owner_nonce: String,
 }
 
@@ -373,51 +387,119 @@ fn lock_is_same_file(left: &fs::Metadata, right: &fs::Metadata) -> bool {
     lock_identity_from_metadata(left) == lock_identity_from_metadata(right)
 }
 
-fn lock_owner_is_current(record: &LockRecord) -> bool {
-    let Some(identity) = process_identity(record.pid) else {
-        return false;
-    };
-    // Legacy lock records do not carry enough identity to prove ownership.
-    // They may be reclaimed only when their PID is dead; a live legacy PID is
-    // retained fail-closed so an unrelated process is never disturbed.
-    if record.starttime_ticks == 0
-        || record.executable_device == 0
-        || record.executable_inode == 0
-        || record.owner_nonce.len() != 32
-    {
-        return true;
+impl LockRecord {
+    fn is_complete(&self) -> bool {
+        self.pid > 0
+            && self.started_at > 0
+            && self.starttime_ticks > 0
+            && self.executable_device > 0
+            && self.executable_inode > 0
+            && self.owner_nonce.len() == 32
     }
-    identity.starttime_ticks == record.starttime_ticks
-        && identity.executable_device == record.executable_device
-        && identity.executable_inode == record.executable_inode
+
+    fn matches_process(&self, identity: &ProcessIdentity) -> bool {
+        self.is_complete()
+            && self.pid == identity.pid
+            && self.starttime_ticks == identity.starttime_ticks
+            && self.executable_device == identity.executable_device
+            && self.executable_inode == identity.executable_inode
+    }
 }
 
-fn current_lock_owner_pid_at(path: &Path) -> Option<u32> {
-    let path_metadata = fs::symlink_metadata(path).ok()?;
+/// Parse only the current, complete lock schema.  The exact key set matters:
+/// accepting a partially populated legacy object would make a numeric PID an
+/// authority again.  Unknown keys are rejected so a future schema cannot be
+/// mistaken for this stop contract without an explicit parser update.
+fn parse_lock_record(bytes: &[u8]) -> Option<LockRecord> {
+    let value = serde_json::from_slice::<serde_json::Value>(bytes).ok()?;
+    let object = value.as_object()?;
+    const REQUIRED_KEYS: [&str; 6] = [
+        "pid",
+        "started_at",
+        "starttime_ticks",
+        "executable_device",
+        "executable_inode",
+        "owner_nonce",
+    ];
+    if object.len() != REQUIRED_KEYS.len()
+        || REQUIRED_KEYS.iter().any(|key| !object.contains_key(*key))
+    {
+        return None;
+    }
+    let record = serde_json::from_value::<LockRecord>(value).ok()?;
+    record.is_complete().then_some(record)
+}
+
+fn lock_owner_is_current(record: &LockRecord) -> bool {
+    process_identity(record.pid).is_some_and(|identity| record.matches_process(&identity))
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct LockSnapshot {
+    identity: LockIdentity,
+    record: LockRecord,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum StopError {
+    LockUnavailable,
+    LockInvalid,
+    OwnerChanged,
+    SignalFailed,
+    Timeout,
+    #[allow(dead_code)]
+    Unsupported,
+}
+
+/// Read a lock while proving that the path and opened file refer to the same
+/// regular file before and after the bounded payload read.  A present but
+/// malformed, incomplete, symlinked, oversized, or replaced lock is never
+/// converted into an authority or removed by the stop path.
+fn read_lock_snapshot(path: &Path) -> Result<Option<LockSnapshot>, StopError> {
+    let path_metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => return Err(StopError::LockUnavailable),
+    };
     if path_metadata.file_type().is_symlink()
         || !path_metadata.is_file()
         || path_metadata.len() > MAX_LOCK_BYTES
     {
-        return None;
+        return Err(StopError::LockInvalid);
     }
-    let mut file = File::open(path).ok()?;
-    let file_metadata = file.metadata().ok()?;
+    let mut file = File::open(path).map_err(|_| StopError::LockUnavailable)?;
+    let file_metadata = file.metadata().map_err(|_| StopError::LockUnavailable)?;
     if !lock_is_same_file(&path_metadata, &file_metadata) {
-        return None;
+        return Err(StopError::OwnerChanged);
     }
     let mut bytes = Vec::with_capacity(path_metadata.len() as usize);
-    file.read_to_end(&mut bytes).ok()?;
+    file.read_to_end(&mut bytes)
+        .map_err(|_| StopError::LockUnavailable)?;
     if bytes.len() > MAX_LOCK_BYTES as usize {
-        return None;
+        return Err(StopError::LockInvalid);
     }
-    let current_path_metadata = fs::symlink_metadata(path).ok()?;
+    let current_path_metadata = fs::symlink_metadata(path).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            StopError::OwnerChanged
+        } else {
+            StopError::LockUnavailable
+        }
+    })?;
     if current_path_metadata.file_type().is_symlink()
         || !lock_is_same_file(&current_path_metadata, &file_metadata)
     {
-        return None;
+        return Err(StopError::OwnerChanged);
     }
-    let record = serde_json::from_slice::<LockRecord>(&bytes).ok()?;
-    lock_owner_is_current(&record).then_some(record.pid)
+    let record = parse_lock_record(&bytes).ok_or(StopError::LockInvalid)?;
+    Ok(Some(LockSnapshot {
+        identity: lock_identity_from_metadata(&file_metadata),
+        record,
+    }))
+}
+
+fn current_lock_owner_pid_at(path: &Path) -> Option<u32> {
+    let snapshot = read_lock_snapshot(path).ok().flatten()?;
+    lock_owner_is_current(&snapshot.record).then_some(snapshot.record.pid)
 }
 
 /// Return only the PID from a complete, current recorder lock identity.
@@ -426,6 +508,89 @@ fn current_lock_owner_pid_at(path: &Path) -> Option<u32> {
 /// treated as authority.
 pub(crate) fn current_daemon_owner_pid() -> Option<u32> {
     current_lock_owner_pid_at(&daemon_lock_path()?)
+}
+
+#[cfg(target_os = "linux")]
+fn pidfd_for_process(pid: u32) -> Result<rustix::fd::OwnedFd, StopError> {
+    use rustix::process::{pidfd_open, Pid, PidfdFlags};
+
+    let raw_pid = i32::try_from(pid).map_err(|_| StopError::SignalFailed)?;
+    let pid = Pid::from_raw(raw_pid).ok_or(StopError::SignalFailed)?;
+    pidfd_open(pid, PidfdFlags::empty()).map_err(|_| StopError::SignalFailed)
+}
+
+/// Send one TERM through a pidfd for a process we spawned ourselves.  This is
+/// used only to reap a losing startup child; the public `--stop` path below
+/// additionally revalidates the profile lock before invoking the same kernel
+/// primitive.
+#[cfg(target_os = "linux")]
+pub(crate) fn send_term_to_owned_process(pid: u32) -> bool {
+    use rustix::process::{pidfd_send_signal, Signal};
+
+    let Ok(pidfd) = pidfd_for_process(pid) else {
+        return false;
+    };
+    pidfd_send_signal(&pidfd, Signal::Term).is_ok()
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn send_term_to_owned_process(_pid: u32) -> bool {
+    false
+}
+
+/// Stop the profile-owned service, if present, using a process-instance-bound
+/// pidfd.  The lock is read and validated before the pidfd is acquired, then
+/// the exact lock identity, record, and process identity are read again after
+/// acquisition.  A single TERM is sent only after both observations agree.
+pub(crate) fn stop_daemon() -> Result<(), StopError> {
+    let path = stop_lock_path().ok_or(StopError::LockUnavailable)?;
+    let Some(initial) = read_lock_snapshot(&path)? else {
+        // An absent profile lock is the idempotent stopped state.
+        return Ok(());
+    };
+    let initial_process = process_identity(initial.record.pid).ok_or(StopError::LockInvalid)?;
+    if !initial.record.matches_process(&initial_process) {
+        return Err(StopError::LockInvalid);
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let pidfd = pidfd_for_process(initial.record.pid)?;
+        let Some(revalidated) = read_lock_snapshot(&path)? else {
+            return Err(StopError::OwnerChanged);
+        };
+        let revalidated_process =
+            process_identity(revalidated.record.pid).ok_or(StopError::OwnerChanged)?;
+        if revalidated != initial || !revalidated.record.matches_process(&revalidated_process) {
+            return Err(StopError::OwnerChanged);
+        }
+
+        // Deliberately do not retry this operation: one invocation owns at
+        // most one TERM, and a failed syscall is reported to the caller.
+        use rustix::process::{pidfd_send_signal, Signal};
+        pidfd_send_signal(&pidfd, Signal::Term).map_err(|_| StopError::SignalFailed)?;
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            match read_lock_snapshot(&path) {
+                Ok(None) => return Ok(()),
+                Ok(Some(current)) if current != initial => return Err(StopError::OwnerChanged),
+                Ok(Some(_)) => {}
+                Err(StopError::OwnerChanged) => return Err(StopError::OwnerChanged),
+                Err(_) => return Err(StopError::LockUnavailable),
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(StopError::Timeout);
+            }
+            thread::sleep(Duration::from_millis(25));
+        }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = initial;
+        Err(StopError::Unsupported)
+    }
 }
 
 fn lock_is_stale(path: &Path) -> Result<bool, DaemonError> {
@@ -643,90 +808,6 @@ fn run_cycle(
     Ok(rows)
 }
 
-async fn shutdown_signal() {
-    #[cfg(unix)]
-    {
-        use tokio::signal::unix::{signal, SignalKind};
-        let ctrl_c = tokio::signal::ctrl_c();
-        match signal(SignalKind::terminate()) {
-            Ok(mut terminate) => {
-                tokio::select! {
-                    _ = ctrl_c => {}
-                    _ = terminate.recv() => {}
-                }
-            }
-            Err(_) => {
-                let _ = ctrl_c.await;
-            }
-        }
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = tokio::signal::ctrl_c().await;
-    }
-}
-
-async fn run_daemon(once: bool) -> Result<(), DaemonError> {
-    let (_history, database, lock_path) = data_paths()?;
-    let Some(_lock) = DaemonLock::acquire(lock_path)? else {
-        eprintln!("codex-info: recorder daemon is already running");
-        return Ok(());
-    };
-    let mut previous = None;
-    match run_cycle(&database, &mut previous) {
-        Ok(rows) => {
-            if rows > 0 {
-                eprintln!("codex-info: recorder daemon committed {rows} samples");
-            }
-        }
-        Err(_) => eprintln!("codex-info: recorder daemon skipped an unsafe input cycle"),
-    }
-    if once {
-        return Ok(());
-    }
-
-    let interval = daemon_interval_from_environment();
-    let mut ticker = tokio::time::interval(interval);
-    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    // `interval` emits an immediate first tick.  The startup cycle above is
-    // that first tick, so consume it before entering the steady-state loop.
-    ticker.tick().await;
-    let shutdown = shutdown_signal();
-    tokio::pin!(shutdown);
-    loop {
-        tokio::select! {
-            _ = &mut shutdown => break,
-            _ = ticker.tick() => {
-                match run_cycle(&database, &mut previous) {
-                    Ok(rows) if rows > 0 => {
-                        eprintln!("codex-info: recorder daemon committed {rows} samples");
-                    }
-                    Ok(_) => {}
-                    Err(_) => {
-                        // Do not retain a failed fingerprint.  A later bounded
-                        // interval can retry after a transient replacement or
-                        // SQLite busy/IO failure without spinning.
-                        previous = None;
-                        eprintln!("codex-info: recorder daemon skipped an unsafe input cycle");
-                    }
-                }
-            }
-        }
-    }
-    Ok(())
-}
-
-pub(crate) fn run_record_daemon(once: bool) -> Result<(), String> {
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_io()
-        .enable_time()
-        .build()
-        .map_err(|_| DaemonError::Runtime.to_string())?;
-    runtime
-        .block_on(run_daemon(once))
-        .map_err(|error| error.to_string())
-}
-
 /// Recorder ownership embedded in the combined daemon+REST service.
 ///
 /// Unlike `run_record_daemon`, this worker does not install a second signal
@@ -905,7 +986,15 @@ mod tests {
     fn stale_pid_lock_is_reclaimed_and_live_lock_is_singleton() {
         let root = temp_root("lock");
         let path = root.join(DAEMON_LOCK_FILE_NAME);
-        fs::write(&path, b"{\"pid\":4294967294,\"started_at\":1}\n").unwrap();
+        let stale = LockRecord {
+            pid: 4_294_967_294,
+            started_at: 1,
+            starttime_ticks: 1,
+            executable_device: 1,
+            executable_inode: 1,
+            owner_nonce: "00".repeat(16),
+        };
+        fs::write(&path, serde_json::to_vec(&stale).unwrap()).unwrap();
         let first = DaemonLock::acquire(path.clone()).unwrap().unwrap();
         assert_eq!(current_lock_owner_pid_at(&path), Some(std::process::id()));
         assert!(DaemonLock::acquire(path.clone()).unwrap().is_none());
@@ -913,6 +1002,53 @@ mod tests {
         assert_eq!(current_lock_owner_pid_at(&path), None);
         assert!(!path.exists());
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn stop_authority_requires_complete_lock_record() {
+        let root = temp_root("strict-lock");
+        let path = root.join(DAEMON_LOCK_FILE_NAME);
+        let current = process_identity(std::process::id()).unwrap();
+        let complete = LockRecord {
+            pid: current.pid,
+            started_at: unix_now(),
+            starttime_ticks: current.starttime_ticks,
+            executable_device: current.executable_device,
+            executable_inode: current.executable_inode,
+            owner_nonce: "ab".repeat(16),
+        };
+        fs::write(&path, serde_json::to_vec(&complete).unwrap()).unwrap();
+        assert_eq!(current_lock_owner_pid_at(&path), Some(std::process::id()));
+
+        for payload in [
+            br#"{"pid":1,"started_at":1}"#.as_slice(),
+            br#"{"pid":1,"started_at":1,"starttime_ticks":1,"executable_device":1,"executable_inode":1}"#.as_slice(),
+            br#"{"pid":1,"started_at":1,"starttime_ticks":1,"executable_device":1,"executable_inode":1,"owner_nonce":"00"}"#.as_slice(),
+            b"not-json".as_slice(),
+        ] {
+            fs::write(&path, payload).unwrap();
+            assert_eq!(current_lock_owner_pid_at(&path), None);
+            assert!(parse_lock_record(payload).is_none());
+        }
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn stop_of_missing_profile_is_success_without_creating_data_root() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let root = std::env::temp_dir().join(format!(
+            "codex-info-daemon-stop-absent-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let old = std::env::var_os("CODEX_INFO_DATA_DIR");
+        std::env::set_var("CODEX_INFO_DATA_DIR", &root);
+        assert_eq!(stop_daemon(), Ok(()));
+        assert!(!root.exists());
+        match old {
+            Some(value) => std::env::set_var("CODEX_INFO_DATA_DIR", value),
+            None => std::env::remove_var("CODEX_INFO_DATA_DIR"),
+        }
     }
 
     #[test]

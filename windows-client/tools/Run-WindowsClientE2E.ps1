@@ -53,6 +53,7 @@ $script:e2eSourceSha = if (-not [string]::IsNullOrWhiteSpace($SourceSha)) { $Sou
 $script:e2eWindowRecords = [System.Collections.Generic.List[object]]::new()
 $script:e2eProcess = $null
 $script:e2eFixtureRunning = $false
+$script:e2ePreviewEnabled = -not [string]::IsNullOrWhiteSpace($env:CODEX_INFO_WINDOWS_PREVIEW)
 $script:e2eSettingsPath = Join-Path $env:LOCALAPPDATA 'CodexInfo\settings.json'
 $script:e2eSettingsBackup = Join-Path ([IO.Path]::GetTempPath()) ("codex-info-e2e-settings-" + [Guid]::NewGuid().ToString('N') + '.json')
 $script:e2eSettingsWasPresent = $false
@@ -648,9 +649,9 @@ function Assert-E2EGraphHasModelData {
     $plotBounds = $Plot.Current.BoundingRectangle
     $bitmap = [System.Drawing.Bitmap]::FromFile($Capture.Path)
     $series = @(
-        @{ Name = 'LUNA'; Color = [System.Drawing.ColorTranslator]::FromHtml('#E6A23C') },
-        @{ Name = 'TERRA'; Color = [System.Drawing.ColorTranslator]::FromHtml('#5DC98A') },
-        @{ Name = 'SOL'; Color = [System.Drawing.ColorTranslator]::FromHtml('#A88CF5') }
+        @{ Name = 'LUNA'; Color = [System.Drawing.ColorTranslator]::FromHtml('#E6A23C'); FlatColor = [System.Drawing.ColorTranslator]::FromHtml('#7B5E31') },
+        @{ Name = 'TERRA'; Color = [System.Drawing.ColorTranslator]::FromHtml('#5DC98A'); FlatColor = [System.Drawing.ColorTranslator]::FromHtml('#377158') },
+        @{ Name = 'SOL'; Color = [System.Drawing.ColorTranslator]::FromHtml('#A88CF5'); FlatColor = [System.Drawing.ColorTranslator]::FromHtml('#5C538D') }
     )
     $hits = @{}
     $columns = @{}
@@ -660,10 +661,10 @@ function Assert-E2EGraphHasModelData {
         $columns[$item.Name] = @{}
     }
     try {
-        $left = [Math]::Max(0, [int]($plotBounds.Left - $window.Left))
-        $top = [Math]::Max(0, [int]($plotBounds.Top - $window.Top))
-        $right = [Math]::Min($bitmap.Width, [int]($plotBounds.Right - $window.Left))
-        $bottom = [Math]::Min($bitmap.Height, [int]($plotBounds.Bottom - $window.Top))
+        [int]$left = [Math]::Max(0, [int]($plotBounds.Left - $window.Left))
+        [int]$top = [Math]::Max(0, [int]($plotBounds.Top - $window.Top))
+        [int]$right = [Math]::Min($bitmap.Width, [int]($plotBounds.Right - $window.Left))
+        [int]$bottom = [Math]::Min($bitmap.Height, [int]($plotBounds.Bottom - $window.Top))
         Assert-E2E ($right -gt $left -and $bottom -gt $top) 'Graph plot bounds are outside the captured window.'
         for ($x = $left; $x -lt $right; $x++) {
             for ($y = $top; $y -lt $bottom; $y++) {
@@ -672,8 +673,12 @@ function Assert-E2EGraphHasModelData {
                     $dr = $pixel.R - $item.Color.R
                     $dg = $pixel.G - $item.Color.G
                     $db = $pixel.B - $item.Color.B
-                    if (($dr * $dr) + ($dg * $dg) + ($db * $db) -le 24 * 24) {
-                        $hits[$item.Name]++
+                    $flatDr = $pixel.R - $item.FlatColor.R
+                    $flatDg = $pixel.G - $item.FlatColor.G
+                    $flatDb = $pixel.B - $item.FlatColor.B
+                    if ((($dr * $dr) + ($dg * $dg) + ($db * $db) -le 24 * 24) -or
+                        (($flatDr * $flatDr) + ($flatDg * $flatDg) + ($flatDb * $flatDb) -le 24 * 24)) {
+                        $hits[$item.Name] = $hits[$item.Name] + 1
                         if (-not $columns[$item.Name].ContainsKey($x)) {
                             $columns[$item.Name][$x] = 0
                         }
@@ -699,9 +704,17 @@ function Assert-E2EGraphHasModelData {
         $spans[$item.Name] = $span
         Assert-E2E ($span -ge [int][Math]::Ceiling(($right - $left) * 0.15)) `
             "Past graph $($item.Name) model series is concentrated at one x position: span=$span."
-        $maxColumnPixels = @($columns[$item.Name].Values | Measure-Object -Maximum).Maximum
-        Assert-E2E ($maxColumnPixels -le [int][Math]::Ceiling(($bottom - $top) * 0.20)) `
-            "Past graph $($item.Name) model series contains an implausible vertical stroke: max-column-pixels=$maxColumnPixels."
+        # A legitimate observation after an unobserved gap is rendered as a
+        # vertical step at that observation timestamp.  The forbidden case is
+        # the synthetic reset jump at the plot's left edge; check that boundary
+        # specifically instead of rejecting valid late observations.
+        $leftBoundaryLimit = $left + [int][Math]::Ceiling(($right - $left) * 0.05)
+        $leftBoundaryPixels = @($columns[$item.Name].GetEnumerator() |
+            Where-Object { [int]$_.Key -le $leftBoundaryLimit } |
+            ForEach-Object { [int]$_.Value } | Measure-Object -Maximum).Maximum
+        if ($null -eq $leftBoundaryPixels) { $leftBoundaryPixels = 0 }
+        Assert-E2E ($leftBoundaryPixels -le [int][Math]::Ceiling(($bottom - $top) * 0.20)) `
+            "Past graph $($item.Name) model series contains a synthetic reset stroke at the left boundary: pixels=$leftBoundaryPixels."
     }
     Write-E2E ("graph-past-model-data: PASS LUNA={0}({1}px span) TERRA={2}({3}px span) SOL={4}({5}px span)" -f `
         $hits['LUNA'], $spans['LUNA'], $hits['TERRA'], $spans['TERRA'], $hits['SOL'], $spans['SOL'])
@@ -722,15 +735,15 @@ function Assert-E2EGraphHasIdleBand {
     $hits = 0
     $columnHits = @{}
     try {
-        $left = [Math]::Max(0, [int]($plotBounds.Left - $window.Left))
-        $top = [Math]::Max(0, [int]($plotBounds.Top - $window.Top))
-        $right = [Math]::Min($bitmap.Width, [int]($plotBounds.Right - $window.Left))
-        $bottom = [Math]::Min($bitmap.Height, [int]($plotBounds.Bottom - $window.Top))
+        [int]$left = [Math]::Max(0, [int]($plotBounds.Left - $window.Left))
+        [int]$top = [Math]::Max(0, [int]($plotBounds.Top - $window.Top))
+        [int]$right = [Math]::Min($bitmap.Width, [int]($plotBounds.Right - $window.Left))
+        [int]$bottom = [Math]::Min($bitmap.Height, [int]($plotBounds.Bottom - $window.Top))
         Assert-E2E ($right -gt $left -and $bottom -gt $top) 'Graph plot bounds are outside the captured window.'
         Assert-E2E ($ExpectedStartFraction -ge 0 -and $ExpectedEndFraction -le 1 -and
             $ExpectedEndFraction -gt $ExpectedStartFraction) 'Idle-band expected range is invalid.'
-        $expectedLeft = $left + [int](($right - $left) * $ExpectedStartFraction)
-        $expectedRight = $left + [int](($right - $left) * $ExpectedEndFraction)
+        [int]$expectedLeft = $left + [int](($right - $left) * $ExpectedStartFraction)
+        [int]$expectedRight = $left + [int](($right - $left) * $ExpectedEndFraction)
         Assert-E2E ($expectedRight -gt $expectedLeft) 'Idle-band expected range is sub-pixel.'
         # #3F5D7C at opacity .22 over #101925 composites near #1A2838.
         # The bounded tolerance accepts compositor rounding while excluding
@@ -742,8 +755,8 @@ function Assert-E2EGraphHasIdleBand {
                 if ($pixel.R -ge 20 -and $pixel.R -le 34 -and
                     $pixel.G -ge 32 -and $pixel.G -le 48 -and
                     $pixel.B -ge 48 -and $pixel.B -le 64) {
-                    $hits++
-                    $columnHits[$x]++
+                    $hits = $hits + 1
+                    $columnHits[$x] = $columnHits[$x] + 1
                 }
             }
         }
@@ -988,7 +1001,7 @@ try {
     $mainCapture = Capture-E2EWindow $mainHandle '01-main-ready'
     Assert-E2E ($mainCapture.Hash.Length -eq 64) 'Main screenshot hash is missing.'
     Assert-E2EMainProductVersion $mainRoot
-    if ($Fixture) {
+    if ($Fixture -or $script:e2ePreviewEnabled) {
         Assert-E2EQuotaGaugePalette -Root $mainRoot -Handle $mainHandle -Capture $mainCapture
     }
     else {
@@ -1006,15 +1019,25 @@ try {
     # period options, metrics, and rows directly; a mutable summary TextBlock
     # peer is deliberately not used as a proxy for those surfaces.
     Start-Sleep -Seconds 5
+    $startupLoading = Find-E2EElementByAutomationId $mainRoot 'Main.StartupLoading'
+    Assert-E2E ($null -eq $startupLoading -or $startupLoading.Current.IsOffscreen -or -not $startupLoading.Current.IsEnabled) `
+        'Startup loading surface is still visible after the first refresh window.'
+    Write-E2E 'main-startup-loading: PASS (first complete generation is visible)'
     $detailsStatus = Find-E2EElementByAutomationId $mainRoot 'Main.DetailsStatus'
     Assert-E2E ($null -ne $detailsStatus) 'Main details status is missing.'
     $detailsStatusText = [string]$detailsStatus.Current.Name
     Write-E2E ("main: details status='{0}' observed" -f $detailsStatusText)
     # A screenshot or a successful status request is not sufficient evidence:
     # the main surface must have accepted the matching details generation.
-    # Fail closed on both locales and on every known unavailable/error wording.
-    $detailsIsLatest = $detailsStatusText -match '最新|Latest'
-    $detailsHasFailure = $detailsStatusText -match '未取得|Unavailable|失敗|error|Error'
+    # Consume the locale-independent AutomationProperties.Name contract rather
+    # than attempting to decode localized rendered text.
+    $detailsContract = Find-E2EElementByAutomationId $mainRoot 'Main.DetailsGenerationContract'
+    Assert-E2E ($null -ne $detailsContract) 'Main details generation contract is missing.'
+    $detailsContractText = [string]$detailsContract.Current.Name
+    $detailsIsLatest = $detailsContractText -eq 'ready'
+    $detailsHasFailure = $detailsContractText -eq 'error'
+    Write-E2E ("main: details contract value='{0}'" -f $detailsContractText)
+    Write-E2E ("main: details contract latest={0} failure={1} length={2}" -f $detailsIsLatest, $detailsHasFailure, $detailsStatusText.Length)
     Assert-E2E ($detailsIsLatest -and -not $detailsHasFailure) `
         "Main details status is not a complete accepted generation: '$detailsStatusText'"
     Write-E2E 'main-details-status: PASS (matching status/details generation accepted)'
@@ -1062,8 +1085,10 @@ try {
     Wait-E2ESelectorLabel $graphRoot 'Graph.PeriodSelector' $pastLabel
     $graphPast = Capture-E2EWindow $graph.Handle '03-graph-past'
     Assert-E2EImageChanged $graphCurrent $graphPast 'Current-to-past period selection'
-    if ($Fixture) {
+    if ($Fixture -or $script:e2ePreviewEnabled) {
         Assert-E2EGraphHasModelData $plot $graph.Handle $graphPast
+    }
+    if ($Fixture) {
         Assert-E2EGraphHasIdleBand $plot $graph.Handle $graphPast
     }
 
@@ -1208,7 +1233,8 @@ try {
     $script:e2eWindowRecords | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $windowRecordPath -Encoding utf8
     Write-E2E "windows: PASS records=$($script:e2eWindowRecords.Count) pid=$clientPid records_path=$windowRecordPath"
 
-    Write-E2E 'windows-client-e2e: PASS (Graph open, past-period model and idle-band pixels, period current/past/current, 2 metrics, 4 toggle OFF/ON cycles, Threads rows/columns, PID/HWND records)'
+    $graphEvidence = if ($Fixture) { 'past-period model and idle-band pixels' } else { 'past-period model pixels' }
+    Write-E2E ("windows-client-e2e: PASS (Graph open, {0}, period current/past/current, 2 metrics, 4 toggle OFF/ON cycles, Threads rows/columns, PID/HWND records)" -f $graphEvidence)
     $script:e2eSuccess = $true
 }
 catch {

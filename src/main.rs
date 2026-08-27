@@ -6,7 +6,7 @@
 mod daemon;
 
 use chrono::{DateTime, Months, Utc};
-use codex_info::i18n::{I18n, PeriodKind, TextKey};
+use codex_info::i18n::{CliTextKey, I18n, PeriodKind, TextKey};
 use codex_info::protocol_contract;
 use codex_info::security;
 use codex_info::server::{
@@ -387,6 +387,49 @@ fn fixed_resize_decision_for_scale(
 
 fn install_fixed_window_guard(window: &slint::Window) {
     install_window_size_guard(window, FIXED_WINDOW_WIDTH, FIXED_WINDOW_HEIGHT);
+}
+
+fn visible_window_position(
+    monitor_position: winit::dpi::PhysicalPosition<i32>,
+    monitor_size: winit::dpi::PhysicalSize<u32>,
+    window_size: winit::dpi::PhysicalSize<u32>,
+) -> winit::dpi::PhysicalPosition<i32> {
+    const MARGIN: i64 = 32;
+    let offset_x = if i64::from(monitor_size.width) >= i64::from(window_size.width) + MARGIN * 2 {
+        MARGIN
+    } else {
+        0
+    };
+    let offset_y = if i64::from(monitor_size.height) >= i64::from(window_size.height) + MARGIN * 2 {
+        MARGIN
+    } else {
+        0
+    };
+    let x = i64::from(monitor_position.x)
+        .saturating_add(offset_x)
+        .clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32;
+    let y = i64::from(monitor_position.y)
+        .saturating_add(offset_y)
+        .clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32;
+    winit::dpi::PhysicalPosition::new(x, y)
+}
+
+/// Put the first window at a visible top-left position on the primary monitor
+/// so a multi-monitor/XWayland placement cannot make a successful launch look
+/// like a blank `run.sh`.
+fn place_main_window_on_primary_monitor(window: &slint::Window) {
+    let _ = window.with_winit_window(|winit_window| {
+        let Some(monitor) = winit_window.primary_monitor() else {
+            return;
+        };
+        let position = visible_window_position(
+            monitor.position(),
+            monitor.size(),
+            winit_window.outer_size(),
+        );
+        winit_window.set_outer_position(position);
+        winit_window.focus_window();
+    });
 }
 
 fn install_resizable_window(window: &slint::Window) {
@@ -1172,8 +1215,16 @@ fn read_thread_rollout_path(
     file.seek(SeekFrom::Start(0)).map_err(|_| ())?;
     let rollout = {
         let mut reader = BufReader::new((&mut file).take(complete_len));
-        thread_contract::parse_rollout_reader_recoverable(&mut reader, complete_len)
-            .map_err(|_| ())?
+        match thread_contract::parse_rollout_reader_recoverable(&mut reader, complete_len) {
+            Ok(rollout) => rollout,
+            Err(error) => {
+                debug_runtime(format!(
+                    "thread rollout parse rejected reason={}",
+                    error.message()
+                ));
+                return Err(());
+            }
+        }
     };
 
     let after_file = file.metadata().map_err(|_| ())?;
@@ -1664,7 +1715,7 @@ fn reset_transition_is_boundary(
     let previous_at = previous_observed_at.unwrap_or(now);
     let previous_horizon = previous_reset.saturating_sub(previous_at);
     let next_horizon = next_reset.saturating_sub(now);
-    let boundary_proximity = window_seconds.max(60).min(3_600);
+    let boundary_proximity = window_seconds.clamp(60, 3_600);
     if previous_horizon <= boundary_proximity && next_horizon >= window_seconds / 2 {
         return true;
     }
@@ -5333,6 +5384,7 @@ impl CodexInfoState {
         let quota = self
             .has_quota_percent
             .then_some(())
+            .filter(|_| self.has_visible_usage())
             .and_then(|_| self.remaining_percent.zip(self.reset_at))
             .map(|(remaining_percent, reset_at)| PublicQuota {
                 remaining_percent: remaining_percent.clamp(0.0, 100.0),
@@ -5658,6 +5710,19 @@ impl CodexInfoState {
             recovery_requested: false,
         };
         match kind {
+            "startup-loading" => {
+                // Authenticated identity is known, but the first local usage
+                // collection has not committed a complete generation yet.
+                // This fixture keeps quota/model data private behind the
+                // startup surface so the X11 evidence can inspect the exact
+                // no-partial-frame contract.
+                state.authenticated = true;
+                state.has_usage = true;
+                state.local_usage_pending = true;
+                state.usage_snapshot_committed = false;
+                state.last_success_at = None;
+                state.status = "認証済みです。利用量を取得しています…".into();
+            }
             "initializing" => {
                 // Match the first safe public snapshot: the native application
                 // has started its read but has not established either identity
@@ -5872,7 +5937,6 @@ impl CodexInfoState {
                                 sol: cumulative.sol * 0.35,
                                 terra: cumulative.terra,
                                 luna: cumulative.luna * 0.45,
-                                ..ModelDollarTotals::default()
                             },
                             ModelTokenTotals::default(),
                         ),
@@ -7274,11 +7338,11 @@ fn sync_threads_window(state: &CodexInfoState, threads_window: &ThreadsWindow) {
 }
 
 const LEGAL_PAGE_CHUNK_SCALARS: usize = 620;
+type NativeLegalPageCache =
+    BTreeMap<&'static str, (Vec<slint::SharedString>, Vec<slint::SharedString>)>;
 
 fn native_legal_pages(i18n: &I18n) -> (Vec<slint::SharedString>, Vec<slint::SharedString>) {
-    static CACHE: OnceLock<
-        Mutex<BTreeMap<&'static str, (Vec<slint::SharedString>, Vec<slint::SharedString>)>>,
-    > = OnceLock::new();
+    static CACHE: OnceLock<Mutex<NativeLegalPageCache>> = OnceLock::new();
     let cache = CACHE.get_or_init(|| Mutex::new(BTreeMap::new()));
     let language_code = i18n.language().code();
     if let Some((names, pages)) = cache
@@ -7490,6 +7554,19 @@ fn account_refresh_due(
         && now.duration_since(last_poll) >= automatic_refresh_interval(authenticated, auth_polling)
 }
 
+/// The authenticated main surface is withheld until its first complete
+/// usage generation is ready. A local-collector failure releases the spinner
+/// so the error/retry state is visible instead of looking like a hang.
+fn native_startup_loading(
+    authenticated: bool,
+    has_visible_usage: bool,
+    local_usage_error: bool,
+    account_error: bool,
+    error: bool,
+) -> bool {
+    authenticated && !has_visible_usage && !local_usage_error && !account_error && !error
+}
+
 fn open_validated_auth_url(value: &str) -> bool {
     let Ok(url) = security::validate_auth_url(value) else {
         return false;
@@ -7647,6 +7724,13 @@ impl CodexInfoState {
         ui.set_has_auth_url(self.auth_url.is_some());
         ui.set_checking(self.checking);
         ui.set_has_error(self.error.is_some());
+        ui.set_startup_loading(native_startup_loading(
+            self.authenticated,
+            self.has_visible_usage(),
+            self.local_usage_error,
+            self.account_error.is_some(),
+            self.error.is_some(),
+        ));
         ui.set_window_title(native_account_window_title(&self.window_title()).into());
         let quota_title = if self.monthly {
             self.i18n.text(TextKey::MonthlyQuotaRemaining)
@@ -8247,23 +8331,42 @@ const DEFAULT_SERVICE_ADDRESS: &str = "127.0.0.1:8787";
 const BACKGROUND_SERVICE_START_TIMEOUT: Duration = Duration::from_secs(5);
 const BACKGROUND_CHILD_CLEANUP_TIMEOUT: Duration = Duration::from_secs(2);
 
+fn cli_error(key: CliTextKey) -> String {
+    I18n::detect().cli_text(key).to_owned()
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum LaunchMode {
     /// Mode 1: one resident owner containing recorder + REST.
     Service(ApiServerConfig),
-    /// Mode 2: X only. It never starts or owns a resident service.
-    UiOnly,
-    /// Mode 3: ensure mode 1 exists at this address, then add the X UI.
+    /// Mode 2: ensure a resident service exists at this address, then add X UI.
     All(ApiServerConfig),
-    /// Backward-compatible diagnostic recorder command.
-    RecordOnly { once: bool },
+    /// Stop this profile's verified resident service and wait for its lock to disappear.
+    Stop,
+    /// Print CLI usage without starting a daemon or UI.
+    Help,
 }
 
 fn default_service_config() -> Result<ApiServerConfig, String> {
     DEFAULT_SERVICE_ADDRESS
         .parse::<SocketAddr>()
-        .map_err(|_| "default service address is invalid".to_owned())
-        .and_then(|address| ApiServerConfig::new(address).map_err(|error| error.to_string()))
+        .map_err(|_| cli_error(CliTextKey::ServiceStartFailed))
+        .and_then(|address| {
+            ApiServerConfig::new(address).map_err(|_| cli_error(CliTextKey::ServiceStartFailed))
+        })
+}
+
+fn service_config_for_port(value: &std::ffi::OsStr) -> Result<ApiServerConfig, String> {
+    let port = value
+        .to_str()
+        .ok_or_else(|| cli_error(CliTextKey::InvalidPort))?
+        .parse::<u16>()
+        .map_err(|_| cli_error(CliTextKey::InvalidPort))?;
+    if port == 0 {
+        return Err(cli_error(CliTextKey::InvalidPort));
+    }
+    ApiServerConfig::new(SocketAddr::from(([127, 0, 0, 1], port)))
+        .map_err(|_| cli_error(CliTextKey::ServiceStartFailed))
 }
 
 fn parse_launch_mode<I>(arguments: I) -> Result<LaunchMode, String>
@@ -8272,43 +8375,17 @@ where
 {
     let arguments = arguments.into_iter().collect::<Vec<_>>();
     match arguments.as_slice() {
-        [] => default_service_config().map(LaunchMode::All),
-        [value] if value == "--all" => default_service_config().map(LaunchMode::All),
-        [value] if value == "--ui-only" => Ok(LaunchMode::UiOnly),
-        [value] if value == "--service" => default_service_config().map(LaunchMode::Service),
-        [service, listen, address] if service == "--service" && listen == "--listen" => {
-            let address = address
-                .to_str()
-                .ok_or_else(|| "--listen requires a numeric loopback address".to_owned())?
-                .parse::<SocketAddr>()
-                .map_err(|_| "--listen requires a numeric loopback address".to_owned())?;
-            ApiServerConfig::new(address)
-                .map(LaunchMode::Service)
-                .map_err(|error| error.to_string())
+        [] => default_service_config().map(LaunchMode::Service),
+        [value] if value == "--help" || value == "--h" || value == "-h" => Ok(LaunchMode::Help),
+        [value] if value == "--ui" => default_service_config().map(LaunchMode::All),
+        [stop] if stop == "--stop" => Ok(LaunchMode::Stop),
+        [port, value] if port == "--port" => {
+            service_config_for_port(value).map(LaunchMode::Service)
         }
-        [record] if record == "--record-daemon" => Ok(LaunchMode::RecordOnly {
-            once: std::env::var_os("CODEX_INFO_DAEMON_ONESHOT").is_some_and(|value| value == "1"),
-        }),
-        [record, once] if record == "--record-daemon" && once == "--once" => {
-            Ok(LaunchMode::RecordOnly { once: true })
+        [ui, port, value] if ui == "--ui" && port == "--port" => {
+            service_config_for_port(value).map(LaunchMode::All)
         }
-        _ => Err("usage: codex_info [--all|--ui-only|--service [--listen 127.0.0.1:PORT]|--record-daemon [--once]]".to_owned()),
-    }
-}
-
-fn apply_launch_environment(
-    mode: LaunchMode,
-    arguments_were_explicit: bool,
-    environment_config: Option<ApiServerConfig>,
-) -> LaunchMode {
-    match (mode, arguments_were_explicit, environment_config) {
-        // Preserve the legacy environment-only service entry point only when
-        // no CLI mode was supplied.
-        (LaunchMode::All(_), false, Some(config)) => LaunchMode::Service(config),
-        // An explicit --all keeps its UI and uses the requested loopback
-        // address for the background daemon+REST service it ensures.
-        (LaunchMode::All(_), true, Some(config)) => LaunchMode::All(config),
-        (mode, _, _) => mode,
+        _ => Err(I18n::detect().language().launch_help().to_owned()),
     }
 }
 
@@ -8379,9 +8456,12 @@ fn terminate_and_reap_owned_child(child: &mut Child) -> bool {
     if matches!(child.try_wait(), Ok(Some(_))) {
         return true;
     }
-    // Never block indefinitely in `wait`: after requesting termination,
-    // `try_wait` both observes and reaps the child within a fixed deadline.
-    let _ = child.kill();
+    // The child is ours, but still pin its process instance before requesting
+    // termination. A forceful Child::kill would bypass the pidfd contract used
+    // by the public --stop path.
+    if !daemon::send_term_to_owned_process(child.id()) {
+        return false;
+    }
     let deadline = Instant::now() + BACKGROUND_CHILD_CLEANUP_TIMEOUT;
     loop {
         if matches!(child.try_wait(), Ok(Some(_))) {
@@ -8399,34 +8479,34 @@ fn ensure_background_service(config: ApiServerConfig) -> Result<(), String> {
     if healthy_combined_service_owner(address).is_some() {
         return Ok(());
     }
-    let executable = std::env::current_exe()
-        .map_err(|_| "combined service executable is unavailable".to_owned())?;
-    let address_text = address.to_string();
+    let executable =
+        std::env::current_exe().map_err(|_| cli_error(CliTextKey::ServiceExecutableUnavailable))?;
+    let port_text = address.port().to_string();
     let child = Command::new(executable)
-        .args(["--service", "--listen", address_text.as_str()])
+        .args(["--port", port_text.as_str()])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
-        .map_err(|_| "combined daemon+REST service could not start".to_owned())?;
+        .map_err(|_| cli_error(CliTextKey::ServiceStartFailed))?;
     let child_pid = child.id();
     let mut owned_child = Some(child);
     let deadline = Instant::now() + BACKGROUND_SERVICE_START_TIMEOUT;
     loop {
         let healthy_owner = healthy_combined_service_owner(address);
         if healthy_owner == Some(child_pid) {
-            // This is the resident child this --all invocation intentionally
+            // This is the resident child this UI+service invocation intentionally
             // created. Dropping the process handle detaches it; it must remain
             // alive after the X UI closes.
             return Ok(());
         }
         if healthy_owner.is_some() {
-            // A concurrent --all/--service won recorder ownership and became
+            // A concurrent UI/service launcher won recorder ownership and became
             // healthy. This invocation must reap only the child it spawned
             // before attaching its UI to that winner.
             if let Some(child) = owned_child.as_mut() {
                 if !terminate_and_reap_owned_child(child) {
-                    return Err("losing combined service child could not be reaped".to_owned());
+                    return Err(cli_error(CliTextKey::ServiceCleanupFailed));
                 }
             }
             return Ok(());
@@ -8439,24 +8519,24 @@ fn ensure_background_service(config: ApiServerConfig) -> Result<(), String> {
                 Err(_) => {
                     let reaped = terminate_and_reap_owned_child(child);
                     return Err(if reaped {
-                        "combined daemon+REST service state is unavailable".to_owned()
+                        cli_error(CliTextKey::ServiceStateUnavailable)
                     } else {
-                        "combined daemon+REST service state is unavailable and its child could not be reaped".to_owned()
+                        cli_error(CliTextKey::ServiceCleanupFailed)
                     });
                 }
             }
         }
         if owned_child.is_none() && daemon::current_daemon_owner_pid().is_none() {
-            return Err("combined daemon+REST service exited before becoming healthy".to_owned());
+            return Err(cli_error(CliTextKey::ServiceExitedBeforeHealthy));
         }
         if Instant::now() >= deadline {
             let reaped = owned_child
                 .as_mut()
                 .is_none_or(terminate_and_reap_owned_child);
             return Err(if reaped {
-                "combined daemon+REST service did not become healthy".to_owned()
+                cli_error(CliTextKey::ServiceNotHealthy)
             } else {
-                "combined daemon+REST service did not become healthy and its child could not be reaped".to_owned()
+                cli_error(CliTextKey::ServiceCleanupFailed)
             });
         }
         thread::sleep(Duration::from_millis(50));
@@ -8509,19 +8589,17 @@ async fn service_shutdown_signal() {
 }
 
 fn run_combined_service(config: ApiServerConfig) -> Result<(), Box<dyn std::error::Error>> {
-    let mut recorder = daemon::RecorderWorker::start().map_err(std::io::Error::other)?;
+    let mut recorder = daemon::RecorderWorker::start()
+        .map_err(|_| std::io::Error::other(cli_error(CliTextKey::ServiceStartFailed)))?;
     if !recorder.is_active() {
         recorder.shutdown();
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::AlreadyExists,
-            "combined daemon+REST service is already owned by another process",
-        )
-        .into());
+        return Err(std::io::Error::other(cli_error(CliTextKey::ServiceAlreadyOwned)).into());
     }
     // Bind REST only after this process owns the recorder. Concurrent service
     // children therefore exit before publishing a listener, and an API bind
     // failure drops the worker and releases its exact lock identity.
-    let mut api_server = ApiServer::start(config)?;
+    let mut api_server = ApiServer::start(config)
+        .map_err(|_| std::io::Error::other(cli_error(CliTextKey::ServiceStartFailed)))?;
     let publisher = api_server.publisher();
     let mut state = CodexInfoState::new();
     publisher.publish_details(state.public_details())?;
@@ -8568,9 +8646,35 @@ fn run_combined_service(config: ApiServerConfig) -> Result<(), Box<dyn std::erro
     Ok(())
 }
 
-fn run_ui() -> Result<(), Box<dyn std::error::Error>> {
+fn run_service_mode(config: ApiServerConfig) -> Result<(), Box<dyn std::error::Error>> {
+    if healthy_combined_service_owner(config.listen_addr()).is_some() {
+        eprintln!(
+            "codex-info: {}",
+            I18n::detect().cli_text(CliTextKey::ServiceReused)
+        );
+        return Ok(());
+    }
+    run_combined_service(config)
+}
+
+fn stop_service_mode() -> Result<(), Box<dyn std::error::Error>> {
+    daemon::stop_daemon().map_err(|error| {
+        let key = match error {
+            daemon::StopError::LockUnavailable => CliTextKey::StopLockUnavailable,
+            daemon::StopError::LockInvalid => CliTextKey::StopLockInvalid,
+            daemon::StopError::OwnerChanged => CliTextKey::StopOwnerChanged,
+            daemon::StopError::SignalFailed => CliTextKey::StopSignalFailed,
+            daemon::StopError::Timeout => CliTextKey::StopTimeout,
+            daemon::StopError::Unsupported => CliTextKey::StopUnsupported,
+        };
+        std::io::Error::other(cli_error(key)).into()
+    })
+}
+
+fn run_ui(initial_service_error: Option<String>) -> Result<(), Box<dyn std::error::Error>> {
     let ui = MainWindow::new()?;
     install_fixed_window_guard(ui.window());
+    place_main_window_on_primary_monitor(ui.window());
     let preview_size = std::env::var("CODEX_INFO_PREVIEW_SIZE")
         .ok()
         .and_then(|value| parse_preview_size(Some(value.as_str())));
@@ -8582,6 +8686,11 @@ fn run_ui() -> Result<(), Box<dyn std::error::Error>> {
             .map(|kind| CodexInfoState::preview(&kind))
             .unwrap_or_else(CodexInfoState::new),
     ));
+    if let Some(error) = initial_service_error {
+        // A failed --ui service must not make the GUI disappear. Publish a
+        // visible retry/error state and keep the window available for recovery.
+        state.borrow_mut().apply_account_error(error);
+    }
     // One graph window owns the three model toggles. The initial state keeps
     // every series enabled, preserving the combined cumulative view.
     let graph_window = Rc::new(RefCell::new(None::<GraphWindow>));
@@ -8969,6 +9078,17 @@ fn run_ui() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     });
+    let weak_ui_for_position = ui.as_weak();
+    let main_window_position_timer = Timer::default();
+    main_window_position_timer.start(
+        TimerMode::SingleShot,
+        Duration::from_millis(100),
+        move || {
+            if let Some(ui) = weak_ui_for_position.upgrade() {
+                place_main_window_on_primary_monitor(ui.window());
+            }
+        },
+    );
     let weak_ui = ui.as_weak();
     let graph_window_for_timer = Rc::clone(&graph_window);
     let threads_window_for_timer = Rc::clone(&threads_window);
@@ -8998,25 +9118,16 @@ fn run_ui() -> Result<(), Box<dyn std::error::Error>> {
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let arguments = std::env::args_os().skip(1).collect::<Vec<_>>();
-    let arguments_were_explicit = !arguments.is_empty();
-    let parsed_mode = parse_launch_mode(arguments).map_err(std::io::Error::other)?;
-    // Only modes that may own a service inspect the legacy listen variable;
-    // --ui-only remains unable to create any listener through inheritance.
-    let environment_config = if matches!(parsed_mode, LaunchMode::All(_)) {
-        ApiServerConfig::from_environment()?
-    } else {
-        None
-    };
-    let mode = apply_launch_environment(parsed_mode, arguments_were_explicit, environment_config);
+    let mode = parse_launch_mode(arguments).map_err(std::io::Error::other)?;
     match mode {
-        LaunchMode::Service(config) => run_combined_service(config),
-        LaunchMode::UiOnly => run_ui(),
+        LaunchMode::Service(config) => run_service_mode(config),
+        LaunchMode::Stop => stop_service_mode(),
         LaunchMode::All(config) => {
-            ensure_background_service(config).map_err(std::io::Error::other)?;
-            run_ui()
+            let startup_error = ensure_background_service(config).err();
+            run_ui(startup_error)
         }
-        LaunchMode::RecordOnly { once } => {
-            daemon::run_record_daemon(once).map_err(std::io::Error::other)?;
+        LaunchMode::Help => {
+            println!("{}", I18n::detect().language().launch_help());
             Ok(())
         }
     }
@@ -9027,20 +9138,20 @@ mod tests {
     use super::winit;
     use super::{
         account_refresh_due, account_window_title, active_thread_model_counts,
-        active_thread_rows_at, add_recovery_usage, apply_launch_environment,
-        automatic_refresh_interval, clamp_graph_preview_size, collapse_remaining_change_points,
-        collect_session_file, complete_rollout_prefix_len, current_history_period_reset,
-        current_label_connector_path, detail_window_title, fetch_active_thread_update_for_paths,
+        active_thread_rows_at, add_recovery_usage, automatic_refresh_interval,
+        clamp_graph_preview_size, collapse_remaining_change_points, collect_session_file,
+        complete_rollout_prefix_len, current_history_period_reset, current_label_connector_path,
+        detail_window_title, fetch_active_thread_update_for_paths,
         fetch_active_thread_update_for_paths_and_state, fixed_resize_decision,
         fixed_resize_decision_for_scale, format_elapsed, format_estimated_cost,
         format_model_usage_columns, format_percent, format_period_label, graph_paths,
         graph_paths_for_selection, graph_period_end, graph_points, graph_time_endpoints,
         is_service_health_response, minute_model_spend, minute_model_spend_for_metric,
         model_usage_timeline_from_events, monthly_window_seconds, native_account_window_title,
-        native_legal_pages, normal_status_text, one_month_before_utc, open_codex_session_paths,
-        parse_launch_mode, parse_preview_size, parse_rate_limits, parse_resize_direction,
-        period_remaining_text, physical_size_for_logical, plan_type_label, preview_model_row,
-        read_recovery_entries, read_thread_rollout_path, recovery_timed_usage,
+        native_legal_pages, native_startup_loading, normal_status_text, one_month_before_utc,
+        open_codex_session_paths, parse_launch_mode, parse_preview_size, parse_rate_limits,
+        parse_resize_direction, period_remaining_text, physical_size_for_logical, plan_type_label,
+        preview_model_row, read_recovery_entries, read_thread_rollout_path, recovery_timed_usage,
         remaining_graph_points, remaining_graph_points_for_metric, remaining_graph_y,
         remaining_marker_positions, remaining_marker_positions_on_points, request_with_timeout,
         reset_transition_is_boundary, same_rollout_identity, separate_current_label_positions,
@@ -9048,15 +9159,15 @@ mod tests {
         session_token_snapshot, smooth_model_spend, smooth_remaining_points,
         split_metric_line_paths, stacked_area_path, terminate_and_reap_owned_child,
         thread_presentation_rows, three_months_before_utc, unused_interval_positions,
-        week_remaining_text, ActiveThread, ActiveThreadUpdate, ApiServer, ApiServerConfig,
-        CodexInfoState, Event, FixedResizeDecision, GraphPaths, GraphWindow, HourlyModelSpend,
-        I18n, LaunchMode, LocalUsageResult, ManualX11Geometry, ManualX11WindowAction,
-        ModelDollarTotals, ModelTokenTotals, ModelUsageRow, ModelUsageTotals, RpcReadEvent,
-        SessionTraversalBudget, TokenSnapshot, UnusedIntervalPosition, UsageEvent, UsageHistory,
-        UsageHistorySample, UsageStore, DEFAULT_SERVICE_ADDRESS, FIXED_WINDOW_HEIGHT,
-        FIXED_WINDOW_WIDTH, GRAPH_METRIC_OPTIONS, GRAPH_WINDOW_PURPOSE,
-        LOCAL_ESTIMATE_PRICE_VERSION, PRODUCT_VERSION, THREADS_WINDOW_PURPOSE,
-        UNAUTHENTICATED_WINDOW_TITLE, WEEK_SECONDS,
+        visible_window_position, week_remaining_text, ActiveThread, ActiveThreadUpdate, ApiServer,
+        ApiServerConfig, CodexInfoState, Event, FixedResizeDecision, GraphPaths, GraphWindow,
+        HourlyModelSpend, I18n, LaunchMode, LocalUsageResult, ManualX11Geometry,
+        ManualX11WindowAction, ModelDollarTotals, ModelTokenTotals, ModelUsageRow,
+        ModelUsageTotals, RpcReadEvent, SessionTraversalBudget, TokenSnapshot,
+        UnusedIntervalPosition, UsageEvent, UsageHistory, UsageHistorySample, UsageStore,
+        DEFAULT_SERVICE_ADDRESS, FIXED_WINDOW_HEIGHT, FIXED_WINDOW_WIDTH, GRAPH_METRIC_OPTIONS,
+        GRAPH_WINDOW_PURPOSE, LOCAL_ESTIMATE_PRICE_VERSION, PRODUCT_VERSION,
+        THREADS_WINDOW_PURPOSE, UNAUTHENTICATED_WINDOW_TITLE, WEEK_SECONDS,
     };
     use serde::Deserialize;
 
@@ -9102,53 +9213,82 @@ mod tests {
     }
 
     #[test]
-    fn launch_modes_are_explicit_and_ui_only_never_maps_to_service() {
+    fn launch_options_follow_the_public_contract() {
         let default_address = DEFAULT_SERVICE_ADDRESS.parse().unwrap();
-        let LaunchMode::All(default_config) = parse_launch_mode(launch_args(&[])).unwrap() else {
-            panic!("default mode was not all");
+        let LaunchMode::Service(default_config) = parse_launch_mode(launch_args(&[])).unwrap()
+        else {
+            panic!("default mode was not service-only");
         };
         assert_eq!(default_config.listen_addr(), default_address);
-        assert_eq!(
-            parse_launch_mode(launch_args(&["--ui-only"])).unwrap(),
-            LaunchMode::UiOnly
-        );
-        let LaunchMode::All(explicit_all_config) =
-            parse_launch_mode(launch_args(&["--all"])).unwrap()
-        else {
-            panic!("explicit --all mode was not selected");
+        let LaunchMode::All(ui_config) = parse_launch_mode(launch_args(&["--ui"])).unwrap() else {
+            panic!("--ui mode was not all");
         };
-        assert_eq!(explicit_all_config.listen_addr(), default_address);
+        assert_eq!(ui_config.listen_addr(), default_address);
+        assert_eq!(
+            parse_launch_mode(launch_args(&["--help"])).unwrap(),
+            LaunchMode::Help
+        );
+        assert_eq!(
+            parse_launch_mode(launch_args(&["--h"])).unwrap(),
+            LaunchMode::Help
+        );
+        assert_eq!(
+            parse_launch_mode(launch_args(&["-h"])).unwrap(),
+            LaunchMode::Help
+        );
+        assert_eq!(
+            parse_launch_mode(launch_args(&["--stop"])).unwrap(),
+            LaunchMode::Stop
+        );
         let LaunchMode::Service(config) =
-            parse_launch_mode(launch_args(&["--service", "--listen", "127.0.0.1:9876"])).unwrap()
+            parse_launch_mode(launch_args(&["--port", "9876"])).unwrap()
         else {
             panic!("service mode was not selected");
         };
         assert_eq!(config.listen_addr(), "127.0.0.1:9876".parse().unwrap());
-        assert!(
-            parse_launch_mode(launch_args(&["--service", "--listen", "0.0.0.0:9876"])).is_err()
-        );
-        assert!(parse_launch_mode(launch_args(&["--ui-only", "--service"])).is_err());
-    }
+        let LaunchMode::All(config) =
+            parse_launch_mode(launch_args(&["--ui", "--port", "4321"])).unwrap()
+        else {
+            panic!("UI mode with explicit port was not selected");
+        };
+        assert_eq!(config.listen_addr(), "127.0.0.1:4321".parse().unwrap());
 
-    #[test]
-    fn explicit_all_keeps_ui_while_implicit_environment_mode_stays_compatible() {
-        let environment_config = ApiServerConfig::new("127.0.0.1:9877".parse().unwrap()).unwrap();
-        let parsed_all = parse_launch_mode(launch_args(&["--all"])).unwrap();
-        assert_eq!(
-            apply_launch_environment(parsed_all, true, Some(environment_config)),
-            LaunchMode::All(environment_config)
-        );
-
-        let implicit = parse_launch_mode(launch_args(&[])).unwrap();
-        assert_eq!(
-            apply_launch_environment(implicit, false, Some(environment_config)),
-            LaunchMode::Service(environment_config)
-        );
-
-        assert_eq!(
-            apply_launch_environment(LaunchMode::UiOnly, true, Some(environment_config)),
-            LaunchMode::UiOnly
-        );
+        for port in ["1", "65535"] {
+            assert!(parse_launch_mode(launch_args(&["--port", port])).is_ok());
+        }
+        for invalid in ["0", "65536", "-1", "abc", "127.0.0.1:9876", ""] {
+            assert!(
+                parse_launch_mode(launch_args(&["--port", invalid])).is_err(),
+                "invalid port accepted: {invalid:?}"
+            );
+        }
+        for legacy in [
+            "--service",
+            "--ui-only",
+            "--all",
+            "--listen",
+            "--record-daemon",
+            "--once",
+            "--ui-onlry",
+        ] {
+            assert!(
+                parse_launch_mode(launch_args(&[legacy])).is_err(),
+                "legacy or misspelled option accepted: {legacy}"
+            );
+        }
+        for invalid in [
+            &["--port"][..],
+            &["--ui", "--port"][..],
+            &["--port", "9876", "--ui"][..],
+            &["--ui", "--ui"][..],
+            &["--stop", "--port", "9876"][..],
+            &["--help", "--ui"][..],
+        ] {
+            assert!(
+                parse_launch_mode(launch_args(invalid)).is_err(),
+                "invalid option combination accepted: {invalid:?}"
+            );
+        }
     }
 
     #[test]
@@ -9240,6 +9380,21 @@ mod tests {
         assert!(initializing.quota.is_none());
         assert!(initializing.models.is_empty());
         assert_eq!(initializing.active_thread_count, 0);
+
+        let startup = CodexInfoState::preview("startup-loading");
+        assert!(startup.authenticated);
+        assert!(!startup.has_visible_usage());
+        assert!(native_startup_loading(
+            startup.authenticated,
+            startup.has_visible_usage(),
+            startup.local_usage_error,
+            startup.account_error.is_some(),
+            startup.error.is_some(),
+        ));
+        assert_eq!(startup.public_snapshot().state, PublicState::Initializing);
+        assert!(startup.public_snapshot().models.is_empty());
+        assert!(startup.public_snapshot().quota.is_none());
+        assert!(startup.public_details().history_samples.is_empty());
 
         let unlimited = CodexInfoState::preview("unlimited").public_snapshot();
         assert_eq!(unlimited.state, PublicState::Ready);
@@ -10180,6 +10335,33 @@ mod tests {
         assert!(state.account_error.is_some());
         assert!(state.error.is_some());
         assert_eq!(state.status, account_status);
+    }
+
+    #[test]
+    fn native_startup_loading_requires_a_complete_authenticated_generation() {
+        assert!(!native_startup_loading(false, false, false, false, false));
+        assert!(native_startup_loading(true, false, false, false, false));
+        assert!(!native_startup_loading(true, true, false, false, false));
+        assert!(!native_startup_loading(true, false, true, false, false));
+        assert!(!native_startup_loading(true, false, false, true, false));
+        assert!(!native_startup_loading(true, false, false, false, true));
+    }
+
+    #[test]
+    fn native_startup_failure_releases_loading_surface() {
+        let mut state = CodexInfoState::preview("startup-loading");
+        let reset_at = state.reset_at.expect("startup preview reset");
+        state.apply_local_usage_error(state.auth_epoch, reset_at, state.window_seconds);
+        assert!(state.local_usage_error);
+        assert!(state.error.is_some());
+        assert!(!native_startup_loading(
+            state.authenticated,
+            state.has_visible_usage(),
+            state.local_usage_error,
+            state.account_error.is_some(),
+            state.error.is_some(),
+        ));
+        assert_eq!(state.public_snapshot().state, PublicState::Error);
     }
 
     #[test]
@@ -11722,6 +11904,26 @@ mod tests {
     }
 
     #[test]
+    fn main_window_position_is_visible_on_the_primary_monitor() {
+        assert_eq!(
+            visible_window_position(
+                winit::dpi::PhysicalPosition::new(1723, 149),
+                winit::dpi::PhysicalSize::new(1920, 1080),
+                winit::dpi::PhysicalSize::new(900, 480),
+            ),
+            winit::dpi::PhysicalPosition::new(1755, 181)
+        );
+        assert_eq!(
+            visible_window_position(
+                winit::dpi::PhysicalPosition::new(-500, -200),
+                winit::dpi::PhysicalSize::new(400, 300),
+                winit::dpi::PhysicalSize::new(900, 480),
+            ),
+            winit::dpi::PhysicalPosition::new(-500, -200)
+        );
+    }
+
+    #[test]
     fn fixed_resize_decision_follows_the_current_os_scale_factor() {
         assert_eq!(physical_size_for_logical(900, 480, 1.0), (900, 480));
         assert_eq!(physical_size_for_logical(900, 480, 1.25), (1125, 600));
@@ -12302,7 +12504,7 @@ mod tests {
         assert!(source.contains("monitor.enforce(ui.window());"));
         assert!(source.contains("monitor.enforce(window.window());"));
         assert!(!source.contains("monitor.enforce(graph.window());"));
-        assert_eq!(source.matches("Duration::from_millis(100)").count(), 1);
+        assert_eq!(source.matches("Duration::from_millis(100)").count(), 2);
         assert_eq!(source.matches("GraphWindow::new()").count(), 1);
         assert_eq!(
             source
@@ -12393,6 +12595,9 @@ mod tests {
         assert!(run.contains("unset WAYLAND_DISPLAY WAYLAND_SOCKET WINIT_X11_SCALE_FACTOR"));
         assert!(!run.contains("export WINIT_X11_SCALE_FACTOR"));
         assert!(run.contains("--release --locked"));
+        assert!(run.contains("E_CARGO_NOT_FOUND"));
+        assert!(!run.contains("デーモン"));
+        assert!(!run.contains("Linux/X11版"));
         assert!(!run.contains("for attempt"));
         assert!(!run.contains("sleep 1"));
     }

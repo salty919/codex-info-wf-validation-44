@@ -735,6 +735,7 @@ dependencies = [
  "iana-time-zone",
  "raw-window-handle",
  "rusqlite",
+ "rustix 0.38.44",
  "serde",
  "serde_json",
  "slint",

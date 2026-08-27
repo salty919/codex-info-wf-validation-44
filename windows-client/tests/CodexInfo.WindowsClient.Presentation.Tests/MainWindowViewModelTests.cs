@@ -13,6 +13,59 @@ namespace CodexInfo.WindowsClient.Presentation.Tests;
 public sealed class MainWindowViewModelTests
 {
     [Fact]
+    public async Task Startup_keeps_content_hidden_until_the_first_snapshot_is_complete()
+    {
+        var client = new BlockingClient();
+        using var viewModel = new MainWindowViewModel(client);
+
+        viewModel.Start();
+        await EventuallyAsync(() => client.CallCount == 1);
+
+        Assert.True(viewModel.IsStartupLoading);
+        Assert.False(viewModel.ShowAuthenticatedContent);
+
+        client.Complete(ValidSnapshot());
+        await EventuallyAsync(() => viewModel.IsAuthenticated && !viewModel.IsStartupLoading);
+
+        Assert.True(viewModel.ShowAuthenticatedContent);
+    }
+
+    [Fact]
+    public async Task Startup_failure_releases_spinner_and_exposes_retry_state()
+    {
+        using var viewModel = new MainWindowViewModel(new SequenceClient(
+            StatusFetchResult.FromFailure(StatusFetchFailure.Transport)));
+
+        viewModel.Start();
+        await EventuallyAsync(() => !viewModel.IsStartupLoading);
+
+        Assert.False(viewModel.IsStartupLoading);
+        Assert.False(viewModel.ShowAuthenticatedContent);
+        Assert.Equal("接続エラー", viewModel.StatusTitle);
+        Assert.True(viewModel.CanRefresh);
+    }
+
+    [Fact]
+    public async Task Startup_waits_for_the_matching_details_generation_before_publishing_content()
+    {
+        var details = new BlockingDetailsClient();
+        using var viewModel = new MainWindowViewModel(
+            new SequenceClient(StatusFetchResult.Success(ValidSnapshot())),
+            details);
+
+        viewModel.Start();
+        await EventuallyAsync(() => details.CallCount == 1);
+
+        Assert.True(viewModel.IsStartupLoading);
+        Assert.False(viewModel.IsAuthenticated);
+
+        details.Complete(DetailsFetchResult.Success(DetailsSnapshot(1)));
+        await EventuallyAsync(() => viewModel.IsAuthenticated && !viewModel.IsStartupLoading);
+
+        Assert.True(viewModel.ShowAuthenticatedContent);
+    }
+
+    [Fact]
     public void ApplyingSavedConnectionStartsTheSelectedWslService()
     {
         var child = new TestConnectionChildProcess();
@@ -30,7 +83,7 @@ public sealed class MainWindowViewModelTests
         Assert.True(viewModel.ApplyConnectionSettings(settings));
         Assert.Single(factory.StartInfos);
         Assert.Equal(
-            ["--distribution", "Ubuntu-24.04", "--", "codex_info", "--service", "--listen", "127.0.0.1:8787"],
+            ["--distribution", "Ubuntu-24.04", "--", "codex_info", "--port", "8787"],
             factory.StartInfos[0].ArgumentList);
     }
 
@@ -283,12 +336,14 @@ public sealed class MainWindowViewModelTests
 
         viewModel.Start();
         await EventuallyAsync(() => viewModel.HasDetails);
+        Assert.Equal("ready", viewModel.DetailsStatusAutomationText);
         Assert.Equal("$1.25", viewModel.Models[0].InputDollarsText);
 
         viewModel.RefreshCommand.Execute(null);
         await EventuallyAsync(() => viewModel.StatusDetail.Contains("前回受信の値", StringComparison.Ordinal));
 
         Assert.True(viewModel.HasDetails);
+        Assert.Equal("error", viewModel.DetailsStatusAutomationText);
         Assert.Equal("$1.25", viewModel.Models[0].InputDollarsText);
         Assert.Contains("前回受信の値", viewModel.StatusDetail, StringComparison.Ordinal);
     }
@@ -489,6 +544,22 @@ public sealed class MainWindowViewModelTests
             index++;
             return Task.FromResult(result);
         }
+    }
+
+    private sealed class BlockingDetailsClient : ILoopbackDetailsClient
+    {
+        private readonly TaskCompletionSource<DetailsFetchResult> completion = new(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public int CallCount { get; private set; }
+
+        public Task<DetailsFetchResult> FetchDetailsAsync(CancellationToken cancellationToken = default)
+        {
+            CallCount++;
+            return completion.Task.WaitAsync(cancellationToken);
+        }
+
+        public void Complete(DetailsFetchResult result) => completion.TrySetResult(result);
     }
 
     private sealed class NeverCalledClient : HealthyStatusClientBase

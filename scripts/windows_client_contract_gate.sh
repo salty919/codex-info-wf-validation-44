@@ -27,6 +27,9 @@ require_text windows-client/src/CodexInfo.WindowsClient/MainWindow.axaml 'Click=
 require_text windows-client/src/CodexInfo.WindowsClient/MainWindow.axaml 'Click="OnOpenLegal"'
 require_text windows-client/src/CodexInfo.WindowsClient/MainWindow.axaml 'Click="OnOpenSettings"'
 require_text windows-client/src/CodexInfo.WindowsClient/MainWindow.axaml 'AutomationProperties.AutomationId="Main.QuotaPeriodGauge"'
+require_text windows-client/src/CodexInfo.WindowsClient/MainWindow.axaml 'AutomationProperties.AutomationId="Main.StartupLoading"'
+require_text windows-client/src/CodexInfo.WindowsClient/MainWindow.axaml 'AutomationProperties.AutomationId="Main.DetailsGenerationContract"'
+require_text windows-client/src/CodexInfo.WindowsClient/MainWindow.axaml 'IsVisible="{Binding ShowAuthenticatedContent}"'
 require_window_text windows-client/src/CodexInfo.WindowsClient/MainWindow.axaml 'Width="900"'
 require_window_text windows-client/src/CodexInfo.WindowsClient/MainWindow.axaml 'Height="480"'
 require_window_text windows-client/src/CodexInfo.WindowsClient/SetupWindow.axaml 'Width="900"'
@@ -100,6 +103,8 @@ require_text windows-client/src/CodexInfo.WindowsClient/Infrastructure/WindowsUp
 require_text windows-client/src/CodexInfo.WindowsClient/Settings/ClientSettings.cs 'WindowsPathSafety.EnsureDirectoryTreeWithoutReparse'
 require_text docs/WINDOWS_CLIENT.md '%USERPROFILE%\.ssh\config'
 require_text docs/PRODUCT_REQUIREMENTS.md '製品バージョンはメイン画面に一度だけ表示し'
+require_text docs/PRODUCT_REQUIREMENTS.md '初回起動では、health・status・detailsの最初の完全な世代が揃うまで'
+require_text docs/REGRESSION_PREVENTION_POLICY.md 'REG-STARTUP-FRAME'
 require_text windows-client/src/CodexInfo.WindowsClient/SetupWindow.axaml 'AutomationProperties.Name="{Binding Texts.Copy}"'
 require_text windows-client/src/CodexInfo.WindowsClient/SetupWindow.axaml 'Background="Transparent" PointerPressed="OnTitlePointerPressed"'
 require_text windows-client/src/CodexInfo.WindowsClient/SetupWindow.axaml.cs 'WindowDragBehavior.Begin(this, e)'
@@ -125,6 +130,8 @@ require_file windows-client/src/CodexInfo.WindowsClient/Infrastructure/WindowsUp
 require_text windows-client/src/CodexInfo.WindowsClient/MainWindow.axaml 'IsVisible="{Binding IsUpdateNotificationVisible}"'
 require_text windows-client/src/CodexInfo.WindowsClient/MainWindow.axaml 'Command="{Binding UpdateCommand}"'
 require_text windows-client/src/CodexInfo.WindowsClient/ViewModels/MainWindowViewModel.cs 'public bool IsUpdateNotificationVisible => !IsAuthRequired'
+require_text windows-client/src/CodexInfo.WindowsClient/ViewModels/MainWindowViewModel.cs 'public bool IsStartupLoading => initialLoadPending'
+require_text windows-client/src/CodexInfo.WindowsClient/ViewModels/MainWindowViewModel.cs 'public bool ShowAuthenticatedContent => IsAuthenticated && !IsStartupLoading'
 require_text windows-client/src/CodexInfo.WindowsClient.Core/WindowsUpdateClient.cs 'https://api.github.com/repos/salty919/codex_info_v2/releases?per_page=20'
 require_text windows-client/src/CodexInfo.WindowsClient/Infrastructure/WindowsUpdateCoordinator.cs 'StartAvailableUpdateAsync'
 require_text windows-client/Directory.Build.props '<Version>'
@@ -134,7 +141,7 @@ require_text windows-client/src/CodexInfo.WindowsClient.Core/ProductInfo.cs 'Ass
 require_text windows-client/src/CodexInfo.WindowsClient/MainWindow.axaml 'ProductVersionText'
 require_text windows-client/src/CodexInfo.WindowsClient/MainWindow.axaml 'AutomationProperties.AutomationId="Main.ProductVersion"'
 require_text windows-client/src/CodexInfo.WindowsClient/Settings/ConnectionProcessFactory.cs 'codex_info'
-require_text windows-client/src/CodexInfo.WindowsClient/Settings/ConnectionProcessFactory.cs '--service'
+require_text windows-client/src/CodexInfo.WindowsClient/Settings/ConnectionProcessFactory.cs '--port'
 main_version_marker_count="$(rg -o --fixed-strings 'AutomationProperties.AutomationId="Main.ProductVersion"' windows-client/src/CodexInfo.WindowsClient/MainWindow.axaml | wc -l)"
 [[ "$main_version_marker_count" -eq 1 ]] ||
     fail "main version automation marker must appear exactly once: count=$main_version_marker_count"
@@ -162,6 +169,10 @@ windows_version="$(sed -n 's/.*<Version>\([^<]*\)<\/Version>.*/\1/p' windows-cli
 [[ -n "$native_version" && "$native_version" == "$windows_version" ]] ||
     fail "native and Windows versions differ: native=$native_version windows=$windows_version"
 require_text ui/components.slint 'product-version: string'
+require_text ui/app.slint 'startup-loading: false'
+require_text ui/app.slint 'text: "◌  " + root.strings.checking;'
+require_text src/main.rs '"startup-loading"'
+require_text src/main.rs 'native_startup_failure_releases_loading_surface'
 require_text ui/components.slint 'root.strings.usage-status + " · " + root.strings.product-version'
 if rg -q --fixed-strings -- 'root.strings.usage-trend + " · " + root.strings.product-version' ui/components.slint ||
    rg -q --fixed-strings -- 'root.strings.active-threads + " · " + root.strings.product-version' ui/components.slint ||
@@ -204,6 +215,12 @@ for native_trigger in 'Cargo.toml' 'Cargo.lock' 'build.rs' 'run.sh' 'src/**' 'pr
     require_text .github/workflows/windows-client.yml "      - \"$native_trigger\""
 done
 require_text .github/workflows/windows-client.yml 'dtolnay/rust-toolchain@stable'
+require_text .github/workflows/windows-client.yml 'x11-apps'
+regression_step_line="$(rg -n 'name: Enforce regression checks' .github/workflows/windows-client.yml | head -n 1 | cut -d: -f1)"
+windows_contract_step_line="$(rg -n 'name: Enforce Windows feature contract' .github/workflows/windows-client.yml | head -n 1 | cut -d: -f1)"
+[[ -n "$regression_step_line" && -n "$windows_contract_step_line" &&
+    "$regression_step_line" -lt "$windows_contract_step_line" ]] ||
+    fail 'X/native regression checks must run before the Windows feature contract gate'
 final_gate_line="$(rg -n 'bash scripts/final_acceptance_gate.sh artifacts/windows-ui-e2e' .github/workflows/windows-client.yml | cut -d: -f1 | tail -n 1)"
 [[ -n "$final_gate_line" ]] || fail 'final acceptance gate invocation is missing'
 if ! sed -n "$((final_gate_line - 4)),${final_gate_line}p" .github/workflows/windows-client.yml |
@@ -241,6 +258,17 @@ for required_history_test in \
     periodic_quota_refresh_retains_last_good_main_snapshot \
     product_version_is_visible_once_on_native_main_surface; do
     require_text scripts/regression_guard.sh "run_required_rust_test $required_history_test"
+done
+require_text scripts/regression_guard.sh 'run_required_rust_lib_test recoverable_rollout_parser_skips_only_malformed_token_count_records'
+require_text scripts/regression_guard.sh 'run_required_rust_test public_snapshot_is_whitelisted_and_tracks_auth_state'
+for required_thread_failure_test in \
+    thread_c_all_current_cycle_failure_classes_return_no_partial_snapshot \
+    thread_c_candidate_failure_rejects_the_complete_cycle \
+    thread_c_known_token_invalid_event_rejects_entire_rollout \
+    thread_c_no_thread_and_all_candidate_failure_are_distinct \
+    thread_c_private_accumulator_abort_never_yields_partial_snapshot \
+    thread_c_snapshot_rejects_partial_candidate_reads; do
+    require_text scripts/regression_guard.sh "run_required_rust_lib_test \"\$required_thread_failure_test\""
 done
 require_text .github/workflows/windows-client.yml 'Get-GitHubResourceStatus'
 require_text .github/workflows/windows-client.yml 'gh api --method POST "repos/$repository/git/refs"'
@@ -315,6 +343,7 @@ require_text windows-client/tools/Run-WindowsClientE2E.ps1 'Assert-E2EGraphHasMo
 require_text windows-client/tools/Run-WindowsClientE2E.ps1 'Assert-E2EGraphHasModelData $plot $graph.Handle $graphPast'
 require_text windows-client/tools/Run-WindowsClientE2E.ps1 'Main.DetailsStatus'
 require_text windows-client/tools/Run-WindowsClientE2E.ps1 'main-details-status: PASS (matching status/details generation accepted)'
+require_text windows-client/tools/Run-WindowsClientE2E.ps1 'main-startup-loading: PASS (first complete generation is visible)'
 require_text windows-client/tools/Run-WindowsClientE2E.ps1 'Main details status is not a complete accepted generation'
 require_text windows-client/tools/Run-WindowsClientE2E.ps1 'parts[1] == "/v1/health"'
 require_text windows-client/tools/Run-WindowsClientE2E.ps1 '\"service\":\"codex-info\"'
@@ -364,6 +393,13 @@ require_text docs/WINDOWS_CLIENT_REQUIREMENTS.md 'WIN-PAR-13'
 require_text docs/WINDOWS_CLIENT_REQUIREMENTS.md 'WIN-INSTALL-01'
 require_text docs/REGRESSION_PREVENTION_POLICY.md 'windows_window_move_smoke.ps1 -AllowPhysicalInput'
 require_file scripts/x11_graph_visual_gate.sh
+require_file scripts/x11_startup_visual_gate.sh
+require_file docs/REQUIREMENTS_LEDGER.md
+for required_ledger_id in X-START-01 X-START-02 X-START-03 X-GRAPH-01 X-THREAD-01 WIN-START-01 WIN-GRAPH-01 WIN-VERSION-01 PROC-LEDGER-01; do
+    require_text docs/REQUIREMENTS_LEDGER.md "| $required_ledger_id |"
+done
+require_text scripts/regression_guard.sh 'bash scripts/requirements_ledger_gate.sh --final'
+require_text scripts/requirements_ledger_gate.sh 'final gate requires verified status'
 require_text scripts/x11_graph_visual_gate.sh 'dedicated idle-band pixels are missing'
 require_text scripts/x11_graph_visual_gate.sh 'implausible vertical stroke'
 require_text docs/PRODUCT_REQUIREMENTS.md '# Codex Info 製品要件'

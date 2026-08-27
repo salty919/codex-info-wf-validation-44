@@ -1259,9 +1259,10 @@ pub fn parse_rollout_reader<R: BufRead>(
 /// Tool output can legitimately exceed the bounded record size.  Those
 /// records are not needed to determine the running/model/token state, and the
 /// bounded reader consumes each complete bad line before returning its error.
-/// Skipping only those two transport-level failures preserves all trustworthy
-/// state around the bad record while retaining strict validation for known
-/// event shapes and unterminated files.
+/// A malformed `token_count` envelope is likewise non-liveness data: some
+/// live writers can split a large rate-limit payload at a physical newline.
+/// Skip only that explicitly identified event family; lifecycle and model
+/// records remain strict so an invalid state cannot be presented as running.
 pub fn parse_rollout_reader_recoverable<R: BufRead>(
     reader: &mut R,
     snapshot_bytes: u64,
@@ -1296,10 +1297,76 @@ pub fn parse_rollout_reader_recoverable<R: BufRead>(
         if !terminated {
             return Err(RolloutError::UnterminatedLine);
         }
-        let value: Value = serde_json::from_str(&line).map_err(|_| RolloutError::InvalidJson)?;
+        let value: Value = match serde_json::from_str(&line) {
+            Ok(value) => value,
+            Err(_) if is_malformed_token_count_record(&line) => continue,
+            Err(_) => return Err(RolloutError::InvalidJson),
+        };
         apply_rollout_event(&value, &mut state)?;
     }
     finish_rollout(state)
+}
+
+fn is_malformed_token_count_record(line: &str) -> bool {
+    let Some(payload_start) = line.find("\"payload\"") else {
+        return false;
+    };
+    // Require the root event family before the payload and the token-count
+    // family inside the payload. This keeps whitespace variants recoverable
+    // while preventing malformed lifecycle/model records that merely mention
+    // token_count from being skipped.
+    contains_string_field(&line[..payload_start], "type", "event_msg")
+        && contains_string_field(&line[payload_start..], "type", "token_count")
+}
+
+fn contains_string_field(input: &str, key: &str, expected: &str) -> bool {
+    let marker = format!("\"{key}\"");
+    let expected_marker = format!("\"{expected}\"");
+    let mut offset = 0;
+    while let Some(key_start) = find_json_key(input, &marker, offset) {
+        let start = key_start + marker.len();
+        let bytes = input.as_bytes();
+        let mut cursor = start;
+        while bytes.get(cursor).is_some_and(u8::is_ascii_whitespace) {
+            cursor += 1;
+        }
+        if bytes.get(cursor) != Some(&b':') {
+            offset = key_start + 1;
+            continue;
+        }
+        cursor += 1;
+        while bytes.get(cursor).is_some_and(u8::is_ascii_whitespace) {
+            cursor += 1;
+        }
+        if input[cursor..].starts_with(&expected_marker) {
+            return true;
+        }
+        offset = key_start + 1;
+    }
+    false
+}
+
+/// Find a key token outside quoted JSON strings. The surrounding record may
+/// be truncated, so this intentionally performs only bounded lexical state
+/// tracking rather than attempting to deserialize an incomplete object.
+fn find_json_key(input: &str, marker: &str, from: usize) -> Option<usize> {
+    let bytes = input.as_bytes();
+    let mut in_string = false;
+    let mut escaped = false;
+    for index in from..bytes.len() {
+        let byte = bytes[index];
+        if byte == b'"' && !escaped {
+            if !in_string && input[index..].starts_with(marker) {
+                return Some(index);
+            }
+            in_string = !in_string;
+        }
+        escaped = in_string && byte == b'\\' && !escaped;
+        if byte != b'\\' {
+            escaped = false;
+        }
+    }
+    None
 }
 
 /// Validate an in-memory rollout with the same streaming parser used by live
@@ -3351,6 +3418,46 @@ mod tests {
         assert!(parsed.is_running());
         assert_eq!(parsed.model(), "gpt-5.6-luna");
         assert_eq!(parsed.total_tokens(), Some(321));
+    }
+
+    #[test]
+    fn recoverable_rollout_parser_skips_only_malformed_token_count_records() {
+        let bytes = b"{\"type\":\"thread_context\",\"model\":\"gpt-5.6-luna\"}\n{\"type\":\"task_started\"}\n{\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"rate_limits\":{\"primary\":{\"use\n{\"type\":\"task_complete\"}\n";
+        let parsed = parse_rollout_reader_recoverable(&mut Cursor::new(bytes), bytes.len() as u64)
+            .expect("malformed token_count is non-liveness data");
+        assert!(!parsed.is_running());
+        assert_eq!(parsed.model(), "gpt-5.6-luna");
+
+        let lifecycle = b"{\"type\":\"task_started\"}\n{\"type\":\"event_msg\",\"payload\":{\"type\":\"task_complete\"\n";
+        assert_eq!(
+            parse_rollout_reader_recoverable(&mut Cursor::new(lifecycle), lifecycle.len() as u64),
+            Err(RolloutError::InvalidJson)
+        );
+
+        let spaced = b"{ \"type\" : \"event_msg\", \"payload\" : { \"type\" : \"token_count\", \"info\" : {\n{\"type\":\"task_complete\"}\n";
+        let parsed =
+            parse_rollout_reader_recoverable(&mut Cursor::new(spaced), spaced.len() as u64)
+                .expect("whitespace-only token_count envelope is non-liveness data");
+        assert!(!parsed.is_running());
+
+        let lifecycle_with_token_word =
+            b"{\"type\":\"task_started\",\"payload\":{\"type\":\"token_count\"\n";
+        assert_eq!(
+            parse_rollout_reader_recoverable(
+                &mut Cursor::new(lifecycle_with_token_word),
+                lifecycle_with_token_word.len() as u64
+            ),
+            Err(RolloutError::InvalidJson)
+        );
+
+        let quoted_words = b"{\"note\":\"\\\"type\\\":\\\"event_msg\\\" and \\\"type\\\":\\\"token_count\\\"\",\"payload\":{\n";
+        assert_eq!(
+            parse_rollout_reader_recoverable(
+                &mut Cursor::new(quoted_words),
+                quoted_words.len() as u64
+            ),
+            Err(RolloutError::InvalidJson)
+        );
     }
 
     #[test]

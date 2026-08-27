@@ -42,7 +42,7 @@ env HOME="$temp_root/home" \
     XDG_RUNTIME_DIR="$temp_root/runtime" \
     CODEX_INFO_PREVIEW=graph-collision \
     CODEX_INFO_PREVIEW_SIZE=940x640 \
-    "$BINARY" --ui-only >"$temp_root/client.log" 2>&1 &
+    "$BINARY" --ui >"$temp_root/client.log" 2>&1 &
 preview_pid="$!"
 
 graph_id=""
@@ -83,6 +83,7 @@ lib.XOpenDisplay.argtypes = [ctypes.c_char_p]
 lib.XOpenDisplay.restype = ctypes.c_void_p
 lib.XMoveWindow.argtypes = [ctypes.c_void_p, ctypes.c_ulong, ctypes.c_int, ctypes.c_int]
 lib.XRaiseWindow.argtypes = [ctypes.c_void_p, ctypes.c_ulong]
+lib.XUnmapWindow.argtypes = [ctypes.c_void_p, ctypes.c_ulong]
 lib.XFlush.argtypes = [ctypes.c_void_p]
 display = lib.XOpenDisplay(None)
 if not display:
@@ -90,8 +91,11 @@ if not display:
 graph = int(sys.argv[1], 16)
 main = int(sys.argv[2], 16) if len(sys.argv) > 2 and sys.argv[2] else 0
 if main:
-    lib.XMoveWindow(display, main, 1000, 100)
-lib.XMoveWindow(display, graph, 3000, 100)
+    # Unmap the owner during capture. Window managers may ignore client-side
+    # moves of decorated windows, which otherwise lets the main surface blend
+    # into the graph image and makes the visual oracle non-deterministic.
+    lib.XUnmapWindow(display, main)
+lib.XMoveWindow(display, graph, 0, 0)
 lib.XRaiseWindow(display, graph)
 lib.XFlush(display)
 PY

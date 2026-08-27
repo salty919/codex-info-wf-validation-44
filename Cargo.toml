@@ -28,6 +28,10 @@ rusqlite = { version = "0.32", features = ["bundled", "limits", "backup"] }
 raw-window-handle = "0.6"
 x11rb = "0.13"
 url = "2"
+# Linux process-instance signalling for the profile-owned --stop contract.
+# The safe pidfd wrappers avoid a PID-only TOCTOU without adding unsafe code to
+# this crate.
+rustix = { version = "0.38.44", default-features = false, features = ["std", "process"] }
 
 [build-dependencies]
 slint-build = "1.17.1"

@@ -29,9 +29,9 @@ if [[ -z "$CODEX_INFO_CARGO" ]] && command -v rustup >/dev/null 2>&1; then
 fi
 
 if [[ -z "$CODEX_INFO_CARGO" || ! -x "$CODEX_INFO_CARGO" ]]; then
-    echo "run.sh: cargo が見つかりません。Rust/Cargoをインストールするか、PATHを設定してください。" >&2
-    echo "例: curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh" >&2
-    echo "インストール後に source \"\$HOME/.cargo/env\" を実行してから再試行してください。" >&2
+    # Keep launcher diagnostics language-neutral; all user-facing product copy
+    # (including CLI help) is owned by the Rust i18n catalog.
+    echo "run.sh: E_CARGO_NOT_FOUND" >&2
     exit 127
 fi
 

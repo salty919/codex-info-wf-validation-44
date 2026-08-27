@@ -190,18 +190,18 @@ jobs:
         with:
           fetch-depth: 0
       - name: Install required test tools
-        run: sudo apt-get update && sudo apt-get install --no-install-recommends --yes ripgrep sqlite3 xvfb xauth x11-utils libxkbcommon-x11-0
+        run: sudo apt-get update && sudo apt-get install --no-install-recommends --yes ripgrep sqlite3 xvfb xauth x11-utils x11-apps libxkbcommon-x11-0
       - name: Enforce data protection policy
         run: bash scripts/data_protection_gate.sh
       - uses: actions/setup-dotnet@v4
         with:
           dotnet-version: "10.0.x"
-      - name: Enforce Windows feature contract
-        run: bash scripts/windows_client_contract_gate.sh
       - name: Install Rust toolchain for native regression gate
         uses: dtolnay/rust-toolchain@stable
       - name: Enforce regression checks
         run: xvfb-run --auto-servernum --server-args='-screen 0 1280x800x24' bash scripts/regression_guard.sh
+      - name: Enforce Windows feature contract
+        run: bash scripts/windows_client_contract_gate.sh
 
   windows-build:
     runs-on: windows-latest
@@ -373,7 +373,7 @@ jobs:
           name: windows-ui-e2e
           path: artifacts/windows-ui-e2e
       - name: Install final gate tools
-        run: sudo apt-get update && sudo apt-get install --no-install-recommends --yes ripgrep xvfb xauth x11-utils libxkbcommon-x11-0
+        run: sudo apt-get update && sudo apt-get install --no-install-recommends --yes ripgrep xvfb xauth x11-utils x11-apps libxkbcommon-x11-0
       - name: Install Rust toolchain for final native gate
         uses: dtolnay/rust-toolchain@stable
       - name: Run final acceptance gate before merge
@@ -402,7 +402,7 @@ jobs:
           name: windows-ui-e2e
           path: artifacts/windows-ui-e2e
       - name: Install final gate tools
-        run: sudo apt-get update && sudo apt-get install --no-install-recommends --yes ripgrep xvfb xauth x11-utils libxkbcommon-x11-0
+        run: sudo apt-get update && sudo apt-get install --no-install-recommends --yes ripgrep xvfb xauth x11-utils x11-apps libxkbcommon-x11-0
       - name: Install Rust toolchain for final native gate
         uses: dtolnay/rust-toolchain@stable
       - name: Run final acceptance gate

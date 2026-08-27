@@ -56,6 +56,7 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
     private bool refreshing;
     private bool authLaunchFailed;
     private bool disposed;
+    private bool initialLoadPending = true;
     private int started;
 
     public MainWindowViewModel(
@@ -131,6 +132,15 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
     /// </summary>
     public bool IsAuthenticated => snapshot is { Authenticated: true } && !IsAuthRequired;
 
+    /// <summary>
+    /// Keeps the first frame stable while the health, status, and auxiliary
+    /// details generation is being assembled.  Subsequent polls update the
+    /// already-published generation without hiding the content.
+    /// </summary>
+    public bool IsStartupLoading => initialLoadPending;
+
+    public bool ShowAuthenticatedContent => IsAuthenticated && !IsStartupLoading;
+
     public bool HasActiveThreads => ActiveThreadCount > 0;
 
     public bool HasNoActiveThreads => !HasActiveThreads;
@@ -184,6 +194,17 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
             };
         }
     }
+
+    /// <summary>
+    /// Locale-independent UI Automation contract for the details generation.
+    /// The visible status remains localized, while UI tests consume this
+    /// stable value instead of decoding rendered text.
+    /// </summary>
+    public string DetailsStatusAutomationText => detailsSnapshot is not null && detailsFailure is null
+        ? "ready"
+        : detailsFailure is null
+            ? "pending"
+            : "error";
 
     public string RemainingPercentText
     {
@@ -426,6 +447,7 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
         Notify(nameof(LastReceivedText));
         Notify(nameof(ShowLastReceived));
         Notify(nameof(DetailsStatusText));
+        Notify(nameof(DetailsStatusAutomationText));
         Notify(nameof(QuotaWindowText));
         Notify(nameof(QuotaRemainingText));
         Notify(nameof(RemainingPercentText));
@@ -533,6 +555,7 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
                         ? DetailsFetchFailure.Transport
                         : DetailsFetchFailure.Response;
                     Notify(nameof(DetailsStatusText));
+                    Notify(nameof(DetailsStatusAutomationText));
                     ApplyFailure(detailsFailure == DetailsFetchFailure.Transport
                         ? StatusFetchFailure.Transport
                         : StatusFetchFailure.Response);
@@ -556,6 +579,12 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
         }
         finally
         {
+            if (initialLoadPending)
+            {
+                initialLoadPending = false;
+                Notify(nameof(IsStartupLoading));
+                Notify(nameof(ShowAuthenticatedContent));
+            }
             SetRefreshing(false);
             refreshGate.Release();
         }
@@ -616,6 +645,7 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
             Notify(nameof(HasDetails));
             Notify(nameof(DetailsSnapshot));
             Notify(nameof(DetailsStatusText));
+            Notify(nameof(DetailsStatusAutomationText));
             Notify(nameof(EstimatedCostText));
             NotifyActiveThreadProperties();
         }
@@ -653,6 +683,7 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
         Notify(nameof(HasDetails));
         Notify(nameof(DetailsSnapshot));
         Notify(nameof(DetailsStatusText));
+        Notify(nameof(DetailsStatusAutomationText));
         Notify(nameof(ModelUsagePeriodText));
         Notify(nameof(EstimatedCostText));
         Notify(nameof(HasModels));
@@ -666,6 +697,7 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
         // auxiliary owner fault and is independent of the status banner.
         detailsFailure = failure;
         Notify(nameof(DetailsStatusText));
+        Notify(nameof(DetailsStatusAutomationText));
     }
 
     private void SetRefreshing(bool value)
@@ -688,6 +720,7 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
         Notify(nameof(AuthenticationText));
         Notify(nameof(IsAuthRequired));
         Notify(nameof(IsAuthenticated));
+        Notify(nameof(ShowAuthenticatedContent));
         Notify(nameof(PlanText));
         Notify(nameof(ActiveThreadCountText));
         Notify(nameof(ResetAtText));

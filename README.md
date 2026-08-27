@@ -12,16 +12,16 @@ Codex App ServerからChatGPT/Codexアカウントのレート制限と週次ま
 ```bash
 git clone https://github.com/salty919/codex_info_v2.git
 cd codex_info_v2
-./run.sh
+./run.sh --ui
 ```
 
 別の場所へコピーして使う場合は、履歴の保存先を明示できます。
 
 ```bash
-CODEX_INFO_DATA_DIR="$PWD/data" ./run.sh
+CODEX_INFO_DATA_DIR="$PWD/data" ./run.sh --ui
 ```
 
-起動モードは3つです。`./run.sh --service`は記録daemonとloopback RESTを1プロセスで起動し、`./run.sh --ui-only`は既存サービスへ追加するX UIだけを起動してdaemon/RESTを生成しません。通常の引数なし`./run.sh`または明示的な`./run.sh --all`は既存サービスを再利用し、なければdaemon+RESTを起動してからX UIを表示します。後方互換の`CODEX_INFO_API_LISTEN=127.0.0.1:8787 ./run.sh`だけはWindowを作らないservice起動であり、同じ環境変数を使ってUIも追加するときは`./run.sh --all`を明示します。サービスを自動起動するには`bash scripts/install_systemd_recorder.sh`、自動起動から外すには`bash scripts/install_systemd_recorder.sh --remove`を使います。解除してもSQLite履歴、バックアップ、reset hint、実行ファイルは削除しません。収集周期`CODEX_INFO_DAEMON_INTERVAL_SECS`は5〜3600秒へ制限されます。
+公開起動契約は限定されています。引数なしの`./run.sh`は記録daemonとloopback RESTだけを`127.0.0.1:8787`で起動し、`./run.sh --port PORT`はloopbackのポートだけを変更します。X画面を使う場合は`./run.sh --ui`、ポートも指定する場合は`./run.sh --ui --port PORT`です。`./run.sh --stop`は同じprofileの検証済みdaemonだけを停止し、`./run.sh --help`は利用可能な形を表示します。任意アドレスの指定や旧起動オプションは受理しません。サービスを自動起動するには`bash scripts/install_systemd_recorder.sh`、自動起動から外すには`bash scripts/install_systemd_recorder.sh --remove`を使います。解除してもSQLite履歴、バックアップ、reset hint、実行ファイルは削除しません。収集周期`CODEX_INFO_DAEMON_INTERVAL_SECS`は5〜3600秒へ制限されます。
 
 初回起動時の画面内タイトルは`Codex Info`です。ネイティブタイトルバーは使わず、アプリ内では認証パネルが接続状態を案内します。
 
@@ -99,7 +99,7 @@ Linux / WSL 側でネイティブ画面を維持したまま、Windows クライ
 
 ## Windowサイズとプレビュー
 
-登録top-level surface inventoryはMain、Setup、Settings、Graph、Threads、Legalの正確な6個で、HelpはMain内surface（追加HWND=0）です。runtime open HWNDはMain=1＋open child subset 0..5、合計1..6で、各childはsingleton、5 childを全て開いた時だけ6となります。Main/Setup/Settings/Threads/Legalはlogical client `initial=min=max=900×480` fixed、Graphは`initial=940×640`、`min=700×480`、`max=unbounded`、resizableです。登録された6 surfaceはMinimize/Closeを持ち、native resize/maximize/restoreはGraphだけです。ネイティブタイトルバーは全Windowで無効にし、ボタン以外の画面領域をドラッグして移動できます。物理サイズはOSのDPI／拡大率に連動し、Graphの最大化／復元は現在モニターのwork areaへ適用します。状態別の確認には`CODEX_INFO_PREVIEW=initializing|auth|normal|warning|reset-warning|error|zero|full|monthly|unlimited|idle|legal`を使い、グラフ表示は`CODEX_INFO_PREVIEW=graph|graph-old`で確認できます。`CODEX_INFO_PREVIEW_SIZE`はGraphの初期サイズを上書きするレイアウト検証用です。メイン画面の指定例は`CODEX_INFO_PREVIEW=normal ./run.sh`です。
+登録top-level surface inventoryはMain、Setup、Settings、Graph、Threads、Legalの正確な6個で、HelpはMain内surface（追加HWND=0）です。runtime open HWNDはMain=1＋open child subset 0..5、合計1..6で、各childはsingleton、5 childを全て開いた時だけ6となります。Main/Setup/Settings/Threads/Legalはlogical client `initial=min=max=900×480` fixed、Graphは`initial=940×640`、`min=700×480`、`max=unbounded`、resizableです。登録された6 surfaceはMinimize/Closeを持ち、native resize/maximize/restoreはGraphだけです。ネイティブタイトルバーは全Windowで無効にし、ボタン以外の画面領域をドラッグして移動できます。物理サイズはOSのDPI／拡大率に連動し、Graphの最大化／復元は現在モニターのwork areaへ適用します。状態別の確認には`CODEX_INFO_PREVIEW=initializing|auth|normal|warning|reset-warning|error|zero|full|monthly|unlimited|idle|legal`を使い、グラフ表示は`CODEX_INFO_PREVIEW=graph|graph-old`で確認できます。`CODEX_INFO_PREVIEW_SIZE`はGraphの初期サイズを上書きするレイアウト検証用です。メイン画面の指定例は`CODEX_INFO_PREVIEW=normal ./run.sh --ui`です。
 
 ## UIを調整する場所
 

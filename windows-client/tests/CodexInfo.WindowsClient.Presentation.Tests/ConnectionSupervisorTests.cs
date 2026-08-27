@@ -24,7 +24,7 @@ public sealed class ConnectionSupervisorTests
         Assert.Single(factory.StartInfos);
         Assert.Equal("wsl.exe", factory.StartInfos[0].FileName);
         Assert.Equal(
-            ["--distribution", "Ubuntu-24.04", "--", "codex_info", "--service", "--listen", "127.0.0.1:8787"],
+            ["--distribution", "Ubuntu-24.04", "--", "codex_info", "--port", "8787"],
             factory.StartInfos[0].ArgumentList);
 
         Assert.True(supervisor.EnsureStarted(settings));
