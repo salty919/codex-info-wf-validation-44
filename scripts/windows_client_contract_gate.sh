@@ -439,8 +439,12 @@ require_text .github/workflows/windows-client.yml 'version-prepared:'
 require_text .github/workflows/windows-client.yml 'contents: read'
 require_text .github/workflows/windows-client.yml "if: github.event_name == 'pull_request_target' && github.event.pull_request.merged == true"
 require_text .github/workflows/windows-client.yml 'python3 scripts/release_quality_run_resolver.py'
+require_text .github/workflows/windows-client.yml 'runs?event=pull_request&head_sha=$PR_HEAD_SHA&per_page=100'
 if rg -q --fixed-strings '.pull_requests' .github/workflows/windows-client.yml; then
     fail 'post-merge release must not trust the optional workflow-run pull_requests association'
+fi
+if rg -q --fixed-strings 'runs?event=pull_request&status=completed&head_sha=' .github/workflows/windows-client.yml; then
+    fail 'post-merge release workflow must query all workflow-run statuses'
 fi
 require_file .github/workflows/version-prepare.yml
 require_text .github/workflows/version-prepare.yml 'pull_request_target:'

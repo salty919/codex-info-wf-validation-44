@@ -76,8 +76,15 @@
   main上のmerge結果を同一性検証できる方式に限定する。
 - PR品質確認を開始する前に、PR branch上のversion 3ファイルだけをexact next patchへ自動更新する。その
   version commitを含む最新mainとの合成treeを品質確認し、mergeによって採番を確定する。採番commit自身では
-  高コスト品質jobを開始せず、新しいheadに対する次のworkflow runで一度だけ確認する。merge後は検証済みtree
-  との一致を確認し、再テストせずmanifest生成とRelease公開を行う。同時mergeと公開は直列化する。
+  高コスト品質jobを開始せず、新しいheadに対する次のworkflow runで一度だけ確認する。
+  ready_for_review等で同じheadの正当な品質runが複数存在し得るため、merge後はeventとPR APIの
+  全identity（PR番号、head/base repository・ref・SHA、merge SHA）および`merged_at`の一致を確認してから、
+  quality run APIをstatusで絞らず全status・全page取得し、同一identityのexact候補がすべて
+  `created_at <= updated_at <= merged_at`を満たすことを検証する。そのうち`run_number`が最大で一意のcandidateだけを選び、
+  そのcandidateが`completed`/`success`のときだけ受理する。最新candidateの`failure`/`cancelled`/`pending`、
+  tie、候補zero、malformed、merge後（post-merge）run、pagination不完全・異常はartifact取得前にfail-closedとし、
+  older successへfallbackしない。`pull_requests`はauthorityにせず、検証済みtreeとの一致を確認し、
+  quality test/buildを再実行せずmanifest生成とRelease公開を行う。同時mergeと公開は直列化する。
   PR品質証拠とtreeが一致しない、version以外の差分が混入する、tag/Releaseが別SHAを
   指す、通信障害、5xx、部分uploadの場合は上書きせずfail-closedで停止する。
 - PR由来のcheckout、script、workflow、artifactを、repository contents・checks・Releaseへのwrite権限を
