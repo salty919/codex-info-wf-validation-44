@@ -389,16 +389,20 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          mapfile -t quality_runs < <(
-            gh api --paginate \
-              "repos/$REPOSITORY/actions/workflows/windows-client.yml/runs?event=pull_request&status=completed&head_sha=$PR_HEAD_SHA&per_page=100" \
-              --jq ".workflow_runs[] | select(.conclusion == \"success\" and any(.pull_requests[]; .number == ($PR_NUMBER | tonumber))) | .id"
-          )
-          if [[ "${#quality_runs[@]}" -ne 1 ]]; then
-            echo "expected exactly one successful PR quality run for PR $PR_NUMBER head $PR_HEAD_SHA; found ${#quality_runs[@]}" >&2
-            exit 1
-          fi
-          printf 'run-id=%s\n' "${quality_runs[0]}" >> "$GITHUB_OUTPUT"
+          pull_request_json="$RUNNER_TEMP/release-quality-pull-request.json"
+          workflow_runs_json="$RUNNER_TEMP/release-quality-workflow-runs.json"
+          gh api --method GET \
+            "repos/$REPOSITORY/pulls/$PR_NUMBER" > "$pull_request_json"
+          gh api --method GET --paginate --slurp \
+            "repos/$REPOSITORY/actions/workflows/windows-client.yml/runs?event=pull_request&status=completed&head_sha=$PR_HEAD_SHA&per_page=100" \
+            > "$workflow_runs_json"
+          resolved_run_id="$(
+            python3 scripts/release_quality_run_resolver.py \
+              --event "$GITHUB_EVENT_PATH" \
+              --pull-request "$pull_request_json" \
+              --workflow-runs "$workflow_runs_json"
+          )"
+          printf 'run-id=%s\n' "$resolved_run_id" >> "$GITHUB_OUTPUT"
       - name: Download accepted PR release candidate
         uses: actions/download-artifact@v4
         with:

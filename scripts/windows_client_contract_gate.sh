@@ -392,6 +392,10 @@ require_text .github/workflows/windows-client.yml 'types: [closed]'
 require_text .github/workflows/windows-client.yml 'version-prepared:'
 require_text .github/workflows/windows-client.yml 'contents: read'
 require_text .github/workflows/windows-client.yml "if: github.event_name == 'pull_request_target' && github.event.pull_request.merged == true"
+require_text .github/workflows/windows-client.yml 'python3 scripts/release_quality_run_resolver.py'
+if rg -q --fixed-strings '.pull_requests' .github/workflows/windows-client.yml; then
+    fail 'post-merge release must not trust the optional workflow-run pull_requests association'
+fi
 require_file .github/workflows/version-prepare.yml
 require_text .github/workflows/version-prepare.yml 'pull_request_target:'
 require_text .github/workflows/version-prepare.yml 'ref: refs/heads/main'
@@ -664,6 +668,8 @@ require_file scripts/workflow_quality_gate.py
 require_file scripts/ci_trust_fixture.py
 require_file scripts/release_candidate_gate.sh
 require_file scripts/release_candidate_gate_test.sh
+require_file scripts/release_quality_run_resolver.py
+require_file scripts/test_release_quality_run_resolver.py
 require_file scripts/release_state_gate.py
 require_file docs/REQUIREMENTS_LEDGER.md
 for required_ledger_id in X-START-01 X-START-02 X-START-03 X-GRAPH-01 X-THREAD-01 WIN-START-01 WIN-GRAPH-01 WIN-VERSION-01 PROC-LEDGER-01; do
@@ -681,6 +687,7 @@ require_file windows-client/CodeCoverage.runsettings
 # test suite, UI run, or acceptance job.
 PYTHONDONTWRITEBYTECODE=1 python3 scripts/workflow_quality_gate.py --self-test
 PYTHONDONTWRITEBYTECODE=1 python3 scripts/ci_trust_fixture.py --self-test
+PYTHONDONTWRITEBYTECODE=1 python3 scripts/test_release_quality_run_resolver.py
 bash scripts/final_acceptance_gate_test.sh
 bash scripts/release_candidate_gate_test.sh
 PYTHONDONTWRITEBYTECODE=1 python3 scripts/release_state_gate.py --self-test

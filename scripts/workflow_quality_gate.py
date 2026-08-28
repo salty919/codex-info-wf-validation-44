@@ -348,6 +348,85 @@ def _active_run_text(block: RunBlock) -> str:
     )
 
 
+_POWERSHELL_PATH_CHARS = frozenset("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_.-")
+
+
+def _powershell_relative_prefix_is_command(prefix: str) -> bool:
+    """Accept only the finite relative-path prefix used by current PS steps.
+
+    ``prefix`` ends immediately before the owner filename.  A call operator
+    may precede the path (the smoke step uses ``@(& ./scripts``); anything
+    that looks like a command word, an empty path component, or ``..`` is
+    rejected.  The explicit character scan avoids an ambiguous repeated
+    regex over attacker-controlled workflow text.
+    """
+    left = 0
+    right = len(prefix)
+    while left < right and prefix[left].isspace():
+        left += 1
+    while right > left and prefix[right - 1].isspace():
+        right -= 1
+    if left == right:
+        return True
+
+    # Keep only the path after the final PowerShell call operator.  The
+    # caller has already removed quoted text, and a command word without '&'
+    # remains part of the candidate and therefore fails path validation.
+    call = -1
+    index = left
+    while index < right:
+        if prefix[index] == "&":
+            call = index
+        index += 1
+    if call >= 0:
+        # The current array-expression form has only a variable assignment
+        # and ``@(`` before ``&``.  Reject ordinary command words such as
+        # ``Write-Output & .`` instead of treating every ampersand as a
+        # trusted command boundary.
+        index = left
+        while index < call:
+            character = prefix[index]
+            if character.isspace() or character in "@()=":
+                index += 1
+                continue
+            if character == "$":
+                index += 1
+                if index >= call or prefix[index] not in _POWERSHELL_PATH_CHARS:
+                    return False
+                while index < call and prefix[index] in _POWERSHELL_PATH_CHARS:
+                    index += 1
+                continue
+            return False
+        left = call + 1
+        while left < right and prefix[left].isspace():
+            left += 1
+    if left == right:
+        return False
+
+    # A bare '.' is the prefix left by the marker scanner for './owner.ps1'.
+    if right - left == 1 and prefix[left] == ".":
+        return True
+    if right - left < 3 or prefix[left : left + 2] != "./":
+        return False
+
+    component_start = left + 2
+    if component_start == right:
+        return False
+    index = component_start
+    while index <= right:
+        if index == right or prefix[index] == "/":
+            if index == component_start:
+                return False
+            component = prefix[component_start:index]
+            if component == "..":
+                return False
+            component_start = index + 1
+        elif prefix[index] not in _POWERSHELL_PATH_CHARS:
+            return False
+        index += 1
+    return component_start == right + 1
+
+
 def _owner_occurrences(owner: str, text: str) -> int:
     """Count marker tokens only where the surrounding syntax invokes them."""
     pattern = OWNER_PATTERNS[owner]
@@ -367,11 +446,7 @@ def _owner_occurrences(owner: str, text: str) -> int:
                     count += 1
                 elif not segment and line[match.start() :].startswith(("./", "scripts/")):
                     count += 1
-            elif (
-                re.match(r"^(?:&\s*)?(?:\./|[A-Za-z0-9_.-]+/)+[A-Za-z0-9_.-]*$", segment)
-                or re.search(r"(?:^|[({])\s*&\s*\.$", segment)
-                or not segment
-            ):
+            elif _powershell_relative_prefix_is_command(segment):
                 count += 1
     return count
 
@@ -514,6 +589,9 @@ class MergeState:
     provenance_tree: str
     runs: tuple[MergeRun, ...]
     provenance_id: str = ""
+    branch_protection: Mapping[str, object] | None = None
+    ruleset: Mapping[str, object] | None = None
+    default_setup: Mapping[str, object] | None = None
 
 
 _SHA40 = re.compile(r"^[0-9a-fA-F]{40}$")
@@ -527,10 +605,112 @@ def _full_sha(value: object) -> bool:
     return isinstance(value, str) and _SHA40.fullmatch(value) is not None
 
 
+def _mapping(value: object) -> Mapping[str, object] | None:
+    return value if isinstance(value, Mapping) else None
+
+
+def _exact_string_list(value: object, expected: set[str]) -> bool:
+    if type(value) is not list or any(type(item) is not str for item in value):
+        return False
+    return len(value) == len(expected) and len(set(value)) == len(value) and set(value) == expected
+
+
+def _valid_branch_protection(policy: object) -> bool:
+    """Validate the raw branch-protection response, not a normalized proxy."""
+    payload = _mapping(policy)
+    if payload is None:
+        return False
+    required = _mapping(payload.get("required_status_checks"))
+    if required is None or required.get("strict") is not True:
+        return False
+    expected = {"acceptance", "version-prepared"}
+    if not _exact_string_list(required.get("contexts"), expected):
+        return False
+    checks = required.get("checks")
+    if type(checks) is not list or len(checks) != len(expected):
+        return False
+    check_contexts: list[str] = []
+    for check in checks:
+        entry = _mapping(check)
+        if entry is None or type(entry.get("context")) is not str:
+            return False
+        if type(entry.get("app_id")) is not int or entry["app_id"] != 15368:
+            return False
+        check_contexts.append(entry["context"])
+    return (
+        len(check_contexts) == len(set(check_contexts))
+        and set(check_contexts) == expected
+    )
+
+
+def _valid_codeql_ruleset(policy: object) -> bool:
+    """Validate the raw GitHub ruleset response and its exact CodeQL rule."""
+    payload = _mapping(policy)
+    if payload is None:
+        return False
+    if payload.get("target") != "branch" or payload.get("enforcement") != "active":
+        return False
+    if type(payload.get("bypass_actors")) is not list or payload["bypass_actors"] != []:
+        return False
+
+    conditions = _mapping(payload.get("conditions"))
+    ref_name = _mapping(conditions.get("ref_name")) if conditions is not None else None
+    if ref_name is None:
+        return False
+    if not _exact_string_list(ref_name.get("include"), {"refs/heads/main"}):
+        return False
+    if not _exact_string_list(ref_name.get("exclude"), set()):
+        return False
+
+    rules = payload.get("rules")
+    if type(rules) is not list or len(rules) != 1:
+        return False
+    rule = _mapping(rules[0])
+    if rule is None or rule.get("type") != "code_scanning":
+        return False
+    parameters = _mapping(rule.get("parameters"))
+    tools = parameters.get("code_scanning_tools") if parameters is not None else None
+    if type(tools) is not list or len(tools) != 1:
+        return False
+    codeql = _mapping(tools[0])
+    return codeql is not None and (
+        codeql.get("tool") == "CodeQL"
+        and codeql.get("alerts_threshold") == "errors"
+        and codeql.get("security_alerts_threshold") == "high_or_higher"
+    )
+
+
+def _valid_default_setup(setup: object) -> bool:
+    """Validate default-setup state while leaving the language set dynamic."""
+    payload = _mapping(setup)
+    if payload is None or payload.get("state") != "configured":
+        return False
+    languages = payload.get("languages")
+    return (
+        type(languages) is list
+        and bool(languages)
+        and all(type(language) is str and language.strip() for language in languages)
+        and len(set(languages)) == len(languages)
+    )
+
+
 def evaluate_merge_state(state: MergeState) -> bool:
-    """Return ALLOW only for one exact, current-head synthetic run set."""
-    required = {"acceptance", "version-prepared", "CodeQL"}
-    if state.required_contexts != required or state.strict is not True:
+    """Return ALLOW only for one exact, current-head synthetic run set.
+
+    The raw policy evidence is checked here so callers cannot bypass the
+    authority schema with a hand-built normalized dataclass.  Pending CodeQL
+    analysis and current-head enforcement remain GitHub's official ruleset
+    responsibilities; this oracle intentionally verifies policy declaration
+    without duplicating that runtime behavior.
+    """
+    required = {"acceptance", "version-prepared"}
+    if (
+        state.required_contexts != required
+        or state.strict is not True
+        or not _valid_branch_protection(state.branch_protection)
+        or not _valid_codeql_ruleset(state.ruleset)
+        or not _valid_default_setup(state.default_setup)
+    ):
         return False
     if not all(
         _full_sha(value)
@@ -586,7 +766,7 @@ def _valid_merge_state() -> MergeState:
     head = "2222222222222222222222222222222222222222"
     tree = "3333333333333333333333333333333333333333"
     return MergeState(
-        required_contexts=frozenset({"acceptance", "version-prepared", "CodeQL"}),
+        required_contexts=frozenset({"acceptance", "version-prepared"}),
         strict=True,
         current_base=base,
         current_head=head,
@@ -602,13 +782,51 @@ def _valid_merge_state() -> MergeState:
                 jobs=(
                     MergeJob("acceptance", job_id="job-acceptance"),
                     MergeJob("version-prepared", job_id="job-version"),
-                    MergeJob("CodeQL", job_id="job-codeql"),
                 ),
-                artifact_ids=("artifact-acceptance", "artifact-version", "artifact-codeql"),
+                artifact_ids=("artifact-acceptance", "artifact-version"),
                 provenance_markers=(f"source-sha: {head}", f"tree-sha: {tree}"),
             ),
         ),
         provenance_id="provenance-101",
+        branch_protection={
+            "required_status_checks": {
+                "strict": True,
+                "contexts": ["acceptance", "version-prepared"],
+                "checks": [
+                    {"context": "acceptance", "app_id": 15368},
+                    {"context": "version-prepared", "app_id": 15368},
+                ],
+            },
+        },
+        ruleset={
+            "target": "branch",
+            "enforcement": "active",
+            "bypass_actors": [],
+            "conditions": {
+                "ref_name": {
+                    "include": ["refs/heads/main"],
+                    "exclude": [],
+                },
+            },
+            "rules": [
+                {
+                    "type": "code_scanning",
+                    "parameters": {
+                        "code_scanning_tools": [
+                            {
+                                "tool": "CodeQL",
+                                "alerts_threshold": "errors",
+                                "security_alerts_threshold": "high_or_higher",
+                            },
+                        ],
+                    },
+                },
+            ],
+        },
+        default_setup={
+            "state": "configured",
+            "languages": ["actions", "csharp", "python", "rust"],
+        },
     )
 
 
@@ -761,12 +979,56 @@ def _run_quality_wrapper_cases() -> int:
     return 2
 
 
+def _run_powershell_position_cases() -> int:
+    prefix_cases = (
+        ("empty-prefix", "", True),
+        ("bare-relative", ".", True),
+        ("relative-path", "./windows-client/tools", True),
+        ("call-relative-path", "& ./windows-client/tools", True),
+        ("array-call-relative-path", "$moveSmokeOutput = @(& .", True),
+        ("quoted-prefix", 'echo "./windows-client/tools', False),
+        ("command-word", "Write-Output ./windows-client/tools", False),
+        ("command-before-call", "Write-Output & .", False),
+        ("empty-path", "./", False),
+        ("empty-component", "./windows-client//tools", False),
+        ("parent-traversal", "./windows-client/../tools", False),
+        ("unsafe-character", "./windows-client/tools\\nested", False),
+        ("long-repetition", "./" * 10000, False),
+    )
+    for name, prefix, expected in prefix_cases:
+        actual = _powershell_relative_prefix_is_command(prefix)
+        if actual is not expected:
+            raise AssertionError(f"PowerShell prefix fixture {name} expected {expected}, got {actual}")
+
+    owner_cases = (
+        ("Build-WindowsInstaller", "Build-WindowsInstaller.ps1"),
+        ("Build-WindowsInstaller", "./windows-client/tools/Build-WindowsInstaller.ps1"),
+        ("Run-WindowsClientE2E", "& ./windows-client/tools/Run-WindowsClientE2E.ps1"),
+        (
+            "windows_window_move_smoke",
+            "$moveSmokeOutput = @(& ./scripts/windows_window_move_smoke.ps1",
+        ),
+    )
+    for owner, command in owner_cases:
+        if _owner_occurrences(owner, command) != 1:
+            raise AssertionError(f"actual PowerShell owner command was not counted: {owner}: {command}")
+
+    quoted = _active_run_text(RunBlock("ui-quality", 'echo "./windows-client/tools/Build-WindowsInstaller.ps1"', 1))
+    if _owner_occurrences("Build-WindowsInstaller", quoted) != 0:
+        raise AssertionError("quoted PowerShell owner fixture was counted")
+    require_text = "require_text: ./windows-client/tools/Build-WindowsInstaller.ps1"
+    if _owner_occurrences("Build-WindowsInstaller", require_text) != 0:
+        raise AssertionError("require_text PowerShell owner fixture was counted")
+    return len(prefix_cases) + len(owner_cases) + 2
+
+
 def _run_static_cases() -> int:
     cases = 1
     baseline_errors = validate_workflows()
     if baseline_errors:
         raise AssertionError("production workflow baseline failed: " + "; ".join(baseline_errors))
     cases += _run_quality_wrapper_cases()
+    cases += _run_powershell_position_cases()
     for name, mutate in _static_mutations():
         with tempfile.TemporaryDirectory(prefix="workflow-quality-") as temporary:
             windows, rust = _copy_workflows(Path(temporary))
@@ -799,14 +1061,350 @@ def _run_merge_cases() -> int:
     def jobs_update(state: MergeState, jobs: tuple[MergeJob, ...]) -> MergeState:
         return run_update(state, jobs=jobs)
 
+    def raw_update(
+        state: MergeState,
+        field: str,
+        path: tuple[str, ...],
+        value: object,
+    ) -> MergeState:
+        raw = getattr(state, field)
+        if not isinstance(raw, Mapping):
+            raise AssertionError(f"cannot mutate non-mapping policy {field}")
+        updated: dict[str, object] = dict(raw)
+        cursor = updated
+        for key in path[:-1]:
+            nested = cursor.get(key)
+            if not isinstance(nested, Mapping):
+                raise AssertionError(f"cannot mutate missing policy path {field}.{key}")
+            nested_copy = dict(nested)
+            cursor[key] = nested_copy
+            cursor = nested_copy
+        cursor[path[-1]] = value
+        return replace(state, **{field: updated})
+
+    def codeql_required(state: MergeState) -> MergeState:
+        with_codeql_contexts = raw_update(
+            state,
+            "branch_protection",
+            ("required_status_checks", "contexts"),
+            ["acceptance", "version-prepared", "CodeQL"],
+        )
+        return raw_update(
+            with_codeql_contexts,
+            "branch_protection",
+            ("required_status_checks", "checks"),
+            [
+                {"context": "acceptance", "app_id": 15368},
+                {"context": "version-prepared", "app_id": 15368},
+                {"context": "CodeQL", "app_id": 15368},
+            ],
+        )
+
+    def neutral_codeql_aggregate(state: MergeState) -> MergeState:
+        return codeql_required(
+            jobs_update(
+                state,
+                (
+                    *state.runs[0].jobs,
+                    MergeJob("CodeQL", job_id="job-codeql", conclusion="neutral"),
+                ),
+            )
+        )
+
     mutations: tuple[tuple[str, Callable[[MergeState], MergeState], bool], ...] = (
         ("valid", lambda state: state, True),
+        ("legacy-codeql-required", codeql_required, False),
+        ("neutral-codeql-aggregate", neutral_codeql_aggregate, False),
+        ("branch-protection-missing", lambda state: replace(state, branch_protection=None), False),
+        ("branch-protection-wrong-type", lambda state: replace(state, branch_protection=[]), False),
+        (
+            "required-status-checks-missing",
+            lambda state: replace(state, branch_protection={}),
+            False,
+        ),
+        (
+            "required-status-checks-null",
+            lambda state: raw_update(state, "branch_protection", ("required_status_checks",), None),
+            False,
+        ),
+        (
+            "strict-wrong-type",
+            lambda state: raw_update(state, "branch_protection", ("required_status_checks", "strict"), "true"),
+            False,
+        ),
+        (
+            "contexts-wrong-type",
+            lambda state: raw_update(state, "branch_protection", ("required_status_checks", "contexts"), "acceptance"),
+            False,
+        ),
+        (
+            "contexts-duplicate",
+            lambda state: raw_update(
+                state,
+                "branch_protection",
+                ("required_status_checks", "contexts"),
+                ["acceptance", "acceptance"],
+            ),
+            False,
+        ),
+        (
+            "checks-wrong-type",
+            lambda state: raw_update(state, "branch_protection", ("required_status_checks", "checks"), {}),
+            False,
+        ),
+        (
+            "checks-duplicate",
+            lambda state: raw_update(
+                state,
+                "branch_protection",
+                ("required_status_checks", "checks"),
+                [
+                    {"context": "acceptance", "app_id": 15368},
+                    {"context": "acceptance", "app_id": 15368},
+                ],
+            ),
+            False,
+        ),
+        (
+            "checks-wrong-app",
+            lambda state: raw_update(
+                state,
+                "branch_protection",
+                ("required_status_checks", "checks"),
+                [
+                    {"context": "acceptance", "app_id": 15368},
+                    {"context": "version-prepared", "app_id": 1},
+                ],
+            ),
+            False,
+        ),
+        ("ruleset-missing", lambda state: replace(state, ruleset=None), False),
+        ("ruleset-wrong-type", lambda state: replace(state, ruleset=[]), False),
+        (
+            "ruleset-disabled",
+            lambda state: raw_update(state, "ruleset", ("enforcement",), "disabled"),
+            False,
+        ),
+        (
+            "ruleset-wrong-target",
+            lambda state: raw_update(state, "ruleset", ("target",), "repository"),
+            False,
+        ),
+        (
+            "ruleset-main-ref-missing",
+            lambda state: raw_update(state, "ruleset", ("conditions", "ref_name", "include"), []),
+            False,
+        ),
+        (
+            "ruleset-main-ref-extra",
+            lambda state: raw_update(
+                state,
+                "ruleset",
+                ("conditions", "ref_name", "include"),
+                ["refs/heads/main", "refs/heads/release"],
+            ),
+            False,
+        ),
+        (
+            "ruleset-main-ref-wildcard",
+            lambda state: raw_update(state, "ruleset", ("conditions", "ref_name", "include"), ["*"]),
+            False,
+        ),
+        (
+            "ruleset-exclude-ref",
+            lambda state: raw_update(
+                state,
+                "ruleset",
+                ("conditions", "ref_name", "exclude"),
+                ["refs/heads/release"],
+            ),
+            False,
+        ),
+        (
+            "ruleset-conditions-null",
+            lambda state: raw_update(state, "ruleset", ("conditions",), None),
+            False,
+        ),
+        (
+            "ruleset-rules-extra",
+            lambda state: raw_update(
+                state,
+                "ruleset",
+                ("rules",),
+                [
+                    {
+                        "type": "code_scanning",
+                        "parameters": {
+                            "code_scanning_tools": [
+                                {
+                                    "tool": "CodeQL",
+                                    "alerts_threshold": "errors",
+                                    "security_alerts_threshold": "high_or_higher",
+                                },
+                            ],
+                        },
+                    },
+                    {
+                        "type": "code_scanning",
+                        "parameters": {
+                            "code_scanning_tools": [
+                                {
+                                    "tool": "CodeQL",
+                                    "alerts_threshold": "errors",
+                                    "security_alerts_threshold": "high_or_higher",
+                                },
+                            ],
+                        },
+                    },
+                ],
+            ),
+            False,
+        ),
+        (
+            "ruleset-wrong-rule-type",
+            lambda state: raw_update(
+                state,
+                "ruleset",
+                ("rules",),
+                [
+                    {
+                        "type": "branch_name_pattern",
+                        "parameters": {
+                            "code_scanning_tools": [
+                                {
+                                    "tool": "CodeQL",
+                                    "alerts_threshold": "errors",
+                                    "security_alerts_threshold": "high_or_higher",
+                                },
+                            ],
+                        },
+                    },
+                ],
+            ),
+            False,
+        ),
+        (
+            "ruleset-wrong-tool",
+            lambda state: raw_update(
+                state,
+                "ruleset",
+                ("rules",),
+                [
+                    {
+                        "type": "code_scanning",
+                        "parameters": {
+                            "code_scanning_tools": [
+                                {
+                                    "tool": "Semgrep",
+                                    "alerts_threshold": "errors",
+                                    "security_alerts_threshold": "high_or_higher",
+                                },
+                            ],
+                        },
+                    },
+                ],
+            ),
+            False,
+        ),
+        (
+            "ruleset-alert-threshold",
+            lambda state: raw_update(
+                state,
+                "ruleset",
+                ("rules",),
+                [
+                    {
+                        "type": "code_scanning",
+                        "parameters": {
+                            "code_scanning_tools": [
+                                {
+                                    "tool": "CodeQL",
+                                    "alerts_threshold": "none",
+                                    "security_alerts_threshold": "high_or_higher",
+                                },
+                            ],
+                        },
+                    },
+                ],
+            ),
+            False,
+        ),
+        (
+            "ruleset-security-threshold",
+            lambda state: raw_update(
+                state,
+                "ruleset",
+                ("rules",),
+                [
+                    {
+                        "type": "code_scanning",
+                        "parameters": {
+                            "code_scanning_tools": [
+                                {
+                                    "tool": "CodeQL",
+                                    "alerts_threshold": "errors",
+                                    "security_alerts_threshold": "medium_or_higher",
+                                },
+                            ],
+                        },
+                    },
+                ],
+            ),
+            False,
+        ),
+        (
+            "ruleset-bypass",
+            lambda state: raw_update(
+                state,
+                "ruleset",
+                ("bypass_actors",),
+                [{"actor_id": 123, "actor_type": "Integration", "bypass_mode": "always"}],
+            ),
+            False,
+        ),
+        (
+            "default-setup-missing",
+            lambda state: replace(state, default_setup=None),
+            False,
+        ),
+        (
+            "default-setup-wrong-type",
+            lambda state: replace(state, default_setup=[]),
+            False,
+        ),
+        (
+            "default-setup-state-wrong",
+            lambda state: raw_update(state, "default_setup", ("state",), "not-configured"),
+            False,
+        ),
+        (
+            "default-setup-languages-missing",
+            lambda state: replace(state, default_setup={"state": "configured"}),
+            False,
+        ),
+        (
+            "default-setup-languages-wrong-type",
+            lambda state: raw_update(state, "default_setup", ("languages",), "rust"),
+            False,
+        ),
+        (
+            "default-setup-languages-empty",
+            lambda state: raw_update(state, "default_setup", ("languages",), []),
+            False,
+        ),
+        (
+            "default-setup-languages-duplicate",
+            lambda state: raw_update(state, "default_setup", ("languages",), ["rust", "rust"]),
+            False,
+        ),
         ("job-failure", lambda state: jobs_update(state, (replace(state.runs[0].jobs[0], conclusion="failure"), *state.runs[0].jobs[1:])), False),
         ("job-cancelled", lambda state: jobs_update(state, (replace(state.runs[0].jobs[0], conclusion="cancelled"), *state.runs[0].jobs[1:])), False),
         ("job-in-progress", lambda state: jobs_update(state, (replace(state.runs[0].jobs[0], status="in_progress"), *state.runs[0].jobs[1:])), False),
-        ("context-missing", lambda state: jobs_update(state, state.runs[0].jobs[:2]), False),
+        ("job-status-missing", lambda state: jobs_update(state, (replace(state.runs[0].jobs[0], status=""), *state.runs[0].jobs[1:])), False),
+        ("job-status-pending", lambda state: jobs_update(state, (replace(state.runs[0].jobs[0], status="pending"), *state.runs[0].jobs[1:])), False),
+        ("context-missing", lambda state: jobs_update(state, state.runs[0].jobs[:1]), False),
         ("context-extra", lambda state: jobs_update(state, (*state.runs[0].jobs, MergeJob("extra", job_id="job-extra"))), False),
-        ("context-duplicate", lambda state: jobs_update(state, (state.runs[0].jobs[0], replace(state.runs[0].jobs[1], context="acceptance"), state.runs[0].jobs[2])), False),
+        ("context-duplicate", lambda state: jobs_update(state, (state.runs[0].jobs[0], replace(state.runs[0].jobs[1], context="acceptance"))), False),
         ("base-behind", lambda state: run_update(state, base_sha=old_base), False),
         ("base-stale", lambda state: replace(state, current_base=old_base), False),
         ("head-mismatch", lambda state: run_update(state, head_sha=old_head), False),
@@ -814,7 +1412,7 @@ def _run_merge_cases() -> int:
         ("provenance-source-mismatch", lambda state: replace(state, provenance_source=old_head), False),
         ("provenance-tree-mismatch", lambda state: replace(state, provenance_tree=old_tree), False),
         ("strict-false", lambda state: replace(state, strict=False), False),
-        ("context-set-mismatch", lambda state: replace(state, required_contexts=frozenset({"acceptance", "version-prepared"})), False),
+        ("context-set-mismatch", lambda state: replace(state, required_contexts=frozenset({"acceptance"})), False),
         ("run-zero", lambda state: replace(state, runs=()), False),
         ("run-two", lambda state: replace(state, runs=state.runs + (replace(state.runs[0], run_id="run-102"),)), False),
         ("stale-mixed-run", lambda state: replace(state, runs=(state.runs[0], replace(state.runs[0], run_id="run-old", head_sha=old_head, base_sha=old_base, tree_sha=old_tree))), False),
