@@ -279,6 +279,34 @@ wait_for_ready() {
     return 1
 }
 
+wait_for_history_value() {
+    local query="$1" minimum="$2" observed="" read_ok=0
+    for _ in $(seq 1 30); do
+        read_ok=0
+        if [[ -f "$case_db" ]]; then
+            if observed="$(sqlite3 "$case_db" "$query" 2>/dev/null)"; then
+                read_ok=1
+            else
+                observed=""
+            fi
+        else
+            observed=""
+        fi
+        if ((read_ok == 1)) && [[ "$observed" =~ ^[0-9]+$ ]] \
+            && ((10#$observed >= minimum)); then
+            printf '%s\n' "$observed"
+            return 0
+        fi
+        sleep 0.5
+    done
+    if [[ "$observed" =~ ^[0-9]+$ ]]; then
+        printf '%s\n' "$observed"
+    else
+        printf '0\n'
+    fi
+    return 1
+}
+
 require_ready() {
     if ! wait_for_ready; then
         sed -n '1,160p' "$case_root"/*.log >&2 2>/dev/null || true
@@ -416,9 +444,11 @@ run_service_cold_start() {
     launch_service service-cold
     require_ready
     require_one_service "$service_pid"
-    [[ -f "$case_db" ]] || fail "$case_label: history database was not created"
-    before="$(sqlite3 "$case_db" 'SELECT count(*) FROM usage_history;')"
-    [[ "$before" -ge 1 ]] || fail "$case_label: daemon did not persist initial sample"
+    before=0
+    if ! before="$(wait_for_history_value 'SELECT count(*) FROM usage_history;' 1)"; then
+        sed -n '1,160p' "$case_root/service-cold.log" >&2 || true
+        fail "$case_label: daemon did not persist initial sample (observed count=$before)"
+    fi
 
     clk_tck="$(getconf CLK_TCK)"
     cpu_before="$(awk '{print $14+$15}' "/proc/$service_pid/stat")"
@@ -433,12 +463,8 @@ run_service_cold_start() {
     printf '{"timestamp":"%s","type":"token_count","payload":{"info":{"total_token_usage":{"total_tokens":240,"input_tokens":200,"cached_input_tokens":160,"output_tokens":40}}}}\n' \
         "$(date -u -d "@$now2" +%Y-%m-%dT%H:%M:%SZ)" >>"$session"
     after=0
-    for _ in $(seq 1 30); do
-        after="$(sqlite3 "$case_db" 'SELECT COALESCE(MAX(luna_tokens),0) FROM usage_history;')"
-        [[ "$after" -ge 240 ]] && break
-        sleep 0.5
-    done
-    if [[ "$after" -lt 240 ]]; then
+    if ! after="$(wait_for_history_value \
+        'SELECT COALESCE(MAX(luna_tokens),0) FROM usage_history;' 240)"; then
         sed -n '1,160p' "$case_root/service-cold.log" >&2 || true
         fail "$case_label: daemon did not record changed session input (observed luna_tokens=$after)"
     fi
