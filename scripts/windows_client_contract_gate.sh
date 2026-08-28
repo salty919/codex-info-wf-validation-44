@@ -359,6 +359,11 @@ if rg -q '^  push:' .github/workflows/windows-client.yml; then
 fi
 require_text .github/workflows/rust.yml 'dtolnay/rust-toolchain@stable'
 require_text .github/workflows/rust.yml 'x11-apps'
+require_text .github/workflows/rust.yml 'cd artifacts/native-quality'
+require_text .github/workflows/rust.yml 'sha256sum native-quality.txt > SHA256SUMS'
+if rg -q --fixed-strings -- 'sha256sum artifacts/native-quality/native-quality.txt' .github/workflows/rust.yml; then
+    fail 'native quality manifest must use bundle-relative paths'
+fi
 final_gate_line="$(rg -n 'bash scripts/final_acceptance_gate.sh artifacts/windows-ui-e2e' .github/workflows/windows-client.yml | cut -d: -f1 | head -n 1)"
 [[ -n "$final_gate_line" ]] || fail 'final acceptance gate invocation is missing'
 require_text scripts/regression_guard.sh 'cargo check --locked --all-targets'

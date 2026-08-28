@@ -53,7 +53,10 @@ jobs:
           data-protection: PASS
           native-quality: PASS
           EOF
-          sha256sum artifacts/native-quality/native-quality.txt > artifacts/native-quality/SHA256SUMS
+          (
+            cd artifacts/native-quality
+            sha256sum native-quality.txt > SHA256SUMS
+          )
       - name: Upload native quality evidence
         uses: actions/upload-artifact@v4
         with:
