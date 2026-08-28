@@ -46,32 +46,32 @@ bash scripts/quality_artifact_gate.sh \
     "$expected_sha" "$expected_tree" \
     || hold "quality artifact verification failed"
 
-rg -q --fixed-strings "source-sha: $expected_sha" "$log_file" \
+grep -Fq -- "source-sha: $expected_sha" "$log_file" \
     || hold "Windows UI E2E evidence was not produced from expected source SHA: $expected_sha"
-rg -q --fixed-strings "source-sha: $expected_sha" "$move_log" \
+grep -Fq -- "source-sha: $expected_sha" "$move_log" \
     || hold "physical window move smoke evidence was not produced from expected source SHA: $expected_sha"
-rg -q --fixed-strings 'window-move-smoke: PASS' "$move_log" \
+grep -Fq -- 'window-move-smoke: PASS' "$move_log" \
     || hold "physical window move smoke PASS marker is missing"
-if rg -q --fixed-strings 'window-move-smoke: SKIP' "$move_log"; then
+if grep -Fq -- 'window-move-smoke: SKIP' "$move_log"; then
     hold "physical window move smoke was skipped"
 fi
-rg -q --fixed-strings 'fixture: PASS periods=2 threads=3 endpoint=http://127.0.0.1:8787' "$log_file" \
+grep -Fq -- 'fixture: PASS periods=2 threads=3 endpoint=http://127.0.0.1:8787' "$log_file" \
     || hold "Windows fixture PASS marker is missing"
-rg -q --fixed-strings 'main-quota-gauge: seven cells, two X-authority surface colors, and half-period boundary PASS' "$log_file" \
+grep -Fq -- 'main-quota-gauge: seven cells, two X-authority surface colors, and half-period boundary PASS' "$log_file" \
     || hold "Windows quota gauge evidence is missing"
-rg -q --fixed-strings 'main-product-version: PASS' "$log_file" \
+grep -Fq -- 'main-product-version: PASS' "$log_file" \
     || hold "Windows main product-version evidence is missing"
-rg -q --fixed-strings 'child-product-version: PASS role=Graph count=0' "$log_file" \
+grep -Fq -- 'child-product-version: PASS role=Graph count=0' "$log_file" \
     || hold "Windows Graph child product-version evidence is missing"
-rg -q --fixed-strings 'child-product-version: PASS role=Threads count=0' "$log_file" \
+grep -Fq -- 'child-product-version: PASS role=Threads count=0' "$log_file" \
     || hold "Windows Threads child product-version evidence is missing"
-rg -q --fixed-strings 'graph-past-model-data: PASS' "$log_file" \
+grep -Fq -- 'graph-past-model-data: PASS' "$log_file" \
     || hold "Windows past-period graph model-data evidence is missing"
-rg -q --fixed-strings 'graph-past-idle-band: PASS' "$log_file" \
+grep -Fq -- 'graph-past-idle-band: PASS' "$log_file" \
     || hold "Windows past-period idle-band color evidence is missing"
-rg -q --fixed-strings 'main-details-status: PASS (matching status/details generation accepted)' "$log_file" \
+grep -Fq -- 'main-details-status: PASS (matching status/details generation accepted)' "$log_file" \
     || hold "Windows main status/details generation evidence is missing"
-rg -q --fixed-strings 'windows-client-e2e: PASS' "$log_file" \
+grep -Fq -- 'windows-client-e2e: PASS' "$log_file" \
     || hold "Windows UI Automation PASS marker is missing"
 
 # The E2E path is finite by design.  Require every named observation rather
@@ -105,7 +105,7 @@ for capture_name in "${required_captures[@]}"; do
     png_signature="$(head -c 8 "$capture_path" | od -An -tx1 | tr -d '[:space:]')"
     [[ "$png_signature" == '89504e470d0a1a0a' ]] ||
         hold "Windows UI screenshot is not a PNG: $capture_name.png"
-    capture_line="$(rg --fixed-strings "capture: name=$capture_name " "$log_file" | tail -n 1 || true)"
+    capture_line="$(grep -F -- "capture: name=$capture_name " "$log_file" | tail -n 1 || true)"
     [[ -n "$capture_line" ]] || hold "Windows UI capture hash marker is missing: $capture_name.png"
     logged_hash="$(sed -n 's/.* sha256=\([0-9a-fA-F]\{64\}\) .*/\1/p' <<<"$capture_line" | tr '[:upper:]' '[:lower:]')"
     [[ "$logged_hash" =~ ^[0-9a-f]{64}$ ]] || hold "Windows UI capture hash marker is malformed: $capture_name.png"

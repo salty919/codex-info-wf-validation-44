@@ -381,6 +381,11 @@ require_text scripts/final_acceptance_gate.sh 'source-sha: $expected_sha'
 require_text scripts/final_acceptance_gate.sh 'capture: name=$capture_name '
 require_text scripts/final_acceptance_gate.sh 'sha256sum "$capture_path"'
 require_text scripts/final_acceptance_gate.sh 'window-move-smoke: PASS'
+require_text scripts/final_acceptance_gate.sh 'grep -Fq --'
+require_text scripts/final_acceptance_gate.sh 'grep -F --'
+require_file scripts/final_acceptance_gate_test.sh
+require_text scripts/final_acceptance_gate_test.sh 'final-acceptance-gate-test: PASS cases=$cases'
+require_text scripts/final_acceptance_gate_test.sh 'isolated acceptance PATH unexpectedly contains rg'
 require_text .github/workflows/windows-client.yml 'cancel-in-progress: false'
 require_text .github/workflows/windows-client.yml 'pull_request_target:'
 require_text .github/workflows/windows-client.yml 'types: [closed]'
@@ -676,6 +681,7 @@ require_file windows-client/CodeCoverage.runsettings
 # test suite, UI run, or acceptance job.
 PYTHONDONTWRITEBYTECODE=1 python3 scripts/workflow_quality_gate.py --self-test
 PYTHONDONTWRITEBYTECODE=1 python3 scripts/ci_trust_fixture.py --self-test
+bash scripts/final_acceptance_gate_test.sh
 bash scripts/release_candidate_gate_test.sh
 PYTHONDONTWRITEBYTECODE=1 python3 scripts/release_state_gate.py --self-test
 
