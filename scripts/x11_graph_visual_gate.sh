@@ -99,10 +99,16 @@ lib.XMoveWindow(display, graph, 0, 0)
 lib.XRaiseWindow(display, graph)
 lib.XFlush(display)
 PY
-sleep 0.5
-xwd -silent -id "$graph_id" -out "$temp_root/graph.xwd"
+# Window creation and graph painting are asynchronous.  A fixed sleep can
+# capture a partially-painted frame on a busy runner, so require the complete
+# semantic contract in two consecutive captures within a bounded deadline.
+consecutive_passes=0
+validated=false
+for _ in $(seq 1 40); do
+    sleep 0.25
+    xwd -silent -id "$graph_id" -out "$temp_root/graph.xwd"
 
-python3 - "$temp_root/graph.xwd" <<'PY'
+    if python3 - "$temp_root/graph.xwd" >"$temp_root/graph-check.out" 2>"$temp_root/graph-check.err" <<'PY'
 import struct, sys
 from math import sqrt
 
@@ -177,3 +183,19 @@ for name, expected in (
 
 print('x11-graph-visual-gate: PASS (940x640 image, remaining 88->87 without 14% drop, idle band, SOL/TERRA/LUNA pixels present)')
 PY
+    then
+        consecutive_passes=$((consecutive_passes + 1))
+        if (( consecutive_passes >= 2 )); then
+            validated=true
+            break
+        fi
+    else
+        consecutive_passes=0
+    fi
+done
+
+if [[ "$validated" != true ]]; then
+    sed -n '1,20p' "$temp_root/graph-check.err" >&2 || true
+    fail 'complete graph frame did not become stable before the deadline'
+fi
+cat "$temp_root/graph-check.out"
