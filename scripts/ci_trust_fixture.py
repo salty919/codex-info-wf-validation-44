@@ -477,6 +477,23 @@ def validate_static(source: str) -> None:
     if block.count('[[ "$HEAD_REPOSITORY" != "$REPOSITORY" ]]') != 1:
         fail("same-repository mutation guard must occur exactly once")
 
+    blob_start = block.find("create_blob() {\n")
+    blob_end = block.find("\ncargo_toml_blob=", blob_start)
+    if blob_start < 0 or blob_end < 0:
+        fail("blob creation function is missing")
+    blob_block = block[blob_start:blob_end]
+    _require(
+        blob_block,
+        'base64 --wrap=0 "$path" |\n'
+        '    jq -Rs \'{content:.,encoding:"base64"}\' |\n'
+        '    gh api \\\n',
+        "blob payload is JSON on stdin",
+    )
+    if blob_block.count("--input -") != 1:
+        fail("blob creation must read exactly one stdin request")
+    if re.search(r"(?<![A-Za-z0-9_])(?:-f|-F|--field|--raw-field)(?:[=\s])", blob_block):
+        fail("blob content must not be passed through a gh argv field")
+
 
 @dataclass(frozen=True)
 class Scenario:
@@ -682,6 +699,8 @@ def _write_fake_gh(directory: Path) -> Path:
                     index += 2
                     continue
                 if arg == "--input":
+                    if index + 1 >= len(args) or args[index + 1] != "-":
+                        die("--input must read stdin")
                     input_mode = True
                     index += 2
                     continue
@@ -767,8 +786,25 @@ def _write_fake_gh(directory: Path) -> Path:
                 index = len([item for item in transcript if item["method"] == "POST" and item["endpoint"].endswith("/git/blobs")]) - 1
                 if index >= len(config["blob_shas"]):
                     die("too many blob writes")
+                if fields:
+                    die("blob request must not pass fields through argv")
+                if not input_mode:
+                    die("blob request must use stdin JSON")
+                if (
+                    not isinstance(payload, dict)
+                    or set(payload) != {"content", "encoding"}
+                    or payload.get("encoding") != "base64"
+                    or not isinstance(payload.get("content"), str)
+                ):
+                    die("blob request must use exact base64 JSON payload")
+                content_b64 = payload["content"]
+                try:
+                    decoded = base64.b64decode(content_b64, validate=True)
+                except Exception:
+                    die("blob stdin content was not base64")
                 response = {"sha": config["blob_shas"][index]}
-                transcript[-1]["content_b64"] = fields["content"]
+                transcript[-1]["content_b64"] = content_b64
+                transcript[-1]["content_sha256"] = hashlib.sha256(decoded).hexdigest()
                 transcript[-1]["response_sha"] = response["sha"]
                 with open(transcript_path, "w", encoding="utf-8") as handle:
                     json.dump(transcript, handle, separators=(",", ":"))
@@ -1049,12 +1085,24 @@ def _assert_blob_payloads(
     if len(blob_entries) != len(EXPECTED_PATHS):
         fail(f"{result.scenario.name}: {label} expected three blob payloads")
     for path, blob_entry in zip(EXPECTED_PATHS, blob_entries):
+        payload = blob_entry.get("payload")
+        if (
+            not isinstance(payload, dict)
+            or set(payload) != {"content", "encoding"}
+            or payload.get("encoding") != "base64"
+            or not isinstance(payload.get("content"), str)
+        ):
+            fail(f"{result.scenario.name}: {label} blob transcript lacks exact stdin payload for {path}")
+        if payload["content"] != blob_entry.get("content_b64"):
+            fail(f"{result.scenario.name}: {label} blob transcript content mismatch for {path}")
         try:
-            actual_bytes = base64.b64decode(blob_entry["content_b64"], validate=True)
+            actual_bytes = base64.b64decode(payload["content"], validate=True)
         except (KeyError, ValueError):
             fail(f"{result.scenario.name}: {label} blob transcript lacks valid content for {path}")
         if actual_bytes != expected_files[path]:
             fail(f"{result.scenario.name}: {label} bytes differ for {path}")
+        if blob_entry.get("content_sha256") != hashlib.sha256(actual_bytes).hexdigest():
+            fail(f"{result.scenario.name}: {label} blob transcript digest mismatch for {path}")
 
 
 def check_runtime(block: str) -> int:
@@ -1163,7 +1211,7 @@ def check_runtime(block: str) -> int:
                 fail(f"normal: ref update was not strict: {patch!r}")
             if result.output_file:
                 fail(f"normal: unexpected output {result.output_file!r}")
-            if [entry.get("fields", {}).get("content_sha256") for entry in blob_entries] != result.blob_digests:
+            if [entry.get("content_sha256") for entry in blob_entries] != result.blob_digests:
                 fail("normal: blob transcript does not match prepared files")
         elif scenario.name == "final-force-false-conflict":
             _assert_failure(result)
@@ -1206,6 +1254,34 @@ def check_mutations(source: str) -> int:
         "          fi\n"
     )
     tree_line = '              {path:"windows-client/Directory.Build.props",mode:"100644",type:"blob",sha:$windows_props_sha}\n'
+    blob_stdin = (
+        '          create_blob() {\n'
+        '            local path="$1"\n'
+        '            base64 --wrap=0 "$path" |\n'
+        '              jq -Rs \'{content:.,encoding:"base64"}\' |\n'
+        '              gh api \\\n'
+        '                --method POST \\\n'
+        "                -H 'Accept: application/vnd.github+json' \\\n"
+        "                -H 'X-GitHub-Api-Version: 2022-11-28' \\\n"
+        '                "repos/$REPOSITORY/git/blobs" \\\n'
+        '                --input - --jq \'.sha\'\n'
+        '          }\n'
+    )
+    blob_argv = (
+        '          create_blob() {\n'
+        '            local path="$1"\n'
+        '            local encoded\n'
+        '            encoded="$(base64 --wrap=0 "$path")"\n'
+        '            gh api \\\n'
+        '              --method POST \\\n'
+        "              -H 'Accept: application/vnd.github+json' \\\n"
+        "              -H 'X-GitHub-Api-Version: 2022-11-28' \\\n"
+        '              "repos/$REPOSITORY/git/blobs" \\\n'
+        '              -f "content=$encoded" \\\n'
+        '              -f encoding=base64 \\\n'
+        "              --jq '.sha'\n"
+        '          }\n'
+    )
     mutations = [
         ("trusted-checkout-pr-head", "          ref: refs/heads/main\n", "          ref: ${{ github.event.pull_request.head.sha }}\n"),
         ("force-true", "            -F force=false \\\n", "            -F force=true \\\n"),
@@ -1243,6 +1319,7 @@ def check_mutations(source: str) -> int:
             work_assignment,
             work_assignment + '          printf probe > "$GITHUB_WORKSPACE/probe"\n',
         ),
+        ("blob-content-argv", blob_stdin, blob_argv),
     ]
     for name, old, new in mutations:
         mutated = _replace_once(source, old, new, name)

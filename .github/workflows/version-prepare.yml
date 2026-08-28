@@ -181,16 +181,14 @@ jobs:
 
           create_blob() {
             local path="$1"
-            local encoded
-            encoded="$(base64 --wrap=0 "$path")"
-            gh api \
-              --method POST \
-              -H 'Accept: application/vnd.github+json' \
-              -H 'X-GitHub-Api-Version: 2022-11-28' \
-              "repos/$REPOSITORY/git/blobs" \
-              -f "content=$encoded" \
-              -f encoding=base64 \
-              --jq '.sha'
+            base64 --wrap=0 "$path" |
+              jq -Rs '{content:.,encoding:"base64"}' |
+              gh api \
+                --method POST \
+                -H 'Accept: application/vnd.github+json' \
+                -H 'X-GitHub-Api-Version: 2022-11-28' \
+                "repos/$REPOSITORY/git/blobs" \
+                --input - --jq '.sha'
           }
           cargo_toml_blob="$(create_blob "$next/Cargo.toml")"
           cargo_lock_blob="$(create_blob "$next/Cargo.lock")"
