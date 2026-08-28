@@ -1,13 +1,14 @@
 # Copyright (C) 2026 salty919
 # SPDX-License-Identifier: GPL-3.0-only
 
-name: Rust
+# Native quality is called by the Windows workflow for pull requests.  This
+# file intentionally has no push/pull_request trigger: a second workflow run
+# would repeat the native gate after merge and would make its evidence
+# unrelated to the release candidate.
+name: Native quality (reusable)
 
 on:
-  push:
-    branches: [ "main" ]
-  pull_request:
-    branches: [ "main" ]
+  workflow_call:
 
 permissions:
   contents: read
@@ -16,27 +17,49 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  build:
-
+  native-quality:
+    name: native-quality
     runs-on: ubuntu-latest
-
     steps:
-    - uses: actions/checkout@v4
-    - name: Install required test tools
-      run: sudo apt-get update && sudo apt-get install --no-install-recommends --yes ripgrep sqlite3 xvfb xauth x11-utils x11-apps libxkbcommon-x11-0
-    - name: Build
-      run: cargo build --verbose --locked
-    - name: Format check
-      run: cargo fmt --check
-    - name: Check
-      run: cargo check --locked
-    - name: Run tests
-      run: cargo test --verbose --locked
-    - name: Release build
-      run: cargo build --release --locked
-    - name: Recorder daemon live acceptance
-      run: xvfb-run --auto-servernum --server-args='-screen 0 1280x800x24' bash scripts/record_daemon_e2e.sh
-    - name: Enforce data protection policy
-      run: bash scripts/data_protection_gate.sh
-    - name: Enforce cross-client regression checks
-      run: xvfb-run --auto-servernum --server-args='-screen 0 1280x800x24' bash scripts/regression_guard.sh
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Install required native quality tools
+        run: sudo apt-get update && sudo apt-get install --no-install-recommends --yes ripgrep sqlite3 xvfb xauth x11-utils x11-apps libxkbcommon-x11-0
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Run native regression quality gate
+        run: xvfb-run --auto-servernum --server-args='-screen 0 1280x800x24' bash scripts/regression_guard.sh
+      - name: Run recorder daemon live acceptance
+        run: xvfb-run --auto-servernum --server-args='-screen 0 1280x800x24' bash scripts/record_daemon_e2e.sh
+      - name: Run data protection quality gate
+        run: bash scripts/data_protection_gate.sh
+      - name: Write native quality evidence
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts/native-quality
+          source_sha="$(git rev-parse HEAD)"
+          tree_sha="$(git rev-parse 'HEAD^{tree}')"
+          [[ "$source_sha" == "$GITHUB_SHA" ]] || {
+            echo "native quality checkout SHA does not match the workflow SHA" >&2
+            exit 1
+          }
+          cat > artifacts/native-quality/native-quality.txt <<EOF
+          schema: codex-info-quality-v1
+          quality: native
+          source-sha: $source_sha
+          tree-sha: $tree_sha
+          regression-guard: PASS
+          recorder-daemon: PASS
+          data-protection: PASS
+          native-quality: PASS
+          EOF
+          (
+            cd artifacts/native-quality
+            sha256sum native-quality.txt > SHA256SUMS
+          )
+      - name: Upload native quality evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-quality
+          path: artifacts/native-quality
+          if-no-files-found: error

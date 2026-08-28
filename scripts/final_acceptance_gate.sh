@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# This is the release boundary.  It is intentionally fail-closed: a local
-# developer may run the deterministic Rust checks, but release acceptance also
-# requires the raw Windows UI Automation evidence produced by the Windows
-# runner.  No environment variable can replace that evidence.
+# This is the single PR acceptance boundary.  It is intentionally
+# fail-closed, but evidence-only: native, Windows, and UI jobs own execution
+# and upload immutable result bundles; this script only joins and verifies
+# those bundles.  No environment variable can replace the evidence.
 ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 
@@ -16,6 +16,12 @@ hold() {
 evidence_dir="${1:-${WINDOWS_E2E_EVIDENCE_DIR:-}}"
 [[ -n "$evidence_dir" ]] || hold "Windows UI E2E evidence directory is required"
 [[ -d "$evidence_dir" ]] || hold "Windows UI E2E evidence directory is missing: $evidence_dir"
+native_evidence_dir="${2:-${NATIVE_QUALITY_EVIDENCE_DIR:-}}"
+windows_evidence_dir="${3:-${WINDOWS_QUALITY_EVIDENCE_DIR:-}}"
+[[ -n "$native_evidence_dir" ]] || hold "native quality evidence directory is required"
+[[ -n "$windows_evidence_dir" ]] || hold "Windows quality evidence directory is required"
+[[ -d "$native_evidence_dir" ]] || hold "native quality evidence directory is missing: $native_evidence_dir"
+[[ -d "$windows_evidence_dir" ]] || hold "Windows quality evidence directory is missing: $windows_evidence_dir"
 
 log_file="$evidence_dir/windows-client-e2e.log"
 [[ -f "$log_file" ]] || hold "Windows UI E2E log is missing"
@@ -23,35 +29,49 @@ move_log="$evidence_dir/window-move-smoke.log"
 [[ -f "$move_log" ]] || hold "physical window move smoke log is missing"
 expected_sha="${EXPECTED_E2E_SOURCE_SHA:-${GITHUB_SHA:-}}"
 [[ "$expected_sha" =~ ^[0-9a-f]{40}$ ]] || hold "expected E2E source SHA is required"
+expected_tree="${EXPECTED_SOURCE_TREE_SHA:-$(git rev-parse 'HEAD^{tree}' 2>/dev/null || true)}"
+[[ "$expected_tree" =~ ^[0-9a-f]{40}$ ]] || hold "expected source tree SHA is required"
 if [[ -n "$(git status --porcelain=v1 --untracked-files=all)" ]]; then
     hold "source tree is dirty; release evidence must match a clean committed revision"
 fi
-rg -q --fixed-strings "source-sha: $expected_sha" "$log_file" \
+current_sha="$(git rev-parse HEAD 2>/dev/null || true)"
+current_tree="$(git rev-parse 'HEAD^{tree}' 2>/dev/null || true)"
+[[ "$current_sha" == "$expected_sha" ]] ||
+    hold "checked out source SHA does not match expected source SHA: current=$current_sha expected=$expected_sha"
+[[ "$current_tree" == "$expected_tree" ]] ||
+    hold "checked out source tree does not match expected tree: current=$current_tree expected=$expected_tree"
+
+bash scripts/quality_artifact_gate.sh \
+    "$native_evidence_dir" "$windows_evidence_dir" "$evidence_dir" \
+    "$expected_sha" "$expected_tree" \
+    || hold "quality artifact verification failed"
+
+grep -Fq -- "source-sha: $expected_sha" "$log_file" \
     || hold "Windows UI E2E evidence was not produced from expected source SHA: $expected_sha"
-rg -q --fixed-strings "source-sha: $expected_sha" "$move_log" \
+grep -Fq -- "source-sha: $expected_sha" "$move_log" \
     || hold "physical window move smoke evidence was not produced from expected source SHA: $expected_sha"
-rg -q --fixed-strings 'window-move-smoke: PASS' "$move_log" \
+grep -Fq -- 'window-move-smoke: PASS' "$move_log" \
     || hold "physical window move smoke PASS marker is missing"
-if rg -q --fixed-strings 'window-move-smoke: SKIP' "$move_log"; then
+if grep -Fq -- 'window-move-smoke: SKIP' "$move_log"; then
     hold "physical window move smoke was skipped"
 fi
-rg -q --fixed-strings 'fixture: PASS periods=2 threads=3 endpoint=http://127.0.0.1:8787' "$log_file" \
+grep -Fq -- 'fixture: PASS periods=2 threads=3 endpoint=http://127.0.0.1:8787' "$log_file" \
     || hold "Windows fixture PASS marker is missing"
-rg -q --fixed-strings 'main-quota-gauge: seven cells, two X-authority surface colors, and half-period boundary PASS' "$log_file" \
+grep -Fq -- 'main-quota-gauge: seven cells, two X-authority surface colors, and half-period boundary PASS' "$log_file" \
     || hold "Windows quota gauge evidence is missing"
-rg -q --fixed-strings 'main-product-version: PASS' "$log_file" \
+grep -Fq -- 'main-product-version: PASS' "$log_file" \
     || hold "Windows main product-version evidence is missing"
-rg -q --fixed-strings 'child-product-version: PASS role=Graph count=0' "$log_file" \
+grep -Fq -- 'child-product-version: PASS role=Graph count=0' "$log_file" \
     || hold "Windows Graph child product-version evidence is missing"
-rg -q --fixed-strings 'child-product-version: PASS role=Threads count=0' "$log_file" \
+grep -Fq -- 'child-product-version: PASS role=Threads count=0' "$log_file" \
     || hold "Windows Threads child product-version evidence is missing"
-rg -q --fixed-strings 'graph-past-model-data: PASS' "$log_file" \
+grep -Fq -- 'graph-past-model-data: PASS' "$log_file" \
     || hold "Windows past-period graph model-data evidence is missing"
-rg -q --fixed-strings 'graph-past-idle-band: PASS' "$log_file" \
+grep -Fq -- 'graph-past-idle-band: PASS' "$log_file" \
     || hold "Windows past-period idle-band color evidence is missing"
-rg -q --fixed-strings 'main-details-status: PASS (matching status/details generation accepted)' "$log_file" \
+grep -Fq -- 'main-details-status: PASS (matching status/details generation accepted)' "$log_file" \
     || hold "Windows main status/details generation evidence is missing"
-rg -q --fixed-strings 'windows-client-e2e: PASS' "$log_file" \
+grep -Fq -- 'windows-client-e2e: PASS' "$log_file" \
     || hold "Windows UI Automation PASS marker is missing"
 
 # The E2E path is finite by design.  Require every named observation rather
@@ -85,7 +105,7 @@ for capture_name in "${required_captures[@]}"; do
     png_signature="$(head -c 8 "$capture_path" | od -An -tx1 | tr -d '[:space:]')"
     [[ "$png_signature" == '89504e470d0a1a0a' ]] ||
         hold "Windows UI screenshot is not a PNG: $capture_name.png"
-    capture_line="$(rg --fixed-strings "capture: name=$capture_name " "$log_file" | tail -n 1 || true)"
+    capture_line="$(grep -F -- "capture: name=$capture_name " "$log_file" | tail -n 1 || true)"
     [[ -n "$capture_line" ]] || hold "Windows UI capture hash marker is missing: $capture_name.png"
     logged_hash="$(sed -n 's/.* sha256=\([0-9a-fA-F]\{64\}\) .*/\1/p' <<<"$capture_line" | tr '[:upper:]' '[:lower:]')"
     [[ "$logged_hash" =~ ^[0-9a-f]{64}$ ]] || hold "Windows UI capture hash marker is malformed: $capture_name.png"
@@ -93,11 +113,4 @@ for capture_name in "${required_captures[@]}"; do
     [[ "$actual_hash" == "$logged_hash" ]] || hold "Windows UI screenshot hash does not match its E2E log: $capture_name.png"
 done
 
-command -v cargo >/dev/null || hold "cargo is unavailable; Rust acceptance was not executed"
-# regression_guard is the single native acceptance owner. It runs format,
-# commit/tree diff checks, all-target check/test (with a non-zero test count),
-# exact mandatory regression tests, and the release build without duplicating
-# those expensive operations here.
-bash scripts/regression_guard.sh || hold "regression guard failed"
-
-echo "final-acceptance-gate: PASS (Rust checks, mandatory history/graph tests, Windows UI E2E, physical window-move smoke, and source-matched screenshots)"
+echo "final-acceptance-gate: PASS (source-matched native, Windows, and UI evidence; physical window-move smoke; and source-matched screenshots)"

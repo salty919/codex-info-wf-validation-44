@@ -268,13 +268,109 @@ require_text src/main.rs 'include_str!("../LICENSE")'
 require_text src/main.rs 'include_str!("../THIRD_PARTY_NOTICES.md")'
 require_text src/main.rs 'i18n.text(TextKey::LegalProtocol)'
 require_text src/main.rs 'i18n.text(TextKey::LegalThirdParty)'
-require_text .github/workflows/windows-client.yml 'needs: [version-policy, core-tests, windows-build, acceptance]'
+require_text .github/workflows/windows-client.yml 'uses: ./.github/workflows/rust.yml'
+require_text .github/workflows/windows-client.yml 'needs: [version-prepared, native-quality, windows-quality, ui-quality]'
 require_text .github/workflows/windows-client.yml 'Run final acceptance gate before merge'
 require_text .github/workflows/windows-client.yml 'windows_window_move_smoke.ps1 -ClientPath $exe -AllowPhysicalInput'
-require_text .github/workflows/windows-client.yml "--logger 'trx;LogFilePrefix=windows-client'"
-require_text .github/workflows/windows-client.yml 'Expected exactly two Windows TRX reports'
-require_text .github/workflows/windows-client.yml 'TRX counters are missing'
-require_text .github/workflows/windows-client.yml 'Windows test counts are not release-safe:'
+require_text .github/workflows/windows-client.yml 'WINDOWS_CONTRACT_EVIDENCE_DIR'
+ui_quality_scope="$(
+    awk '
+        $0 == "      - name: Write UI quality evidence" {
+            capturing = 1
+            next
+        }
+        capturing && $0 ~ /^      - name:/ { exit }
+        capturing { print }
+    ' .github/workflows/windows-client.yml
+)"
+[[ -n "$ui_quality_scope" ]] || fail 'missing Write UI quality evidence step body'
+require_ui_quality_text() {
+    local pattern="$1"
+    rg -q --fixed-strings -- "$pattern" <<<"$ui_quality_scope" ||
+        fail "missing in Write UI quality evidence step: $pattern"
+}
+require_ui_quality_text '$qualityLines'
+require_ui_quality_text '$qualityPath'
+require_ui_quality_text 'ui-quality.txt'
+require_ui_quality_text '$hashLines'
+require_ui_quality_text '$manifestPath'
+require_ui_quality_text 'SHA256SUMS'
+require_ui_quality_text '[System.Text.UTF8Encoding]::new($false)'
+require_ui_quality_text '[System.IO.File]::WriteAllText('
+require_ui_quality_text '$qualityLines -join "`n"'
+require_ui_quality_text '$hashLines -join "`n"'
+if rg -q --fixed-strings -- 'Set-Content' <<<"$ui_quality_scope"; then
+    fail 'Write UI quality evidence must not use Set-Content'
+fi
+write_all_text_count="$(rg -o --fixed-strings '[System.IO.File]::WriteAllText(' <<<"$ui_quality_scope" | wc -l)"
+[[ "$write_all_text_count" -eq 2 ]] ||
+    fail "UI quality marker and SHA256SUMS must each use WriteAllText: count=$write_all_text_count"
+utf8_no_bom_count="$(rg -o --fixed-strings '[System.Text.UTF8Encoding]::new($false)' <<<"$ui_quality_scope" | wc -l)"
+[[ "$utf8_no_bom_count" -eq 1 ]] ||
+    fail "UI quality evidence must declare one UTF-8 no-BOM encoding: count=$utf8_no_bom_count"
+quality_lines_line="$(rg -n -m1 --fixed-strings '$qualityLines = @(' <<<"$ui_quality_scope" | cut -d: -f1)"
+quality_write_line="$(rg -n -m1 --fixed-strings '[System.IO.File]::WriteAllText(' <<<"$ui_quality_scope" | cut -d: -f1)"
+hash_lines_line="$(rg -n -m1 --fixed-strings '$hashLines = @(' <<<"$ui_quality_scope" | cut -d: -f1)"
+manifest_write_line="$(rg -n -m2 --fixed-strings '[System.IO.File]::WriteAllText(' <<<"$ui_quality_scope" | tail -n1 | cut -d: -f1)"
+[[ -n "$quality_lines_line" && -n "$quality_write_line" && -n "$hash_lines_line" && -n "$manifest_write_line" ]] ||
+    fail 'UI quality marker and manifest writer ordering markers are incomplete'
+(( quality_lines_line < quality_write_line && quality_write_line < hash_lines_line && hash_lines_line < manifest_write_line )) ||
+    fail 'UI quality lines must be written before SHA256SUMS is calculated and written'
+workflow_contract_scope="$(
+    awk '
+        $0 == "  windows-quality:" {
+            in_windows_quality = 1
+            next
+        }
+        in_windows_quality && $0 ~ /^  [[:alnum:]_-]+:/ {
+            exit
+        }
+        in_windows_quality &&
+            $0 == "      - name: Export Windows contract evidence directory" {
+            export_name_count++
+            export_name_line = NR
+        }
+        in_windows_quality && index($0, "WINDOWS_CONTRACT_EVIDENCE_DIR=") {
+            assignment_count++
+        }
+        in_windows_quality && $0 ~ /^        run: printf / &&
+            index($0, "WINDOWS_CONTRACT_EVIDENCE_DIR=$RUNNER_TEMP/codex-info-windows-contract") &&
+            index($0, ">> \"$GITHUB_ENV\"") {
+            export_command_count++
+            export_command_line = NR
+        }
+        in_windows_quality &&
+            $0 == "      - name: Enforce Windows feature contract and tests" {
+            enforce_line = NR
+        }
+        in_windows_quality && $0 == "      - name: Write Windows quality evidence" {
+            write_line = NR
+        }
+        in_windows_quality && $0 ~ /^[[:space:]]+WINDOWS_CONTRACT_EVIDENCE_DIR:/ {
+            yaml_env_count++
+        }
+        END {
+            printf "%d %d %d %d %d %d %d %d\n",
+                export_name_count + 0,
+                export_command_count + 0,
+                assignment_count + 0,
+                yaml_env_count + 0,
+                export_name_line + 0,
+                export_command_line + 0,
+                enforce_line + 0,
+                write_line + 0
+        }
+    ' .github/workflows/windows-client.yml
+)"
+read -r export_name_count export_command_count assignment_count yaml_env_count \
+    export_name_line export_command_line enforce_line write_line <<<"$workflow_contract_scope"
+[[ "$export_name_count" -eq 1 && "$export_command_count" -eq 1 &&
+    "$assignment_count" -eq 1 && "$yaml_env_count" -eq 0 ]] ||
+    fail "Windows contract evidence export must be singular and non-YAML: name=$export_name_count command=$export_command_count assignment=$assignment_count yaml=$yaml_env_count"
+[[ "$export_command_line" -eq $((export_name_line + 2)) &&
+    "$export_command_line" -lt "$enforce_line" && "$enforce_line" -lt "$write_line" ]] ||
+    fail "Windows contract evidence export must precede both consumer steps"
+require_text .github/workflows/windows-client.yml 'windows-tests: PASS'
 require_text .github/workflows/windows-client.yml 'bash scripts/final_acceptance_gate.sh artifacts/windows-ui-e2e'
 require_text .github/workflows/windows-client.yml '-SourceSha $env:GITHUB_SHA'
 require_text .github/workflows/windows-client.yml 'EXPECTED_E2E_SOURCE_SHA: ${{ github.sha }}'
@@ -285,23 +381,39 @@ require_text scripts/final_acceptance_gate.sh 'source-sha: $expected_sha'
 require_text scripts/final_acceptance_gate.sh 'capture: name=$capture_name '
 require_text scripts/final_acceptance_gate.sh 'sha256sum "$capture_path"'
 require_text scripts/final_acceptance_gate.sh 'window-move-smoke: PASS'
+require_text scripts/final_acceptance_gate.sh 'grep -Fq --'
+require_text scripts/final_acceptance_gate.sh 'grep -F --'
+require_file scripts/final_acceptance_gate_test.sh
+require_text scripts/final_acceptance_gate_test.sh 'final-acceptance-gate-test: PASS cases=$cases'
+require_text scripts/final_acceptance_gate_test.sh 'isolated acceptance PATH unexpectedly contains rg'
 require_text .github/workflows/windows-client.yml 'cancel-in-progress: false'
-for native_trigger in 'Cargo.toml' 'Cargo.lock' 'build.rs' 'run.sh' 'src/**' 'protocol/**' 'tests/**' 'ui/**' 'assets/**' 'LICENSE' 'LICENSE.ja.md' 'deny.toml' '.cargo/config.toml' 'scripts/**' 'docs/**'; do
-    require_text .github/workflows/windows-client.yml "      - \"$native_trigger\""
-done
-require_text .github/workflows/windows-client.yml 'dtolnay/rust-toolchain@stable'
-require_text .github/workflows/windows-client.yml 'x11-apps'
-regression_step_line="$(rg -n 'name: Enforce regression checks' .github/workflows/windows-client.yml | head -n 1 | cut -d: -f1)"
-windows_contract_step_line="$(rg -n 'name: Enforce Windows feature contract' .github/workflows/windows-client.yml | head -n 1 | cut -d: -f1)"
-[[ -n "$regression_step_line" && -n "$windows_contract_step_line" &&
-    "$regression_step_line" -lt "$windows_contract_step_line" ]] ||
-    fail 'X/native regression checks must run before the Windows feature contract gate'
-final_gate_line="$(rg -n 'bash scripts/final_acceptance_gate.sh artifacts/windows-ui-e2e' .github/workflows/windows-client.yml | cut -d: -f1 | tail -n 1)"
-[[ -n "$final_gate_line" ]] || fail 'final acceptance gate invocation is missing'
-if ! sed -n "$((final_gate_line - 4)),${final_gate_line}p" .github/workflows/windows-client.yml |
-    rg -q --fixed-strings 'dtolnay/rust-toolchain@stable'; then
-    fail 'final acceptance gate must install the pinned Rust toolchain before running'
+require_text .github/workflows/windows-client.yml 'pull_request_target:'
+require_text .github/workflows/windows-client.yml 'types: [closed]'
+require_text .github/workflows/windows-client.yml 'version-prepared:'
+require_text .github/workflows/windows-client.yml 'contents: read'
+require_text .github/workflows/windows-client.yml "if: github.event_name == 'pull_request_target' && github.event.pull_request.merged == true"
+require_file .github/workflows/version-prepare.yml
+require_text .github/workflows/version-prepare.yml 'pull_request_target:'
+require_text .github/workflows/version-prepare.yml 'ref: refs/heads/main'
+require_text .github/workflows/version-prepare.yml 'persist-credentials: false'
+require_text .github/workflows/version-prepare.yml 'python3 scripts/product_version.py bump --expected "$base_version"'
+require_text .github/workflows/version-prepare.yml 'force=false'
+if rg -q --fixed-strings 'ref: ${{ github.event.pull_request.head.sha }}' .github/workflows/version-prepare.yml ||
+   rg -q --fixed-strings 'checks: write' .github/workflows/version-prepare.yml; then
+    fail 'trusted version preparer must not checkout PR code or own a duplicate check result'
 fi
+if rg -q '^  push:' .github/workflows/windows-client.yml; then
+    fail 'main push must not rerun PR quality or release tests'
+fi
+require_text .github/workflows/rust.yml 'dtolnay/rust-toolchain@stable'
+require_text .github/workflows/rust.yml 'x11-apps'
+require_text .github/workflows/rust.yml 'cd artifacts/native-quality'
+require_text .github/workflows/rust.yml 'sha256sum native-quality.txt > SHA256SUMS'
+if rg -q --fixed-strings -- 'sha256sum artifacts/native-quality/native-quality.txt' .github/workflows/rust.yml; then
+    fail 'native quality manifest must use bundle-relative paths'
+fi
+final_gate_line="$(rg -n 'bash scripts/final_acceptance_gate.sh artifacts/windows-ui-e2e' .github/workflows/windows-client.yml | cut -d: -f1 | head -n 1)"
+[[ -n "$final_gate_line" ]] || fail 'final acceptance gate invocation is missing'
 require_text scripts/regression_guard.sh 'cargo check --locked --all-targets'
 require_text scripts/regression_guard.sh 'cargo test --locked --all-targets'
 require_text scripts/regression_guard.sh 'cargo build --release --locked'
@@ -309,7 +421,6 @@ require_text scripts/regression_guard.sh '--exact --nocapture'
 require_text scripts/regression_guard.sh 'Rust all-target test set contains a zero-test target'
 require_text scripts/regression_guard.sh 'X11 graph visual gate unverified (DISPLAY unavailable)'
 require_text .github/workflows/rust.yml 'xvfb-run --auto-servernum'
-require_text .github/workflows/windows-client.yml 'xvfb-run --auto-servernum'
 for required_history_test in \
     historical_week_fixture_preserves_each_period_and_graph_samples \
     observed_moving_reset_sequence_keeps_the_spend_in_the_selected_graph \
@@ -348,8 +459,14 @@ done
 require_text .github/workflows/windows-client.yml 'Get-GitHubResourceStatus'
 require_text .github/workflows/windows-client.yml 'gh api --method POST "repos/$repository/git/refs"'
 require_text .github/workflows/windows-client.yml 'gh api --method POST "repos/$repository/releases"'
-require_text .github/workflows/windows-client.yml '$draftReleaseEndpoint = "repos/$repository/releases/$($createdRelease.id)"'
+require_text .github/workflows/windows-client.yml 'python3 scripts/release_state_gate.py created --tag $tag'
+require_text .github/workflows/windows-client.yml '$createdReleaseId = [long]$createdRelease.id'
+require_text .github/workflows/windows-client.yml '$draftReleaseEndpoint = "repos/$repository/releases/$createdReleaseId"'
+require_text .github/workflows/windows-client.yml 'python3 scripts/release_state_gate.py draft `'
+require_text .github/workflows/windows-client.yml 'python3 scripts/release_state_gate.py tag --sha $env:EXPECTED_MERGE_SHA'
+require_text .github/workflows/windows-client.yml 'python3 scripts/release_state_gate.py published `'
 require_text .github/workflows/windows-client.yml 'gh release upload $tag $setup $manifest'
+require_text .github/workflows/windows-client.yml 'gh api --method PATCH "repos/$repository/releases/$createdReleaseId"'
 require_text .github/workflows/windows-client.yml '-F draft=false'
 require_file windows-client/src/CodexInfo.WindowsClient/Settings/ClientSettingsSession.cs
 require_text windows-client/src/CodexInfo.WindowsClient/Settings/ClientSettingsSession.cs 'SettingsCorrupt = false'
@@ -534,7 +651,8 @@ if rg -q --fixed-strings 'Start-Sleep' windows-client/tools/Measure-WindowsGraph
 fi
 require_text docs/WINDOWS_CLIENT_REQUIREMENTS.md 'WIN-PAR-13'
 require_text docs/WINDOWS_CLIENT_REQUIREMENTS.md 'WIN-INSTALL-01'
-require_text docs/REGRESSION_PREVENTION_POLICY.md 'windows_window_move_smoke.ps1 -AllowPhysicalInput'
+require_text docs/REGRESSION_PREVENTION_POLICY.md '物理window move証拠'
+require_text docs/REGRESSION_PREVENTION_POLICY.md 'CI受入時の`-AllowPhysicalInput`実行ログ'
 require_text .github/workflows/windows-client.yml '$moveSmokeOutput = @(& ./scripts/windows_window_move_smoke.ps1'
 require_text .github/workflows/windows-client.yml "[string]\$moveSmokeOutput[-1] -ne 'window-move-smoke: PASS'"
 if rg -q --fixed-strings 'if ($LASTEXITCODE -ne 0) { throw '\''Physical window move smoke failed.'\'' }' .github/workflows/windows-client.yml; then
@@ -542,6 +660,11 @@ if rg -q --fixed-strings 'if ($LASTEXITCODE -ne 0) { throw '\''Physical window m
 fi
 require_file scripts/x11_graph_visual_gate.sh
 require_file scripts/x11_startup_visual_gate.sh
+require_file scripts/workflow_quality_gate.py
+require_file scripts/ci_trust_fixture.py
+require_file scripts/release_candidate_gate.sh
+require_file scripts/release_candidate_gate_test.sh
+require_file scripts/release_state_gate.py
 require_file docs/REQUIREMENTS_LEDGER.md
 for required_ledger_id in X-START-01 X-START-02 X-START-03 X-GRAPH-01 X-THREAD-01 WIN-START-01 WIN-GRAPH-01 WIN-VERSION-01 PROC-LEDGER-01; do
     require_text docs/REQUIREMENTS_LEDGER.md "| $required_ledger_id |"
@@ -553,9 +676,29 @@ require_text scripts/x11_graph_visual_gate.sh 'implausible vertical stroke'
 require_text docs/PRODUCT_REQUIREMENTS.md '# Codex Info 製品要件'
 require_file windows-client/CodeCoverage.runsettings
 
+# These finite fixtures are owned by this contract gate.  They exercise the
+# workflow/release trust boundaries without repeating a product build, unit
+# test suite, UI run, or acceptance job.
+PYTHONDONTWRITEBYTECODE=1 python3 scripts/workflow_quality_gate.py --self-test
+PYTHONDONTWRITEBYTECODE=1 python3 scripts/ci_trust_fixture.py --self-test
+bash scripts/final_acceptance_gate_test.sh
+bash scripts/release_candidate_gate_test.sh
+PYTHONDONTWRITEBYTECODE=1 python3 scripts/release_state_gate.py --self-test
+
 if command -v dotnet >/dev/null 2>&1; then
+    contract_evidence_dir="${WINDOWS_CONTRACT_EVIDENCE_DIR:-}"
+    if [[ -n "$contract_evidence_dir" ]]; then
+        [[ ! -e "$contract_evidence_dir" ]] ||
+            fail "Windows contract evidence directory already exists: $contract_evidence_dir"
+        mkdir -p "$contract_evidence_dir"
+    fi
     coverage_results="$(mktemp -d "${TMPDIR:-/tmp}/codex-info-windows-coverage.XXXXXX")"
-    trap 'rm -rf -- "$coverage_results"' EXIT
+    trap '
+        if [[ -n "${contract_evidence_dir:-}" ]]; then
+            cp -R "$coverage_results"/. "$contract_evidence_dir"/
+        fi
+        rm -rf -- "$coverage_results"
+    ' EXIT
     dotnet restore windows-client/CodexInfo.WindowsClient.sln --locked-mode
     dotnet_test_output="$(dotnet test windows-client/CodexInfo.WindowsClient.sln \
         --no-restore \

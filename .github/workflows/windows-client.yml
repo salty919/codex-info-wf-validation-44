@@ -4,206 +4,131 @@
 name: Windows client
 
 on:
-  push:
-    branches: ["main"]
-    paths:
-      - "windows-client/**"
-      - "windows-client/installer/**"
-      - "docs/WINDOWS_CLIENT.md"
-      - "docs/WINDOWS_CLIENT_REQUIREMENTS.md"
-      - "docs/REST_API_V1.md"
-      - "THIRD_PARTY_NOTICES.md"
-      - "COPYRIGHT"
-      - "LICENSES/**"
-      - "assets/NOTICE.txt"
-      - "docs/DATA_PROTECTION_POLICY.md"
-      - "scripts/data_protection_gate.sh"
-      - "scripts/windows_client_contract_gate.sh"
-      - "scripts/regression_guard.sh"
-      - "scripts/final_acceptance_gate.sh"
-      - "docs/REGRESSION_PREVENTION_POLICY.md"
-      - "docs/PRODUCT_REQUIREMENTS.md"
-      - "Cargo.toml"
-      - "Cargo.lock"
-      - "build.rs"
-      - "run.sh"
-      - "src/**"
-      - "protocol/**"
-      - "tests/**"
-      - "ui/**"
-      - "assets/**"
-      - "LICENSE"
-      - "LICENSE.ja.md"
-      - "deny.toml"
-      - ".cargo/config.toml"
-      - "scripts/**"
-      - "docs/**"
-      - ".github/workflows/windows-client.yml"
   pull_request:
     branches: ["main"]
-    paths:
-      - "windows-client/**"
-      - "windows-client/installer/**"
-      - "docs/WINDOWS_CLIENT.md"
-      - "docs/WINDOWS_CLIENT_REQUIREMENTS.md"
-      - "docs/REST_API_V1.md"
-      - "THIRD_PARTY_NOTICES.md"
-      - "COPYRIGHT"
-      - "LICENSES/**"
-      - "assets/NOTICE.txt"
-      - "docs/DATA_PROTECTION_POLICY.md"
-      - "scripts/data_protection_gate.sh"
-      - "scripts/windows_client_contract_gate.sh"
-      - "scripts/regression_guard.sh"
-      - "scripts/final_acceptance_gate.sh"
-      - "docs/REGRESSION_PREVENTION_POLICY.md"
-      - "docs/PRODUCT_REQUIREMENTS.md"
-      - "Cargo.toml"
-      - "Cargo.lock"
-      - "build.rs"
-      - "run.sh"
-      - "src/**"
-      - "protocol/**"
-      - "tests/**"
-      - "ui/**"
-      - "assets/**"
-      - "LICENSE"
-      - "LICENSE.ja.md"
-      - "deny.toml"
-      - ".cargo/config.toml"
-      - "scripts/**"
-      - "docs/**"
-      - ".github/workflows/windows-client.yml"
+    types: [opened, synchronize, reopened, ready_for_review]
+  pull_request_target:
+    branches: ["main"]
+    types: [closed]
 
 permissions:
   contents: read
 
-# Main pushes are queued instead of cancelled so two version changes cannot
-# race between the existence check and the atomic tag creation.
 concurrency:
-  group: windows-client-${{ github.workflow }}-${{ github.ref }}
+  group: windows-client-${{ github.event_name == 'pull_request_target' && 'release-main' || github.event.pull_request.number }}
   cancel-in-progress: false
 
 jobs:
-  version-policy:
+  version-prepared:
+    if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     outputs:
+      ready: ${{ steps.version.outputs.ready }}
       version: ${{ steps.version.outputs.version }}
-      changed: ${{ steps.version.outputs.changed }}
-      upward: ${{ steps.version.outputs.upward }}
-      release: ${{ steps.version.outputs.release }}
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - name: Run release decision fixtures
-        shell: pwsh
-        run: ./windows-client/tools/Test-WindowsReleaseDecision.ps1
-      - name: Validate stable version policy
+          ref: ${{ github.event.pull_request.head.sha }}
+      # The trusted preparer owns `python3 scripts/product_version.py bump --expected "$base_version"`
+      # on temporary API data.  This pull_request job only reads PR data and
+      # never has a token that can mutate contents or checks.
+      - name: Verify the exact next patch version
         id: version
-        shell: pwsh
+        shell: bash
         env:
-          EVENT_NAME: ${{ github.event_name }}
-          EVENT_BEFORE: ${{ github.event.before }}
-          BASE_REF: ${{ github.base_ref }}
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_REF: ${{ github.event.pull_request.head.ref }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
-          $ErrorActionPreference = 'Stop'
-          $propsPath = 'windows-client/Directory.Build.props'
-          $baseCommit = $null
-          if ($env:EVENT_NAME -eq 'pull_request') {
-            $baseCommit = $env:BASE_SHA
-            if ([string]::IsNullOrWhiteSpace($baseCommit)) {
-              $baseCommit = (& git merge-base HEAD "origin/$env:BASE_REF").Trim()
-            }
+          set -euo pipefail
+          [[ "$(git rev-parse HEAD)" == "$HEAD_SHA" ]] || {
+            echo 'version policy checkout does not match the PR head SHA' >&2
+            exit 1
           }
-          else {
-            $baseCommit = $env:EVENT_BEFORE
-            if ([string]::IsNullOrWhiteSpace($baseCommit) -or $baseCommit -match '^0+$') {
-              $parent = & git rev-parse HEAD^ 2>$null
-              if ($LASTEXITCODE -eq 0) {
-                $baseCommit = $parent.Trim()
-              }
-              else {
-                $baseCommit = $null
-              }
-            }
-          }
+          base="$RUNNER_TEMP/base-version"
+          mkdir -p "$base/windows-client"
+          git show "$BASE_SHA:Cargo.toml" > "$base/Cargo.toml"
+          git show "$BASE_SHA:Cargo.lock" > "$base/Cargo.lock"
+          git show "$BASE_SHA:windows-client/Directory.Build.props" > "$base/windows-client/Directory.Build.props"
+          base_version="$(python3 scripts/product_version.py check --cargo-toml "$base/Cargo.toml" --cargo-lock "$base/Cargo.lock" --windows-props "$base/windows-client/Directory.Build.props" | sed -n 's/^version=//p')"
+          current_version="$(python3 scripts/product_version.py check | sed -n 's/^version=//p')"
+          next_version="$(python3 scripts/product_version.py next --version "$base_version" | sed -n 's/^version=//p')"
+          if [[ "$current_version" == "$next_version" ]]; then
+            printf 'ready=true\nversion=%s\n' "$current_version" >> "$GITHUB_OUTPUT"
+          elif [[ "$current_version" == "$base_version" ]]; then
+            echo "trusted version preparation has not committed $next_version to this head" >&2
+            exit 1
+          else
+            echo "PR version must be base $base_version or exact next patch $next_version; found $current_version" >&2
+            exit 1
+          fi
 
-          $basePropsPath = $null
-          if (-not [string]::IsNullOrWhiteSpace($baseCommit)) {
-            & git cat-file -e "${baseCommit}^{commit}" 2>$null
-            if ($LASTEXITCODE -ne 0) {
-              throw "Version comparison base is not a readable commit: $baseCommit"
-            }
+  native-quality:
+    if: github.event_name == 'pull_request' && needs.version-prepared.outputs.ready == 'true'
+    needs: [version-prepared]
+    uses: ./.github/workflows/rust.yml
+    permissions:
+      contents: read
 
-            $baseEntries = @(& git ls-tree --name-only $baseCommit -- $propsPath 2>$null)
-            if ($LASTEXITCODE -ne 0) {
-              throw "Could not inspect version properties at base commit: $baseCommit"
-            }
-            if ($baseEntries.Count -gt 1 -or
-                ($baseEntries.Count -eq 1 -and $baseEntries[0] -ne $propsPath)) {
-              throw "Unexpected version properties tree entry at base commit: $baseCommit"
-            }
-            if ($baseEntries.Count -eq 1) {
-              $basePropsPath = Join-Path $env:RUNNER_TEMP 'codex-info-base-Directory.Build.props'
-              $xmlLines = & git show "${baseCommit}:$propsPath" 2>$null
-              if ($LASTEXITCODE -ne 0) {
-                throw "Could not read version properties at base commit: $baseCommit"
-              }
-              [IO.File]::WriteAllText(
-                $basePropsPath,
-                ($xmlLines -join "`n"),
-                [System.Text.UTF8Encoding]::new($false))
-            }
-            # An exact missing path is the sole first-authority case.
-          }
-
-          $decisionArguments = @{
-            CurrentPropsPath = $propsPath
-            EventName = $env:EVENT_NAME
-            OutputPath = $env:GITHUB_OUTPUT
-          }
-          if ($null -ne $basePropsPath) {
-            $decisionArguments.BasePropsPath = $basePropsPath
-          }
-          $decisionOutputText = (& ./windows-client/tools/Get-WindowsReleaseDecision.ps1 @decisionArguments | Out-String)
-          $versionChanged = $decisionOutputText -match '(?m)^changed=true\s*$'
-          $changedFiles = if ([string]::IsNullOrWhiteSpace($baseCommit)) {
-            @(& git diff --name-only HEAD^ HEAD)
-          }
-          else {
-            @(& git diff --name-only $baseCommit HEAD)
-          }
-          $artifactInputChanged = $changedFiles |
-            Where-Object {
-              $_ -match '^windows-client/(src/|installer/|Directory\.Build\.props$|tools/(Build-WindowsInstaller|New-WindowsUpdateManifest|Collect-ThirdPartyNotices)\.ps1$)'
-            }
-          if ($artifactInputChanged.Count -gt 0 -and -not $versionChanged) {
-            throw "Windows client artifact inputs changed without an upward Directory.Build.props Version change: $($artifactInputChanged -join ', ')"
-          }
-
-  core-tests:
+  windows-quality:
+    if: github.event_name == 'pull_request' && needs.version-prepared.outputs.ready == 'true'
+    needs: [version-prepared]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - name: Install required test tools
-        run: sudo apt-get update && sudo apt-get install --no-install-recommends --yes ripgrep sqlite3 xvfb xauth x11-utils x11-apps libxkbcommon-x11-0
-      - name: Enforce data protection policy
-        run: bash scripts/data_protection_gate.sh
+      - name: Install Windows contract gate tools
+        run: sudo apt-get update && sudo apt-get install --no-install-recommends --yes ripgrep
       - uses: actions/setup-dotnet@v4
         with:
           dotnet-version: "10.0.x"
-      - name: Install Rust toolchain for native regression gate
-        uses: dtolnay/rust-toolchain@stable
-      - name: Enforce regression checks
-        run: xvfb-run --auto-servernum --server-args='-screen 0 1280x800x24' bash scripts/regression_guard.sh
-      - name: Enforce Windows feature contract
+      - name: Export Windows contract evidence directory
+        shell: bash
+        run: printf '%s\n' "WINDOWS_CONTRACT_EVIDENCE_DIR=$RUNNER_TEMP/codex-info-windows-contract" >> "$GITHUB_ENV"
+      - name: Enforce Windows feature contract and tests
         run: bash scripts/windows_client_contract_gate.sh
+      - name: Write Windows quality evidence
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts/windows-quality
+          source_sha="$(git rev-parse HEAD)"
+          tree_sha="$(git rev-parse 'HEAD^{tree}')"
+          [[ "$source_sha" == "$GITHUB_SHA" ]] || {
+            echo "Windows quality checkout SHA does not match the workflow SHA" >&2
+            exit 1
+          }
+          cat > artifacts/windows-quality/windows-quality.txt <<EOF
+          schema: codex-info-quality-v1
+          quality: windows
+          source-sha: $source_sha
+          tree-sha: $tree_sha
+          windows-contract: PASS
+          windows-tests: PASS
+          windows-quality: PASS
+          EOF
+          if [[ -d "$WINDOWS_CONTRACT_EVIDENCE_DIR" ]]; then
+            cp -R "$WINDOWS_CONTRACT_EVIDENCE_DIR"/. artifacts/windows-quality/
+          fi
+          (
+            cd artifacts/windows-quality
+            manifest="$(mktemp)"
+            find . -type f ! -name SHA256SUMS -print0 | sort -z | xargs -0 sha256sum > "$manifest"
+            mv "$manifest" SHA256SUMS
+          )
+      - name: Upload Windows quality evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-quality
+          path: artifacts/windows-quality
+          if-no-files-found: error
 
-  windows-build:
+  ui-quality:
+    if: github.event_name == 'pull_request' && needs.version-prepared.outputs.ready == 'true'
+    needs: [version-prepared]
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -212,49 +137,6 @@ jobs:
       - uses: actions/setup-dotnet@v4
         with:
           dotnet-version: "10.0.x"
-      - name: Restore locked dependencies
-        run: dotnet restore windows-client/CodexInfo.WindowsClient.sln --locked-mode
-      - name: Build Windows client
-        run: dotnet build windows-client/CodexInfo.WindowsClient.sln --no-restore --configuration Release
-      - name: Test REST client and presentation contract
-        shell: pwsh
-        run: |
-          $resultsDirectory = Join-Path $env:RUNNER_TEMP 'codex-info-windows-test-results'
-          if (Test-Path -LiteralPath $resultsDirectory) {
-            Remove-Item -LiteralPath $resultsDirectory -Recurse -Force
-          }
-          New-Item -ItemType Directory -Path $resultsDirectory -Force | Out-Null
-          $testOutput = (& dotnet test windows-client/CodexInfo.WindowsClient.sln --no-restore --configuration Release --results-directory $resultsDirectory --logger 'trx;LogFilePrefix=windows-client' --logger 'console;verbosity=normal' 2>&1 | Out-String)
-          $exitCode = $LASTEXITCODE
-          $testOutput
-          if ($exitCode -ne 0) { throw "Windows tests failed with exit code $exitCode." }
-          $trxFiles = @(Get-ChildItem -LiteralPath $resultsDirectory -Filter '*.trx' -Recurse -File)
-          if ($trxFiles.Count -ne 2) { throw "Expected exactly two Windows TRX reports, found $($trxFiles.Count)." }
-          $totalTests = 0
-          $passedTests = 0
-          $failedTests = 0
-          $notExecutedTests = 0
-          foreach ($trxFile in $trxFiles) {
-            [xml]$trx = Get-Content -LiteralPath $trxFile.FullName -Raw
-            $counters = $trx.SelectSingleNode('/*[local-name()="TestRun"]/*[local-name()="ResultSummary"]/*[local-name()="Counters"]')
-            if ($null -eq $counters) { throw "TRX counters are missing: $($trxFile.FullName)" }
-            $total = [int]$counters.total
-            $executed = [int]$counters.executed
-            $passed = [int]$counters.passed
-            $failed = [int]$counters.failed
-            $notExecuted = [int]$counters.notExecuted
-            if ($total -le 0 -or $executed -ne $total -or $passed -ne $total -or $failed -ne 0 -or $notExecuted -ne 0) {
-              throw "Windows test counts are not release-safe: file=$($trxFile.Name) total=$total executed=$executed passed=$passed failed=$failed notExecuted=$notExecuted"
-            }
-            $totalTests += $total
-            $passedTests += $passed
-            $failedTests += $failed
-            $notExecutedTests += $notExecuted
-          }
-          if ($totalTests -le 0 -or $passedTests -ne $totalTests -or $failedTests -ne 0 -or $notExecutedTests -ne 0) {
-            throw "Windows aggregate test counts are not release-safe: total=$totalTests passed=$passedTests failed=$failedTests notExecuted=$notExecutedTests"
-          }
-          "Windows TRX tests executed: total=$totalTests passed=$passedTests"
       - name: Install locked Inno Setup compiler
         shell: pwsh
         run: |
@@ -346,6 +228,47 @@ jobs:
               if ($uninstallProcess.ExitCode -ne 0) { throw "E2E cleanup uninstall failed with exit code $($uninstallProcess.ExitCode)" }
             }
           }
+      - name: Write UI quality evidence
+        if: success()
+        shell: pwsh
+        run: |
+          $sourceSha = (& git rev-parse HEAD).Trim()
+          $treeSha = (& git rev-parse 'HEAD^{tree}').Trim()
+          if ($sourceSha -ne $env:GITHUB_SHA) { throw 'UI quality checkout SHA does not match the workflow SHA.' }
+          $evidence = Join-Path $env:RUNNER_TEMP 'codex-info-windows-e2e'
+          if (-not (Test-Path -LiteralPath $evidence -PathType Container)) { throw 'Windows UI evidence directory is missing.' }
+          $encoding = [System.Text.UTF8Encoding]::new($false)
+          $qualityLines = @(
+            'schema: codex-info-quality-v1'
+            'quality: ui'
+            "source-sha: $sourceSha"
+            "tree-sha: $treeSha"
+            'windows-ui-e2e: PASS'
+            'window-move-smoke: PASS'
+            'ui-quality: PASS'
+          )
+          $qualityPath = Join-Path $evidence 'ui-quality.txt'
+          [System.IO.File]::WriteAllText(
+            $qualityPath,
+            (($qualityLines -join "`n") + "`n"),
+            $encoding
+          )
+          $hashLines = @(
+            Get-ChildItem -LiteralPath $evidence -File |
+              Where-Object { $_.Name -ne 'SHA256SUMS' } |
+              Sort-Object FullName |
+              ForEach-Object {
+                $hash = (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+                $relative = $_.FullName.Substring($evidence.Length).TrimStart([char[]]@('\', '/')) -replace '\\', '/'
+                "$hash  $relative"
+              }
+          )
+          $manifestPath = Join-Path $evidence 'SHA256SUMS'
+          [System.IO.File]::WriteAllText(
+            $manifestPath,
+            (($hashLines -join "`n") + "`n"),
+            $encoding
+          )
       - name: Upload Windows UI E2E evidence
         if: always()
         uses: actions/upload-artifact@v4
@@ -362,78 +285,158 @@ jobs:
           if-no-files-found: warn
 
   acceptance:
-    if: needs.core-tests.result == 'success' && needs.windows-build.result == 'success'
-    needs: [core-tests, windows-build]
+    # Keep this job key stable so branch protection can require exactly one
+    # aggregate verdict. The read-only required `version-prepared` job owns
+    # the old-head failure; only its exact-next new head reaches acceptance.
+    if: always() && github.event_name == 'pull_request' && needs.version-prepared.outputs.ready == 'true'
+    needs: [version-prepared, native-quality, windows-quality, ui-quality]
     runs-on: ubuntu-latest
     steps:
+      - name: Verify quality job outcomes
+        env:
+          NATIVE_RESULT: ${{ needs.native-quality.result }}
+          WINDOWS_RESULT: ${{ needs.windows-quality.result }}
+          UI_RESULT: ${{ needs.ui-quality.result }}
+          VERSION_READY: ${{ needs.version-prepared.outputs.ready }}
+        run: |
+          set -euo pipefail
+          [[ "$VERSION_READY" == true ]] || { echo 'version preparation did not complete on this revision' >&2; exit 1; }
+          for result in "$NATIVE_RESULT" "$WINDOWS_RESULT" "$UI_RESULT"; do
+            [[ "$result" == success ]] || {
+              echo "quality job did not succeed: $result" >&2
+              exit 1
+            }
+          done
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+      - name: Download native quality evidence
+        uses: actions/download-artifact@v4
+        with:
+          name: native-quality
+          path: artifacts/native-quality
+      - name: Download Windows quality evidence
+        uses: actions/download-artifact@v4
+        with:
+          name: windows-quality
+          path: artifacts/windows-quality
       - name: Download Windows UI E2E evidence
         uses: actions/download-artifact@v4
         with:
           name: windows-ui-e2e
           path: artifacts/windows-ui-e2e
-      - name: Install final gate tools
-        run: sudo apt-get update && sudo apt-get install --no-install-recommends --yes ripgrep xvfb xauth x11-utils x11-apps libxkbcommon-x11-0
-      - name: Install Rust toolchain for final native gate
-        uses: dtolnay/rust-toolchain@stable
-      - name: Run final acceptance gate before merge
-        env:
-          EXPECTED_E2E_SOURCE_SHA: ${{ github.sha }}
-        run: xvfb-run --auto-servernum --server-args='-screen 0 1280x800x24' bash scripts/final_acceptance_gate.sh artifacts/windows-ui-e2e
-
-  release:
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.version-policy.outputs.release == 'true'
-    needs: [version-policy, core-tests, windows-build, acceptance]
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
       - name: Download CI installer artifact
         uses: actions/download-artifact@v4
         with:
           name: windows-client-installer
           path: artifacts/windows-installer
-      - name: Download Windows UI E2E evidence
-        uses: actions/download-artifact@v4
-        with:
-          name: windows-ui-e2e
-          path: artifacts/windows-ui-e2e
-      - name: Install final gate tools
-        run: sudo apt-get update && sudo apt-get install --no-install-recommends --yes ripgrep xvfb xauth x11-utils x11-apps libxkbcommon-x11-0
-      - name: Install Rust toolchain for final native gate
-        uses: dtolnay/rust-toolchain@stable
-      - name: Run final acceptance gate
+      - name: Run final acceptance gate before merge
         env:
           EXPECTED_E2E_SOURCE_SHA: ${{ github.sha }}
-        run: xvfb-run --auto-servernum --server-args='-screen 0 1280x800x24' bash scripts/final_acceptance_gate.sh artifacts/windows-ui-e2e
+        run: bash scripts/final_acceptance_gate.sh artifacts/windows-ui-e2e artifacts/native-quality artifacts/windows-quality
+      - name: Assemble accepted release candidate
+        run: |
+          set -euo pipefail
+          candidate=artifacts/release-candidate
+          rm -rf "$candidate"
+          mkdir -p "$candidate"
+          cp artifacts/windows-installer/CodexInfo.WindowsClient.Setup.exe "$candidate/"
+          cp -R artifacts/native-quality "$candidate/"
+          cp -R artifacts/windows-quality "$candidate/"
+          cp -R artifacts/windows-ui-e2e "$candidate/"
+          source_sha="$(git rev-parse HEAD)"
+          tree_sha="$(git rev-parse 'HEAD^{tree}')"
+          cat > "$candidate/acceptance.txt" <<EOF
+          schema: codex-info-quality-v1
+          source-sha: $source_sha
+          tree-sha: $tree_sha
+          acceptance: PASS
+          EOF
+          (
+            cd "$candidate"
+            manifest="$(mktemp)"
+            find . -type f ! -name SHA256SUMS -print0 | sort -z | xargs -0 sha256sum > "$manifest"
+            mv "$manifest" SHA256SUMS
+          )
+      - name: Upload accepted release candidate
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-candidate
+          path: artifacts/release-candidate
+          if-no-files-found: error
+
+  release:
+    # The push job is deliberately packaging-only.  All quality evidence is
+    # imported from the one accepted PR run below; no test or acceptance gate
+    # is rerun after merge.
+    if: github.event_name == 'pull_request_target' && github.event.pull_request.merged == true
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      actions: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: refs/heads/main
+      - name: Resolve accepted PR quality run
+        id: quality-run
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mapfile -t quality_runs < <(
+            gh api --paginate \
+              "repos/$REPOSITORY/actions/workflows/windows-client.yml/runs?event=pull_request&status=completed&head_sha=$PR_HEAD_SHA&per_page=100" \
+              --jq ".workflow_runs[] | select(.conclusion == \"success\" and any(.pull_requests[]; .number == ($PR_NUMBER | tonumber))) | .id"
+          )
+          if [[ "${#quality_runs[@]}" -ne 1 ]]; then
+            echo "expected exactly one successful PR quality run for PR $PR_NUMBER head $PR_HEAD_SHA; found ${#quality_runs[@]}" >&2
+            exit 1
+          fi
+          printf 'run-id=%s\n' "${quality_runs[0]}" >> "$GITHUB_OUTPUT"
+      - name: Download accepted PR release candidate
+        uses: actions/download-artifact@v4
+        with:
+          name: release-candidate
+          run-id: ${{ steps.quality-run.outputs.run-id }}
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          path: artifacts/release-candidate
+      - name: Verify accepted source and artifact hashes
+        env:
+          EXPECTED_MERGE_SHA: ${{ github.event.pull_request.merge_commit_sha }}
+        run: bash scripts/release_candidate_gate.sh artifacts/release-candidate "$EXPECTED_MERGE_SHA"
       - name: Create deterministic update manifest
+        id: release-version
         shell: pwsh
         env:
-          VERSION: ${{ needs.version-policy.outputs.version }}
           REPOSITORY: ${{ github.repository }}
         run: |
+          $version = (python3 scripts/product_version.py check | Select-String '^version=').Line.Substring(8)
+          "version=$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
           ./windows-client/tools/New-WindowsUpdateManifest.ps1 `
-            -Version $env:VERSION `
-            -InstallerPath ./artifacts/windows-installer/CodexInfo.WindowsClient.Setup.exe `
-            -OutputPath ./artifacts/windows-installer/CodexInfo.WindowsClient.update.json `
+            -Version $version `
+            -InstallerPath ./artifacts/release-candidate/CodexInfo.WindowsClient.Setup.exe `
+            -OutputPath ./artifacts/release-candidate/CodexInfo.WindowsClient.update.json `
             -Repository $env:REPOSITORY
       - name: Create GitHub Release and upload Windows assets
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
-          VERSION: ${{ needs.version-policy.outputs.version }}
+          VERSION: ${{ steps.release-version.outputs.version }}
           REPOSITORY: ${{ github.repository }}
+          EXPECTED_MERGE_SHA: ${{ github.event.pull_request.merge_commit_sha }}
         run: |
           $ErrorActionPreference = 'Stop'
           $tag = "windows-v$env:VERSION"
           $repository = $env:REPOSITORY
-          $setup = './artifacts/windows-installer/CodexInfo.WindowsClient.Setup.exe'
-          $manifest = './artifacts/windows-installer/CodexInfo.WindowsClient.update.json'
+          $setup = './artifacts/release-candidate/CodexInfo.WindowsClient.Setup.exe'
+          $manifest = './artifacts/release-candidate/CodexInfo.WindowsClient.update.json'
 
           function Get-GitHubResourceStatus {
             param([Parameter(Mandatory = $true)][string]$Endpoint)
@@ -487,7 +490,7 @@ jobs:
           # back to attaching a Release to somebody else's ref.
           gh api --method POST "repos/$repository/git/refs" `
             -f "ref=refs/tags/$tag" `
-            -f "sha=$env:GITHUB_SHA" *> $null
+            -f "sha=$env:EXPECTED_MERGE_SHA" *> $null
           if ($LASTEXITCODE -ne 0) { throw "Atomic Git tag creation failed for $tag" }
 
           # Keep the Release invisible until both exact assets have uploaded
@@ -501,12 +504,13 @@ jobs:
             -F draft=true `
             -F prerelease=false
           if ($LASTEXITCODE -ne 0) { throw "Draft GitHub Release creation failed for $tag" }
-          $createdRelease = $createdReleaseJson | ConvertFrom-Json
-          if ($null -eq $createdRelease.id -or $createdRelease.tag_name -ne $tag -or
-              -not $createdRelease.draft -or $createdRelease.prerelease) {
+          $createdReleaseJson | python3 scripts/release_state_gate.py created --tag $tag
+          if ($LASTEXITCODE -ne 0) {
             throw "Created draft GitHub Release state is invalid for $tag"
           }
-          $draftReleaseEndpoint = "repos/$repository/releases/$($createdRelease.id)"
+          $createdRelease = $createdReleaseJson | ConvertFrom-Json
+          $createdReleaseId = [long]$createdRelease.id
+          $draftReleaseEndpoint = "repos/$repository/releases/$createdReleaseId"
 
           gh release upload $tag $setup $manifest --repo $repository
           if ($LASTEXITCODE -ne 0) { throw "Draft GitHub Release asset upload failed for $tag" }
@@ -516,25 +520,10 @@ jobs:
             -H 'X-GitHub-Api-Version: 2022-11-28' `
             $draftReleaseEndpoint
           if ($LASTEXITCODE -ne 0) { throw "Could not inspect the draft GitHub Release for $tag" }
-          $release = $releaseJson | ConvertFrom-Json
-          if ($release.tag_name -ne $tag -or -not $release.draft -or $release.prerelease) {
+          $releaseJson | python3 scripts/release_state_gate.py draft `
+            --tag $tag --setup $setup --manifest $manifest
+          if ($LASTEXITCODE -ne 0) {
             throw "Draft GitHub Release state is invalid for $tag"
-          }
-
-          $expectedAssets = @{
-            ([IO.Path]::GetFileName($setup)) = (Get-Item -LiteralPath $setup).Length
-            ([IO.Path]::GetFileName($manifest)) = (Get-Item -LiteralPath $manifest).Length
-          }
-          $assets = @($release.assets)
-          if ($assets.Count -ne $expectedAssets.Count) {
-            throw "Draft GitHub Release has an unexpected asset count for $tag"
-          }
-          foreach ($asset in $assets) {
-            if (-not $expectedAssets.ContainsKey([string]$asset.name) -or
-                [long]$asset.size -ne [long]$expectedAssets[[string]$asset.name] -or
-                [string]$asset.state -ne 'uploaded') {
-              throw "Draft GitHub Release asset verification failed for $tag"
-            }
           }
 
           $tagJson = & gh api `
@@ -542,12 +531,12 @@ jobs:
             -H 'X-GitHub-Api-Version: 2022-11-28' `
             $tagEndpoint
           if ($LASTEXITCODE -ne 0) { throw "Could not verify the created Git tag for $tag" }
-          $tagRef = $tagJson | ConvertFrom-Json
-          if ([string]$tagRef.object.type -ne 'commit' -or [string]$tagRef.object.sha -ne $env:GITHUB_SHA) {
+          $tagJson | python3 scripts/release_state_gate.py tag --sha $env:EXPECTED_MERGE_SHA
+          if ($LASTEXITCODE -ne 0) {
             throw "Created Git tag does not identify the gated commit for $tag"
           }
 
-          gh api --method PATCH "repos/$repository/releases/$($release.id)" `
+          gh api --method PATCH "repos/$repository/releases/$createdReleaseId" `
             -F draft=false *> $null
           if ($LASTEXITCODE -ne 0) { throw "Publishing the verified GitHub Release failed for $tag" }
 
@@ -556,9 +545,8 @@ jobs:
             -H 'X-GitHub-Api-Version: 2022-11-28' `
             $releaseEndpoint
           if ($LASTEXITCODE -ne 0) { throw "Could not verify the published GitHub Release for $tag" }
-          $published = $publishedJson | ConvertFrom-Json
-          if ($published.tag_name -ne $tag -or $published.draft -or $published.prerelease -or
-              [string]::IsNullOrWhiteSpace([string]$published.published_at) -or
-              @($published.assets).Count -ne $expectedAssets.Count) {
+          $publishedJson | python3 scripts/release_state_gate.py published `
+            --tag $tag --setup $setup --manifest $manifest
+          if ($LASTEXITCODE -ne 0) {
             throw "Published GitHub Release verification failed for $tag"
           }
