@@ -46,9 +46,9 @@ cp scripts/final_acceptance_gate.sh scripts/quality_artifact_gate.sh "$fixture_r
 source_sha="$(git rev-parse HEAD)"
 tree_sha="$(git rev-parse 'HEAD^{tree}')"
 
-printf 'schema: codex-info-quality-v1\nquality: native\nsource-sha: %s\ntree-sha: %s\nregression-guard: PASS\nrecorder-daemon: PASS\ndata-protection: PASS\nnative-quality: PASS\n' \
+printf 'schema: codex-info-quality-v1\nquality: native\nsource-sha: %s\ntree-sha: %s\nrelease-build: PASS\ncli-contract-e2e: PASS\nrecorder-daemon: PASS\nnative-quality: PASS\n' \
     "$source_sha" "$tree_sha" > "$native_dir/native-quality.txt"
-printf 'schema: codex-info-quality-v1\nquality: windows\nsource-sha: %s\ntree-sha: %s\nwindows-contract: PASS\nwindows-tests: PASS\nwindows-quality: PASS\n' \
+printf 'schema: codex-info-quality-v1\nquality: merge-policy\nsource-sha: %s\ntree-sha: %s\nlive-applied-rules: PASS\nmerge-policy: PASS\n' \
     "$source_sha" "$tree_sha" > "$windows_dir/windows-quality.txt"
 printf 'schema: codex-info-quality-v1\nquality: ui\nsource-sha: %s\ntree-sha: %s\nwindows-ui-e2e: PASS\nwindow-move-smoke: PASS\nui-quality: PASS\n' \
     "$source_sha" "$tree_sha" > "$ui_dir/ui-quality.txt"

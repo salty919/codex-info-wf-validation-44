@@ -74,6 +74,7 @@ jobs:
       contents: read
 
   windows-quality:
+    name: Merge policy
     if: github.event_name == 'pull_request' && needs.version-prepared.outputs.ready == 'true'
     needs: [version-prepared]
     runs-on: ubuntu-latest
@@ -89,16 +90,6 @@ jobs:
           set -euo pipefail
           gh api --method GET -H "X-GitHub-Api-Version: 2026-03-10" "repos/$REPOSITORY/rules/branches/main" |
             env -u GH_TOKEN python3 scripts/workflow_quality_gate.py --validate-live-applied-rules
-      - name: Install Windows contract gate tools
-        run: sudo apt-get update && sudo apt-get install --no-install-recommends --yes ripgrep
-      - uses: actions/setup-dotnet@v4
-        with:
-          dotnet-version: "10.0.x"
-      - name: Export Windows contract evidence directory
-        shell: bash
-        run: printf '%s\n' "WINDOWS_CONTRACT_EVIDENCE_DIR=$RUNNER_TEMP/codex-info-windows-contract" >> "$GITHUB_ENV"
-      - name: Enforce Windows feature contract and tests
-        run: bash scripts/windows_client_contract_gate.sh
       - name: Write Windows quality evidence
         run: |
           set -euo pipefail
@@ -111,16 +102,12 @@ jobs:
           }
           cat > artifacts/windows-quality/windows-quality.txt <<EOF
           schema: codex-info-quality-v1
-          quality: windows
+          quality: merge-policy
           source-sha: $source_sha
           tree-sha: $tree_sha
-          windows-contract: PASS
-          windows-tests: PASS
-          windows-quality: PASS
+          live-applied-rules: PASS
+          merge-policy: PASS
           EOF
-          if [[ -d "$WINDOWS_CONTRACT_EVIDENCE_DIR" ]]; then
-            cp -R "$WINDOWS_CONTRACT_EVIDENCE_DIR"/. artifacts/windows-quality/
-          fi
           (
             cd artifacts/windows-quality
             manifest="$(mktemp)"
@@ -304,8 +291,9 @@ jobs:
   acceptance:
     # Keep this job key stable so branch protection can require exactly one
     # aggregate verdict. The read-only required `version-prepared` job owns
-    # the old-head failure; only its exact-next new head reaches acceptance.
-    if: always() && github.event_name == 'pull_request' && needs.version-prepared.outputs.ready == 'true'
+    # version preparation; this job is still instantiated to report every
+    # skipped or failed quality owner through its first outcome check.
+    if: always() && github.event_name == 'pull_request'
     needs: [version-prepared, native-quality, windows-quality, ui-quality]
     runs-on: ubuntu-latest
     steps:
@@ -314,9 +302,11 @@ jobs:
           NATIVE_RESULT: ${{ needs.native-quality.result }}
           WINDOWS_RESULT: ${{ needs.windows-quality.result }}
           UI_RESULT: ${{ needs.ui-quality.result }}
+          VERSION_RESULT: ${{ needs.version-prepared.result }}
           VERSION_READY: ${{ needs.version-prepared.outputs.ready }}
         run: |
           set -euo pipefail
+          [[ "$VERSION_RESULT" == success ]] || { echo "version-prepared job did not succeed: $VERSION_RESULT" >&2; exit 1; }
           [[ "$VERSION_READY" == true ]] || { echo 'version preparation did not complete on this revision' >&2; exit 1; }
           for result in "$NATIVE_RESULT" "$WINDOWS_RESULT" "$UI_RESULT"; do
             [[ "$result" == success ]] || {
@@ -391,6 +381,7 @@ jobs:
     permissions:
       contents: write
       actions: read
+      pull-requests: read
     steps:
       - uses: actions/checkout@v4
         with:

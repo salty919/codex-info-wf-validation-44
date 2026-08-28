@@ -66,10 +66,14 @@
   `1.0.10`とする。major/minorは利用者の明示指示を要する別変更でだけ更新し、自動採番処理は変更しない。
   `Cargo.toml`、root packageの`Cargo.lock`、`windows-client/Directory.Build.props`が開始時点で同値でない場合、
   または期待元versionとmainが一致しない場合は、3ファイルを一つも変更せず停止する。
-- PRの最新mainとの合成treeに対し、native、Windows、実Windows UIの品質確認を各1回だけ実行する。
-  同じtest/gateを別job、別workflow、acceptance、Releaseで再実行しない。単一のrequired acceptanceは
-  先行jobの成功、検証対象tree、source SHA、Windows証拠の対応を検査し、失敗・未完了・古い証拠では
-  mergeを許可しない。merge方式は、検証済みtreeとmain上のmerge結果を同一性検証できる方式に限定する。
+- PR作成前は単一のローカル入口からnative deterministic test、data protection契約、Windows unit/contract testを
+  各1回だけ実行する。必須Rust testは1回の全target実行結果から名前と成功を確認し、個別に再実行しない。
+  PRではrelease artifactに必要なnative buildとCLI/recorder実行、mainの実適用merge rule、実Windows installer/UIを
+  各1回だけ確認し、ローカルと同じtest/gateを別job、別workflow、acceptance、Releaseで再実行しない。すべてのmergeが
+  release candidateを作るためpath classifierでartifact producerを省略せず、高コストなdeterministic testをPRへ戻さない。
+  単一のrequired acceptanceは先行jobの成功、検証対象tree、source SHA、各artifact証拠の対応だけを検査し、
+  version準備を含む失敗・未完了・古い証拠では明示的に失敗してmergeを許可しない。merge方式は、検証済みtreeと
+  main上のmerge結果を同一性検証できる方式に限定する。
 - PR品質確認を開始する前に、PR branch上のversion 3ファイルだけをexact next patchへ自動更新する。その
   version commitを含む最新mainとの合成treeを品質確認し、mergeによって採番を確定する。採番commit自身では
   高コスト品質jobを開始せず、新しいheadに対する次のworkflow runで一度だけ確認する。merge後は検証済みtree
@@ -84,6 +88,9 @@
 - CodeQLはmerge必須gateとし、critical/high findingをdismissやworkflow無効化で通過させない。外部AI findingsが
   provider側の未対応modelで継続失敗する場合は、そのAI機能だけをrepository単位で無効化できるが、CodeQL、
   code-scanning alerts、required acceptanceは維持する。
+- Codex code reviewはPRの変更が確定した最新headに対して`@codex review`を1回だけ起動する補助レビューとする。
+  古いheadの結果や未解決かつnon-outdatedのP0/P1をready判定へ流用せず、独自API key workflowを追加しない。
+  Codex reviewはCodeQL、required acceptance、必要な承認の代替にしない。
 - `windows-vX.Y.Z` tagは原子的に新規作成する。Setupとmanifestは非公開Draft上でexact 2資産の名前・size・
   状態・commit SHAを検証し終えてから公開し、既存tag/Releaseへ上書きして継続しない。
 - release artifactはsource、lockfile、実payload、license/notice、署名、version、対象platformを一つのrelease identityで追跡する。

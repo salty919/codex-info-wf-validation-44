@@ -32,6 +32,7 @@ from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
 WORKFLOW = ROOT / ".github" / "workflows" / "version-prepare.yml"
+RELEASE_WORKFLOW = ROOT / ".github" / "workflows" / "windows-client.yml"
 EXPECTED_PATHS = (
     "Cargo.toml",
     "Cargo.lock",
@@ -112,6 +113,44 @@ def _replace_once(source: str, old: str, new: str, label: str) -> str:
     if count != 1:
         fail(f"mutation target {label!r} occurred {count} times, expected 1")
     return source.replace(old, new, 1)
+
+
+def _release_job_permissions(source: str) -> tuple[str, ...]:
+    """Extract the release job's small, explicit permission mapping."""
+
+    marker = "  release:\n"
+    marker_indexes = [index for index, line in enumerate(source.splitlines()) if line == marker.rstrip("\n")]
+    if len(marker_indexes) != 1:
+        fail("windows release job marker must occur exactly once")
+    lines = source.splitlines()
+    start = marker_indexes[0]
+    end = next(
+        (index for index in range(start + 1, len(lines)) if re.match(r"^  [A-Za-z0-9_.-]+:", lines[index])),
+        len(lines),
+    )
+    job = lines[start:end]
+    permission_indexes = [index for index, line in enumerate(job) if line == "    permissions:"]
+    if len(permission_indexes) != 1:
+        fail("windows release job must have one permissions mapping")
+    permission_start = permission_indexes[0]
+    permissions: list[str] = []
+    for line in job[permission_start + 1 :]:
+        if line and not line.startswith("      "):
+            break
+        if line.startswith("      "):
+            permissions.append(line.strip())
+    return tuple(permissions)
+
+
+def validate_release_permissions(source: str) -> None:
+    """Keep the release PR lookup at the least privilege required by GitHub."""
+
+    permissions = _release_job_permissions(source)
+    expected = ("contents: write", "actions: read", "pull-requests: read")
+    if permissions != expected:
+        fail(f"release job permissions must be exactly {expected}, found {permissions}")
+    if "pull-requests: write" in permissions or "issues: write" in permissions:
+        fail("release job must not grant PR or issue write access")
 
 
 _ALLOWED_SHELL_COMMANDS = frozenset(
@@ -1331,6 +1370,36 @@ def check_mutations(source: str) -> int:
     return len(mutations)
 
 
+def check_release_permission_mutations(source: str) -> int:
+    """Exercise the finite release-job permission contract."""
+
+    mutations = (
+        (
+            "release-pull-requests-missing",
+            "      pull-requests: read\n",
+            "",
+        ),
+        (
+            "release-pull-requests-write",
+            "      pull-requests: read\n",
+            "      pull-requests: write\n",
+        ),
+        (
+            "release-permission-excess",
+            "      actions: read\n",
+            "      actions: read\n      packages: read\n",
+        ),
+    )
+    for name, old, new in mutations:
+        mutated = _replace_once(source, old, new, name)
+        try:
+            validate_release_permissions(mutated)
+        except FixtureError:
+            continue
+        fail(f"release permission mutation escaped static oracle: {name}")
+    return len(mutations)
+
+
 def self_test() -> tuple[int, int]:
     try:
         source = WORKFLOW.read_text(encoding="utf-8")
@@ -1338,6 +1407,9 @@ def self_test() -> tuple[int, int]:
         block = extract_run_block(source)
         runtime_cases = check_runtime(block)
         mutation_cases = check_mutations(source)
+        release_source = RELEASE_WORKFLOW.read_text(encoding="utf-8")
+        validate_release_permissions(release_source)
+        mutation_cases += check_release_permission_mutations(release_source)
         if runtime_cases <= 0 or mutation_cases <= 0:
             fail("case counts must be positive")
         return runtime_cases, mutation_cases

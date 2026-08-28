@@ -50,6 +50,8 @@ EXPECTED_NEEDS = {
 
 OWNER_PATTERNS = {
     "regression_guard": re.compile(r"(?:^|[\s'\"./])scripts/regression_guard\.sh(?:\s|$)"),
+    "release_build": re.compile(r"(?:^|[\s;&|])cargo build --release --locked(?:\s|$)"),
+    "cli_contract_e2e": re.compile(r"(?:^|[\s'\"./])scripts/cli_contract_e2e\.sh(?:\s|$)"),
     "record_daemon_e2e": re.compile(r"(?:^|[\s'\"./])scripts/record_daemon_e2e\.sh(?:\s|$)"),
     "data_protection_gate": re.compile(r"(?:^|[\s'\"./])scripts/data_protection_gate\.sh(?:\s|$)"),
     "windows_client_contract_gate": re.compile(
@@ -63,15 +65,18 @@ OWNER_PATTERNS = {
     "final_acceptance_gate": re.compile(r"(?:^|[\s'\"./])scripts/final_acceptance_gate\.sh(?:\s|$)"),
 }
 OWNER_JOBS = {
-    "regression_guard": "native-quality",
+    "release_build": "native-quality",
+    "cli_contract_e2e": "native-quality",
     "record_daemon_e2e": "native-quality",
-    "data_protection_gate": "native-quality",
-    "windows_client_contract_gate": "windows-quality",
     "Build-WindowsInstaller": "ui-quality",
     "Run-WindowsClientE2E": "ui-quality",
     "windows_window_move_smoke": "ui-quality",
     "final_acceptance_gate": "acceptance",
 }
+PR_OWNERS = frozenset(OWNER_JOBS)
+LOCAL_OWNERS = frozenset(
+    {"regression_guard", "data_protection_gate", "windows_client_contract_gate"}
+)
 PRODUCER_PATTERNS = tuple(
     pattern
     for name, pattern in OWNER_PATTERNS.items()
@@ -442,6 +447,8 @@ def _powershell_relative_prefix_is_command(prefix: str) -> bool:
 def _owner_occurrences(owner: str, text: str) -> int:
     """Count marker tokens only where the surrounding syntax invokes them."""
     pattern = OWNER_PATTERNS[owner]
+    if owner == "release_build":
+        return sum(len(pattern.findall(line)) for line in text.splitlines())
     count = 0
     suffix = ".ps1" if owner in {"Build-WindowsInstaller", "Run-WindowsClientE2E", "windows_window_move_smoke"} else ".sh"
     for line in text.splitlines():
@@ -497,7 +504,7 @@ def _quality_commands(workflow: Workflow, job_names: Iterable[str]) -> list[str]
 
 
 def _live_audit_contract(workflow: Workflow) -> list[str]:
-    """Require one fail-closed applied-rules audit before local Windows work."""
+    """Require one fail-closed applied-rules audit before provenance output."""
     errors: list[str] = []
     job = workflow.jobs.get("windows-quality")
     if job is None:
@@ -559,14 +566,6 @@ def _live_audit_contract(workflow: Workflow) -> list[str]:
             or step_text.count("REPOSITORY: ${{ github.repository }}") != 1
         ):
             errors.append("live policy audit repository must come from repository context")
-        enforce_marker = "      - name: Enforce Windows feature contract and tests"
-        enforce_indices = [
-            index
-            for index, line in enumerate(workflow.lines)
-            if line == enforce_marker
-        ]
-        if len(enforce_indices) != 1 or markers[0] >= enforce_indices[0]:
-            errors.append("live policy audit must precede the Windows contract gate")
         job_start = next(
             (index for index, line in enumerate(workflow.lines) if line == "  windows-quality:"),
             -1,
@@ -584,18 +583,57 @@ def _live_audit_contract(workflow: Workflow) -> list[str]:
             for index in range(job_start + 1, job_end)
             if workflow.lines[index] == "      - uses: actions/checkout@v4"
         ]
-        install_indices = [
+        provenance_indices = [
             index
             for index in range(job_start + 1, job_end)
-            if workflow.lines[index] == "      - name: Install Windows contract gate tools"
+            if workflow.lines[index] == "      - name: Write Windows quality evidence"
         ]
         if (
             len(checkout_indices) != 1
-            or len(install_indices) != 1
+            or len(provenance_indices) != 1
             or markers[0] <= checkout_indices[0]
-            or markers[0] >= install_indices[0]
+            or markers[0] >= provenance_indices[0]
         ):
-            errors.append("live policy audit must run after checkout and before local setup")
+            errors.append("live policy audit must run after checkout and before provenance output")
+        step_markers = [
+            index
+            for index in range(job_start + 1, job_end)
+            if workflow.lines[index].startswith("      - ")
+        ]
+        if len(step_markers) != 4:
+            errors.append("windows-quality must contain checkout, live audit, provenance, and upload steps only")
+        else:
+            try:
+                checkout_step = step_markers.index(checkout_indices[0])
+                audit_step = step_markers.index(markers[0])
+                provenance_step = step_markers.index(provenance_indices[0])
+            except ValueError:
+                errors.append("windows-quality step boundaries are ambiguous")
+            else:
+                if (checkout_step, audit_step, provenance_step) != (0, 1, 2):
+                    errors.append("windows-quality must audit immediately after checkout and write provenance next")
+        job_text = "\n".join(workflow.lines[job_start:job_end])
+        for forbidden in (
+            "apt-get",
+            "actions/setup-dotnet@",
+            "scripts/windows_client_contract_gate.sh",
+            "WINDOWS_CONTRACT_EVIDENCE_DIR",
+        ):
+            if forbidden in job_text:
+                errors.append(f"windows-quality must not contain local gate setup or execution: {forbidden}")
+        provenance_text = "\n".join(workflow.lines[provenance_indices[0] : job_end]) if provenance_indices else ""
+        for marker in (
+            "quality: merge-policy",
+            "source-sha:",
+            "tree-sha:",
+            "live-applied-rules: PASS",
+            "merge-policy: PASS",
+        ):
+            if marker not in provenance_text:
+                errors.append(f"Windows merge-policy evidence is missing {marker}")
+        for marker in ("windows-contract: PASS", "windows-tests: PASS", "windows-quality: PASS"):
+            if marker in provenance_text:
+                errors.append(f"Windows merge-policy evidence retains obsolete marker {marker}")
         for env_start in (
             index
             for index in range(job_start + 1, job_end)
@@ -615,6 +653,26 @@ def _live_audit_contract(workflow: Workflow) -> list[str]:
                 for index in range(env_start + 1, env_end)
             ):
                 errors.append("live policy audit token must not be job-wide")
+    return errors
+
+
+def _native_artifact_contract(workflow: Workflow) -> list[str]:
+    """Require the native job's three execution and evidence owners."""
+    job = workflow.jobs.get("native-quality")
+    if job is None:
+        return ["missing native-quality job for native artifact contract"]
+    text = "\n".join(block.body for block in job.run_blocks)
+    errors: list[str] = []
+    for marker in (
+        "release-build: PASS",
+        "cli-contract-e2e: PASS",
+        "recorder-daemon: PASS",
+    ):
+        if text.count(marker) != 1:
+            errors.append(f"native evidence marker cardinality is not one: {marker}")
+    for marker in ("data-protection: PASS", "regression-guard: PASS"):
+        if marker in text:
+            errors.append(f"native evidence retains local-only marker: {marker}")
     return errors
 
 
@@ -660,12 +718,43 @@ def validate_workflows(windows_path: Path = WINDOWS_WORKFLOW, rust_path: Path = 
                 errors.append("cancel-in-progress is not false")
 
         acceptance_if = windows.jobs.get("acceptance", Job("", {}, (), ())).properties.get("if", "")
-        if not (
-            "always()" in acceptance_if
-            and "github.event_name == 'pull_request'" in acceptance_if
-            and "needs.version-prepared.outputs.ready == 'true'" in acceptance_if
-        ):
-            errors.append("acceptance does not guard always/PR/version-ready")
+        if acceptance_if != "always() && github.event_name == 'pull_request'":
+            errors.append("acceptance must always instantiate on pull_request")
+        acceptance = windows.jobs.get("acceptance")
+        if acceptance is None or not acceptance.run_blocks:
+            errors.append("acceptance outcome check is missing")
+        else:
+            first_acceptance_run = acceptance.run_blocks[0].body
+            for required in (
+                '[[ "$VERSION_RESULT" == success ]]',
+                '[[ "$VERSION_READY" == true ]]',
+                'for result in "$NATIVE_RESULT" "$WINDOWS_RESULT" "$UI_RESULT"',
+                '[[ "$result" == success ]]',
+            ):
+                if required not in first_acceptance_run:
+                    errors.append(f"acceptance first step is missing outcome guard: {required}")
+            acceptance_start = next(
+                (index for index, line in enumerate(windows.lines) if line == "  acceptance:"),
+                -1,
+            )
+            acceptance_end = next(
+                (
+                    index
+                    for index in range(acceptance_start + 1, len(windows.lines))
+                    if re.match(r"^  [A-Za-z0-9_.-]+:", windows.lines[index])
+                ),
+                len(windows.lines),
+            )
+            acceptance_text = "\n".join(windows.lines[acceptance_start:acceptance_end])
+            for required in (
+                "VERSION_RESULT:",
+                "VERSION_READY:",
+                "NATIVE_RESULT:",
+                "WINDOWS_RESULT:",
+                "UI_RESULT:",
+            ):
+                if required not in acceptance_text:
+                    errors.append(f"acceptance first step environment is missing {required}")
         release_if = windows.jobs.get("release", Job("", {}, (), ())).properties.get("if", "")
         if not (
             "github.event_name == 'pull_request_target'" in release_if
@@ -674,13 +763,19 @@ def validate_workflows(windows_path: Path = WINDOWS_WORKFLOW, rust_path: Path = 
             errors.append("release is not closed-and-merged-only")
 
         counts = _owner_counts((windows, rust))
-        for owner, blocks in counts.items():
+        for owner in PR_OWNERS:
+            blocks = counts[owner]
             if len(blocks) != 1:
-                errors.append(f"owner {owner} cardinality is {len(blocks)}")
+                errors.append(f"PR owner {owner} cardinality is {len(blocks)}")
             elif blocks[0].job != OWNER_JOBS[owner]:
-                errors.append(f"owner {owner} is in job {blocks[0].job}")
+                errors.append(f"PR owner {owner} is in job {blocks[0].job}")
+        for owner in LOCAL_OWNERS:
+            blocks = counts[owner]
+            if blocks:
+                errors.append(f"local owner {owner} appears in PR workflows: {len(blocks)}")
         if "acceptance" in windows.jobs and "release" in windows.jobs:
             errors.extend(_quality_commands(windows, ("acceptance", "release")))
+        errors.extend(_native_artifact_contract(rust))
         errors.extend(_live_audit_contract(windows))
 
         # A reusable workflow must advertise workflow_call; this avoids
@@ -1085,13 +1180,63 @@ def _static_mutations() -> tuple[tuple[str, Callable[[Path, Path], None]], ...]:
 
     def duplicate_owner(windows: Path, _rust: Path) -> None:
         text = windows.read_text(encoding="utf-8")
-        needle = "run: bash scripts/windows_client_contract_gate.sh"
-        replacement = "run: |\n          bash scripts/windows_client_contract_gate.sh\n          bash scripts/regression_guard.sh"
+        needle = "          mkdir -p artifacts/windows-quality\n"
+        replacement = needle + "          bash scripts/windows_client_contract_gate.sh\n"
+        windows.write_text(_replace_exact(text, needle, replacement), encoding="utf-8")
+
+    def duplicate_data_owner(_windows: Path, rust: Path) -> None:
+        text = rust.read_text(encoding="utf-8")
+        needle = "      - name: Write native quality evidence\n"
+        replacement = "      - name: Run data protection quality gate\n        run: bash scripts/data_protection_gate.sh\n" + needle
+        rust.write_text(_replace_exact(text, needle, replacement), encoding="utf-8")
+
+    def missing_release_marker(_windows: Path, rust: Path) -> None:
+        text = rust.read_text(encoding="utf-8")
+        rust.write_text(
+            _replace_exact(text, "          release-build: PASS\n", ""),
+            encoding="utf-8",
+        )
+
+    def missing_cli_marker(_windows: Path, rust: Path) -> None:
+        text = rust.read_text(encoding="utf-8")
+        rust.write_text(
+            _replace_exact(text, "          cli-contract-e2e: PASS\n", ""),
+            encoding="utf-8",
+        )
+
+    def missing_merge_policy_marker(windows: Path, _rust: Path) -> None:
+        text = windows.read_text(encoding="utf-8")
+        windows.write_text(
+            _replace_exact(text, "          merge-policy: PASS\n", ""),
+            encoding="utf-8",
+        )
+
+    def local_apt_setup(windows: Path, _rust: Path) -> None:
+        text = windows.read_text(encoding="utf-8")
+        needle = "          mkdir -p artifacts/windows-quality\n"
+        replacement = needle + "          sudo apt-get update\n"
+        windows.write_text(_replace_exact(text, needle, replacement), encoding="utf-8")
+
+    def local_dotnet_setup(windows: Path, _rust: Path) -> None:
+        text = windows.read_text(encoding="utf-8")
+        needle = "          mkdir -p artifacts/windows-quality\n"
+        replacement = needle + "          actions/setup-dotnet@v4\n"
         windows.write_text(_replace_exact(text, needle, replacement), encoding="utf-8")
 
     def no_acceptance_always(windows: Path, _rust: Path) -> None:
         text = windows.read_text(encoding="utf-8")
         windows.write_text(_replace_exact(text, "if: always() && github.event_name == 'pull_request'", "if: github.event_name == 'pull_request'"), encoding="utf-8")
+
+    def missing_version_outcome_guard(windows: Path, _rust: Path) -> None:
+        text = windows.read_text(encoding="utf-8")
+        needle = '          [[ "$VERSION_RESULT" == success ]] || { echo "version-prepared job did not succeed: $VERSION_RESULT" >&2; exit 1; }\n'
+        windows.write_text(_replace_exact(text, needle, ""), encoding="utf-8")
+
+    def missing_owner_outcome_guard(windows: Path, _rust: Path) -> None:
+        text = windows.read_text(encoding="utf-8")
+        needle = '          for result in "$NATIVE_RESULT" "$WINDOWS_RESULT" "$UI_RESULT"; do\n'
+        replacement = '          for result in "$NATIVE_RESULT" "$WINDOWS_RESULT"; do\n'
+        windows.write_text(_replace_exact(text, needle, replacement), encoding="utf-8")
 
     def add_path_filter(windows: Path, _rust: Path) -> None:
         text = windows.read_text(encoding="utf-8")
@@ -1101,24 +1246,6 @@ def _static_mutations() -> tuple[tuple[str, Callable[[Path, Path], None]], ...]:
         text = windows.read_text(encoding="utf-8")
         needle = "run: bash scripts/final_acceptance_gate.sh artifacts/windows-ui-e2e artifacts/native-quality artifacts/windows-quality"
         replacement = "run: |\n          bash scripts/final_acceptance_gate.sh artifacts/windows-ui-e2e artifacts/native-quality artifacts/windows-quality\n          cargo test"
-        windows.write_text(_replace_exact(text, needle, replacement), encoding="utf-8")
-
-    def nested_env_run(windows: Path, _rust: Path) -> None:
-        text = windows.read_text(encoding="utf-8")
-        needle = "run: bash scripts/windows_client_contract_gate.sh"
-        replacement = "env:\n          run: bash scripts/windows_client_contract_gate.sh"
-        windows.write_text(_replace_exact(text, needle, replacement), encoding="utf-8")
-
-    def require_text_false_positive(windows: Path, _rust: Path) -> None:
-        text = windows.read_text(encoding="utf-8")
-        needle = "run: bash scripts/windows_client_contract_gate.sh"
-        replacement = "run: |\n          require_text: bash scripts/windows_client_contract_gate.sh"
-        windows.write_text(_replace_exact(text, needle, replacement), encoding="utf-8")
-
-    def quoted_false_positive(windows: Path, _rust: Path) -> None:
-        text = windows.read_text(encoding="utf-8")
-        needle = "run: bash scripts/windows_client_contract_gate.sh"
-        replacement = "run: |\n          echo \"bash scripts/windows_client_contract_gate.sh\""
         windows.write_text(_replace_exact(text, needle, replacement), encoding="utf-8")
 
     def forbidden_quality_tool(command: str) -> Callable[[Path, Path], None]:
@@ -1191,7 +1318,7 @@ def _static_mutations() -> tuple[tuple[str, Callable[[Path, Path], None]], ...]:
         start, end = live_audit_scope(text)
         audit = text[start:end]
         without_audit = text[:start] + text[end:]
-        insertion = without_audit.index("      - name: Export Windows contract evidence directory")
+        insertion = without_audit.index("      - name: Upload Windows quality evidence")
         windows.write_text(
             without_audit[:insertion] + audit + without_audit[insertion:],
             encoding="utf-8",
@@ -1217,12 +1344,17 @@ def _static_mutations() -> tuple[tuple[str, Callable[[Path, Path], None]], ...]:
     return (
         ("dag-edge-missing", missing_dag),
         ("owner-duplicate", duplicate_owner),
+        ("data-owner-pr-workflow", duplicate_data_owner),
+        ("native-release-marker-missing", missing_release_marker),
+        ("native-cli-marker-missing", missing_cli_marker),
+        ("merge-policy-marker-missing", missing_merge_policy_marker),
+        ("windows-local-apt-setup", local_apt_setup),
+        ("windows-local-dotnet-setup", local_dotnet_setup),
         ("acceptance-always-missing", no_acceptance_always),
+        ("acceptance-version-outcome-missing", missing_version_outcome_guard),
+        ("acceptance-owner-outcome-missing", missing_owner_outcome_guard),
         ("pull-request-path-filter", add_path_filter),
         ("quality-command-in-acceptance", forbidden_quality_command),
-        ("nested-env-run-not-command", nested_env_run),
-        ("require-text-not-command", require_text_false_positive),
-        ("quoted-not-command", quoted_false_positive),
         ("unknown-job", unknown_job),
         ("unknown-needs", unknown_need),
         ("quality-cargo", forbidden_quality_tool("cargo test")),

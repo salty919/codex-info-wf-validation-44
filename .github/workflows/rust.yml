@@ -27,12 +27,12 @@ jobs:
       - name: Install required native quality tools
         run: sudo apt-get update && sudo apt-get install --no-install-recommends --yes ripgrep sqlite3 xvfb xauth x11-utils x11-apps libxkbcommon-x11-0
       - uses: dtolnay/rust-toolchain@stable
-      - name: Run native regression quality gate
-        run: xvfb-run --auto-servernum --server-args='-screen 0 1280x800x24' bash scripts/regression_guard.sh
+      - name: Build native release
+        run: cargo build --release --locked
+      - name: Run public CLI lifecycle acceptance
+        run: bash scripts/cli_contract_e2e.sh
       - name: Run recorder daemon live acceptance
         run: xvfb-run --auto-servernum --server-args='-screen 0 1280x800x24' bash scripts/record_daemon_e2e.sh
-      - name: Run data protection quality gate
-        run: bash scripts/data_protection_gate.sh
       - name: Write native quality evidence
         run: |
           set -euo pipefail
@@ -48,9 +48,9 @@ jobs:
           quality: native
           source-sha: $source_sha
           tree-sha: $tree_sha
-          regression-guard: PASS
+          release-build: PASS
+          cli-contract-e2e: PASS
           recorder-daemon: PASS
-          data-protection: PASS
           native-quality: PASS
           EOF
           (

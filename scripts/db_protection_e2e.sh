@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Isolated DB-protection acceptance check. The Rust tests exercise the
-# UsageStore implementation; the temporary SQLite fixture is an independent
-# read-only oracle for quick_check, reload, row counts, logical row hashes,
-# and file hashes. No user CODEX_HOME or history database is touched.
+# Isolated DB-protection acceptance check. The temporary SQLite fixture is a
+# bounded read-only oracle for backup generations, quick_check, reload, row
+# counts, logical row hashes, file hashes, and restore-failure preservation.
+# No user CODEX_HOME or history database is touched.
 ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 
@@ -13,7 +13,7 @@ fail() {
     exit 1
 }
 
-for command in cargo python3 sqlite3 sha256sum rg; do
+for command in python3 sqlite3 sha256sum; do
     command -v "$command" >/dev/null || fail "$command is required"
 done
 
@@ -23,63 +23,11 @@ cleanup() {
 }
 trap cleanup EXIT
 
-run_rust_test() {
-    local test_name="$1"
-    local log_file="$tmp_root/${test_name}.log"
-    printf '+ cargo test --locked --test usage_store %s -- --nocapture\n' "$test_name"
-    if ! cargo test --locked --test usage_store "$test_name" -- --nocapture \
-        2>&1 | tee "$log_file"; then
-        fail "Rust regression test failed: $test_name"
-    fi
-    rg -q 'running [1-9][0-9]* tests?' "$log_file" \
-        || fail "Rust regression test did not run: $test_name"
-    rg -q 'test result: ok' "$log_file" \
-        || fail "Rust regression test was not successful: $test_name"
-    printf 'rust-test: PASS (%s)\n' "$test_name"
-}
-
-run_runtime_probe() {
-    local log_file="$tmp_root/db_protection_runtime.log"
-    printf '+ cargo test --locked --test db_protection_runtime db_protection_runtime_backup_migration_restore -- --nocapture\n'
-    if ! cargo test --locked --test db_protection_runtime \
-        db_protection_runtime_backup_migration_restore -- --nocapture \
-        2>&1 | tee "$log_file"; then
-        fail "real SQLite backup/migration/restore runtime probe failed"
-    fi
-    rg -q 'test result: ok' "$log_file" \
-        || fail "real SQLite runtime probe was not successful"
-    rg -q 'backup-failure-source-preserved: PASS' "$log_file" \
-        || fail "backup failure preservation evidence missing"
-    rg -q 'backup-generations: PASS' "$log_file" \
-        || fail "three backup generations evidence missing"
-    rg -q 'migration-success: PASS' "$log_file" \
-        || fail "migration success evidence missing"
-    rg -q 'migration-failure-source-preserved: PASS' "$log_file" \
-        || fail "migration failure preservation evidence missing"
-    rg -q 'manual-restore: PASS' "$log_file" \
-        || fail "manual restore evidence missing"
-    rg -q 'restart-reload-source-preserved: PASS' "$log_file" \
-        || fail "restart/reload preservation evidence missing"
-    printf 'rust-runtime-probe: PASS (backup/migration/restore/reopen with quick_check and row/file SHA-256)\n'
-}
-
-# These tests are deliberately named individually in the output so a review
-# can map each failure boundary to the requirement it covers.
-run_runtime_probe
-run_rust_test backup_generations_are_sqlite_consistent_and_bounded
-run_rust_test failed_backup_rotation_keeps_existing_generation_untouched
-run_rust_test verified_migration_switches_only_after_candidate_validation
-run_rust_test invalid_migration_candidate_leaves_source_untouched
-run_rust_test migration_that_drops_a_valid_row_is_rejected_before_switch
-run_rust_test opening_an_old_schema_is_rejected_without_migration
-run_rust_test corrupt_database_error_preserves_the_original_file
-
 db="$tmp_root/usage_history.sqlite3"
 
 # Keep the fixture schema/value set bounded and non-sensitive. The backup
 # generations below use SQLite's online-backup API through Python's standard
-# library, while the project's own online-backup implementation is exercised
-# by the focused Rust tests above.
+# library and are intentionally independent of project test execution.
 python3 - "$db" <<'PY'
 import sqlite3
 import sys
@@ -253,6 +201,4 @@ printf 'restore-failure-source-preserved: PASS source_quick_check=%s source_sign
     "$restore_source_quick_after" "$restore_source_after" "$restore_source_file_after" \
     "$restore_backup_quick_after" "$restore_backup_after" "$restore_backup_file_after"
 
-printf 'migration-success-source-preserved: PASS (verified_migration_switches_only_after_candidate_validation)\n'
-printf 'migration-failure-source-preserved: PASS (invalid_migration_candidate_leaves_source_untouched, migration_that_drops_a_valid_row_is_rejected_before_switch)\n'
-printf 'db-protection-e2e: PASS (3 backup generations quick_check/reload, source row/hash invariant, backup/migration/restore failure tests)\n'
+printf 'db-protection-e2e: PASS (3 backup generations quick_check/reload, row/file hashes, restore-failure source preservation)\n'

@@ -29,7 +29,6 @@ if git rev-parse --verify HEAD^ >/dev/null 2>&1; then
 fi
 run_checked 'Rust format check' cargo fmt --check
 run_checked 'Rust all-target check' cargo check --locked --all-targets
-run_checked 'Requirements ledger schema check' bash scripts/requirements_ledger_gate.sh
 run_checked 'Requirements ledger final check' bash scripts/requirements_ledger_gate.sh --final
 
 require_text docs/PRODUCT_REQUIREMENTS.md '全直積、N倍、N二乗、N階乗のcase生成を行わない'
@@ -37,6 +36,8 @@ require_text docs/PRODUCT_REQUIREMENTS.md '製品バージョンはメイン画�
 require_text docs/REGRESSION_PREVENTION_POLICY.md 'REG-WIN-DRAG'
 require_text docs/REGRESSION_PREVENTION_POLICY.md 'X先行の変更凍結を必須とする'
 require_text docs/REGRESSION_PREVENTION_POLICY.md '物理window move証拠'
+# The backticks are a literal documentation marker, not shell expansion.
+# shellcheck disable=SC2016
 require_text docs/REGRESSION_PREVENTION_POLICY.md 'CI受入時の`-AllowPhysicalInput`実行ログ'
 for required_ledger_id in X-START-01 X-START-02 X-START-03 X-GRAPH-01 X-THREAD-01 WIN-START-01 WIN-GRAPH-01 WIN-VERSION-01 PROC-LEDGER-01; do
     require_text docs/REQUIREMENTS_LEDGER.md "| $required_ledger_id |"
@@ -88,38 +89,6 @@ require_text windows-client/tests/CodexInfo.WindowsClient.Presentation.Tests/Mai
 require_text windows-client/tests/CodexInfo.WindowsClient.Presentation.Tests/MainWindowViewModelTests.cs 'Startup_failure_releases_spinner_and_exposes_retry_state'
 require_text windows-client/tests/CodexInfo.WindowsClient.Presentation.Tests/MainWindowViewModelTests.cs 'Startup_waits_for_the_matching_details_generation_before_publishing_content'
 
-run_required_rust_test() {
-    local test_name="$1"
-    local output
-    output="$(cargo test --locked --bin codex_info "tests::$test_name" -- --exact --nocapture 2>&1)" || {
-        printf '%s\n' "$output" >&2
-        fail "required Rust regression test failed: $test_name"
-    }
-    printf '%s\n' "$output"
-    if ! rg -q --fixed-strings "test tests::$test_name ... ok" <<<"$output"; then
-        fail "required Rust regression test did not run and pass exactly: $test_name"
-    fi
-    if ! rg -q --fixed-strings 'running 1 test' <<<"$output"; then
-        fail "required Rust regression test executed an unexpected test count: $test_name"
-    fi
-}
-
-run_required_rust_lib_test() {
-    local test_name="$1"
-    local output
-    output="$(cargo test --locked --lib "thread_contract::tests::$test_name" -- --exact --nocapture 2>&1)" || {
-        printf '%s\n' "$output" >&2
-        fail "required Rust lib regression test failed: $test_name"
-    }
-    printf '%s\n' "$output"
-    if ! rg -q --fixed-strings "test thread_contract::tests::$test_name ... ok" <<<"$output"; then
-        fail "required Rust lib regression test did not run and pass exactly: $test_name"
-    fi
-    if ! rg -q --fixed-strings 'running 1 test' <<<"$output"; then
-        fail "required Rust lib regression test executed an unexpected test count: $test_name"
-    fi
-}
-
 all_target_output="$(cargo test --locked --all-targets -- --nocapture 2>&1)" || {
     printf '%s\n' "$all_target_output" >&2
     fail 'Rust all-target tests failed'
@@ -131,35 +100,42 @@ fi
 if rg -q '^running 0 tests?$' <<<"$all_target_output"; then
     fail 'Rust all-target test set contains a zero-test target'
 fi
-run_checked 'Rust release build' cargo build --release --locked
-run_checked 'Public CLI lifecycle E2E' bash scripts/cli_contract_e2e.sh
 
-# This guard is executable evidence, not only a source-policy scan.  A future
-# caller cannot obtain PASS by omitting the history/graph tests or by selecting
-# a filter that matches zero tests.
-run_required_rust_test historical_week_fixture_preserves_each_period_and_graph_samples
-run_required_rust_test observed_moving_reset_sequence_keeps_the_spend_in_the_selected_graph
-run_required_rust_test long_rolling_reset_sequence_stays_in_one_period_after_a_real_boundary
-run_required_rust_test quota_only_reset_fragments_stay_with_the_adjacent_spend_period
-run_required_rust_test live_rolling_quota_chain_does_not_expose_an_empty_past_period
-run_required_rust_test affected_period_keeps_sol_spend_and_unobserved_quota_distinct
-run_required_rust_test shared_graph_fixture_is_the_x_history_oracle
-run_required_rust_test model_graph_does_not_invent_spend_during_an_unobserved_gap
-run_required_rust_test unused_intervals_mark_long_gap_before_observed_spend
-run_required_rust_test graph_controls_use_one_visual_boundary_and_show_short_histories
-run_required_rust_test remaining_graph_does_not_infer_quota_loss_from_model_spend
-run_required_rust_test affected_timestamp_does_not_mix_a_singleton_reset_period_into_history
-run_required_rust_test ambiguous_missing_quota_row_at_a_spend_timestamp_is_not_a_period
-run_required_rust_test singleton_reset_snapshot_overlapping_a_spend_period_stays_separate
-run_required_rust_test graph_collision_preview_matches_the_historical_singleton_oracle
-run_required_rust_test moving_reset_collision_at_30_and_60_seconds_fails_closed
-run_required_rust_test record_rejects_alias_quota_collision_before_canonical_merge
-run_required_rust_test same_timestamp_reset_drift_above_jitter_fails_closed
-run_required_rust_test startup_load_sanitizes_legacy_same_timestamp_quota_collision
-run_required_rust_test periodic_quota_refresh_retains_last_good_main_snapshot
-run_required_rust_test product_version_is_visible_once_on_native_main_surface
-run_required_rust_test public_snapshot_is_whitelisted_and_tracks_auth_state
-run_required_rust_lib_test recoverable_rollout_parser_skips_only_malformed_token_count_records
+require_rust_test_pass() {
+    local qualified_name="$1"
+    rg -q --fixed-strings "test ${qualified_name} ... ok" <<<"$all_target_output" ||
+        fail "required Rust test did not run and pass in the all-target output: $qualified_name"
+}
+
+# These focused regressions are acceptance requirements, but must be proven by
+# the one all-target test invocation above so that no test gets a second run.
+for required_test in \
+    historical_week_fixture_preserves_each_period_and_graph_samples \
+    observed_moving_reset_sequence_keeps_the_spend_in_the_selected_graph \
+    long_rolling_reset_sequence_stays_in_one_period_after_a_real_boundary \
+    quota_only_reset_fragments_stay_with_the_adjacent_spend_period \
+    live_rolling_quota_chain_does_not_expose_an_empty_past_period \
+    affected_period_keeps_sol_spend_and_unobserved_quota_distinct \
+    shared_graph_fixture_is_the_x_history_oracle \
+    model_graph_does_not_invent_spend_during_an_unobserved_gap \
+    unused_intervals_mark_long_gap_before_observed_spend \
+    graph_controls_use_one_visual_boundary_and_show_short_histories \
+    remaining_graph_does_not_infer_quota_loss_from_model_spend \
+    affected_timestamp_does_not_mix_a_singleton_reset_period_into_history \
+    ambiguous_missing_quota_row_at_a_spend_timestamp_is_not_a_period \
+    singleton_reset_snapshot_overlapping_a_spend_period_stays_separate \
+    graph_collision_preview_matches_the_historical_singleton_oracle \
+    moving_reset_collision_at_30_and_60_seconds_fails_closed \
+    record_rejects_alias_quota_collision_before_canonical_merge \
+    same_timestamp_reset_drift_above_jitter_fails_closed \
+    startup_load_sanitizes_legacy_same_timestamp_quota_collision \
+    periodic_quota_refresh_retains_last_good_main_snapshot \
+    product_version_is_visible_once_on_native_main_surface \
+    public_snapshot_is_whitelisted_and_tracks_auth_state; do
+    require_rust_test_pass "tests::$required_test"
+done
+require_rust_test_pass \
+    'thread_contract::tests::recoverable_rollout_parser_skips_only_malformed_token_count_records'
 for required_thread_failure_test in \
     thread_c_all_current_cycle_failure_classes_return_no_partial_snapshot \
     thread_c_candidate_failure_rejects_the_complete_cycle \
@@ -167,8 +143,32 @@ for required_thread_failure_test in \
     thread_c_no_thread_and_all_candidate_failure_are_distinct \
     thread_c_private_accumulator_abort_never_yields_partial_snapshot \
     thread_c_snapshot_rejects_partial_candidate_reads; do
-    run_required_rust_lib_test "$required_thread_failure_test"
+    require_rust_test_pass "thread_contract::tests::$required_thread_failure_test"
 done
+
+# Data-protection tests live in several Rust targets.  Match their fully
+# qualified output names without hard-coding a module path that is not part of
+# the contract.
+for required_data_test in \
+    db_protection_runtime_backup_migration_restore \
+    failed_backup_rotation_keeps_existing_generation_untouched \
+    migration_that_drops_a_valid_row_is_rejected_before_switch \
+    oversized_tool_records_do_not_hide_following_usage_samples \
+    recoverable_rollout_parser_keeps_running_state_around_large_tool_output \
+    concurrent_collectors_merge_one_minute_without_duplicate_rows \
+    backup_generations_are_sqlite_consistent_and_bounded \
+    verified_migration_switches_only_after_candidate_validation \
+    invalid_migration_candidate_leaves_source_untouched \
+    stale_pid_lock_is_reclaimed_and_live_lock_is_singleton \
+    opening_an_old_schema_is_rejected_without_migration \
+    corrupt_database_error_preserves_the_original_file; do
+    if ! rg -q --fixed-strings "test ${required_data_test} ... ok" <<<"$all_target_output" &&
+       ! rg -q -e "^test [^[:space:]]+::${required_data_test} \.\.\. ok$" <<<"$all_target_output"; then
+        fail "required data-protection test did not run and pass in the all-target output: $required_data_test"
+    fi
+done
+
+run_checked 'Rust release build' cargo build --release --locked
 
 # When a local X11 display is available, require a fresh rendered graph image
 # as part of the same delivery check. Headless runners cannot satisfy this
