@@ -42,7 +42,18 @@ for required_ledger_id in X-START-01 X-START-02 X-START-03 X-GRAPH-01 X-THREAD-0
 done
 require_file scripts/x11_graph_visual_gate.sh
 require_file scripts/x11_startup_visual_gate.sh
+require_text scripts/x11_graph_visual_gate.sh 'lib.XMoveWindow(display, main, 1280, 0)'
+require_text scripts/x11_graph_visual_gate.sh 'lib.XLowerWindow(display, main)'
+if rg -q --fixed-strings 'XUnmapWindow' scripts/x11_graph_visual_gate.sh; then
+    fail 'X11 graph gate must not unmap the shared Slint owner before first-frame acceptance'
+fi
 require_file scripts/cli_contract_e2e.sh
+require_text scripts/cli_contract_e2e.sh "initial_commit='codex-info: recorder committed 1 samples'"
+require_text scripts/cli_contract_e2e.sh "fixture_now=\"\$(date -u +%s)\""
+require_text scripts/cli_contract_e2e.sh '"CODEX_INFO_DAEMON_INTERVAL_SECS=5"'
+require_text scripts/cli_contract_e2e.sh 'BEGIN EXCLUSIVE;'
+require_text scripts/cli_contract_e2e.sh "'forced transient recorder failure was not observed'"
+require_text scripts/cli_contract_e2e.sh "sqlite3 -batch -bail -cmd '.timeout 2000'"
 require_text scripts/x11_graph_visual_gate.sh 'graph child window title redundantly exposes product version'
 require_text scripts/windows_client_contract_gate.sh 'main version automation marker must appear exactly once'
 require_text scripts/windows_client_contract_gate.sh 'child window must not render a product version'
@@ -56,6 +67,10 @@ require_text windows-client/src/CodexInfo.WindowsClient/Settings/ConnectionProce
 require_text windows-client/src/CodexInfo.WindowsClient/Settings/ConnectionProcessFactory.cs '--port'
 require_text windows-client/tools/Run-WindowsClientE2E.ps1 'main-details-status: PASS (matching status/details generation accepted)'
 require_text windows-client/tools/Run-WindowsClientE2E.ps1 'main-startup-loading: PASS (first complete generation is visible)'
+require_text windows-client/tools/Run-WindowsClientE2E.ps1 'legal-plain-text: PASS (all 9 rendered notices, Back, Minimize, and Close are usable)'
+require_text windows-client/tests/CodexInfo.WindowsClient.Presentation.Tests/LegalNoticeCatalogTests.cs 'EveryPackagedMarkdownUrlAndCodeBodySurvivesProjection'
+require_text windows-client/tests/CodexInfo.WindowsClient.Presentation.Tests/LegalNoticeCatalogTests.cs 'FencedCodePreservesHtmlCommentDelimitersWhileOutsideProjectionRemovesThem'
+require_text windows-client/tests/CodexInfo.WindowsClient.Presentation.Tests/LegalNoticeCatalogTests.cs 'MalformedInjectedMarkdownUsesTheExistingFailClosedLoadPage'
 require_text windows-client/tools/Run-WindowsClientE2E.ps1 'Assert-E2EGraphModelPixels'
 require_text windows-client/tests/CodexInfo.WindowsClient.Presentation.Tests/GraphPlotControlTests.cs 'PlotProjectionUsesFlatVerticalAndContiguousSegmentsForFirstObservation'
 require_text windows-client/tests/CodexInfo.WindowsClient.Presentation.Tests/GraphPlotControlTests.cs 'IdleBandsUseTheDedicatedVisibleNeutralColor'

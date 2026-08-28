@@ -76,6 +76,9 @@ fi
 # Keep the graph and its main owner from overlapping on multi-monitor X11
 # sessions. This is test-only window arrangement; the product never moves a
 # user's cursor or other application window.
+# The main window has one intentional 100ms startup placement. Let that finish
+# before arranging the capture surfaces so it cannot move back over Graph.
+sleep 0.25
 python3 - "$graph_id" "$main_id" <<'PY'
 import ctypes, sys
 lib = ctypes.CDLL('libX11.so.6')
@@ -83,21 +86,24 @@ lib.XOpenDisplay.argtypes = [ctypes.c_char_p]
 lib.XOpenDisplay.restype = ctypes.c_void_p
 lib.XMoveWindow.argtypes = [ctypes.c_void_p, ctypes.c_ulong, ctypes.c_int, ctypes.c_int]
 lib.XRaiseWindow.argtypes = [ctypes.c_void_p, ctypes.c_ulong]
-lib.XUnmapWindow.argtypes = [ctypes.c_void_p, ctypes.c_ulong]
-lib.XFlush.argtypes = [ctypes.c_void_p]
+lib.XLowerWindow.argtypes = [ctypes.c_void_p, ctypes.c_ulong]
+lib.XSync.argtypes = [ctypes.c_void_p, ctypes.c_int]
 display = lib.XOpenDisplay(None)
 if not display:
     raise SystemExit('XOpenDisplay failed')
 graph = int(sys.argv[1], 16)
 main = int(sys.argv[2], 16) if len(sys.argv) > 2 and sys.argv[2] else 0
 if main:
-    # Unmap the owner during capture. Window managers may ignore client-side
-    # moves of decorated windows, which otherwise lets the main surface blend
-    # into the graph image and makes the visual oracle non-deterministic.
-    lib.XUnmapWindow(display, main)
+    # Keep the shared Slint renderer active. Unmapping the owner before the
+    # first Graph frame is complete can suspend a fresh Xvfb backend and leave
+    # a permanently partial child frame. Lowering the owner keeps it mapped
+    # while the raised Graph remains the only visible capture surface. Move
+    # it beyond the 1280px-wide test root after its one-shot placement timer.
+    lib.XMoveWindow(display, main, 1280, 0)
+    lib.XLowerWindow(display, main)
 lib.XMoveWindow(display, graph, 0, 0)
 lib.XRaiseWindow(display, graph)
-lib.XFlush(display)
+lib.XSync(display, 0)
 PY
 # Window creation and graph painting are asynchronous.  A fixed sleep can
 # capture a partially-painted frame on a busy runner, so require the complete
