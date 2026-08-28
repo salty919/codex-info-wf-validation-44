@@ -237,7 +237,8 @@ jobs:
           if ($sourceSha -ne $env:GITHUB_SHA) { throw 'UI quality checkout SHA does not match the workflow SHA.' }
           $evidence = Join-Path $env:RUNNER_TEMP 'codex-info-windows-e2e'
           if (-not (Test-Path -LiteralPath $evidence -PathType Container)) { throw 'Windows UI evidence directory is missing.' }
-          @(
+          $encoding = [System.Text.UTF8Encoding]::new($false)
+          $qualityLines = @(
             'schema: codex-info-quality-v1'
             'quality: ui'
             "source-sha: $sourceSha"
@@ -245,7 +246,13 @@ jobs:
             'windows-ui-e2e: PASS'
             'window-move-smoke: PASS'
             'ui-quality: PASS'
-          ) | Set-Content -LiteralPath (Join-Path $evidence 'ui-quality.txt') -Encoding utf8
+          )
+          $qualityPath = Join-Path $evidence 'ui-quality.txt'
+          [System.IO.File]::WriteAllText(
+            $qualityPath,
+            (($qualityLines -join "`n") + "`n"),
+            $encoding
+          )
           $hashLines = @(
             Get-ChildItem -LiteralPath $evidence -File |
               Where-Object { $_.Name -ne 'SHA256SUMS' } |
@@ -256,7 +263,12 @@ jobs:
                 "$hash  $relative"
               }
           )
-          $hashLines | Set-Content -LiteralPath (Join-Path $evidence 'SHA256SUMS') -Encoding utf8
+          $manifestPath = Join-Path $evidence 'SHA256SUMS'
+          [System.IO.File]::WriteAllText(
+            $manifestPath,
+            (($hashLines -join "`n") + "`n"),
+            $encoding
+          )
       - name: Upload Windows UI E2E evidence
         if: always()
         uses: actions/upload-artifact@v4

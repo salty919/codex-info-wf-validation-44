@@ -273,6 +273,49 @@ require_text .github/workflows/windows-client.yml 'needs: [version-prepared, nat
 require_text .github/workflows/windows-client.yml 'Run final acceptance gate before merge'
 require_text .github/workflows/windows-client.yml 'windows_window_move_smoke.ps1 -ClientPath $exe -AllowPhysicalInput'
 require_text .github/workflows/windows-client.yml 'WINDOWS_CONTRACT_EVIDENCE_DIR'
+ui_quality_scope="$(
+    awk '
+        $0 == "      - name: Write UI quality evidence" {
+            capturing = 1
+            next
+        }
+        capturing && $0 ~ /^      - name:/ { exit }
+        capturing { print }
+    ' .github/workflows/windows-client.yml
+)"
+[[ -n "$ui_quality_scope" ]] || fail 'missing Write UI quality evidence step body'
+require_ui_quality_text() {
+    local pattern="$1"
+    rg -q --fixed-strings -- "$pattern" <<<"$ui_quality_scope" ||
+        fail "missing in Write UI quality evidence step: $pattern"
+}
+require_ui_quality_text '$qualityLines'
+require_ui_quality_text '$qualityPath'
+require_ui_quality_text 'ui-quality.txt'
+require_ui_quality_text '$hashLines'
+require_ui_quality_text '$manifestPath'
+require_ui_quality_text 'SHA256SUMS'
+require_ui_quality_text '[System.Text.UTF8Encoding]::new($false)'
+require_ui_quality_text '[System.IO.File]::WriteAllText('
+require_ui_quality_text '$qualityLines -join "`n"'
+require_ui_quality_text '$hashLines -join "`n"'
+if rg -q --fixed-strings -- 'Set-Content' <<<"$ui_quality_scope"; then
+    fail 'Write UI quality evidence must not use Set-Content'
+fi
+write_all_text_count="$(rg -o --fixed-strings '[System.IO.File]::WriteAllText(' <<<"$ui_quality_scope" | wc -l)"
+[[ "$write_all_text_count" -eq 2 ]] ||
+    fail "UI quality marker and SHA256SUMS must each use WriteAllText: count=$write_all_text_count"
+utf8_no_bom_count="$(rg -o --fixed-strings '[System.Text.UTF8Encoding]::new($false)' <<<"$ui_quality_scope" | wc -l)"
+[[ "$utf8_no_bom_count" -eq 1 ]] ||
+    fail "UI quality evidence must declare one UTF-8 no-BOM encoding: count=$utf8_no_bom_count"
+quality_lines_line="$(rg -n -m1 --fixed-strings '$qualityLines = @(' <<<"$ui_quality_scope" | cut -d: -f1)"
+quality_write_line="$(rg -n -m1 --fixed-strings '[System.IO.File]::WriteAllText(' <<<"$ui_quality_scope" | cut -d: -f1)"
+hash_lines_line="$(rg -n -m1 --fixed-strings '$hashLines = @(' <<<"$ui_quality_scope" | cut -d: -f1)"
+manifest_write_line="$(rg -n -m2 --fixed-strings '[System.IO.File]::WriteAllText(' <<<"$ui_quality_scope" | tail -n1 | cut -d: -f1)"
+[[ -n "$quality_lines_line" && -n "$quality_write_line" && -n "$hash_lines_line" && -n "$manifest_write_line" ]] ||
+    fail 'UI quality marker and manifest writer ordering markers are incomplete'
+(( quality_lines_line < quality_write_line && quality_write_line < hash_lines_line && hash_lines_line < manifest_write_line )) ||
+    fail 'UI quality lines must be written before SHA256SUMS is calculated and written'
 workflow_contract_scope="$(
     awk '
         $0 == "  windows-quality:" {
