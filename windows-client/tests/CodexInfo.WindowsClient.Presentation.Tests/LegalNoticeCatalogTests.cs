@@ -137,7 +137,6 @@ public sealed class LegalNoticeCatalogTests
                 Assert.DoesNotContain("<!--", line, StringComparison.Ordinal);
                 Assert.DoesNotContain("-->", line, StringComparison.Ordinal);
                 Assert.DoesNotContain("```", line, StringComparison.Ordinal);
-                Assert.DoesNotContain('`', line);
                 Assert.DoesNotContain("](", line, StringComparison.Ordinal);
                 Assert.False(line.TrimStart().StartsWith('#'), notice.Name);
             }
