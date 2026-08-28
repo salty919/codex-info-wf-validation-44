@@ -211,7 +211,14 @@ def resolve_quality_run(event: Any, pull_request: Any, workflow_runs: Any) -> in
         raise ResolutionError("pull-request identity does not match event")
 
     runs = _workflow_runs(workflow_runs)
-    resolved = [_run_id(run, event_identity) for run in runs]
+    if any(not isinstance(run, dict) for run in runs):
+        raise ResolutionError("invalid workflow run")
+    successful_runs = [
+        run
+        for run in runs
+        if run.get("status") == "completed" and run.get("conclusion") == "success"
+    ]
+    resolved = [_run_id(run, event_identity) for run in successful_runs]
     if len(resolved) != 1:
         raise ResolutionError(
             f"expected exactly one successful workflow run, found {len(resolved)}"

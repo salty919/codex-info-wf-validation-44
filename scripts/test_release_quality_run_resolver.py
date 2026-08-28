@@ -156,6 +156,47 @@ class ReleaseQualityRunResolverTests(unittest.TestCase):
         two_runs["workflow_runs"][1]["id"] = 987655
         self.assert_rejected(event_fixture(), pull_request_fixture(), two_runs)
 
+    def test_ignores_unsuccessful_runs_around_valid_success(self) -> None:
+        success = runs_fixture()["workflow_runs"][0]
+        unsuccessful = copy.deepcopy(success)
+        unsuccessful["id"] = 987653
+        unsuccessful["conclusion"] = "failure"
+        for name, ordered_runs in (
+            ("failed before success", [unsuccessful, success]),
+            ("failed after success", [success, unsuccessful]),
+        ):
+            with self.subTest(name=name):
+                result = self.run_resolver(
+                    event_fixture(),
+                    pull_request_fixture(),
+                    {"workflow_runs": ordered_runs},
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout, "987654\n")
+
+        cancelled = copy.deepcopy(success)
+        cancelled["id"] = 987652
+        cancelled["conclusion"] = "cancelled"
+        result = self.run_resolver(
+            event_fixture(),
+            pull_request_fixture(),
+            {"workflow_runs": [cancelled, success]},
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "987654\n")
+
+    def test_rejects_unsuccessful_only_runs(self) -> None:
+        unsuccessful = runs_fixture()["workflow_runs"][0]
+        unsuccessful["conclusion"] = "failure"
+        self.assert_rejected(
+            event_fixture(), pull_request_fixture(), {"workflow_runs": [unsuccessful]}
+        )
+
+    def test_rejects_non_dict_workflow_run(self) -> None:
+        self.assert_rejected(
+            event_fixture(), pull_request_fixture(), {"workflow_runs": [None]}
+        )
+
     def test_rejects_event_and_pull_request_identity_mismatches(self) -> None:
         cases: dict[str, tuple[Any, Any]] = {
             "event number": (
