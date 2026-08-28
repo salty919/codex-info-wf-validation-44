@@ -333,9 +333,11 @@ jobs:
             & ./windows-client/tools/Run-WindowsClientE2E.ps1 -ClientPath $exe -OutputDirectory $e2eOutput -Fixture -SourceSha $env:GITHUB_SHA
             if (-not $?) { throw 'Windows UI Automation E2E failed.' }
             "source-sha: $env:GITHUB_SHA" | Set-Content -LiteralPath $moveSmokeLog -Encoding utf8
-            & ./scripts/windows_window_move_smoke.ps1 -ClientPath $exe -AllowPhysicalInput *>&1 |
-              Tee-Object -FilePath $moveSmokeLog -Append
-            if ($LASTEXITCODE -ne 0) { throw 'Physical window move smoke failed.' }
+            $moveSmokeOutput = @(& ./scripts/windows_window_move_smoke.ps1 -ClientPath $exe -AllowPhysicalInput *>&1)
+            $moveSmokeOutput | Tee-Object -FilePath $moveSmokeLog -Append
+            if ($moveSmokeOutput.Count -eq 0 -or [string]$moveSmokeOutput[-1] -ne 'window-move-smoke: PASS') {
+              throw 'Physical window move smoke did not report its terminal PASS contract.'
+            }
           }
           finally {
             $uninstaller = Get-ChildItem -LiteralPath $install -Filter 'unins*.exe' -File -ErrorAction SilentlyContinue | Select-Object -First 1
