@@ -148,7 +148,16 @@ jobs:
       - name: Install locked Inno Setup compiler
         shell: pwsh
         run: |
+          winget source update --name winget --disable-interactivity
+          $sourceUpdateExitCode = $LASTEXITCODE
+          if ($sourceUpdateExitCode -ne 0) {
+            throw ('WinGet source update failed with exit code 0x{0:X8}.' -f $sourceUpdateExitCode)
+          }
           winget install --id JRSoftware.InnoSetup.7 --version 7.1.0 -e -s winget --scope user --silent --accept-package-agreements --accept-source-agreements --disable-interactivity
+          $installExitCode = $LASTEXITCODE
+          if ($installExitCode -ne 0) {
+            throw ('WinGet Inno Setup install failed with exit code 0x{0:X8}.' -f $installExitCode)
+          }
           $compiler = Join-Path $env:LOCALAPPDATA 'Programs\Inno Setup 7\ISCC.exe'
           if (-not (Test-Path $compiler -PathType Leaf)) { throw 'Inno Setup 7.1.0 compiler was not installed.' }
           "INNO_SETUP_COMPILER=$compiler" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
