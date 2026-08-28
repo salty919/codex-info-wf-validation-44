@@ -42,6 +42,11 @@ for required_ledger_id in X-START-01 X-START-02 X-START-03 X-GRAPH-01 X-THREAD-0
 done
 require_file scripts/x11_graph_visual_gate.sh
 require_file scripts/x11_startup_visual_gate.sh
+require_text scripts/x11_graph_visual_gate.sh 'lib.XMoveWindow(display, main, 1280, 0)'
+require_text scripts/x11_graph_visual_gate.sh 'lib.XLowerWindow(display, main)'
+if rg -q --fixed-strings 'XUnmapWindow' scripts/x11_graph_visual_gate.sh; then
+    fail 'X11 graph gate must not unmap the shared Slint owner before first-frame acceptance'
+fi
 require_file scripts/cli_contract_e2e.sh
 require_text scripts/cli_contract_e2e.sh "initial_commit='codex-info: recorder committed 1 samples'"
 require_text scripts/cli_contract_e2e.sh "fixture_now=\"\$(date -u +%s)\""
