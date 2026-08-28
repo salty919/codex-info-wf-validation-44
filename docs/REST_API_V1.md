@@ -93,8 +93,8 @@ SQLite transaction、WAL/SHM、migration、prune、backup、DB row/hash、Publis
 | request | method | result | response / side effect |
 | --- | --- | --- | --- |
 | `/v1/health` | `GET` | `200` | JSON health object、required `Content-Type`/`Cache-Control` headers、DB write/transaction=0 |
-| `/v1/status` | `GET` | `200` | current `PublishedPair` status、同上header、DB write/transaction=0 |
-| `/v1/details` | `GET` | `200` | current `PublishedPair` details、同上header、DB write/transaction=0 |
+| `/v1/status` | `GET` | `200` | current `PublishedPair` status、共通headerに加えて必須`Codex-Info-Published-Pair`、DB write/transaction=0 |
+| `/v1/details` | `GET` | `200` | current `PublishedPair` details、共通headerに加えて必須`Codex-Info-Published-Pair`、DB write/transaction=0 |
 | 上記known path | `HEAD/POST/PUT/PATCH/DELETE/OPTIONS`等全non-GET | `405` | 固定JSON error、同上header、DB/WAL/SHM/migration/prune/backup=0 |
 | unknown、case-altered、末尾slash、query付きpath（methodを問わない） | any | `404` | 固定JSON error、同上header、DB/WAL/SHM/migration/prune/backup=0 |
 
@@ -192,7 +192,11 @@ dollarは有限かつ0以上のJSON numberである。ドルはcreditや為替�
 `reset_at`はperiod groupのcanonical reset境界であり、sampleの所属判定に使う。`end_at`は現在期間では
 観測時刻、途中で次期間へ切り替わった過去期間では次期間開始へclipできるため、`end_at`をcanonical
 reset境界として代用してはならない。clientは`id`をparseせず、sampleの`reset_at`がperiodの
-`reset_at - 60 <= sample.reset_at <= reset_at`に入るものだけを同periodへcanonicalizeする。
+`reset_at - 60 <= sample.reset_at <= reset_at`に入るものだけを同periodへcanonicalizeする。各sampleは
+exactly one periodへ所属し、そのperiodの`start_at <= timestamp <= end_at`を満たす。raw
+`(sample.reset_at,timestamp)`が一意でも、canonicalize後の`(period.id,timestamp)`が衝突するcandidateは
+同一分に異なる残量・累積値を並べて垂直変化を作り得るため全体rejectする。merge、max、last-row、null化、
+array順選択で衝突を隠さない。
 
 `label`はLinux/X側が同じperiod groupの表示に用いたreference labelであり、selection keyでもWindowsの
 日時parse入力でもない。serverは`DESIGN.md`のcanonical period ID、start/end、起動時timezone、DST offset、
@@ -257,9 +261,12 @@ rootとsiblingの相対rankを保ったまま親先行depth-first・subtree-cont
 
 全objectは上記キーを全て必須とし、未知、大小文字違い、同一object内の重複、型違い、
 配列上限超過が1件でもあればcandidate全体を拒否する。status/detailsはサーバー側で一つの
-write lockにより同じ`PublishedPair`からatomic publishする。Windowsが別々のHTTP requestで
-同一cycleの表示を更新する場合は、現行`(ProfileScopeId, AccountScopeId, StorageEpoch, SupervisorLeaseIdentity, CollectorEpoch, CycleSeq)`、
-共通core field、`DataGeneration`、canonical fingerprint、`RootHash`が一致した組だけをcommitする。
+write lockにより同じ`PublishedPair`からatomic publishする。serverの`SnapshotPublisher`は現行
+`(ProfileScopeId, AccountScopeId, StorageEpoch, SupervisorLeaseIdentity, CollectorEpoch, CycleSeq)`、
+`DataGeneration`、`DataHash`、canonical fingerprint、`RootHash`が一致する内部candidateだけをpublishし、
+その成功publishへ一つの`Codex-Info-Published-Pair`を割り当てる。Windowsが別々のHTTP requestで同一cycleの
+表示を更新する場合は、両bodyのstrict schema/domain、共通core fieldのfield-by-field一致、両headerのexact一致を
+全て満たす組だけをcommitする。wireに存在しないserver内部値をWindowsが推測または再計算しない。
 片側失敗、更新競合、一致しない組、stale lease/epoch/cycleは架空の世代番号を補わず、DB、memory、REST、UIを
 変更せず両方のlast-good pairを保持して次cycleで再取得する。statusだけS1へ進みdetails D0を
 残す混合世代、detailsだけを先行更新する混合世代、片側のDB read/writeは許可しない。
@@ -293,12 +300,49 @@ healthはlistener到達性だけで、認証、ready、DB健全性、PublishedPa
 - `Content-Type`は`application/json; charset=utf-8`。parameter追加、charset欠落、別charsetを生成しない。
 - `Cache-Control`は`no-store`。
 - fixed bodyでは`Content-Length`をUTF-8 bytesと一致させる。
+- `/v1/status`と`/v1/details`の200応答は`Codex-Info-Published-Pair`をexactly one持つ。値は
+  ASCII `v1:`に128-bit server epochの32桁lowercase hex、続けて128-bit publish counterの
+  32桁lowercase hexを置いた67 bytesだけとする。同じimmutable `PublishedPair`から生成した両応答は
+  同じ値になる。clientはprefix/length/lowercase hexだけを検証し、epoch/counterを業務値としてparse、sort、
+  永続化、表示せず、同一candidate内のopaque equality tokenとしてだけ扱う。
+  `/v1/health`、error、unknown/method拒否応答はこのheaderを持たない。
 - response header aggregateは8 KiB以下。`Set-Cookie`、`Location`、`Content-Encoding`、
   `WWW-Authenticate`、authentication/proxy headerは0件。
 
 clientはContent-Typeをcase-insensitive tokenとしてparseするが、media type=`application/json`かつ
 唯一のparameter charset=`utf-8`を両方要求する。charsetなしを受理しない。body key順やJSON insignificant
-whitespaceはidentityに使わず、parse後のexact key/value集合とcanonical再serialization SHAをoracleにする。
+whitespaceはidentityに使わず、parse後のexact key/value集合、型、値、配列順をfield-by-fieldで検査する。
+clientはbodyのcanonical再serialization SHA、未公開のadmission tuple、`DataGeneration`、`DataHash`、
+canonical fingerprint、`RootHash`を再計算または推測しない。それらはserver内部のpublisher admissionであり、
+wire上では`Codex-Info-Published-Pair`が同じimmutable pairの比較専用identityを所有する。
+
+server epochはprocess起動時、listener bindより前にOS CSPRNGからexact 16 bytesを一度取得し、all-zeroなら
+再試行せず起動を非0終了する。credential、profile/account値、path、admission tuple、body hashをepochへ混ぜない。
+epochはprocess lifetime中不変で、単独ではwire・log・永続領域へ出さない。publish counterのownerは
+`SnapshotPublisher`一つで、初期値0、最初の成功publishを1とする。完全candidateのschema/domain/admission検証後、
+一つのpublisher write lock内でcounterをchecked-addし、epoch+counter tokenをpairへ設定してからrootを一度だけ
+交換する。reject、cancel、read、HTTP request、同じpairの再応答はcounterとrootを変更しない。公開bodyが同じでも
+新しい成功publishはcounterを増やす。同時publishはlock取得順に別counterを持つ。counterがu128::MAXなら旧pairを
+変更せず、publisherをpermanent-failedとしてlistenerを閉じprocessを非0終了する。OS CSPRNGのcollision resistanceを
+process再起動間の分離境界とし、同一process内のgeneration一意性はcounterで決定的に保証する。このheaderは外部が
+bodyから再計算するcontent proofではなく、同じpublisher pairを結ぶ比較専用identityである。
+
+server起動時はlistenerがrequestをacceptする前に、schema-validなdefault `initializing` status/detailsを最初の
+成功publishとしてcounter=1へ構築する。従って起動直後からstatus/detailsにはpair identityが存在し、最初の実data
+publishはcounter=2となる。default pairのserializationまたはidentity構築に失敗した場合はbind済みsocketを公開せず
+起動を非0終了し、pairなしの200応答を返さない。test用の未publish publisherはcounter=0から最初の明示publishを1として
+固定vectorを検査できるが、production listenerは未publish stateを外部へ公開しない。
+
+固定oracleは次のとおりとする。testではCSPRNG sourceを注入し、production CSPRNGを置換しない。
+
+| server epoch (hex) | successful publish counter | exact header value |
+| --- | ---: | --- |
+| `00112233445566778899aabbccddeeff` | 1 | `v1:00112233445566778899aabbccddeeff00000000000000000000000000000001` |
+| `00112233445566778899aabbccddeeff` | 2 | `v1:00112233445566778899aabbccddeeff00000000000000000000000000000002` |
+| `00112233445566778899aabbccddeef0` | 1 | `v1:00112233445566778899aabbccddeef000000000000000000000000000000001` |
+
+counter=1のpairをpublish後にinvalid candidateをrejectした場合、次のstatus/detailsもcounter=1のexact headerを返す。
+counter=1のpairを再度HTTP取得するだけでも同じ値を返し、counter=2へ進めない。
 
 ### Server error response
 
@@ -356,10 +400,13 @@ product syscall traceを検査する。同一request再入で副作用countが�
 
 ### Atomic status/details client admission
 
-client cycleはhealth受理後にstatusとdetailsを各1回取得し、両方のschema/domain/common coreが一致した場合だけ
+client cycleはhealth受理後にstatusとdetailsを各1回取得し、両方のschema/domain/common coreがfield-by-fieldで一致した場合だけ
 同じroot generationとして一括commitする。statusだけvalid、detailsだけvalid、片側timeout/non-200/invalid、
-common field不一致では両方をdiscardし、直前の完全pairを保持する。wireにgeneration fieldを追加せず、client内部の
-request cycle IDとcanonical common-core hashで同一候補を結ぶ。`WIN-I-016`を含む具体契約はこの規則と異なる
+common field不一致では両方をdiscardし、直前の完全pairを保持する。wireにJSON generation fieldを追加せず、client内部の
+request cycle IDと両応答のexactな`Codex-Info-Published-Pair`一致で同一候補を結ぶ。common-core hashやbody SHAを
+別のidentityとして作らず、同名fieldの型と値を直接比較する。
+header欠落、重複、値の大小文字差、prefix/長さ/hex不正、不一致はcandidate全体をrejectし、次cycleまで自動再取得を
+繰り返さない。`WIN-I-016`を含む具体契約はこの規則と異なる
 status-only commitを許可しない。
 ただし`auth_required`のsecurity visibility transitionはdata pairのcommitではない。
 schema-validな`state=auth_required,authenticated=false`を受理した場合、detailsがinvalidでも

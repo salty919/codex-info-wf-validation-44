@@ -242,7 +242,7 @@ fn input_fingerprint(hint: Option<ResetHint>) -> Result<InputFingerprint, Daemon
     if let Some(root) = crate::local_sessions_root() {
         match fs::symlink_metadata(&root) {
             Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
-                return Err(DaemonError::Input)
+                return Err(DaemonError::Input);
             }
             Ok(_) => {
                 let paths = crate::session_jsonl_files(&root).map_err(|_| DaemonError::Input)?;

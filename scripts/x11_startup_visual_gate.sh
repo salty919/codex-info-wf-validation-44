@@ -11,8 +11,12 @@ binary="$root_dir/target/release/codex_info"
 temp_parent="${TMPDIR:-/tmp}"
 temp_root="$(mktemp -d "$temp_parent/codex-info-x11-startup.XXXXXX")"
 preview_pid=""
+failure_pid=""
+blocker_pid=""
 cleanup() {
     if [[ -n "$preview_pid" ]] && kill -0 "$preview_pid" 2>/dev/null; then kill "$preview_pid" 2>/dev/null || true; wait "$preview_pid" 2>/dev/null || true; fi
+    if [[ -n "$failure_pid" ]] && kill -0 "$failure_pid" 2>/dev/null; then kill "$failure_pid" 2>/dev/null || true; wait "$failure_pid" 2>/dev/null || true; fi
+    if [[ -n "$blocker_pid" ]] && kill -0 "$blocker_pid" 2>/dev/null; then kill "$blocker_pid" 2>/dev/null || true; wait "$blocker_pid" 2>/dev/null || true; fi
     case "$temp_root" in
         "$temp_parent"/codex-info-x11-startup.*) rm -rf -- "$temp_root" ;;
         *) echo 'x11-startup-visual-gate: refusing unexpected cleanup' >&2 ;;
@@ -97,4 +101,67 @@ for start in quota_blue:
 if largest[1] >= 100 and largest[0] >= 100:
     raise SystemExit(f'partial quota payload leaked: component area={largest[0]} width={largest[1]} height={largest[2]}')
 print('x11-startup-visual-gate: PASS (900x480, header/version visible, centered spinner visible, partial payload hidden)')
+PY
+
+# X-START-05: the UI and its service must use the same selected endpoint.
+# Occupy an ephemeral loopback port with a non-codex HTTP listener. The GUI
+# must remain visible in its bounded failure/retry surface and must not fall
+# back to a healthy service on the default port.
+kill "$preview_pid" 2>/dev/null || true
+wait "$preview_pid" 2>/dev/null || true
+preview_pid=""
+python3 -u -m http.server 0 --bind 127.0.0.1 >"$temp_root/blocker.log" 2>&1 &
+blocker_pid="$!"
+blocked_port=""
+for _ in $(seq 1 40); do
+    blocked_port="$(sed -n 's/.* port \([0-9][0-9]*\) .*/\1/p' "$temp_root/blocker.log" | head -n 1)"
+    [[ "$blocked_port" =~ ^[0-9]+$ ]] && break
+    sleep 0.05
+done
+[[ "$blocked_port" =~ ^[0-9]+$ ]] || fail 'could not allocate the failure-port fixture'
+env HOME="$temp_root/home" XDG_CONFIG_HOME="$temp_root/config" XDG_DATA_HOME="$temp_root/data" XDG_CACHE_HOME="$temp_root/cache" XDG_STATE_HOME="$temp_root/state" XDG_RUNTIME_DIR="$temp_root/runtime" "$binary" --ui --port "$blocked_port" >"$temp_root/failure-client.log" 2>&1 &
+failure_pid="$!"
+failure_window_id=""
+for _ in $(seq 1 120); do
+    while read -r candidate; do
+        window_pid="$(xprop -id "$candidate" _NET_WM_PID 2>/dev/null | awk -F'= ' '{print $2}' | tr -d '[:space:]')"
+        if [[ "$window_pid" == "$failure_pid" ]]; then failure_window_id="$candidate"; break; fi
+    done < <(xwininfo -root -tree 2>/dev/null | awk '/^ +0x[0-9a-f]+/ {print $1}')
+    [[ -n "$failure_window_id" ]] && break
+    sleep 0.125
+done
+[[ -n "$failure_window_id" ]] || { sed -n '1,120p' "$temp_root/failure-client.log" >&2 || true; fail 'failure-port GUI did not render'; }
+sleep 1
+kill -0 "$failure_pid" 2>/dev/null || fail 'failure-port GUI exited after rendering'
+xwd -silent -id "$failure_window_id" -out "$temp_root/failure.xwd"
+python3 - "$temp_root/failure.xwd" <<'PY'
+import struct, sys
+from math import sqrt
+data = open(sys.argv[1], 'rb').read()
+h = struct.unpack('>25I', data[:100])
+header_size, width, height, bytes_per_line, colors = h[0], h[4], h[5], h[12], h[19]
+if (width, height) != (900, 480):
+    raise SystemExit(f'unexpected failure image size: {width}x{height}')
+offset = header_size + colors * 12
+stride = bytes_per_line // width
+def rgb(x, y):
+    i = offset + y * bytes_per_line + x * stride
+    return data[i + 2], data[i + 1], data[i]
+def near(a, b, tolerance=24):
+    return sqrt(sum((a[i] - b[i]) ** 2 for i in range(3))) <= tolerance
+failure_pixels = sum(
+    near(rgb(x, y), (239, 106, 106))
+    for y in range(180, 280)
+    for x in range(35, 720)
+)
+cta_pixels = sum(
+    near(rgb(x, y), (86, 178, 245))
+    for y in range(150, 250)
+    for x in range(35, 430)
+)
+if failure_pixels < 20:
+    raise SystemExit(f'selected-endpoint failure text is missing: pixels={failure_pixels}')
+if cta_pixels < 500:
+    raise SystemExit(f'failure recovery action is missing: pixels={cta_pixels}')
+print(f'x11-startup-failure-port-gate: PASS (window retained, selected-endpoint failure pixels={failure_pixels}, recovery pixels={cta_pixels})')
 PY

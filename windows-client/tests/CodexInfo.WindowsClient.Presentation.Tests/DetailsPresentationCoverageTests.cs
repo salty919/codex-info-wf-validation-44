@@ -217,28 +217,23 @@ public sealed class DetailsPresentationCoverageTests
     }
 
     [Fact]
-    public async Task ThreadsWindow_CyclesMissingFieldsAndLocaleRebuildAreBounded()
+    public async Task ThreadsWindow_MissingFieldsOrphanAndLocaleRebuildAreBounded()
     {
         var now = DateTimeOffset.UtcNow;
         var threadsData = new[]
         {
-            new ApiThreadDetails("cycle-a", "A", "cycle-b", "model-a", "", null, null, null, now.AddMinutes(-4).ToUnixTimeSeconds(), null, false, null, false),
-            new ApiThreadDetails("cycle-b", "B", "cycle-a", "model-b", "", null, null, null, now.AddMinutes(-3).ToUnixTimeSeconds(), null, false, null, false),
+            new ApiThreadDetails("root", "Root", null, "model-root", "", null, null, null, now.AddMinutes(-4).ToUnixTimeSeconds(), null, false, null, false),
             new ApiThreadDetails("orphan", "", "missing-parent", "fallback-model", "", 321, 55, null, null, null, true, null, true),
         };
         using var main = await StartMainAsync(CreateDetails(Array.Empty<ApiHistoryPeriod>(), threadsData));
         using var threads = new ThreadsWindowViewModel(main);
 
-        Assert.Equal(3, threads.Threads.Count);
+        Assert.Equal(2, threads.Threads.Count);
         Assert.All(threads.Threads, item => Assert.InRange(item.TreeDepth, 0, 3));
 
-        var cycleA = Assert.Single(threads.Threads, item => item.Id == "cycle-a");
-        var cycleB = Assert.Single(threads.Threads, item => item.Id == "cycle-b");
         var orphan = Assert.Single(threads.Threads, item => item.Id == "orphan");
-        Assert.True(cycleA.ConnectedToParent);
-        Assert.True(cycleB.ConnectedToParent);
-        Assert.Contains("cycle-b", cycleA.ParentText);
-        Assert.Contains("cycle-a", cycleB.ParentText);
+        var root = Assert.Single(threads.Threads, item => item.Id == "root");
+        Assert.False(root.ConnectedToParent);
         Assert.Contains("missing-parent", orphan.ParentText);
         Assert.Equal("fallback-model", orphan.ModelText);
         Assert.EndsWith("—", orphan.ContextText, StringComparison.Ordinal);
@@ -317,7 +312,10 @@ public sealed class DetailsPresentationCoverageTests
             periods,
             periods.SelectMany(period => period.Samples).ToArray(),
             threads,
-            "estimated");
+            "estimated")
+        {
+            PublishedPair = PublishedPairTestFixtures.Canonical,
+        };
     }
 
     private static string LoadRepositoryFile(params string[] segments)
@@ -389,7 +387,10 @@ public sealed class DetailsPresentationCoverageTests
                 model.InputTokens,
                 model.CachedInputTokens,
                 model.OutputTokens)).ToArray(),
-            details.ActiveThreadCount);
+            details.ActiveThreadCount)
+        {
+            PublishedPair = details.PublishedPair,
+        };
         var main = new MainWindowViewModel(
             new StaticStatusClient(StatusFetchResult.Success(status)),
             new StaticDetailsClient(DetailsFetchResult.Success(details)));

@@ -12,6 +12,10 @@ namespace CodexInfo.WindowsClient.Core.Tests;
 
 public sealed class LoopbackBoundaryCoverageTests
 {
+    private const string PublishedPairHeader = "Codex-Info-Published-Pair";
+    private const string CanonicalPublishedPair =
+        "v1:00112233445566778899aabbccddeeff00000000000000000000000000000001";
+
     [Fact]
     public void NullHandlerAndDefaultConstructionHaveExplicitContracts()
     {
@@ -164,6 +168,7 @@ public sealed class LoopbackBoundaryCoverageTests
                 Content = new ThrowingContent(new IOException("read failed")),
             };
             response.Headers.CacheControl = new CacheControlHeaderValue { NoStore = true };
+            response.Headers.TryAddWithoutValidation(PublishedPairHeader, CanonicalPublishedPair);
             return response;
         }));
 
@@ -187,28 +192,32 @@ public sealed class LoopbackBoundaryCoverageTests
     }
 
     [Fact]
-    public async Task DetailsAcceptsOrphansAndLeavesUnmatchedSamplesUnattached()
+    public async Task DetailsRejectsUnmatchedSamplesInsteadOfDroppingAndPreservesOrphanValidation()
     {
-        var json = DetailsJson()
-            .Replace("\"end_at\":253402300799", "\"end_at\":253402300798", StringComparison.Ordinal)
-            .Replace("\"end_at\":253402300798,\"reset_at\":253402300799", "\"end_at\":253402300798,\"reset_at\":253402300798", StringComparison.Ordinal)
-            .Replace("\"parent_thread_id\":null", "\"parent_thread_id\":\"missing\"", StringComparison.Ordinal);
+        var unmatched = DetailsJson().Replace(
+            "\"timestamp\":253402300680",
+            "\"timestamp\":253402300800",
+            StringComparison.Ordinal);
+        var orphan = DetailsJson().Replace(
+            "\"parent_thread_id\":null",
+            "\"parent_thread_id\":\"missing\"",
+            StringComparison.Ordinal);
 
-        var result = await FetchDetails(json);
+        var unmatchedResult = await FetchDetails(unmatched);
+        var orphanResult = await FetchDetails(orphan);
 
-        Assert.True(result.IsSuccess);
-        var details = result.Snapshot!;
-        Assert.Empty(details.HistoryPeriods[0].Samples);
-        Assert.True(details.Threads[0].IsOrphan);
+        Assert.Equal(DetailsFetchFailure.Response, unmatchedResult.Failure);
+        Assert.Null(unmatchedResult.Snapshot);
+        Assert.True(orphanResult.IsSuccess);
+        Assert.True(orphanResult.Snapshot!.Threads[0].IsOrphan);
     }
 
     [Fact]
-    public async Task DetailsSortsSamplesAndTraversesParentChain()
+    public async Task DetailsPreservesCanonicalSampleOrderAndTraversesParentChain()
     {
         var child = "{\"id\":\"thread-2\",\"title\":\"Child\",\"parent_thread_id\":\"thread-1\",\"model\":\"TERRA\",\"model_label\":\"TERRA\",\"total_tokens\":null,\"context_usage_tokens\":null,\"context_window_tokens\":null,\"created_at\":null,\"last_user_message_at\":null,\"is_subagent\":true,\"depth\":null}";
-        var sample = "{\"timestamp\":2,\"reset_at\":253402300799,\"remaining_percent\":null,\"sol_dollars\":0,\"terra_dollars\":0,\"luna_dollars\":0,\"sol_tokens\":0,\"terra_tokens\":0,\"luna_tokens\":0}";
-        // Keep both samples in the flat collection; the second one sorts before the original.
-        var originalSample = "{\"timestamp\":1,\"reset_at\":253402300799,\"remaining_percent\":null,\"sol_dollars\":1.25,\"terra_dollars\":0.0,\"luna_dollars\":0.0,\"sol_tokens\":6,\"terra_tokens\":0,\"luna_tokens\":0}";
+        var sample = "{\"timestamp\":253402300620,\"reset_at\":253402300799,\"remaining_percent\":null,\"sol_dollars\":0,\"terra_dollars\":0,\"luna_dollars\":0,\"sol_tokens\":0,\"terra_tokens\":0,\"luna_tokens\":0}";
+        var originalSample = "{\"timestamp\":253402300680,\"reset_at\":253402300799,\"remaining_percent\":null,\"sol_dollars\":1.25,\"terra_dollars\":0.0,\"luna_dollars\":0.0,\"sol_tokens\":6,\"terra_tokens\":0,\"luna_tokens\":0}";
         var json = DetailsJson()
             .Replace("\"remaining_percent\":42.5", "\"remaining_percent\":null", StringComparison.Ordinal)
             .Replace(originalSample, sample + "," + originalSample, StringComparison.Ordinal)
@@ -218,7 +227,7 @@ public sealed class LoopbackBoundaryCoverageTests
 
         Assert.True(result.IsSuccess);
         Assert.Equal(2, result.Snapshot!.HistoryPeriods[0].Samples.Count);
-        Assert.Equal(1, result.Snapshot.HistoryPeriods[0].Samples[0].Timestamp);
+        Assert.Equal(253402300620, result.Snapshot.HistoryPeriods[0].Samples[0].Timestamp);
         Assert.Equal("thread-2", result.Snapshot.Threads[1].Id);
         Assert.Equal((ulong?)null, result.Snapshot.Threads[1].CumulativeTokens);
     }
@@ -321,6 +330,7 @@ public sealed class LoopbackBoundaryCoverageTests
                 Content = new ThrowingContent(new InvalidOperationException("read failed")),
             };
             response.Headers.CacheControl = new CacheControlHeaderValue { NoStore = true };
+            response.Headers.TryAddWithoutValidation(PublishedPairHeader, CanonicalPublishedPair);
             return response;
         }));
 
@@ -345,13 +355,13 @@ public sealed class LoopbackBoundaryCoverageTests
 
     private static async Task<StatusFetchResult> FetchStatus(string json)
     {
-        using var client = new LoopbackStatusClient(new StubHandler(_ => JsonResponse(json)));
+        using var client = new LoopbackStatusClient(new StubHandler(_ => JsonResponse(json, includePublishedPair: true)));
         return await client.FetchAsync(CancellationToken.None);
     }
 
     private static async Task<DetailsFetchResult> FetchDetails(string json)
     {
-        using var client = new LoopbackStatusClient(new StubHandler(_ => JsonResponse(json)));
+        using var client = new LoopbackStatusClient(new StubHandler(_ => JsonResponse(json, includePublishedPair: true)));
         return await client.FetchDetailsAsync(CancellationToken.None);
     }
 
@@ -415,13 +425,18 @@ public sealed class LoopbackBoundaryCoverageTests
         return json.Length;
     }
 
-    private static HttpResponseMessage JsonResponse(string json)
+    private static HttpResponseMessage JsonResponse(string json, bool includePublishedPair = false)
     {
         var response = new HttpResponseMessage(HttpStatusCode.OK)
         {
             Content = new StringContent(json, Encoding.UTF8, "application/json"),
         };
         response.Headers.CacheControl = new CacheControlHeaderValue { NoStore = true };
+        if (includePublishedPair)
+        {
+            response.Headers.TryAddWithoutValidation(PublishedPairHeader, CanonicalPublishedPair);
+        }
+
         return response;
     }
 
@@ -429,7 +444,7 @@ public sealed class LoopbackBoundaryCoverageTests
         "{\"api_version\":\"v1\",\"state\":\"ready\",\"observed_at\":1,\"authenticated\":true,\"plan_label\":\"Pro\",\"quota\":{\"remaining_percent\":98.5,\"reset_at\":253402300799,\"window_seconds\":1,\"monthly\":false},\"models\":[{\"name\":\"SOL\",\"input_tokens\":1,\"cached_input_tokens\":2,\"output_tokens\":3}],\"active_thread_count\":3}";
 
     private static string DetailsJson() =>
-        "{\"api_version\":\"v1\",\"state\":\"ready\",\"observed_at\":1,\"authenticated\":true,\"plan_label\":\"Pro\",\"quota\":{\"remaining_percent\":98.5,\"reset_at\":253402300799,\"window_seconds\":604800,\"monthly\":false},\"models\":[{\"name\":\"SOL\",\"input_tokens\":10,\"cached_input_tokens\":2,\"output_tokens\":3,\"input_dollars\":0.5,\"cached_input_dollars\":0.25,\"output_dollars\":0.5}],\"active_thread_count\":1,\"history_periods\":[{\"id\":\"253402300799\",\"start_at\":253341820799,\"end_at\":253402300799,\"reset_at\":253402300799,\"label\":\"2026/08/01 — 2026/08/08\",\"current\":true}],\"history_samples\":[{\"timestamp\":1,\"reset_at\":253402300799,\"remaining_percent\":42.5,\"sol_dollars\":1.25,\"terra_dollars\":0.0,\"luna_dollars\":0.0,\"sol_tokens\":6,\"terra_tokens\":0,\"luna_tokens\":0}],\"threads\":[{\"id\":\"thread-1\",\"title\":\"Task\",\"parent_thread_id\":null,\"model\":\"SOL\",\"model_label\":\"SOL\",\"total_tokens\":20,\"context_usage_tokens\":10,\"context_window_tokens\":80,\"created_at\":1,\"last_user_message_at\":1,\"is_subagent\":false,\"depth\":0}],\"estimated_cost_label\":\"概算 $1\"}";
+        "{\"api_version\":\"v1\",\"state\":\"ready\",\"observed_at\":253402300740,\"authenticated\":true,\"plan_label\":\"Pro\",\"quota\":{\"remaining_percent\":98.5,\"reset_at\":253402300799,\"window_seconds\":604800,\"monthly\":false},\"models\":[{\"name\":\"SOL\",\"input_tokens\":10,\"cached_input_tokens\":2,\"output_tokens\":3,\"input_dollars\":0.5,\"cached_input_dollars\":0.25,\"output_dollars\":0.5}],\"active_thread_count\":1,\"history_periods\":[{\"id\":\"253402300799\",\"start_at\":253341820740,\"end_at\":253402300740,\"reset_at\":253402300799,\"label\":\"2026/08/01 — 2026/08/08\",\"current\":true}],\"history_samples\":[{\"timestamp\":253402300680,\"reset_at\":253402300799,\"remaining_percent\":42.5,\"sol_dollars\":1.25,\"terra_dollars\":0.0,\"luna_dollars\":0.0,\"sol_tokens\":6,\"terra_tokens\":0,\"luna_tokens\":0}],\"history_gaps\":[],\"threads\":[{\"id\":\"thread-1\",\"title\":\"Task\",\"parent_thread_id\":null,\"model\":\"SOL\",\"model_label\":\"SOL\",\"total_tokens\":20,\"context_usage_tokens\":10,\"context_window_tokens\":80,\"created_at\":1,\"last_user_message_at\":1,\"is_subagent\":false,\"depth\":0}],\"estimated_cost_label\":\"概算 $1\"}";
 
     private sealed class StubHandler(Func<HttpRequestMessage, HttpResponseMessage> responder) : HttpMessageHandler
     {

@@ -225,6 +225,16 @@ The exact details contract revision is `rest-v1-details-reset-at-20260823`; each
 its canonical `reset_at` independently from its potentially clipped graph `end_at`, and `history_gaps` contains only
 confirmed, redacted `recorder-gap-ledger-v1` projections. A server/client revision mismatch rejects the
 whole pair and retains the last complete root.
+The paired-response revision is `rest-v1-published-pair-header-20260827`.
+Every successful `/v1/status` and `/v1/details` response contains exactly one
+`Codex-Info-Published-Pair` header whose value is `v1:` followed by 64 lowercase
+hex characters: a 128-bit process server epoch followed by a 128-bit successful-publish
+counter. Both responses must carry the exact same value in addition
+to passing their strict JSON, domain, and common-core validation. A missing,
+duplicate, malformed, case-altered, or mismatched value rejects the complete
+candidate and retains the last complete root. Health and error responses do not
+carry this header. The client treats the value only as an opaque equality token;
+it does not derive data meaning from either component. The JSON shapes remain unchanged.
 It contains bounded model cost rows, reset periods, minute history samples,
 bounded active-thread rows, and the aggregate cost label. Timestamps are
 positive Unix seconds; percentages and dollar values are finite and
@@ -232,6 +242,10 @@ non-negative; model names are only `SOL`, `TERRA`, or `LUNA`; all user-visible
 labels are one-line bounded Unicode text. Unknown or duplicate keys, malformed
 JSON, oversized bodies, and values outside those limits are rejected without
 replacing the last valid details snapshot.
+After reset-tolerance canonicalization, `(period.id, timestamp)` is also unique.
+A collision rejects the complete candidate; Windows must not merge, maximize,
+select the last row, null a conflicting remaining value, or render multiple
+vertical values at one canonical minute.
 
 The API does not expose account email, filesystem paths, raw backend errors,
 session contents, or credentials. Authentication actions remain a separate

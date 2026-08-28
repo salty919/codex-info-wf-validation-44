@@ -414,25 +414,49 @@
           <TextBlock FontSize="13" FontWeight="SemiBold" Text="{Binding StatusTitle}" TextWrapping="NoWrap" />
           <TextBlock Classes="label" FontSize="11" Text="{Binding StatusDetail}" TextWrapping="NoWrap" />
         </StackPanel>
-        <StackPanel Grid.Column="2" Orientation="Horizontal" Spacing="6" VerticalAlignment="Center" IsVisible="{Binding IsAuthRequired}">
+        <StackPanel Grid.Column="2" Orientation="Horizontal" Spacing="6" VerticalAlignment="Center" IsVisible="{Binding IsAuthStartVisible}">
           <Button Classes="refresh"
                   MinWidth="112"
                   Height="28"
                   Padding="6,2"
-                  IsVisible="{Binding IsAuthRequired}"
                   Command="{Binding AuthCommand}"
                   AutomationProperties.Name="{Binding Texts.AuthStart}"
+                  AutomationProperties.AutomationId="Main.Status.AuthStart"
                   ToolTip.Tip="{Binding Texts.AuthStart}"
                   Content="{Binding Texts.AuthStart}" />
+        </StackPanel>
+        <StackPanel Grid.Column="2" Orientation="Horizontal" Spacing="6" VerticalAlignment="Center" IsVisible="{Binding IsAuthCheckVisible}">
           <Button Classes="refresh"
                   MinWidth="112"
                   Height="28"
                   Padding="6,2"
-                  IsVisible="{Binding IsAuthRequired}"
                   Command="{Binding CheckAuthCommand}"
                   AutomationProperties.Name="{Binding Texts.AuthCheck}"
+                  AutomationProperties.AutomationId="Main.Status.AuthCheck"
                   ToolTip.Tip="{Binding Texts.AuthCheck}"
                   Content="{Binding Texts.AuthCheck}" />
+        </StackPanel>
+        <StackPanel Grid.Column="2" Orientation="Horizontal" Spacing="6" VerticalAlignment="Center" IsVisible="{Binding IsRetryVisible}">
+          <Button Classes="refresh"
+                  MinWidth="92"
+                  Height="28"
+                  Padding="6,2"
+                  Command="{Binding RetryCommand}"
+                  AutomationProperties.Name="{Binding Texts.Retry}"
+                  AutomationProperties.AutomationId="Main.Status.Retry"
+                  ToolTip.Tip="{Binding Texts.Retry}"
+                  Content="{Binding Texts.Retry}" />
+        </StackPanel>
+        <StackPanel Grid.Column="2" Orientation="Horizontal" Spacing="6" VerticalAlignment="Center" IsVisible="{Binding IsRefreshingVisible}">
+          <Button Classes="refresh"
+                  MinWidth="112"
+                  Height="28"
+                  Padding="6,2"
+                  IsEnabled="False"
+                  AutomationProperties.Name="{Binding Texts.Refreshing}"
+                  AutomationProperties.AutomationId="Main.Status.Refreshing"
+                  ToolTip.Tip="{Binding Texts.Refreshing}"
+                  Content="{Binding Texts.Refreshing}" />
         </StackPanel>
         <StackPanel Grid.Column="2" Orientation="Horizontal" Spacing="6" VerticalAlignment="Center" IsVisible="{Binding IsUpdateNotificationVisible}">
           <TextBlock Classes="label" FontSize="11" VerticalAlignment="Center" Text="{Binding UpdateNotificationText}" TextWrapping="NoWrap" />
@@ -443,6 +467,7 @@
                   IsVisible="{Binding IsUpdateActionVisible}"
                   Command="{Binding UpdateCommand}"
                   AutomationProperties.Name="{Binding UpdateButtonText}"
+                  AutomationProperties.AutomationId="Main.Status.Update"
                   ToolTip.Tip="{Binding UpdateButtonText}"
                   Content="{Binding UpdateButtonText}" />
         </StackPanel>

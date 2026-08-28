@@ -10,12 +10,13 @@ use codex_info::i18n::{CliTextKey, I18n, PeriodKind, TextKey};
 use codex_info::protocol_contract;
 use codex_info::security;
 use codex_info::server::{
-    ApiServer, ApiServerConfig, PublicDetailedModelUsage, PublicDetails, PublicHistoryPeriod,
-    PublicHistorySample, PublicModelUsage, PublicQuota, PublicSnapshot, PublicState, PublicThread,
-    MAX_PUBLIC_THREADS,
+    validate_public_threads, ApiServer, ApiServerConfig, PublicDetailedModelUsage, PublicDetails,
+    PublicHistoryPeriod, PublicHistorySample, PublicModelUsage, PublicQuota, PublicSnapshot,
+    PublicState, PublicThread,
 };
 use codex_info::thread_contract::{
-    self, PageAcceptance, ThreadCycleAccumulator, ThreadCycleOutcome, ValidatedThreadCandidate,
+    self, PageAcceptance, ThreadCycleAccumulator, ThreadCycleOutcome, ThreadTopologyNode,
+    ValidatedThreadCandidate,
 };
 use codex_info::thread_state;
 use codex_info::usage_store::{self, UsageStore};
@@ -300,6 +301,17 @@ const ROLLING_RESET_ARTIFACT_MAX_OBSERVATION_GAP_SECONDS: i64 = 2 * 3_600;
 const LEGACY_MOVING_RESET_HORIZON_TOLERANCE_SECONDS: i64 = 120;
 const LEGACY_MOVING_RESET_PAIR_GAP_SECONDS: i64 = 3_600;
 const LEGACY_MOVING_RESET_PAIR_HORIZON_TOLERANCE_SECONDS: i64 = 60;
+
+/// Return the start of the collector's minute bucket using mathematical
+/// floor semantics, including for timestamps before the Unix epoch.
+///
+/// The authoritative period boundary is an external timestamp and therefore
+/// cannot be allowed to wrap if converting its bucket index back to seconds
+/// ever overflows. Callers that cannot represent the bucket must fail closed.
+fn minute_start(timestamp: i64) -> Option<i64> {
+    timestamp.div_euclid(60).checked_mul(60)
+}
+
 #[cfg(test)]
 const GRAPH_METRIC_OPTIONS: [&str; 2] = ["ドル", "トークン"];
 const FIXED_WINDOW_WIDTH: u32 = 900;
@@ -1073,6 +1085,25 @@ struct ActiveThread {
     depth: Option<i32>,
 }
 
+impl ActiveThread {
+    fn to_public_thread(&self) -> PublicThread {
+        PublicThread {
+            id: self.id.clone(),
+            title: self.title.clone(),
+            parent_thread_id: self.parent_thread_id.clone(),
+            model: self.model.clone(),
+            model_label: self.model_label.clone(),
+            total_tokens: self.total_tokens,
+            context_usage_tokens: self.context_usage_tokens,
+            context_window_tokens: self.context_window_tokens,
+            created_at: self.created_at,
+            last_user_message_at: self.last_user_message_at,
+            is_subagent: self.is_subagent,
+            depth: self.depth,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct ThreadPresentationRow {
     index: usize,
@@ -1113,14 +1144,6 @@ fn monthly_window_seconds(reset_at: i64) -> i64 {
     end.checked_sub_months(Months::new(1))
         .map(|start| (end - start).num_seconds().max(1))
         .unwrap_or(31 * 86_400)
-}
-
-fn graph_period_end(reset_at: i64, current_reset_at: Option<i64>, now: i64) -> i64 {
-    if current_reset_at.is_some_and(|current| same_reset_period(current, reset_at)) {
-        now.min(reset_at)
-    } else {
-        reset_at
-    }
 }
 
 fn parse_rate_limits(
@@ -1541,11 +1564,6 @@ fn fetch_active_thread_update_for_paths_and_state(
         ));
     }
 
-    let mut by_id = BTreeMap::new();
-    for thread in threads {
-        by_id.insert(thread.id.clone(), thread);
-    }
-    let mut threads = by_id.into_values().collect::<Vec<_>>();
     threads.sort_by(|left, right| {
         right
             .updated_at
@@ -2229,6 +2247,60 @@ fn current_history_period_reset(
                 .then_with(|| right.canonical_reset_at.cmp(&left.canonical_reset_at))
         })
         .map(|period| period.canonical_reset_at)
+}
+
+/// Apply the authoritative quota bounds to the current raw period only.
+///
+/// `UsageHistory` remains the owner of raw inventory and historical grouping.
+/// This bounded projection gives current consumers the quota reset/window
+/// boundary without deleting or clipping any stored sample. A current period
+/// with an owned row before the authoritative start is rejected wholesale so
+/// no caller can publish a mixed or invented interval.
+fn apply_authoritative_current_bounds(
+    mut periods: Vec<HistoryPeriod>,
+    samples: &[UsageHistorySample],
+    current_reset_at: Option<i64>,
+    window_seconds: i64,
+    observed_at: i64,
+) -> Vec<HistoryPeriod> {
+    let Some(current_reset_at) = current_reset_at else {
+        return periods;
+    };
+    let Some(current_index) = periods.iter().position(|period| {
+        current_reset_at.abs_diff(period.canonical_reset_at) <= RESET_AT_TOLERANCE_SECONDS as u64
+    }) else {
+        return periods;
+    };
+    let canonical_reset_at = periods[current_index].canonical_reset_at;
+    let Some(authoritative_start) = (window_seconds > 0)
+        .then(|| canonical_reset_at.checked_sub(window_seconds))
+        .flatten()
+    else {
+        periods.remove(current_index);
+        return periods;
+    };
+    let Some(start) = minute_start(authoritative_start) else {
+        periods.remove(current_index);
+        return periods;
+    };
+    let end = canonical_reset_at.min(observed_at);
+    if end < start {
+        periods.remove(current_index);
+        return periods;
+    }
+
+    let owned_group = reset_sample_groups(samples).into_iter().find(|group| {
+        group.canonical_reset_at.abs_diff(canonical_reset_at) <= RESET_AT_TOLERANCE_SECONDS as u64
+    });
+    if owned_group.is_some_and(|group| group.samples.iter().any(|sample| sample.timestamp < start))
+    {
+        periods.remove(current_index);
+        return periods;
+    }
+
+    periods[current_index].start = start;
+    periods[current_index].end = end;
+    periods
 }
 
 #[derive(Debug, Default)]
@@ -5351,6 +5423,10 @@ struct CodexInfoState {
     /// a fresh authenticated quota snapshot is committed.
     recovery_period: Option<(i64, i64)>,
     recovery_requested: bool,
+    /// In UI mode, the service listener is the single owner of the visible
+    /// snapshot. Keep a failed selected endpoint latched until that same
+    /// endpoint becomes healthy; never fall back to the default port.
+    service_endpoint_error: Option<String>,
 }
 
 impl CodexInfoState {
@@ -5436,7 +5512,11 @@ impl CodexInfoState {
     /// This is deliberately derived from the same state as `public_snapshot`
     /// so status and details are published atomically as one generation.
     fn public_details(&self) -> PublicDetails {
-        let mut snapshot = self.public_snapshot();
+        self.public_details_at(Utc::now().timestamp())
+    }
+
+    fn public_details_at(&self, now: i64) -> PublicDetails {
+        let snapshot = self.public_snapshot();
         let models = if self.authenticated && self.has_visible_usage() {
             self.model_usage
                 .iter()
@@ -5458,13 +5538,14 @@ impl CodexInfoState {
             Vec::new()
         };
 
-        let now = Utc::now().timestamp();
         let history_cutoff = DateTime::<Utc>::from_timestamp(now, 0)
             .map(one_month_before_utc)
             .unwrap_or(now);
         let history_periods = if self.authenticated && self.has_visible_usage() {
-            let periods = self.history_periods();
-            let current_period_reset = current_history_period_reset(&periods, self.reset_at, now);
+            let observed_at = snapshot.observed_at.unwrap_or(now);
+            let periods = self.history_periods_at(observed_at);
+            let current_period_reset =
+                current_history_period_reset(&periods, self.reset_at, observed_at);
             periods
                 .into_iter()
                 .map(|period| {
@@ -5472,14 +5553,9 @@ impl CodexInfoState {
                     PublicHistoryPeriod {
                         id: period.canonical_reset_at.to_string(),
                         start_at: period.start,
-                        // `HistoryPeriod::end` is clipped to now for graph
-                        // rendering. The API describes the actual period
-                        // boundary so clients can render a complete window.
-                        end_at: if current {
-                            period.canonical_reset_at
-                        } else {
-                            period.end
-                        },
+                        // The same bounded period instance feeds graph,
+                        // labels, and the public details document.
+                        end_at: period.end,
                         reset_at: period.canonical_reset_at,
                         label: period.label,
                         current,
@@ -5524,32 +5600,11 @@ impl CodexInfoState {
         let mut threads = if self.authenticated && self.has_visible_usage() {
             self.active_threads
                 .iter()
-                .take(MAX_PUBLIC_THREADS)
-                .map(|thread| PublicThread {
-                    id: thread.id.clone(),
-                    title: thread.title.clone(),
-                    parent_thread_id: thread.parent_thread_id.clone(),
-                    model: thread.model.clone(),
-                    model_label: thread.model_label.clone(),
-                    total_tokens: thread.total_tokens,
-                    context_usage_tokens: thread.context_usage_tokens,
-                    context_window_tokens: thread.context_window_tokens,
-                    created_at: thread.created_at,
-                    last_user_message_at: thread.last_user_message_at,
-                    is_subagent: thread.is_subagent,
-                    depth: thread.depth,
-                })
+                .map(ActiveThread::to_public_thread)
                 .collect::<Vec<_>>()
         } else {
             Vec::new()
         };
-        if threads.len() != self.active_threads.len() {
-            // Keep the public count consistent with the bounded rows. This
-            // branch is only reachable for a pathological process with more
-            // than the API's maximum active-thread budget.
-            snapshot.active_thread_count = threads.len() as u64;
-        }
-
         // Ensure no stale unauthenticated rows survive if an auxiliary worker
         // completed just as the account state changed.
         if !snapshot.authenticated {
@@ -5565,6 +5620,10 @@ impl CodexInfoState {
             active_thread_count: snapshot.active_thread_count,
             history_periods,
             history_samples,
+            // No confirmed recorder_gap_ledger authority is connected to the
+            // Rust producer yet. Publish the field explicitly without
+            // inferring gaps from missing local samples.
+            history_gaps: Vec::new(),
             threads,
             estimated_cost_label: self.estimated_cost_label.clone(),
         }
@@ -5636,6 +5695,7 @@ impl CodexInfoState {
             last_thread_poll: Instant::now(),
             recovery_period,
             recovery_requested: false,
+            service_endpoint_error: None,
         }
     }
 
@@ -5708,6 +5768,7 @@ impl CodexInfoState {
             last_thread_poll: Instant::now(),
             recovery_period: None,
             recovery_requested: false,
+            service_endpoint_error: None,
         };
         match kind {
             "startup-loading" => {
@@ -6045,7 +6106,7 @@ impl CodexInfoState {
     }
 
     fn request_read(&mut self, status: &str) {
-        if self.preview {
+        if self.preview || self.service_endpoint_error.is_some() {
             return;
         }
         if !self.bridge.send(AccountCommand::Read) {
@@ -6059,6 +6120,29 @@ impl CodexInfoState {
         }
         self.checking = true;
         self.status = status.into();
+    }
+
+    fn hold_service_endpoint_error(&mut self, error: String) {
+        if self.service_endpoint_error.is_none() {
+            self.advance_auth_epoch();
+            self.thread_checking = false;
+        }
+        self.service_endpoint_error = Some(error.clone());
+        self.checking = false;
+        self.account_error = Some(error.clone());
+        self.error = Some(error);
+        self.status =
+            "利用状況を取得できません。指定されたREST endpointへの接続を確認してください。".into();
+    }
+
+    fn clear_service_endpoint_error(&mut self) {
+        if self.service_endpoint_error.take().is_some() {
+            self.account_error = None;
+            self.error = None;
+            self.checking = true;
+            self.status = "Codex app-serverへ接続しています…".into();
+            self.last_poll = Instant::now();
+        }
     }
 
     fn advance_auth_epoch(&mut self) {
@@ -6155,19 +6239,46 @@ impl CodexInfoState {
         self.selected_history_period = "履歴なし".into();
     }
 
-    fn apply_active_thread_update(&mut self, update: ActiveThreadUpdate) -> bool {
+    fn admit_active_thread_update(&mut self, update: ActiveThreadUpdate) -> bool {
         match update {
-            ActiveThreadUpdate::Snapshot(threads) => self.active_threads = threads,
-            ActiveThreadUpdate::NoThread => self.active_threads.clear(),
-            // A failed read is not evidence that the previous rows are still
-            // running. Fail closed so a stopped thread cannot remain visible
-            // merely because the latest live-state check was unavailable.
-            ActiveThreadUpdate::Failed => {
-                self.active_threads.clear();
-                return true;
+            ActiveThreadUpdate::Snapshot(threads) => {
+                let public_threads = threads
+                    .iter()
+                    .map(ActiveThread::to_public_thread)
+                    .collect::<Vec<_>>();
+                if validate_public_threads(&public_threads).is_err() {
+                    return true;
+                }
+                let topology = public_threads
+                    .iter()
+                    .map(|thread| ThreadTopologyNode {
+                        id: thread.id.as_str(),
+                        parent_thread_id: thread.parent_thread_id.as_deref(),
+                    })
+                    .collect::<Vec<_>>();
+                if thread_contract::validate_selected_thread_topology(&topology).is_err() {
+                    return true;
+                }
+                self.active_threads = threads;
+                false
             }
+            ActiveThreadUpdate::NoThread => {
+                if validate_public_threads(&[]).is_err()
+                    || thread_contract::validate_selected_thread_topology(&[]).is_err()
+                {
+                    return true;
+                }
+                self.active_threads.clear();
+                false
+            }
+            // A failed read is not a valid empty candidate. Keep the last
+            // complete rows and expose the existing failure state instead.
+            ActiveThreadUpdate::Failed => true,
         }
-        false
+    }
+
+    fn apply_active_thread_update(&mut self, update: ActiveThreadUpdate) -> bool {
+        self.admit_active_thread_update(update)
     }
 
     fn apply_usage_event(&mut self, event: UsageEvent) {
@@ -6217,8 +6328,10 @@ impl CodexInfoState {
             // matching local collector commits; reset_at can legitimately
             // drift while the service reports a rolling boundary.
             let follows_current = self.selected_reset_at.is_none()
-                || previous_reset_at
-                    .is_some_and(|previous| self.selected_reset_at == Some(previous));
+                || previous_reset_at.is_some_and(|previous| {
+                    self.selected_reset_at
+                        .is_some_and(|selected| same_reset_period(selected, previous))
+                });
             if follows_current {
                 self.selected_reset_at = self.reset_at;
                 self.selected_history_period.clear();
@@ -6419,9 +6532,8 @@ impl CodexInfoState {
             return;
         }
         self.thread_checking = false;
-        // The worker could not establish a fresh live snapshot. Do not expose
-        // rows from the previous successful poll as if they were running.
-        self.active_threads.clear();
+        // The worker could not establish a fresh live snapshot. Keep the
+        // previous complete rows while exposing the existing error state.
         self.thread_error = true;
         let _ = message;
         self.refresh_partial_failure_status();
@@ -6583,14 +6695,25 @@ impl CodexInfoState {
     }
 
     fn history_periods(&self) -> Vec<HistoryPeriod> {
-        let now = Utc::now().timestamp();
-        let mut periods = self.history.periods(now, self.reset_at);
+        self.history_periods_at(Utc::now().timestamp())
+    }
+
+    fn history_periods_at(&self, observed_at: i64) -> Vec<HistoryPeriod> {
+        let mut periods = self.history.periods(observed_at, self.reset_at);
+        periods = apply_authoritative_current_bounds(
+            periods,
+            &self.history.samples,
+            self.reset_at,
+            self.window_seconds,
+            observed_at,
+        );
         periods.retain(|period| {
             DateTime::<Utc>::from_timestamp(period.start, 0).is_some()
                 && DateTime::<Utc>::from_timestamp(period.end, 0).is_some()
                 && DateTime::<Utc>::from_timestamp(period.canonical_reset_at, 0).is_some()
         });
-        let current_period_reset = current_history_period_reset(&periods, self.reset_at, now);
+        let current_period_reset =
+            current_history_period_reset(&periods, self.reset_at, observed_at);
         for period in &mut periods {
             let is_current = current_period_reset == Some(period.canonical_reset_at);
             // The visible current period runs through its next reset, while
@@ -6820,13 +6943,7 @@ impl CodexInfoState {
         self.window_seconds.max(WEEK_SECONDS)
     }
 
-    fn period_end_for_reset(&self, reset_at: i64) -> i64 {
-        self.history
-            .period_for_id(reset_at, Utc::now().timestamp(), self.reset_at)
-            .map(|period| period.end)
-            .unwrap_or_else(|| graph_period_end(reset_at, self.reset_at, Utc::now().timestamp()))
-    }
-
+    #[allow(dead_code)]
     fn graph_paths_for_selection(
         &self,
         show_luna: bool,
@@ -6834,26 +6951,63 @@ impl CodexInfoState {
         show_sol: bool,
         show_tokens: bool,
     ) -> GraphPaths {
-        let selected_reset = self.selected_history_reset();
-        let samples = self.history.samples_for_reset(selected_reset);
-        let period = selected_reset.and_then(|reset| {
-            self.history
-                .period_for_id(reset, Utc::now().timestamp(), self.reset_at)
-        });
-        let reset_at = period
-            .as_ref()
-            .map(|period| period.canonical_reset_at)
-            .or_else(|| samples.last().map(|sample| sample.reset_at))
-            .unwrap_or(0);
-        let period_start = period
-            .as_ref()
-            .map(|period| period.start)
-            .unwrap_or_else(|| reset_at.saturating_sub(self.period_seconds_for_reset(reset_at)));
-        let period_end = period
-            .as_ref()
-            .map(|period| period.end)
-            .unwrap_or_else(|| self.period_end_for_reset(reset_at))
-            .max(period_start + 1);
+        self.graph_paths_for_selection_at(
+            Utc::now().timestamp(),
+            show_luna,
+            show_terra,
+            show_sol,
+            show_tokens,
+        )
+    }
+
+    fn selected_history_reset_for_periods(&self, periods: &[HistoryPeriod]) -> Option<i64> {
+        if let Some(period) = periods
+            .iter()
+            .find(|period| period.label == self.selected_history_period)
+        {
+            return Some(period.canonical_reset_at);
+        }
+        if let Some(selected) = self.selected_reset_at {
+            return periods
+                .iter()
+                .find(|period| {
+                    period.canonical_reset_at.abs_diff(selected)
+                        <= RESET_AT_TOLERANCE_SECONDS as u64
+                })
+                .map(|period| period.canonical_reset_at);
+        }
+        if let Some(current) = self.reset_at {
+            return periods
+                .iter()
+                .find(|period| {
+                    period.canonical_reset_at.abs_diff(current) <= RESET_AT_TOLERANCE_SECONDS as u64
+                })
+                .map(|period| period.canonical_reset_at);
+        }
+        periods.first().map(|period| period.canonical_reset_at)
+    }
+
+    fn graph_paths_for_selection_at(
+        &self,
+        observed_at: i64,
+        show_luna: bool,
+        show_terra: bool,
+        show_sol: bool,
+        show_tokens: bool,
+    ) -> GraphPaths {
+        let periods = self.history_periods_at(observed_at);
+        let Some(selected_reset) = self.selected_history_reset_for_periods(&periods) else {
+            return GraphPaths::default();
+        };
+        let samples = self.history.samples_for_reset(Some(selected_reset));
+        let Some(period) = periods
+            .iter()
+            .find(|period| period.canonical_reset_at == selected_reset)
+        else {
+            return GraphPaths::default();
+        };
+        let period_start = period.start;
+        let period_end = period.end.max(period_start + 1);
         let sample_references = samples.iter().collect::<Vec<_>>();
         let mut paths = graph_paths_for_selection(
             &sample_references,
@@ -6888,7 +7042,9 @@ fn sync_graph_window(state: &CodexInfoState, graph: &GraphWindow) {
     let token_metric = state.selected_metric == "トークン"
         || state.selected_metric == state.i18n.text(TextKey::TokenMetric);
     graph.set_show_tokens(token_metric);
-    let mut paths = state.graph_paths_for_selection(
+    let observed_at = Utc::now().timestamp();
+    let mut paths = state.graph_paths_for_selection_at(
+        observed_at,
         graph.get_show_luna(),
         graph.get_show_terra(),
         graph.get_show_sol(),
@@ -6901,7 +7057,7 @@ fn sync_graph_window(state: &CodexInfoState, graph: &GraphWindow) {
         graph.get_show_terra(),
         graph.get_show_sol(),
     );
-    let time_labels = state.graph_time_labels();
+    let time_labels = state.graph_time_labels_at(observed_at);
     graph.set_graph_data(state.graph_data().into());
     graph.set_unused_intervals(slint::ModelRc::new(slint::VecModel::from(
         paths
@@ -7166,9 +7322,8 @@ fn thread_presentation_rows(threads: &[ActiveThread]) -> Vec<ThreadPresentationR
         .iter()
         .map(|thread| {
             thread
-                .is_subagent
-                .then_some(thread.parent_thread_id.as_deref())
-                .flatten()
+                .parent_thread_id
+                .as_deref()
                 .and_then(|parent_id| by_id.get(parent_id).copied())
         })
         .collect::<Vec<_>>();
@@ -7679,6 +7834,9 @@ impl CodexInfoState {
     }
 
     fn open_auth(&mut self) {
+        if self.service_endpoint_error.is_some() {
+            return;
+        }
         if let Some(url) = self.auth_url.clone() {
             let opened = open_validated_auth_url(&url);
             if !opened {
@@ -7841,13 +7999,19 @@ impl CodexInfoState {
             .unwrap_or_else(|| "履歴なし".into())
     }
 
+    #[allow(dead_code)]
     fn graph_time_labels(&self) -> [String; 5] {
-        let Some(reset_at) = self.selected_history_reset() else {
+        self.graph_time_labels_at(Utc::now().timestamp())
+    }
+
+    fn graph_time_labels_at(&self, observed_at: i64) -> [String; 5] {
+        let periods = self.history_periods_at(observed_at);
+        let Some(reset_at) = self.selected_history_reset_for_periods(&periods) else {
             return Default::default();
         };
-        let Some(period) =
-            self.history
-                .period_for_id(reset_at, Utc::now().timestamp(), self.reset_at)
+        let Some(period) = periods
+            .iter()
+            .find(|period| period.canonical_reset_at == reset_at)
         else {
             return Default::default();
         };
@@ -8543,7 +8707,16 @@ fn ensure_background_service(config: ApiServerConfig) -> Result<(), String> {
     }
 }
 
-fn poll_service_state(state: &mut CodexInfoState) {
+fn poll_service_state(state: &mut CodexInfoState, service_endpoint: SocketAddr) {
+    if !service_is_healthy(service_endpoint) {
+        let error = state
+            .service_endpoint_error
+            .clone()
+            .unwrap_or_else(|| cli_error(CliTextKey::ServiceStateUnavailable));
+        state.hold_service_endpoint_error(error);
+        return;
+    }
+    state.clear_service_endpoint_error();
     state.poll();
     if account_refresh_due(
         Instant::now(),
@@ -8623,7 +8796,7 @@ fn run_combined_service(config: ApiServerConfig) -> Result<(), Box<dyn std::erro
             tokio::select! {
                 _ = &mut shutdown => break,
                 _ = ticker.tick() => {
-                    poll_service_state(&mut state);
+                    poll_service_state(&mut state, config.listen_addr());
                     match publisher.publish_details(state.public_details()) {
                         Ok(()) => {
                             if last_publish_error.take().is_some() {
@@ -8671,7 +8844,10 @@ fn stop_service_mode() -> Result<(), Box<dyn std::error::Error>> {
     })
 }
 
-fn run_ui(initial_service_error: Option<String>) -> Result<(), Box<dyn std::error::Error>> {
+fn run_ui(
+    initial_service_error: Option<String>,
+    service_config: ApiServerConfig,
+) -> Result<(), Box<dyn std::error::Error>> {
     let ui = MainWindow::new()?;
     install_fixed_window_guard(ui.window());
     place_main_window_on_primary_monitor(ui.window());
@@ -8689,7 +8865,7 @@ fn run_ui(initial_service_error: Option<String>) -> Result<(), Box<dyn std::erro
     if let Some(error) = initial_service_error {
         // A failed --ui service must not make the GUI disappear. Publish a
         // visible retry/error state and keep the window available for recovery.
-        state.borrow_mut().apply_account_error(error);
+        state.borrow_mut().hold_service_endpoint_error(error);
     }
     // One graph window owns the three model toggles. The initial state keeps
     // every series enabled, preserving the combined cumulative view.
@@ -9097,7 +9273,7 @@ fn run_ui(initial_service_error: Option<String>) -> Result<(), Box<dyn std::erro
         timer.start(TimerMode::Repeated, Duration::from_secs(1), move || {
             if let Some(ui) = weak_ui.upgrade() {
                 let mut state = state.borrow_mut();
-                poll_service_state(&mut state);
+                poll_service_state(&mut state, service_config.listen_addr());
                 state.sync_ui(&ui);
                 if let Some(graph) = graph_window_for_timer.borrow().as_ref() {
                     if graph.window().is_visible() {
@@ -9124,7 +9300,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         LaunchMode::Stop => stop_service_mode(),
         LaunchMode::All(config) => {
             let startup_error = ensure_background_service(config).err();
-            run_ui(startup_error)
+            run_ui(startup_error, config)
         }
         LaunchMode::Help => {
             println!("{}", I18n::detect().language().launch_help());
@@ -9145,12 +9321,12 @@ mod tests {
         fetch_active_thread_update_for_paths_and_state, fixed_resize_decision,
         fixed_resize_decision_for_scale, format_elapsed, format_estimated_cost,
         format_model_usage_columns, format_percent, format_period_label, graph_paths,
-        graph_paths_for_selection, graph_period_end, graph_points, graph_time_endpoints,
-        is_service_health_response, minute_model_spend, minute_model_spend_for_metric,
-        model_usage_timeline_from_events, monthly_window_seconds, native_account_window_title,
-        native_legal_pages, native_startup_loading, normal_status_text, one_month_before_utc,
-        open_codex_session_paths, parse_launch_mode, parse_preview_size, parse_rate_limits,
-        parse_resize_direction, period_remaining_text, physical_size_for_logical, plan_type_label,
+        graph_paths_for_selection, graph_points, graph_time_endpoints, is_service_health_response,
+        minute_model_spend, minute_model_spend_for_metric, model_usage_timeline_from_events,
+        monthly_window_seconds, native_account_window_title, native_legal_pages,
+        native_startup_loading, normal_status_text, one_month_before_utc, open_codex_session_paths,
+        parse_launch_mode, parse_preview_size, parse_rate_limits, parse_resize_direction,
+        period_remaining_text, physical_size_for_logical, plan_type_label, poll_service_state,
         preview_model_row, read_recovery_entries, read_thread_rollout_path, recovery_timed_usage,
         remaining_graph_points, remaining_graph_points_for_metric, remaining_graph_y,
         remaining_marker_positions, remaining_marker_positions_on_points, request_with_timeout,
@@ -9172,37 +9348,196 @@ mod tests {
     use serde::Deserialize;
 
     #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
     struct GraphFixture {
-        period_start: i64,
-        period_end: i64,
-        reset_at: i64,
-        samples: Vec<GraphFixtureSample>,
+        expected_period_start: i64,
+        expected_period_end: i64,
+        expected_reset_at: i64,
+        expected_raw_timestamps: Vec<i64>,
+        expected_graph_timestamps: Vec<i64>,
         expected_remaining: Vec<f64>,
         expected_sol_max: f64,
         expected_period_count: usize,
+        details_response: GraphFixtureDetailsResponse,
     }
 
     #[derive(Deserialize)]
-    struct GraphFixtureSample {
+    #[serde(deny_unknown_fields)]
+    struct GraphFixtureDetailsResponse {
+        api_version: String,
+        state: String,
+        observed_at: i64,
+        authenticated: bool,
+        plan_label: String,
+        quota: GraphFixtureQuota,
+        models: Vec<Value>,
+        active_thread_count: usize,
+        history_periods: Vec<GraphFixtureHistoryPeriod>,
+        history_samples: Vec<GraphFixtureHistorySample>,
+        history_gaps: Vec<Value>,
+        threads: Vec<Value>,
+        estimated_cost_label: String,
+    }
+
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct GraphFixtureQuota {
+        remaining_percent: f64,
+        reset_at: i64,
+        window_seconds: i64,
+        monthly: bool,
+    }
+
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct GraphFixtureHistoryPeriod {
+        id: String,
+        start_at: i64,
+        end_at: i64,
+        reset_at: i64,
+        label: String,
+        current: bool,
+    }
+
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct GraphFixtureHistorySample {
         timestamp: i64,
+        reset_at: i64,
         remaining_percent: Option<f64>,
         sol_dollars: f64,
         terra_dollars: f64,
         luna_dollars: f64,
+        sol_tokens: u64,
+        terra_tokens: u64,
+        luna_tokens: u64,
     }
+
+    impl GraphFixtureHistorySample {
+        fn to_usage_history_sample(&self) -> UsageHistorySample {
+            UsageHistorySample {
+                timestamp: self.timestamp,
+                reset_at: self.reset_at,
+                remaining_percent: self.remaining_percent.unwrap_or(-1.0),
+                sol_dollars: self.sol_dollars,
+                terra_dollars: self.terra_dollars,
+                luna_dollars: self.luna_dollars,
+                sol_tokens: self.sol_tokens,
+                terra_tokens: self.terra_tokens,
+                luna_tokens: self.luna_tokens,
+            }
+        }
+    }
+
+    fn state_from_graph_fixture(fixture: &GraphFixture) -> CodexInfoState {
+        let details = &fixture.details_response;
+        let samples = details
+            .history_samples
+            .iter()
+            .map(GraphFixtureHistorySample::to_usage_history_sample)
+            .collect::<Vec<_>>();
+        let history = UsageHistory {
+            samples,
+            ..UsageHistory::default()
+        };
+        let canonical_reset_at = history.canonical_reset_at(details.quota.reset_at);
+        let mut state = CodexInfoState::preview("normal");
+        state.authenticated = details.authenticated;
+        state.plan_label = details.plan_label.clone();
+        state.remaining_percent = Some(details.quota.remaining_percent);
+        state.has_quota_percent = true;
+        state.has_usage = true;
+        state.local_usage_pending = false;
+        state.reset_at = Some(details.quota.reset_at);
+        state.window_seconds = details.quota.window_seconds;
+        state.monthly = details.quota.monthly;
+        state.last_success_at = Some(details.observed_at);
+        state.history = history;
+        state.selected_reset_at = Some(canonical_reset_at);
+        state.selected_history_period.clear();
+        state
+    }
+
+    fn active_thread_fixture(index: usize, updated_at: i64) -> ActiveThread {
+        let parent_thread_id = (index % 3 == 2).then(|| format!("parent-{index:03}"));
+        ActiveThread {
+            id: format!("thread-{index:03}"),
+            created_at: Some(1_000 + index as i64),
+            updated_at,
+            title: format!("title-{index:03}"),
+            model: format!("model-{index:03}"),
+            model_label: format!("model-label-{index:03}"),
+            total_tokens: Some(index as u64),
+            context_usage_tokens: Some(index as u64 + 1),
+            context_window_tokens: Some(10_000 + index as u64),
+            last_user_message_at: Some(2_000 + index as i64),
+            is_subagent: parent_thread_id.is_some(),
+            parent_thread_id,
+            depth: (index % 3 == 2).then_some((index % 8) as i32),
+        }
+    }
+
+    fn assert_public_thread_matches(active: &ActiveThread, public: &super::PublicThread) {
+        assert_eq!(public.id, active.id);
+        assert_eq!(public.title, active.title);
+        assert_eq!(public.parent_thread_id, active.parent_thread_id);
+        assert_eq!(public.model, active.model);
+        assert_eq!(public.model_label, active.model_label);
+        assert_eq!(public.total_tokens, active.total_tokens);
+        assert_eq!(public.context_usage_tokens, active.context_usage_tokens);
+        assert_eq!(public.context_window_tokens, active.context_window_tokens);
+        assert_eq!(public.created_at, active.created_at);
+        assert_eq!(public.last_user_message_at, active.last_user_message_at);
+        assert_eq!(public.is_subagent, active.is_subagent);
+        assert_eq!(public.depth, active.depth);
+    }
+
+    fn raw_loopback_get(address: SocketAddr, route: &str) -> String {
+        let mut stream = TcpStream::connect(address).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let request =
+            format!("GET {route} HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\n\r\n");
+        stream.write_all(request.as_bytes()).unwrap();
+        stream.flush().unwrap();
+        let mut response = String::new();
+        stream.read_to_string(&mut response).unwrap();
+        response
+    }
+
+    fn raw_loopback_body(response: &str) -> Value {
+        let (_, body) = response
+            .split_once("\r\n\r\n")
+            .expect("loopback response has headers and body");
+        serde_json::from_str(body).expect("loopback response body is JSON")
+    }
+
+    fn raw_loopback_pair(response: &str) -> String {
+        response
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("Codex-Info-Published-Pair")
+                    .then(|| value.trim().to_owned())
+            })
+            .expect("published pair header")
+    }
+
     use super::{
         claim_manual_x11_action, forbidden_x11_states, manual_resize_geometry,
         manual_window_geometry, motif_wm_functions, motif_wm_resizable_functions, X11StateAtoms,
     };
     use chrono::{TimeZone, Utc};
     use codex_info::security;
-    use codex_info::server::PublicState;
+    use codex_info::server::{ApiSnapshotError, PublicState, MAX_PUBLIC_THREADS};
     use codex_info::thread_contract;
     use rusqlite::Connection;
     use serde_json::{json, Value};
     use std::collections::{BTreeMap, BTreeSet};
     use std::fs::{self, File};
     use std::io::{BufReader, Read, Seek, SeekFrom, Write};
+    use std::net::{SocketAddr, TcpListener, TcpStream};
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::mpsc;
@@ -9292,6 +9627,28 @@ mod tests {
     }
 
     #[test]
+    fn ui_polling_holds_selected_endpoint_error_until_that_endpoint_is_healthy() {
+        let blocker = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = blocker.local_addr().unwrap();
+        let mut state = CodexInfoState::preview("normal");
+        state.preview = false;
+        state.service_endpoint_error = Some("selected endpoint unavailable".into());
+
+        poll_service_state(&mut state, endpoint);
+        assert_eq!(
+            state.service_endpoint_error.as_deref(),
+            Some("selected endpoint unavailable")
+        );
+
+        drop(blocker);
+        let mut server =
+            ApiServer::start(ApiServerConfig::new(endpoint).unwrap()).expect("selected endpoint");
+        poll_service_state(&mut state, endpoint);
+        assert!(state.service_endpoint_error.is_none());
+        server.shutdown();
+    }
+
+    #[test]
     fn service_health_requires_a_complete_success_json_body_without_waiting_for_eof() {
         let valid = b"HTTP/1.1 200 OK\r\nContent-Length: 43\r\nConnection: keep-alive\r\n\r\n{\"api_version\":\"v1\",\"service\":\"codex-info\"}";
         assert!(is_service_health_response(valid));
@@ -9356,6 +9713,7 @@ mod tests {
         assert!(details.models[0].input_dollars > 0.0);
         assert!(!details.history_periods.is_empty());
         assert!(!details.history_samples.is_empty());
+        assert!(details.history_gaps.is_empty());
         assert_eq!(details.threads.len(), 1);
         assert_eq!(details.threads[0].model_label, "gpt-5.6-sol");
         let details_json = serde_json::to_value(details).expect("public details serializes");
@@ -9402,6 +9760,154 @@ mod tests {
     }
 
     #[test]
+    fn public_details_preserves_256_thread_rows_and_all_fields_for_publication() {
+        let mut state = CodexInfoState::preview("normal");
+        state.active_threads = (0..MAX_PUBLIC_THREADS)
+            .map(|index| active_thread_fixture(index, 10_000 - index as i64))
+            .collect();
+        state.history = UsageHistory::default();
+
+        let details = state.public_details();
+        assert_eq!(details.threads.len(), 256);
+        assert_eq!(details.active_thread_count, 256);
+        for (active, public) in state.active_threads.iter().zip(&details.threads) {
+            assert_public_thread_matches(active, public);
+        }
+        assert_eq!(
+            details
+                .threads
+                .iter()
+                .map(|thread| thread.id.as_str())
+                .collect::<Vec<_>>(),
+            (0..256)
+                .map(|index| format!("thread-{index:03}"))
+                .collect::<Vec<_>>()
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>()
+        );
+
+        let mut server =
+            ApiServer::start(ApiServerConfig::new("127.0.0.1:0".parse().unwrap()).unwrap())
+                .unwrap();
+        assert_eq!(server.publisher().publish_details(details), Ok(()));
+        server.shutdown();
+    }
+
+    #[test]
+    fn public_details_preserves_257_thread_rows_and_rejects_publication_atomically() {
+        let mut state = CodexInfoState::preview("normal");
+        state.active_threads = (0..=MAX_PUBLIC_THREADS)
+            .map(|index| active_thread_fixture(index, 10_000 - index as i64))
+            .collect();
+        state.history = UsageHistory::default();
+        let over_capacity = state.public_details();
+        assert_eq!(over_capacity.threads.len(), 257);
+        assert_eq!(over_capacity.active_thread_count, 257);
+
+        state.active_threads.truncate(MAX_PUBLIC_THREADS);
+        let known_good = state.public_details();
+        let mut server =
+            ApiServer::start(ApiServerConfig::new("127.0.0.1:0".parse().unwrap()).unwrap())
+                .unwrap();
+        let publisher = server.publisher();
+        publisher.publish_details(known_good).unwrap();
+        let before_pair = publisher.published_pair();
+        let before_status = raw_loopback_get(server.local_addr(), "/v1/status");
+        let before_details = raw_loopback_get(server.local_addr(), "/v1/details");
+
+        assert_eq!(
+            publisher.publish_details(over_capacity),
+            Err(ApiSnapshotError::ListTooLong)
+        );
+        assert_eq!(publisher.published_pair(), before_pair);
+        assert_eq!(
+            raw_loopback_get(server.local_addr(), "/v1/status"),
+            before_status
+        );
+        assert_eq!(
+            raw_loopback_get(server.local_addr(), "/v1/details"),
+            before_details
+        );
+        server.shutdown();
+    }
+
+    #[test]
+    fn service_publishes_old_rows_error_and_latest_quota_without_freeze() {
+        let mut state = CodexInfoState::preview("normal");
+        state.history = UsageHistory::default();
+        let old = active_thread_fixture(0, 100);
+        state.active_threads = vec![old.clone()];
+
+        let mut server =
+            ApiServer::start(ApiServerConfig::new("127.0.0.1:0".parse().unwrap()).unwrap())
+                .unwrap();
+        let publisher = server.publisher();
+        publisher.publish_details(state.public_details()).unwrap();
+        let before_pair = publisher.published_pair();
+
+        let mut cycle_a = active_thread_fixture(10, 220);
+        cycle_a.parent_thread_id = Some("thread-011".into());
+        let mut cycle_b = active_thread_fixture(11, 219);
+        cycle_b.parent_thread_id = Some("thread-010".into());
+        state.apply_thread_result(
+            state.auth_epoch,
+            ActiveThreadUpdate::Snapshot(vec![cycle_a, cycle_b]),
+        );
+        assert_eq!(state.active_threads.as_slice(), std::slice::from_ref(&old));
+        assert!(state.thread_error);
+
+        let reset_at = state.reset_at.expect("preview reset");
+        state.apply_usage_event(usage_event(Some(37.0), reset_at));
+        publisher.publish_details(state.public_details()).unwrap();
+
+        let status = raw_loopback_get(server.local_addr(), "/v1/status");
+        let details = raw_loopback_get(server.local_addr(), "/v1/details");
+        assert_eq!(raw_loopback_pair(&status), raw_loopback_pair(&details));
+        assert_ne!(publisher.published_pair(), before_pair);
+        assert_eq!(raw_loopback_body(&status)["state"], "error");
+        assert_eq!(raw_loopback_body(&details)["state"], "error");
+        assert_eq!(
+            raw_loopback_body(&status)["quota"]["remaining_percent"],
+            37.0
+        );
+        assert_eq!(
+            raw_loopback_body(&details)["quota"]["remaining_percent"],
+            37.0
+        );
+        assert_eq!(raw_loopback_body(&details)["active_thread_count"], 1);
+        assert_eq!(raw_loopback_body(&details)["threads"][0]["id"], old.id);
+
+        state.apply_usage_event(usage_event(Some(29.0), reset_at));
+        publisher.publish_details(state.public_details()).unwrap();
+        assert_eq!(raw_loopback_body(&status)["state"], "error");
+        let advanced_status = raw_loopback_get(server.local_addr(), "/v1/status");
+        assert_eq!(
+            raw_loopback_body(&advanced_status)["quota"]["remaining_percent"],
+            29.0
+        );
+
+        let replacement = active_thread_fixture(1, 230);
+        state.apply_thread_result(
+            state.auth_epoch,
+            ActiveThreadUpdate::Snapshot(vec![replacement.clone()]),
+        );
+        assert_eq!(
+            state.active_threads.as_slice(),
+            std::slice::from_ref(&replacement)
+        );
+        assert!(!state.thread_error);
+        publisher.publish_details(state.public_details()).unwrap();
+        let recovered = raw_loopback_get(server.local_addr(), "/v1/details");
+        assert_eq!(raw_loopback_body(&recovered)["state"], "ready");
+        assert_eq!(
+            raw_loopback_body(&recovered)["threads"][0]["id"],
+            replacement.id
+        );
+        server.shutdown();
+    }
+
+    #[test]
     fn public_details_materializes_exactly_one_calendar_month() {
         let mut state = CodexInfoState::preview("normal");
         let now = Utc::now();
@@ -9431,6 +9937,31 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(timestamps, vec![cutoff + 1, now_timestamp]);
+    }
+
+    #[test]
+    fn public_details_current_period_end_is_effective_observed_end() {
+        let now = Utc::now().timestamp();
+        let reset_at = now + 3_600;
+        let mut state = CodexInfoState::preview("normal");
+        state.reset_at = Some(reset_at);
+        state.last_success_at = Some(now - 120);
+        state.history.samples = vec![UsageHistorySample::new(
+            now - 60,
+            reset_at,
+            80.0,
+            ModelDollarTotals::default(),
+        )];
+
+        let details = state.public_details();
+        let observed_at = details.observed_at.expect("fixture has an observation");
+        let current = details
+            .history_periods
+            .iter()
+            .find(|period| period.current)
+            .expect("fixture has a current period");
+        assert_eq!(current.end_at, reset_at.min(observed_at));
+        assert!(current.end_at < current.reset_at);
     }
 
     #[test]
@@ -9796,10 +10327,16 @@ mod tests {
 
         state.apply_thread_result(state.auth_epoch, ActiveThreadUpdate::Failed);
         assert!(state.thread_error);
-        assert!(state.active_threads.is_empty());
-        assert_eq!(state.public_snapshot().active_thread_count, 0);
-        assert!(state.public_details().threads.is_empty());
-        assert!(active_thread_rows_at(&state.active_threads, 0).is_empty());
+        assert_eq!(state.active_threads, previous);
+        assert_eq!(
+            state.public_snapshot().active_thread_count,
+            previous.len() as u64
+        );
+        assert_eq!(state.public_details().threads.len(), previous.len());
+        assert_eq!(
+            active_thread_rows_at(&state.active_threads, 0).len(),
+            previous.len()
+        );
         assert_eq!(
             state.status,
             "利用枠は更新しました。スレッド情報の取得に失敗し、実行中の状態は未確認です。"
@@ -10085,6 +10622,7 @@ mod tests {
     #[test]
     fn thread_failure_preserves_quota_plan_reset_and_history() {
         let mut state = CodexInfoState::preview("normal");
+        let previous_threads = state.active_threads.clone();
         let reset_at = state.reset_at.expect("preview reset");
         state.apply_usage_event(usage_event(Some(23.0), reset_at));
         let plan = state.plan_label.clone();
@@ -10098,7 +10636,7 @@ mod tests {
         assert_eq!(state.history.samples, history);
         assert!(state.thread_error);
         assert!(!state.thread_checking);
-        assert!(state.active_threads.is_empty());
+        assert_eq!(state.active_threads, previous_threads);
         assert_eq!(
             state.status,
             "利用枠は更新しました。スレッド情報の取得に失敗し、実行中の状態は未確認です。"
@@ -10108,35 +10646,23 @@ mod tests {
     #[test]
     fn thread_failure_recovery_requires_a_new_complete_snapshot() {
         let mut state = CodexInfoState::preview("normal");
-        state.active_threads = vec![ActiveThread {
-            id: "old-running".into(),
-            ..ActiveThread::default()
-        }];
+        let old = active_thread_fixture(0, 100);
+        state.active_threads = vec![old.clone()];
         state.thread_checking = true;
 
-        // A failed cycle must not leave the previous running row visible.
+        // A failed cycle keeps the previous complete row visible.
         state.apply_thread_result(state.auth_epoch, ActiveThreadUpdate::Failed);
-        assert!(state.active_threads.is_empty());
+        assert_eq!(state.active_threads, [old]);
         assert!(state.thread_error);
         assert!(!state.thread_checking);
 
-        // Recovery is only allowed through a subsequent complete snapshot;
-        // an arbitrary partial row is never merged with the cleared state.
+        // Recovery is only allowed through a subsequent complete snapshot.
+        let replacement = active_thread_fixture(1, 120);
         state.apply_thread_result(
             state.auth_epoch,
-            ActiveThreadUpdate::Snapshot(vec![ActiveThread {
-                id: "new-running".into(),
-                ..ActiveThread::default()
-            }]),
+            ActiveThreadUpdate::Snapshot(vec![replacement.clone()]),
         );
-        assert_eq!(
-            state
-                .active_threads
-                .iter()
-                .map(|thread| thread.id.as_str())
-                .collect::<Vec<_>>(),
-            ["new-running"]
-        );
+        assert_eq!(state.active_threads, [replacement]);
         assert!(!state.thread_error);
         assert!(!state.thread_checking);
     }
@@ -10309,6 +10835,184 @@ mod tests {
             )],
         });
         assert_eq!(state.selected_history_reset(), Some(next_reset));
+    }
+
+    #[test]
+    fn quota_reset_jitter_within_authority_moves_selection_to_new_period() {
+        let offsets = [-60_i64, -1, 0, 1, 60];
+        let mut failures = Vec::new();
+
+        for offset in offsets {
+            let mut state = CodexInfoState::preview("normal");
+            let previous_reset = state.reset_at.expect("preview reset");
+            let next_reset = previous_reset + WEEK_SECONDS;
+            state.selected_reset_at = Some(previous_reset + offset);
+            state.selected_history_period = "stale selected period".into();
+
+            state.apply_usage_event(usage_event(Some(99.0), next_reset));
+
+            if state.selected_reset_at != Some(next_reset)
+                || !state.selected_history_period.is_empty()
+            {
+                failures.push(offset);
+            }
+        }
+
+        assert!(
+            failures.is_empty(),
+            "within-authority offsets must follow the new period; exact-equality RED failures: {failures:?}"
+        );
+    }
+
+    #[test]
+    fn explicit_historical_selection_outside_authority_stays_selected_after_reset() {
+        let previous_reset = CodexInfoState::preview("normal")
+            .reset_at
+            .expect("preview reset");
+        let next_reset = previous_reset + WEEK_SECONDS;
+
+        for selected_reset in [previous_reset - 61, previous_reset - WEEK_SECONDS] {
+            let mut state = CodexInfoState::preview("normal");
+            state.selected_reset_at = Some(selected_reset);
+            state.selected_history_period = "explicit historical period".into();
+
+            state.apply_usage_event(usage_event(Some(99.0), next_reset));
+
+            assert_eq!(state.selected_reset_at, Some(selected_reset));
+            assert_eq!(state.selected_history_period, "explicit historical period");
+        }
+    }
+
+    #[test]
+    fn rolling_reset_drift_without_boundary_keeps_selection_and_label() {
+        let mut state = CodexInfoState::preview("normal");
+        let previous_reset = state.reset_at.expect("preview reset");
+        state.selected_reset_at = Some(previous_reset);
+        state.selected_history_period = "explicit current period".into();
+
+        state.apply_usage_event(usage_event(Some(13.0), previous_reset + 120));
+
+        assert_eq!(state.selected_reset_at, Some(previous_reset));
+        assert_eq!(state.selected_history_period, "explicit current period");
+    }
+
+    #[test]
+    fn jittered_rollover_commits_new_period_for_label_graph_and_samples() {
+        const PREVIOUS_RESET: i64 = 2_000_000_000;
+        const NEXT_RESET: i64 = PREVIOUS_RESET + WEEK_SECONDS;
+        const OBSERVED_AT: i64 = PREVIOUS_RESET + 86_400;
+        const OLD_SAMPLE_AT: i64 = PREVIOUS_RESET - 3_600;
+        const NEW_SAMPLE_AT_1: i64 = PREVIOUS_RESET + 3_600;
+        const NEW_SAMPLE_AT_2: i64 = PREVIOUS_RESET + 7_200;
+
+        let mut state = CodexInfoState::preview("normal");
+        state.reset_at = Some(PREVIOUS_RESET);
+        state.remaining_percent = Some(20.0);
+        state.last_success_at = Some(PREVIOUS_RESET - 60);
+        state.selected_reset_at = Some(PREVIOUS_RESET + 1);
+        state.selected_history_period = "stale selected period".into();
+        state.history = UsageHistory {
+            db_path: None,
+            samples: vec![UsageHistorySample::new(
+                OLD_SAMPLE_AT,
+                PREVIOUS_RESET,
+                20.0,
+                ModelDollarTotals {
+                    sol: 0.25,
+                    terra: 0.5,
+                    luna: 0.75,
+                },
+            )],
+            startup_maintenance_done: true,
+        };
+
+        state.apply_usage_event(usage_event(Some(80.0), NEXT_RESET));
+        assert_eq!(state.selected_reset_at, Some(NEXT_RESET));
+        assert!(state.selected_history_period.is_empty());
+
+        // Admit a fixed, matching local payload through the production commit
+        // path. The preview state is switched off only to exercise backfill
+        // admission; its database path is absent, so this remains read-only.
+        state.preview = false;
+        state.last_success_at = Some(OBSERVED_AT);
+        // Keep the fixed backfill rows as the sole admitted graph payload;
+        // the live commit would otherwise append a wall-clock sample and
+        // move the bounded acquisition window away from this deterministic
+        // fixture.
+        state.remaining_percent = None;
+        state.apply_local_usage_success(LocalUsageResult {
+            auth_epoch: state.auth_epoch,
+            reset_at: NEXT_RESET,
+            window_seconds: WEEK_SECONDS,
+            model_usage: ModelUsageTotals::default(),
+            history_samples: vec![
+                UsageHistorySample::new(
+                    NEW_SAMPLE_AT_1,
+                    NEXT_RESET,
+                    80.0,
+                    ModelDollarTotals {
+                        sol: 1.0,
+                        terra: 2.0,
+                        luna: 3.0,
+                    },
+                ),
+                UsageHistorySample::new(
+                    NEW_SAMPLE_AT_2,
+                    NEXT_RESET,
+                    79.0,
+                    ModelDollarTotals {
+                        sol: 2.0,
+                        terra: 4.0,
+                        luna: 6.0,
+                    },
+                ),
+            ],
+        });
+        state.remaining_percent = Some(80.0);
+
+        let periods = state.history_periods_at(OBSERVED_AT);
+        let selected_period = periods
+            .iter()
+            .find(|period| period.canonical_reset_at == NEXT_RESET)
+            .expect("new period is present");
+        let old_period = periods
+            .iter()
+            .find(|period| period.canonical_reset_at == PREVIOUS_RESET)
+            .expect("old period is present");
+        assert_eq!(selected_period.start, PREVIOUS_RESET.div_euclid(60) * 60);
+        assert_eq!(selected_period.end, OBSERVED_AT);
+        assert_ne!(selected_period.label, old_period.label);
+        assert_eq!(
+            state.selected_history_reset_for_periods(&periods),
+            Some(NEXT_RESET)
+        );
+
+        let selected_samples = state.history.samples_for_reset(Some(NEXT_RESET));
+        assert_eq!(selected_samples.len(), 2);
+        assert!(selected_samples.iter().all(|sample| {
+            sample.reset_at == NEXT_RESET
+                && sample.timestamp >= PREVIOUS_RESET
+                && sample.timestamp <= OBSERVED_AT
+        }));
+        assert!(selected_samples
+            .iter()
+            .all(|sample| sample.timestamp != OLD_SAMPLE_AT));
+
+        let details = state.public_details_at(OBSERVED_AT);
+        let public_period = details
+            .history_periods
+            .iter()
+            .find(|period| period.reset_at == NEXT_RESET)
+            .expect("new public period is present");
+        assert_eq!(public_period.label, selected_period.label);
+        assert_eq!(public_period.start_at, PREVIOUS_RESET.div_euclid(60) * 60);
+        assert_eq!(public_period.end_at, OBSERVED_AT);
+
+        let paths = state.graph_paths_for_selection_at(OBSERVED_AT, true, true, true, false);
+        assert!(paths.remaining.starts_with("M0.00 "));
+        assert!(paths.remaining.contains("L100.00 "));
+        assert!(paths.sol.starts_with("M0.00 "));
+        assert!(paths.sol.contains("L100.00 "));
     }
 
     #[test]
@@ -11243,6 +11947,355 @@ mod tests {
                 + "\n",
         )
         .unwrap();
+    }
+
+    fn write_distinct_running_rollout(
+        path: &Path,
+        model: &str,
+        total_tokens: u64,
+        context_usage_tokens: u64,
+        context_window_tokens: u64,
+        user_timestamp: &str,
+        completed: bool,
+    ) {
+        let mut records = vec![
+            json!({"type":"thread_context","model":model}),
+            json!({
+                "type":"event_msg",
+                "timestamp":user_timestamp,
+                "payload":{"type":"user_message"}
+            }),
+            json!({
+                "type":"event_msg",
+                "payload":{
+                    "type":"token_count",
+                    "info":{
+                        "total_token_usage":{"total_tokens":total_tokens},
+                        "last_token_usage":{"total_tokens":context_usage_tokens},
+                        "model_context_window":context_window_tokens
+                    }
+                }
+            }),
+            json!({"type":"task_started"}),
+        ];
+        if completed {
+            records.push(json!({"type":"task_complete"}));
+        }
+        fs::write(
+            path,
+            records
+                .into_iter()
+                .map(|value| value.to_string())
+                .collect::<Vec<_>>()
+                .join("\n")
+                + "\n",
+        )
+        .unwrap();
+    }
+
+    fn add_native_state_thread_with_values(
+        root: &Path,
+        id: &str,
+        rollout_path: &Path,
+        name: &str,
+        preview: &str,
+        updated_at: i64,
+    ) {
+        let connection = Connection::open(root.join("state_5.sqlite")).unwrap();
+        connection
+            .execute(
+                "INSERT INTO threads
+                 (id, rollout_path, updated_at, archived, name, preview, thread_source)
+                 VALUES (?1, ?2, ?3, 0, ?4, ?5, 'subagent')",
+                rusqlite::params![
+                    id,
+                    rollout_path.to_string_lossy().as_ref(),
+                    updated_at,
+                    name,
+                    preview,
+                ],
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn root_native_duplicate_candidate_is_preserved_then_rejected_atomically() {
+        static NEXT_ROOT: AtomicU64 = AtomicU64::new(0);
+        let root = std::env::temp_dir().join(format!(
+            "codex-info-root-native-duplicate-{}-{}",
+            std::process::id(),
+            NEXT_ROOT.fetch_add(1, Ordering::Relaxed)
+        ));
+        create_native_state_schema(&root);
+        let sessions = root.join("sessions");
+        let owner_rollout = sessions.join("owner.jsonl");
+        let root_rollout = sessions.join("root.jsonl");
+        let native_rollout = sessions.join("native.jsonl");
+        let root_timestamp = "2026-01-01T00:00:42Z";
+        let native_timestamp = "2026-01-02T00:00:43Z";
+        write_distinct_running_rollout(
+            &owner_rollout,
+            "owner-model",
+            1,
+            2,
+            3,
+            root_timestamp,
+            true,
+        );
+        write_distinct_running_rollout(
+            &root_rollout,
+            "root-model",
+            111,
+            222,
+            333,
+            root_timestamp,
+            false,
+        );
+        write_distinct_running_rollout(
+            &native_rollout,
+            "native-model",
+            999,
+            888,
+            777,
+            native_timestamp,
+            false,
+        );
+        add_native_state_thread_with_values(
+            &root,
+            "collision",
+            &native_rollout,
+            "native-title",
+            "native-preview",
+            1,
+        );
+        add_native_state_edge(&root, "owner", "collision");
+
+        let (sender, receiver) = mpsc::channel();
+        sender
+            .send(RpcReadEvent::Line(
+                super::security::RpcLine::new(
+                    json!({
+                        "id": 200,
+                        "result": {"data": [
+                            thread_list_item("collision", 20, &root_rollout),
+                            thread_list_item("owner", 10, &owner_rollout)
+                        ]}
+                    })
+                    .to_string(),
+                )
+                .unwrap(),
+            ))
+            .unwrap();
+        let active_paths = BTreeSet::from([
+            fs::canonicalize(&owner_rollout).unwrap(),
+            fs::canonicalize(&root_rollout).unwrap(),
+            fs::canonicalize(&native_rollout).unwrap(),
+        ]);
+        let mut input = Vec::new();
+        let mut next_id = 200;
+        let update = fetch_active_thread_update_for_paths_and_state(
+            &mut input,
+            &receiver,
+            &mut next_id,
+            &sessions,
+            &active_paths,
+            Some(&root),
+        );
+        let rows = match update {
+            ActiveThreadUpdate::Snapshot(rows) => rows,
+            other => panic!("duplicate fixture did not produce a snapshot: {other:?}"),
+        };
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].id, "collision");
+        assert_eq!(rows[1].id, "collision");
+        assert_eq!(
+            rows[0],
+            ActiveThread {
+                id: "collision".into(),
+                created_at: Some(1),
+                updated_at: 20,
+                title: "title-collision".into(),
+                model: "root-model".into(),
+                model_label: "root-model".into(),
+                total_tokens: Some(111),
+                context_usage_tokens: Some(222),
+                context_window_tokens: Some(333),
+                last_user_message_at: Some(
+                    chrono::DateTime::parse_from_rfc3339(root_timestamp)
+                        .unwrap()
+                        .timestamp(),
+                ),
+                is_subagent: false,
+                parent_thread_id: None,
+                depth: None,
+            }
+        );
+        assert_eq!(
+            rows[1],
+            ActiveThread {
+                id: "collision".into(),
+                created_at: None,
+                updated_at: 1,
+                title: "native-title".into(),
+                model: "native-model".into(),
+                model_label: "native-model".into(),
+                total_tokens: Some(999),
+                context_usage_tokens: Some(888),
+                context_window_tokens: Some(777),
+                last_user_message_at: Some(
+                    chrono::DateTime::parse_from_rfc3339(native_timestamp)
+                        .unwrap()
+                        .timestamp(),
+                ),
+                is_subagent: true,
+                parent_thread_id: Some("owner".into()),
+                depth: Some(1),
+            }
+        );
+
+        let mut state = CodexInfoState::preview("normal");
+        state.history = UsageHistory::default();
+        state.active_threads = rows;
+        let candidate = state.public_details();
+        assert_eq!(candidate.threads.len(), 2);
+        assert_eq!(candidate.active_thread_count, 2);
+
+        let mut server =
+            ApiServer::start(ApiServerConfig::new("127.0.0.1:0".parse().unwrap()).unwrap())
+                .unwrap();
+        let publisher = server.publisher();
+        let mut known_good_state = CodexInfoState::preview("normal");
+        known_good_state.history = UsageHistory::default();
+        publisher
+            .publish_details(known_good_state.public_details())
+            .unwrap();
+        let before_pair = publisher.published_pair();
+        let before_status = raw_loopback_get(server.local_addr(), "/v1/status");
+        let before_details = raw_loopback_get(server.local_addr(), "/v1/details");
+        assert_eq!(
+            publisher.publish_details(candidate),
+            Err(ApiSnapshotError::InvalidThread)
+        );
+        assert_eq!(publisher.published_pair(), before_pair);
+        assert_eq!(
+            raw_loopback_get(server.local_addr(), "/v1/status"),
+            before_status
+        );
+        assert_eq!(
+            raw_loopback_get(server.local_addr(), "/v1/details"),
+            before_details
+        );
+        server.shutdown();
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn root_and_native_candidates_follow_fixed_updated_at_then_id_order() {
+        static NEXT_ROOT: AtomicU64 = AtomicU64::new(0);
+        let root = std::env::temp_dir().join(format!(
+            "codex-info-root-native-order-{}-{}",
+            std::process::id(),
+            NEXT_ROOT.fetch_add(1, Ordering::Relaxed)
+        ));
+        create_native_state_schema(&root);
+        let sessions = root.join("sessions");
+        let owner_rollout = sessions.join("owner.jsonl");
+        write_distinct_running_rollout(
+            &owner_rollout,
+            "owner-model",
+            1,
+            2,
+            3,
+            "2026-01-01T00:00:01Z",
+            true,
+        );
+
+        let root_specs = [
+            ("root-late", 40_i64, "2026-01-01T00:00:10Z"),
+            ("z-root", 20_i64, "2026-01-01T00:00:11Z"),
+            ("root-old", 10_i64, "2026-01-01T00:00:12Z"),
+        ];
+        let mut active_paths = BTreeSet::from([fs::canonicalize(&owner_rollout).unwrap()]);
+        let mut root_items = Vec::new();
+        for (index, (id, updated_at, timestamp)) in root_specs.into_iter().enumerate() {
+            let path = sessions.join(format!("{id}.jsonl"));
+            write_distinct_running_rollout(
+                &path,
+                &format!("{id}-model"),
+                100 + index as u64,
+                200 + index as u64,
+                300 + index as u64,
+                timestamp,
+                false,
+            );
+            active_paths.insert(fs::canonicalize(&path).unwrap());
+            root_items.push(thread_list_item(id, updated_at, &path));
+        }
+
+        let native_specs = [
+            ("native-mid", 30_i64, "2026-01-02T00:00:10Z"),
+            ("a-native", 20_i64, "2026-01-02T00:00:11Z"),
+            ("native-old", 5_i64, "2026-01-02T00:00:12Z"),
+        ];
+        for (index, (id, updated_at, timestamp)) in native_specs.into_iter().enumerate() {
+            let path = sessions.join(format!("{id}.jsonl"));
+            write_distinct_running_rollout(
+                &path,
+                &format!("{id}-model"),
+                400 + index as u64,
+                500 + index as u64,
+                600 + index as u64,
+                timestamp,
+                false,
+            );
+            active_paths.insert(fs::canonicalize(&path).unwrap());
+            add_native_state_thread_with_values(
+                &root,
+                id,
+                &path,
+                &format!("native-title-{id}"),
+                &format!("native-preview-{id}"),
+                updated_at,
+            );
+            add_native_state_edge(&root, "owner", id);
+        }
+
+        let (sender, receiver) = mpsc::channel();
+        root_items.push(thread_list_item("owner", 1, &owner_rollout));
+        sender
+            .send(RpcReadEvent::Line(
+                super::security::RpcLine::new(
+                    json!({"id": 210, "result": {"data": root_items}}).to_string(),
+                )
+                .unwrap(),
+            ))
+            .unwrap();
+        let mut input = Vec::new();
+        let mut next_id = 210;
+        let update = fetch_active_thread_update_for_paths_and_state(
+            &mut input,
+            &receiver,
+            &mut next_id,
+            &sessions,
+            &active_paths,
+            Some(&root),
+        );
+        let rows = match update {
+            ActiveThreadUpdate::Snapshot(rows) => rows,
+            other => panic!("order fixture did not produce a snapshot: {other:?}"),
+        };
+        assert_eq!(
+            rows.iter().map(|row| row.id.as_str()).collect::<Vec<_>>(),
+            [
+                "root-late",
+                "native-mid",
+                "z-root",
+                "a-native",
+                "root-old",
+                "native-old"
+            ]
+        );
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -12473,7 +13526,10 @@ mod tests {
             "height: parent.height - root.history-toggle-y - 32px;",
             "height: parent.height - 52px;",
         ] {
-            assert!(source.contains(expression), "missing layout formula: {expression}");
+            assert!(
+                source.contains(expression),
+                "missing layout formula: {expression}"
+            );
         }
         let geometry = |width: f64, height: f64| {
             let margin = (20.0 + (width - 700.0) / 24.0).clamp(20.0, 30.0);
@@ -12681,7 +13737,7 @@ mod tests {
     }
 
     #[test]
-    fn history_periods_navigate_newest_older_newer_and_end_past_period_at_reset() {
+    fn history_periods_navigate_newest_older_and_newer() {
         let mut history = UsageHistory::default();
         for (timestamp, reset_at) in [(100, 300), (200, 200), (300, 100)] {
             history.samples.push(UsageHistorySample::new(
@@ -12692,8 +13748,6 @@ mod tests {
             ));
         }
         assert_eq!(history.reset_periods_desc(), vec![100, 200, 300]);
-        assert_eq!(graph_period_end(200, Some(300), 350), 200);
-        assert_eq!(graph_period_end(300, Some(300), 250), 250);
     }
 
     #[test]
@@ -14265,58 +15319,98 @@ mod tests {
 
     #[test]
     fn shared_graph_fixture_is_the_x_history_oracle() {
-        const SPEC_REMAINING: [f64; 5] = [87.0, 44.0, 1.0, 1.0, 1.0];
+        const SPEC_REMAINING: [f64; 6] = [100.0, 87.0, 44.0, 1.0, 1.0, 1.0];
         const SPEC_SOL_MAX: f64 = 420.40;
         const SPEC_PERIOD_COUNT: usize = 1;
         let fixture: GraphFixture =
             serde_json::from_str(include_str!("../tests/fixtures/graph_delayed_quota.json"))
                 .expect("valid shared graph fixture");
-        // These literals are the reviewed acceptance oracle.  The fixture is
+        // These literals are the reviewed acceptance oracle. The fixture is
         // test input, not an implementation-generated expected-value source.
         assert_eq!(fixture.expected_remaining, SPEC_REMAINING);
         assert_eq!(fixture.expected_sol_max, SPEC_SOL_MAX);
         assert_eq!(fixture.expected_period_count, SPEC_PERIOD_COUNT);
-        let samples = fixture
-            .samples
+        assert_eq!(fixture.expected_raw_timestamps.len(), 5);
+        assert_eq!(fixture.expected_graph_timestamps.len(), 6);
+
+        let wire = &fixture.details_response;
+        assert_eq!(wire.api_version, "v1");
+        assert_eq!(wire.state, "ready");
+        assert!(wire.authenticated);
+        assert_eq!(wire.active_thread_count, 0);
+        assert_eq!(wire.models.len(), 3);
+        assert!(wire.history_gaps.is_empty());
+        assert!(wire.threads.is_empty());
+        assert_eq!(wire.estimated_cost_label, "概算 $451");
+        assert_eq!(wire.quota.reset_at, fixture.expected_reset_at);
+        assert!(wire.quota.window_seconds > 0);
+        let wire_period = wire
+            .history_periods
+            .first()
+            .expect("fixture has one history period");
+        assert_eq!(wire.history_periods.len(), SPEC_PERIOD_COUNT);
+        assert_eq!(wire_period.id, fixture.expected_reset_at.to_string());
+        assert_eq!(wire_period.start_at, fixture.expected_period_start);
+        assert_eq!(wire_period.end_at, fixture.expected_period_end);
+        assert_eq!(wire_period.reset_at, fixture.expected_reset_at);
+        assert_eq!(wire_period.label, "history");
+        assert!(wire_period.current);
+        assert_eq!(
+            wire.history_samples
+                .iter()
+                .map(|sample| sample.timestamp)
+                .collect::<Vec<_>>(),
+            fixture.expected_raw_timestamps
+        );
+
+        let state = state_from_graph_fixture(&fixture);
+        let observed_at = wire.observed_at;
+        let expected_samples = wire
+            .history_samples
             .iter()
-            .map(|sample| match sample.remaining_percent {
-                Some(remaining) => UsageHistorySample::new_with_usage(
-                    sample.timestamp,
-                    fixture.reset_at,
-                    remaining,
-                    ModelDollarTotals {
-                        sol: sample.sol_dollars,
-                        terra: sample.terra_dollars,
-                        luna: sample.luna_dollars,
-                    },
-                    ModelTokenTotals::default(),
-                ),
-                None => UsageHistorySample::from_model_history(
-                    sample.timestamp,
-                    fixture.reset_at,
-                    ModelDollarTotals {
-                        sol: sample.sol_dollars,
-                        terra: sample.terra_dollars,
-                        luna: sample.luna_dollars,
-                    },
-                ),
-            })
+            .map(GraphFixtureHistorySample::to_usage_history_sample)
             .collect::<Vec<_>>();
-        let history = UsageHistory {
-            samples,
-            ..UsageHistory::default()
-        };
-        let periods = history.periods(fixture.period_end, Some(fixture.reset_at));
+        let periods = state.history_periods_at(observed_at);
         assert_eq!(periods.len(), SPEC_PERIOD_COUNT);
-        assert_eq!(periods[0].start, fixture.period_start);
-        assert_eq!(periods[0].end, fixture.period_end);
-        let selected = history.samples_for_reset(Some(fixture.reset_at));
+        let period = periods.first().expect("state has one current period");
+        assert_eq!(period.start, fixture.expected_period_start);
+        assert_eq!(period.end, fixture.expected_period_end);
+        assert_eq!(period.canonical_reset_at, fixture.expected_reset_at);
+
+        let selected = state
+            .history
+            .samples_for_reset(Some(period.canonical_reset_at));
+        assert_eq!(selected.len(), fixture.expected_raw_timestamps.len());
+        assert_eq!(selected, expected_samples);
+        assert_eq!(
+            selected
+                .iter()
+                .map(|sample| sample.timestamp)
+                .collect::<Vec<_>>(),
+            fixture.expected_raw_timestamps
+        );
+        assert_eq!(
+            selected.last().map(|sample| sample.timestamp),
+            Some(fixture.expected_period_end)
+        );
+
         let references = selected.iter().collect::<Vec<_>>();
-        let remaining =
-            remaining_graph_points(&references, fixture.period_start, fixture.period_end);
-        assert_eq!(remaining.len(), SPEC_REMAINING.len());
-        for (point, expected) in remaining.iter().zip(SPEC_REMAINING) {
-            assert!((point.1 - expected).abs() < 0.000_001);
+        let remaining = remaining_graph_points(
+            &references,
+            fixture.expected_period_start,
+            fixture.expected_period_end,
+        );
+        let remaining_by_timestamp = remaining.iter().fold(BTreeMap::new(), |mut values, point| {
+            values.insert(point.0, point.1);
+            values
+        });
+        assert_eq!(remaining_by_timestamp.len(), SPEC_REMAINING.len());
+        assert_eq!(
+            remaining_by_timestamp.keys().copied().collect::<Vec<_>>(),
+            fixture.expected_graph_timestamps
+        );
+        for (point, expected) in remaining_by_timestamp.values().zip(SPEC_REMAINING) {
+            assert!((point - expected).abs() < 0.000_001);
         }
         assert_eq!(
             selected
@@ -14324,6 +15418,471 @@ mod tests {
                 .map(|sample| sample.sol_dollars)
                 .fold(0.0, f64::max),
             SPEC_SOL_MAX
+        );
+        assert_eq!(
+            remaining.first(),
+            Some(&(fixture.expected_period_start, 100.0))
+        );
+        assert_eq!(remaining.get(1).map(|point| point.1), Some(100.0));
+        assert_eq!(remaining.get(2).map(|point| point.1), Some(87.0));
+        assert_eq!(
+            remaining.get(1).map(|point| point.0),
+            remaining.get(2).map(|point| point.0)
+        );
+        assert!(remaining.windows(2).any(|pair| {
+            pair[0].0 == pair[1].0 && (pair[0].1 - pair[1].1).abs() > f64::EPSILON
+        }));
+        assert!(!remaining.windows(2).take(2).any(|pair| {
+            pair[0].0 < selected[0].timestamp
+                && pair[1].0 == selected[0].timestamp
+                && (pair[0].1 - pair[1].1).abs() > f64::EPSILON
+        }));
+
+        let minute = graph_time_endpoints(
+            minute_model_spend_for_metric(&references, false),
+            fixture.expected_period_start,
+            fixture.expected_period_end,
+        );
+        assert_eq!(
+            minute
+                .iter()
+                .map(|point| point.timestamp)
+                .collect::<Vec<_>>(),
+            fixture.expected_graph_timestamps
+        );
+        let graph = state.graph_paths_for_selection_at(observed_at, true, true, true, false);
+        let expected_graph = graph_paths_for_selection(
+            &references,
+            fixture.expected_period_start,
+            fixture.expected_period_end,
+            true,
+            true,
+            true,
+            false,
+        );
+        assert_eq!(graph.remaining, expected_graph.remaining);
+        assert!(graph
+            .unused_intervals
+            .iter()
+            .any(|interval| { interval.start.abs() < 0.000_001 && interval.width > 0.0 }));
+
+        let labels = state.graph_time_labels_at(observed_at);
+        let expected_labels = [0.0, 0.25, 0.5, 0.75, 1.0].map(|fraction| {
+            let span = (fixture.expected_period_end - fixture.expected_period_start) as f64;
+            let timestamp = fixture.expected_period_start + (span * fraction) as i64;
+            state.i18n.format_graph_time(timestamp).unwrap_or_default()
+        });
+        assert_eq!(labels, expected_labels);
+
+        let details = state.public_details_at(observed_at);
+        let public_period = details
+            .history_periods
+            .iter()
+            .find(|period| period.current)
+            .expect("public details has one current period");
+        assert_eq!(public_period.start_at, fixture.expected_period_start);
+        assert_eq!(public_period.end_at, fixture.expected_period_end);
+        assert_eq!(public_period.reset_at, fixture.expected_reset_at);
+        assert_eq!(
+            details
+                .history_samples
+                .iter()
+                .map(|sample| sample.timestamp)
+                .collect::<Vec<_>>(),
+            fixture.expected_raw_timestamps
+        );
+        let published_samples = details
+            .history_samples
+            .iter()
+            .map(|sample| UsageHistorySample {
+                timestamp: sample.timestamp,
+                reset_at: sample.reset_at,
+                remaining_percent: sample.remaining_percent.unwrap_or(-1.0),
+                sol_dollars: sample.sol_dollars,
+                terra_dollars: sample.terra_dollars,
+                luna_dollars: sample.luna_dollars,
+                sol_tokens: sample.sol_tokens,
+                terra_tokens: sample.terra_tokens,
+                luna_tokens: sample.luna_tokens,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(published_samples, expected_samples);
+    }
+
+    #[test]
+    fn current_period_bounds_stay_canonical_across_quota_reset_jitter() {
+        const CANONICAL_RESET: i64 = 2_000_010_000;
+        const WINDOW_SECONDS: i64 = 3_600;
+        const OBSERVED_AT: i64 = CANONICAL_RESET - 30;
+        const CANONICAL_START: i64 = CANONICAL_RESET - WINDOW_SECONDS;
+        const CANONICAL_END: i64 = OBSERVED_AT;
+        const OFFSETS: [i64; 6] = [-60, -30, -1, 1, 30, 60];
+
+        let mut server =
+            ApiServer::start(ApiServerConfig::new("127.0.0.1:0".parse().unwrap()).unwrap())
+                .unwrap();
+        for offset in OFFSETS {
+            let quota_reset = CANONICAL_RESET + offset;
+            let raw_samples = vec![
+                UsageHistorySample {
+                    timestamp: CANONICAL_START + 60,
+                    reset_at: CANONICAL_RESET,
+                    remaining_percent: 92.0,
+                    sol_dollars: 1.0,
+                    terra_dollars: 0.0,
+                    luna_dollars: 0.0,
+                    sol_tokens: 1,
+                    terra_tokens: 0,
+                    luna_tokens: 0,
+                },
+                UsageHistorySample {
+                    timestamp: CANONICAL_RESET - 60,
+                    reset_at: CANONICAL_RESET,
+                    remaining_percent: 80.0,
+                    sol_dollars: 42.0,
+                    terra_dollars: 0.0,
+                    luna_dollars: 0.0,
+                    sol_tokens: 42,
+                    terra_tokens: 0,
+                    luna_tokens: 0,
+                },
+            ];
+            let mut state = CodexInfoState::preview("normal");
+            state.reset_at = Some(quota_reset);
+            state.window_seconds = WINDOW_SECONDS;
+            state.last_success_at = Some(OBSERVED_AT);
+            state.history = UsageHistory {
+                samples: raw_samples,
+                ..UsageHistory::default()
+            };
+            state.selected_reset_at = Some(quota_reset);
+            state.selected_history_period.clear();
+
+            let periods = state.history_periods_at(OBSERVED_AT);
+            assert_eq!(periods.len(), 1, "offset={offset}");
+            assert_eq!(
+                periods
+                    .iter()
+                    .filter(|period| {
+                        current_history_period_reset(&periods, state.reset_at, OBSERVED_AT)
+                            == Some(period.canonical_reset_at)
+                    })
+                    .count(),
+                1,
+                "offset={offset}"
+            );
+            let period = periods.first().expect("one jitter period");
+            assert_eq!(
+                period.canonical_reset_at, CANONICAL_RESET,
+                "offset={offset}"
+            );
+            assert_eq!(period.start, CANONICAL_START, "offset={offset}");
+            assert_eq!(period.end, CANONICAL_END, "offset={offset}");
+
+            let selected = state.history.samples_for_reset(Some(quota_reset));
+            assert_eq!(selected.len(), 2, "offset={offset}");
+            assert!(selected.iter().all(|sample| {
+                sample.reset_at == CANONICAL_RESET
+                    && sample.reset_at.abs_diff(quota_reset)
+                        <= super::RESET_AT_TOLERANCE_SECONDS as u64
+            }));
+            let references = selected.iter().collect::<Vec<_>>();
+            let graph = state.graph_paths_for_selection_at(OBSERVED_AT, true, true, true, false);
+            let expected_graph = graph_paths_for_selection(
+                &references,
+                CANONICAL_START,
+                CANONICAL_END,
+                true,
+                true,
+                true,
+                false,
+            );
+            assert_eq!(graph.remaining, expected_graph.remaining, "offset={offset}");
+
+            let labels = state.graph_time_labels_at(OBSERVED_AT);
+            let expected_labels = [0.0, 0.25, 0.5, 0.75, 1.0].map(|fraction| {
+                let span = (CANONICAL_END - CANONICAL_START) as f64;
+                let timestamp = CANONICAL_START + (span * fraction) as i64;
+                state.i18n.format_graph_time(timestamp).unwrap_or_default()
+            });
+            assert_eq!(labels, expected_labels, "offset={offset}");
+
+            let details = state.public_details_at(OBSERVED_AT);
+            let public_periods = &details.history_periods;
+            assert_eq!(public_periods.len(), 1, "offset={offset}");
+            let public_period = public_periods.first().expect("one public jitter period");
+            assert!(public_period.current, "offset={offset}");
+            assert_eq!(
+                public_period.id,
+                CANONICAL_RESET.to_string(),
+                "offset={offset}"
+            );
+            assert_eq!(public_period.reset_at, CANONICAL_RESET, "offset={offset}");
+            assert_eq!(public_period.start_at, CANONICAL_START, "offset={offset}");
+            assert_eq!(
+                public_period.end_at,
+                public_period.reset_at.min(OBSERVED_AT),
+                "offset={offset}"
+            );
+            assert_eq!(public_period.end_at, CANONICAL_END, "offset={offset}");
+            assert_eq!(
+                state
+                    .history
+                    .samples
+                    .iter()
+                    .map(|sample| sample.reset_at)
+                    .collect::<Vec<_>>(),
+                vec![CANONICAL_RESET, CANONICAL_RESET],
+                "offset={offset}"
+            );
+            assert!(
+                server.publisher().publish_details(details).is_ok(),
+                "offset={offset}"
+            );
+        }
+        server.shutdown();
+    }
+
+    #[test]
+    fn fresh_startup_selects_current_minute_canonical_period_end_to_end() {
+        const WINDOW_SECONDS: i64 = 3_600;
+        let observed_at = Utc::now().timestamp();
+        let raw_start = (observed_at - 3_000).div_euclid(60) * 60 + 34;
+        let canonical_reset = raw_start + WINDOW_SECONDS;
+        let current_alias = canonical_reset - 1;
+        let old_reset = raw_start - 60;
+        let floor_start = raw_start.div_euclid(60) * 60;
+        assert_ne!(raw_start, floor_start);
+
+        let current_samples = [
+            UsageHistorySample::new_with_usage(
+                raw_start,
+                current_alias,
+                92.0,
+                ModelDollarTotals {
+                    sol: 1.0,
+                    ..ModelDollarTotals::default()
+                },
+                ModelTokenTotals::default(),
+            ),
+            UsageHistorySample::new_with_usage(
+                raw_start + 60,
+                canonical_reset,
+                80.0,
+                ModelDollarTotals {
+                    sol: 3.0,
+                    ..ModelDollarTotals::default()
+                },
+                ModelTokenTotals::default(),
+            ),
+        ];
+        assert_eq!(current_samples[0].timestamp, floor_start);
+        assert!(floor_start <= current_samples[0].timestamp);
+
+        let mut state = CodexInfoState::preview("normal");
+        state.reset_at = Some(current_alias);
+        state.window_seconds = WINDOW_SECONDS;
+        state.last_success_at = Some(observed_at);
+        state.history = UsageHistory {
+            samples: vec![
+                UsageHistorySample::new_with_usage(
+                    raw_start - 120,
+                    old_reset,
+                    65.0,
+                    ModelDollarTotals {
+                        sol: 99.0,
+                        ..ModelDollarTotals::default()
+                    },
+                    ModelTokenTotals::default(),
+                ),
+                current_samples[0].clone(),
+                current_samples[1].clone(),
+            ],
+            ..UsageHistory::default()
+        };
+        // Fresh startup has no persisted selection; all downstream consumers
+        // must resolve the same current canonical period.
+        state.selected_reset_at = None;
+        state.selected_history_period.clear();
+
+        let periods = state.history_periods_at(observed_at);
+        let current = periods
+            .iter()
+            .find(|period| period.canonical_reset_at == canonical_reset)
+            .expect("current minute period survives authoritative bounds");
+        assert_eq!(periods.len(), 2);
+        assert_eq!(current.start, floor_start);
+        assert!(current.start <= current_samples[0].timestamp);
+        assert!(!current.label.is_empty());
+
+        state.select_latest_history();
+        assert_eq!(state.selected_reset_at, Some(canonical_reset));
+        assert_eq!(state.selected_history_reset(), Some(canonical_reset));
+        assert_eq!(
+            state.selected_history_period,
+            state
+                .history_periods_at(observed_at)
+                .into_iter()
+                .find(|period| period.canonical_reset_at == canonical_reset)
+                .expect("current period label")
+                .label
+        );
+
+        let graph_samples: Vec<UsageHistorySample> =
+            serde_json::from_str(&state.graph_data()).expect("selected graph JSON");
+        assert_eq!(graph_samples.len(), current_samples.len());
+        assert!(graph_samples
+            .iter()
+            .all(|sample| sample.reset_at == canonical_reset));
+        assert!(graph_samples.iter().any(|sample| {
+            (sample.sol_dollars - current_samples[1].sol_dollars).abs() < f64::EPSILON
+        }));
+
+        let paths = state.graph_paths_for_selection_at(observed_at, true, true, true, false);
+        assert!(!paths.remaining.is_empty());
+        assert!(!paths.sol.is_empty());
+        assert_eq!(paths.current_sol_label, "$3.00");
+    }
+
+    #[test]
+    fn fresh_startup_rejects_current_period_with_one_minute_early_owned_row() {
+        const WINDOW_SECONDS: i64 = 3_600;
+        let observed_at = Utc::now().timestamp();
+        let raw_start = (observed_at - 3_000).div_euclid(60) * 60 + 34;
+        let canonical_reset = raw_start + WINDOW_SECONDS;
+        let current_alias = canonical_reset - 1;
+        let old_reset = raw_start - 60;
+        let floor_start = raw_start.div_euclid(60) * 60;
+
+        let mut state = CodexInfoState::preview("normal");
+        state.reset_at = Some(current_alias);
+        state.window_seconds = WINDOW_SECONDS;
+        state.last_success_at = Some(observed_at);
+        state.history = UsageHistory {
+            samples: vec![
+                UsageHistorySample::new_with_usage(
+                    raw_start - 120,
+                    old_reset,
+                    65.0,
+                    ModelDollarTotals {
+                        sol: 99.0,
+                        ..ModelDollarTotals::default()
+                    },
+                    ModelTokenTotals::default(),
+                ),
+                // The constructor keeps the same minute-start representation
+                // as the collector, but this row is one full bucket early.
+                UsageHistorySample::new_with_usage(
+                    raw_start - 60,
+                    current_alias,
+                    92.0,
+                    ModelDollarTotals {
+                        sol: 1.0,
+                        ..ModelDollarTotals::default()
+                    },
+                    ModelTokenTotals::default(),
+                ),
+                UsageHistorySample::new_with_usage(
+                    raw_start + 60,
+                    canonical_reset,
+                    80.0,
+                    ModelDollarTotals {
+                        sol: 3.0,
+                        ..ModelDollarTotals::default()
+                    },
+                    ModelTokenTotals::default(),
+                ),
+            ],
+            ..UsageHistory::default()
+        };
+        state.selected_reset_at = None;
+        state.selected_history_period.clear();
+
+        let periods = state.history_periods_at(observed_at);
+        assert!(periods
+            .iter()
+            .all(|period| period.canonical_reset_at != canonical_reset));
+        assert_eq!(
+            periods
+                .iter()
+                .map(|period| period.canonical_reset_at)
+                .collect::<Vec<_>>(),
+            vec![old_reset]
+        );
+        assert!(periods.iter().all(|period| period.start < floor_start));
+
+        state.select_latest_history();
+        assert_eq!(state.selected_reset_at, Some(old_reset));
+        let graph_samples: Vec<UsageHistorySample> =
+            serde_json::from_str(&state.graph_data()).expect("selected old graph JSON");
+        assert_eq!(graph_samples.len(), 1);
+        assert_eq!(graph_samples[0].reset_at, old_reset);
+        assert_eq!(
+            state
+                .graph_paths_for_selection_at(observed_at, true, true, true, false)
+                .current_sol_label,
+            "$99.00"
+        );
+    }
+
+    #[test]
+    fn shared_graph_current_period_rejects_an_early_owned_row() {
+        let fixture: GraphFixture =
+            serde_json::from_str(include_str!("../tests/fixtures/graph_delayed_quota.json"))
+                .expect("valid shared graph fixture");
+        let mut state = state_from_graph_fixture(&fixture);
+        let quota = &fixture.details_response.quota;
+        let computed_start = quota
+            .reset_at
+            .checked_sub(quota.window_seconds)
+            .expect("fixture reset/window fit in i64");
+        state.history.samples.push(UsageHistorySample {
+            timestamp: computed_start - 60,
+            reset_at: quota.reset_at,
+            remaining_percent: 92.0,
+            sol_dollars: 0.0,
+            terra_dollars: 0.0,
+            luna_dollars: 0.0,
+            sol_tokens: 0,
+            terra_tokens: 0,
+            luna_tokens: 0,
+        });
+
+        let raw = state.history.samples_for_reset(Some(quota.reset_at));
+        assert_eq!(
+            raw.len(),
+            fixture.details_response.history_samples.len() + 1
+        );
+        assert_eq!(
+            raw.first().map(|sample| sample.timestamp),
+            Some(computed_start - 60)
+        );
+        let periods = state.history_periods_at(fixture.details_response.observed_at);
+        assert!(periods.is_empty(), "invalid current period must be omitted");
+
+        let graph = state.graph_paths_for_selection_at(
+            fixture.details_response.observed_at,
+            true,
+            true,
+            true,
+            false,
+        );
+        assert!(graph.remaining.is_empty());
+        assert!(graph.unused_intervals.is_empty());
+        assert_eq!(
+            state.graph_time_labels_at(fixture.details_response.observed_at),
+            <[String; 5]>::default()
+        );
+        let details = state.public_details_at(fixture.details_response.observed_at);
+        assert!(details.history_periods.is_empty());
+        assert_eq!(details.history_samples.len(), raw.len());
+        let raw_payload: Vec<UsageHistorySample> =
+            serde_json::from_str(&state.history.graph_data_for_reset(quota.reset_at))
+                .expect("raw graph payload remains serializable");
+        assert_eq!(raw_payload.len(), raw.len());
+        assert_eq!(
+            raw_payload.first().map(|sample| sample.timestamp),
+            Some(computed_start - 60)
         );
     }
 
@@ -16879,5 +18438,421 @@ mod tests {
         assert!(header.contains("font-size: 22px;"));
         assert!(header.contains("font-size: 16px;"));
         assert!(header.contains("z: 2;"));
+    }
+
+    #[test]
+    fn shared_admission_rejects_invalid_snapshot_before_commit_in_service_and_ui() {
+        let old = active_thread_fixture(0, 100);
+        let mut service_state = CodexInfoState::preview("normal");
+        let mut ui_state = CodexInfoState::preview("normal");
+        service_state.active_threads = vec![old.clone()];
+        ui_state.active_threads = vec![old.clone()];
+
+        let over_capacity = (0..=256)
+            .map(|index| active_thread_fixture(index, 200 - index as i64))
+            .collect::<Vec<_>>();
+        for state in [&mut service_state, &mut ui_state] {
+            state.apply_thread_result(
+                state.auth_epoch,
+                ActiveThreadUpdate::Snapshot(over_capacity.clone()),
+            );
+            assert_eq!(state.active_threads.as_slice(), std::slice::from_ref(&old));
+            assert!(state.thread_error);
+            assert!(!state
+                .active_threads
+                .iter()
+                .any(|thread| thread.id == "thread-256"));
+        }
+
+        let duplicate = vec![active_thread_fixture(1, 210), active_thread_fixture(1, 209)];
+        for state in [&mut service_state, &mut ui_state] {
+            state.apply_thread_result(
+                state.auth_epoch,
+                ActiveThreadUpdate::Snapshot(duplicate.clone()),
+            );
+            assert_eq!(state.active_threads.as_slice(), std::slice::from_ref(&old));
+            assert!(state.thread_error);
+        }
+
+        let mut cycle_a = active_thread_fixture(10, 220);
+        cycle_a.parent_thread_id = Some("thread-011".into());
+        let mut cycle_b = active_thread_fixture(11, 219);
+        cycle_b.parent_thread_id = Some("thread-010".into());
+        for state in [&mut service_state, &mut ui_state] {
+            state.apply_thread_result(
+                state.auth_epoch,
+                ActiveThreadUpdate::Snapshot(vec![cycle_a.clone(), cycle_b.clone()]),
+            );
+            assert_eq!(state.active_threads.as_slice(), std::slice::from_ref(&old));
+            assert!(state.thread_error);
+        }
+    }
+
+    #[test]
+    fn failed_thread_update_preserves_rows_but_nothread_clears_after_success() {
+        let old = active_thread_fixture(0, 100);
+        let mut state = CodexInfoState::preview("normal");
+        state.active_threads = vec![old.clone()];
+
+        state.apply_thread_result(state.auth_epoch, ActiveThreadUpdate::Failed);
+        assert_eq!(state.active_threads, [old]);
+        assert!(state.thread_error);
+
+        state.apply_thread_result(state.auth_epoch, ActiveThreadUpdate::NoThread);
+        assert!(state.active_threads.is_empty());
+        assert!(!state.thread_error);
+    }
+
+    #[test]
+    fn every_parent_id_defines_x_hierarchy_even_without_subagent_flag() {
+        let mut parent = active_thread_fixture(0, 100);
+        parent.is_subagent = false;
+        parent.parent_thread_id = None;
+        let mut child = active_thread_fixture(1, 90);
+        child.is_subagent = false;
+        child.parent_thread_id = Some(parent.id.clone());
+
+        let rows = thread_presentation_rows(&[parent, child]);
+        assert_eq!(rows.len(), 2);
+        assert!(rows[1].connected_to_parent);
+        assert_eq!(rows[1].forest_depth, 1);
+    }
+
+    #[test]
+    fn real_acquisition_cycle_rejection_preserves_x_rest_and_recovers() {
+        static NEXT_ROOT: AtomicU64 = AtomicU64::new(0);
+        let root = std::env::temp_dir().join(format!(
+            "codex-info-real-acquisition-cycle-{}-{}",
+            std::process::id(),
+            NEXT_ROOT.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&root).unwrap();
+
+        let accepted_root_path = root.join("accepted-root.jsonl");
+        let accepted_child_path = root.join("accepted-child.jsonl");
+        let cycle_a_path = root.join("cycle-a.jsonl");
+        let cycle_b_path = root.join("cycle-b.jsonl");
+        let replacement_path = root.join("replacement.jsonl");
+        write_distinct_running_rollout(
+            &accepted_root_path,
+            "accepted-root-model",
+            100,
+            10,
+            1000,
+            "2026-01-01T00:00:01Z",
+            false,
+        );
+        write_distinct_running_rollout(
+            &accepted_child_path,
+            "accepted-child-model",
+            200,
+            20,
+            1000,
+            "2026-01-01T00:00:02Z",
+            false,
+        );
+        write_distinct_running_rollout(
+            &cycle_a_path,
+            "cycle-a-model",
+            300,
+            30,
+            1000,
+            "2026-01-01T00:00:03Z",
+            false,
+        );
+        write_distinct_running_rollout(
+            &cycle_b_path,
+            "cycle-b-model",
+            400,
+            40,
+            1000,
+            "2026-01-01T00:00:04Z",
+            false,
+        );
+        write_distinct_running_rollout(
+            &replacement_path,
+            "replacement-model",
+            500,
+            50,
+            1000,
+            "2026-01-01T00:00:05Z",
+            false,
+        );
+
+        let named_item = |id: &str, updated_at: i64, path: &Path| {
+            let mut item = thread_list_item(id, updated_at, path);
+            item["name"] = json!(id);
+            item
+        };
+        let accepted_root = named_item("accepted-root", 200, &accepted_root_path);
+        let mut accepted_child = named_item("accepted-child", 190, &accepted_child_path);
+        accepted_child["source"] = json!({
+            "subAgent": {"thread_spawn": {
+                "parent_thread_id": "accepted-root",
+                "depth": 1
+            }}
+        });
+
+        let active_paths = BTreeSet::from([
+            fs::canonicalize(&accepted_root_path).unwrap(),
+            fs::canonicalize(&accepted_child_path).unwrap(),
+            fs::canonicalize(&cycle_a_path).unwrap(),
+            fs::canonicalize(&cycle_b_path).unwrap(),
+            fs::canonicalize(&replacement_path).unwrap(),
+        ]);
+        let (sender, receiver) = mpsc::channel();
+        let mut next_id = 700_u64;
+        sender
+            .send(RpcReadEvent::Line(
+                super::security::RpcLine::new(
+                    json!({
+                        "id": 700,
+                        "result": {"data": [accepted_root, accepted_child]}
+                    })
+                    .to_string(),
+                )
+                .unwrap(),
+            ))
+            .unwrap();
+        let mut input = Vec::new();
+        let accepted_update = fetch_active_thread_update_for_paths_and_state(
+            &mut input,
+            &receiver,
+            &mut next_id,
+            &root,
+            &active_paths,
+            None,
+        );
+        assert!(matches!(
+            &accepted_update,
+            ActiveThreadUpdate::Snapshot(rows)
+                if rows.iter().map(|row| row.id.as_str()).collect::<Vec<_>>()
+                    == ["accepted-root", "accepted-child"]
+        ));
+        assert_eq!(next_id, 701);
+        assert_eq!(String::from_utf8(input).unwrap().lines().count(), 1);
+
+        let mut state = CodexInfoState::preview("normal");
+        state.history = UsageHistory::default();
+        state.apply_thread_result(state.auth_epoch, accepted_update);
+        assert!(!state.thread_error);
+        let expected_old_ids = ["accepted-root", "accepted-child"];
+        assert_eq!(
+            state
+                .active_threads
+                .iter()
+                .map(|thread| thread.id.as_str())
+                .collect::<Vec<_>>(),
+            expected_old_ids
+        );
+        let old_x_rows = active_thread_rows_at(&state.active_threads, 10_000);
+        assert_eq!(
+            old_x_rows
+                .iter()
+                .map(|row| row.title.to_string())
+                .collect::<Vec<_>>(),
+            expected_old_ids
+        );
+
+        let mut server =
+            ApiServer::start(ApiServerConfig::new("127.0.0.1:0".parse().unwrap()).unwrap())
+                .unwrap();
+        let publisher = server.publisher();
+        publisher.publish_details(state.public_details()).unwrap();
+        let old_status = raw_loopback_get(server.local_addr(), "/v1/status");
+        let old_details = raw_loopback_get(server.local_addr(), "/v1/details");
+        assert_eq!(
+            raw_loopback_pair(&old_status),
+            raw_loopback_pair(&old_details)
+        );
+        assert_eq!(raw_loopback_body(&old_status)["state"], "ready");
+        assert_eq!(
+            raw_loopback_body(&old_details)["threads"][0]["id"],
+            "accepted-root"
+        );
+        assert_eq!(
+            raw_loopback_body(&old_details)["threads"][1]["id"],
+            "accepted-child"
+        );
+
+        let mut cycle_a = named_item("cycle-a", 400, &cycle_a_path);
+        cycle_a["source"] = json!({
+            "subAgent": {"thread_spawn": {
+                "parent_thread_id": "cycle-b",
+                "depth": 1
+            }}
+        });
+        let mut cycle_b = named_item("cycle-b", 390, &cycle_b_path);
+        cycle_b["source"] = json!({
+            "subAgent": {"thread_spawn": {
+                "parent_thread_id": "cycle-a",
+                "depth": 1
+            }}
+        });
+        sender
+            .send(RpcReadEvent::Line(
+                super::security::RpcLine::new(
+                    json!({
+                        "id": 701,
+                        "result": {"data": [cycle_a, cycle_b]}
+                    })
+                    .to_string(),
+                )
+                .unwrap(),
+            ))
+            .unwrap();
+        let cycle_update = fetch_active_thread_update_for_paths_and_state(
+            &mut Vec::new(),
+            &receiver,
+            &mut next_id,
+            &root,
+            &active_paths,
+            None,
+        );
+        assert!(matches!(
+            &cycle_update,
+            ActiveThreadUpdate::Snapshot(rows)
+                if rows.iter().map(|row| row.id.as_str()).collect::<Vec<_>>()
+                    == ["cycle-a", "cycle-b"]
+        ));
+        assert_eq!(next_id, 702);
+        state.apply_thread_result(state.auth_epoch, cycle_update);
+        assert!(state.thread_error);
+        assert_eq!(
+            state
+                .active_threads
+                .iter()
+                .map(|thread| thread.id.as_str())
+                .collect::<Vec<_>>(),
+            expected_old_ids
+        );
+        let cycle_x_rows = active_thread_rows_at(&state.active_threads, 10_000);
+        let cycle_x_titles = cycle_x_rows
+            .iter()
+            .map(|row| row.title.to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(cycle_x_titles, expected_old_ids);
+        assert!(!cycle_x_titles
+            .iter()
+            .any(|id| id == "cycle-a" || id == "cycle-b"));
+
+        let reset_at = state.reset_at.expect("preview quota has reset");
+        state.apply_usage_event(usage_event(Some(37.0), reset_at));
+        state.model_usage = vec![ModelUsageRow {
+            name: "SOL".into(),
+            tokens: 1_750,
+            input_tokens: 1_500,
+            cached_input_tokens: 500,
+            output_tokens: 250,
+        }];
+        publisher.publish_details(state.public_details()).unwrap();
+        let cycle_status = raw_loopback_get(server.local_addr(), "/v1/status");
+        let cycle_details = raw_loopback_get(server.local_addr(), "/v1/details");
+        assert_ne!(
+            raw_loopback_pair(&cycle_status),
+            raw_loopback_pair(&old_status)
+        );
+        assert_eq!(
+            raw_loopback_pair(&cycle_status),
+            raw_loopback_pair(&cycle_details)
+        );
+        for body in [
+            raw_loopback_body(&cycle_status),
+            raw_loopback_body(&cycle_details),
+        ] {
+            assert_eq!(body["state"], "error");
+            assert_eq!(body["quota"]["remaining_percent"], 37.0);
+            assert_eq!(body["models"][0]["name"], "SOL");
+            assert_eq!(body["models"][0]["input_tokens"], 1_000);
+            assert_eq!(body["models"][0]["cached_input_tokens"], 500);
+            assert_eq!(body["models"][0]["output_tokens"], 250);
+        }
+        let cycle_details_body = raw_loopback_body(&cycle_details);
+        assert_eq!(cycle_details_body["active_thread_count"], 2);
+        assert_eq!(cycle_details_body["threads"][0]["id"], "accepted-root");
+        assert_eq!(cycle_details_body["threads"][1]["id"], "accepted-child");
+        assert!(!cycle_details_body["threads"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|thread| { thread["id"] == "cycle-a" || thread["id"] == "cycle-b" }));
+
+        let replacement = named_item("replacement", 500, &replacement_path);
+        sender
+            .send(RpcReadEvent::Line(
+                super::security::RpcLine::new(
+                    json!({
+                        "id": 702,
+                        "result": {"data": [replacement]}
+                    })
+                    .to_string(),
+                )
+                .unwrap(),
+            ))
+            .unwrap();
+        let replacement_update = fetch_active_thread_update_for_paths_and_state(
+            &mut Vec::new(),
+            &receiver,
+            &mut next_id,
+            &root,
+            &active_paths,
+            None,
+        );
+        assert!(matches!(
+            &replacement_update,
+            ActiveThreadUpdate::Snapshot(rows)
+                if rows.len() == 1 && rows[0].id == "replacement"
+        ));
+        assert_eq!(next_id, 703);
+        state.apply_thread_result(state.auth_epoch, replacement_update);
+        assert!(!state.thread_error);
+        assert_eq!(
+            state
+                .active_threads
+                .iter()
+                .map(|thread| thread.id.as_str())
+                .collect::<Vec<_>>(),
+            ["replacement"]
+        );
+        let replacement_x_rows = active_thread_rows_at(&state.active_threads, 10_000);
+        assert_eq!(
+            replacement_x_rows
+                .iter()
+                .map(|row| row.title.to_string())
+                .collect::<Vec<_>>(),
+            ["replacement"]
+        );
+        publisher.publish_details(state.public_details()).unwrap();
+        let recovered_status = raw_loopback_get(server.local_addr(), "/v1/status");
+        let recovered_details = raw_loopback_get(server.local_addr(), "/v1/details");
+        assert_eq!(
+            raw_loopback_pair(&recovered_status),
+            raw_loopback_pair(&recovered_details)
+        );
+        assert_eq!(raw_loopback_body(&recovered_status)["state"], "ready");
+        assert_eq!(
+            raw_loopback_body(&recovered_status)["active_thread_count"],
+            1
+        );
+        let recovered_details_body = raw_loopback_body(&recovered_details);
+        assert_eq!(recovered_details_body["state"], "ready");
+        assert_eq!(recovered_details_body["active_thread_count"], 1);
+        assert_eq!(
+            recovered_details_body["threads"].as_array().unwrap().len(),
+            1
+        );
+        assert_eq!(recovered_details_body["threads"][0]["id"], "replacement");
+        assert!(!recovered_details_body["threads"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|thread| {
+                matches!(
+                    thread["id"].as_str(),
+                    Some("accepted-root" | "accepted-child" | "cycle-a" | "cycle-b")
+                )
+            }));
+        server.shutdown();
+        let _ = fs::remove_dir_all(root);
     }
 }

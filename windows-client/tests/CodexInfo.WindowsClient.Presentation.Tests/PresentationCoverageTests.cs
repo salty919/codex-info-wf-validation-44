@@ -414,7 +414,10 @@ public sealed class PresentationCoverageTests
                 new ApiModelUsage("SOL", 9, 8, 7),
                 new ApiModelUsage("TERRA", 6, 5, 4),
             ],
-            4);
+            4)
+        {
+            PublishedPair = PublishedPairTestFixtures.Canonical,
+        };
         var details = new ApiDetailsSnapshot(
             ApiState.Ready,
             now,
@@ -435,7 +438,10 @@ public sealed class PresentationCoverageTests
                 new ApiThreadDetails("luna", "LUNA", null, "gpt-luna", "LUNA", 1, 1, 2, now, now, false, 0, false),
                 new ApiThreadDetails("other", "Other", null, "gpt-other", "SOL TERRA", 1, 1, 2, now, now, false, 0, false),
             ],
-            "概算 $9");
+            "概算 $9")
+        {
+            PublishedPair = PublishedPairTestFixtures.Canonical,
+        };
 
         using var main = new MainWindowViewModel(
             new SequenceStatusClient(StatusFetchResult.Success(status)),
@@ -522,7 +528,10 @@ public sealed class PresentationCoverageTests
             [],
             [],
             [],
-            "mismatch");
+            "mismatch")
+        {
+            PublishedPair = PublishedPairTestFixtures.Canonical,
+        };
         using var main = new MainWindowViewModel(
             new SequenceStatusClient(StatusFetchResult.Success(status)),
             new SequenceDetailsClient(DetailsFetchResult.Success(mismatched)));
@@ -775,7 +784,10 @@ public sealed class PresentationCoverageTests
             "Pro",
             new ApiQuota(75, now + 604_800, 604_800, false),
             [new ApiModelUsage("SOL", 1, 2, 3)],
-            1);
+            1)
+        {
+            PublishedPair = PublishedPairTestFixtures.Canonical,
+        };
     }
 
     private static async Task EventuallyAsync(Func<bool> condition)

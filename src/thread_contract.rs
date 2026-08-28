@@ -1544,6 +1544,65 @@ pub enum ThreadCycleOutcome {
     CycleError,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ThreadTopologyNode<'a> {
+    pub id: &'a str,
+    pub parent_thread_id: Option<&'a str>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ThreadTopologyError {
+    Cycle,
+}
+
+/// Validate only parent topology for an already schema-validated, unique
+/// thread slice. Missing parents are valid orphan edges. The caller owns
+/// capacity and duplicate validation.
+pub fn validate_selected_thread_topology(
+    nodes: &[ThreadTopologyNode<'_>],
+) -> Result<(), ThreadTopologyError> {
+    let mut indices = HashMap::with_capacity(nodes.len());
+    for (index, node) in nodes.iter().enumerate() {
+        debug_assert!(
+            indices.insert(node.id, index).is_none(),
+            "topology input must already have unique IDs"
+        );
+    }
+
+    let parent_indices = nodes
+        .iter()
+        .map(|node| {
+            node.parent_thread_id
+                .and_then(|parent_id| indices.get(parent_id).copied())
+        })
+        .collect::<Vec<_>>();
+    let mut colors = vec![0u8; nodes.len()];
+
+    for start in 0..nodes.len() {
+        if colors[start] == 2 {
+            continue;
+        }
+        let mut path = Vec::new();
+        let mut current = Some(start);
+        while let Some(index) = current {
+            match colors[index] {
+                0 => {
+                    colors[index] = 1;
+                    path.push(index);
+                    current = parent_indices[index];
+                }
+                1 => return Err(ThreadTopologyError::Cycle),
+                2 => break,
+                _ => unreachable!("topology color has only three states"),
+            }
+        }
+        for index in path {
+            colors[index] = 2;
+        }
+    }
+    Ok(())
+}
+
 /// Consume a terminal page cycle and collect every running candidate.
 /// The reader adapter owns secure-open and metadata checks; any adapter or
 /// rollout failure rejects that candidate without publishing partial fields.
@@ -3800,5 +3859,101 @@ mod tests {
         include!("thread_contract_slice3_title.inc.rs");
         include!("thread_contract_slice3_schema.inc.rs");
         include!("thread_contract_slice3_numeric.inc.rs");
+    }
+
+    #[test]
+    fn thread_topology_accepts_null_root_and_missing_parent_orphan() {
+        assert_eq!(
+            validate_selected_thread_topology(&[ThreadTopologyNode {
+                id: "root",
+                parent_thread_id: None,
+            }]),
+            Ok(())
+        );
+        assert_eq!(
+            validate_selected_thread_topology(&[ThreadTopologyNode {
+                id: "orphan",
+                parent_thread_id: Some("missing"),
+            }]),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn thread_topology_accepts_parent_and_siblings() {
+        assert_eq!(
+            validate_selected_thread_topology(&[
+                ThreadTopologyNode {
+                    id: "root",
+                    parent_thread_id: None,
+                },
+                ThreadTopologyNode {
+                    id: "child-a",
+                    parent_thread_id: Some("root"),
+                },
+                ThreadTopologyNode {
+                    id: "child-b",
+                    parent_thread_id: Some("root"),
+                },
+            ]),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn thread_topology_rejects_self_two_node_and_long_cycles() {
+        assert_eq!(
+            validate_selected_thread_topology(&[ThreadTopologyNode {
+                id: "self",
+                parent_thread_id: Some("self"),
+            }]),
+            Err(ThreadTopologyError::Cycle)
+        );
+        assert_eq!(
+            validate_selected_thread_topology(&[
+                ThreadTopologyNode {
+                    id: "a",
+                    parent_thread_id: Some("b"),
+                },
+                ThreadTopologyNode {
+                    id: "b",
+                    parent_thread_id: Some("a"),
+                },
+            ]),
+            Err(ThreadTopologyError::Cycle)
+        );
+        assert_eq!(
+            validate_selected_thread_topology(&[
+                ThreadTopologyNode {
+                    id: "a",
+                    parent_thread_id: Some("b"),
+                },
+                ThreadTopologyNode {
+                    id: "b",
+                    parent_thread_id: Some("c"),
+                },
+                ThreadTopologyNode {
+                    id: "c",
+                    parent_thread_id: Some("a"),
+                },
+            ]),
+            Err(ThreadTopologyError::Cycle)
+        );
+    }
+
+    #[test]
+    fn thread_topology_accepts_fixed_256_node_chain() {
+        let ids = (0..256)
+            .map(|index| format!("n{index:03}"))
+            .collect::<Vec<_>>();
+        let nodes = ids
+            .iter()
+            .enumerate()
+            .map(|(index, id)| ThreadTopologyNode {
+                id: id.as_str(),
+                parent_thread_id: (index > 0).then(|| ids[index - 1].as_str()),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(validate_selected_thread_topology(&nodes), Ok(()));
     }
 }

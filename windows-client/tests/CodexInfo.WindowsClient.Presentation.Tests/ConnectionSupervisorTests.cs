@@ -97,6 +97,44 @@ public sealed class ConnectionSupervisorTests
         Assert.False(child.StartCalled);
     }
 
+    [Fact]
+    public void ExplicitRestartUsesFiniteOutcomeAndDoesNotReuseLiveChild()
+    {
+        var first = new FakeChildProcess();
+        var second = new FakeChildProcess();
+        var factory = new FakeChildProcessFactory(first, second);
+        using var supervisor = new ConnectionSupervisor(factory);
+        var settings = WslSettings();
+
+        Assert.True(supervisor.EnsureStarted(settings));
+        Assert.Equal(ConnectionRestartOutcome.Started, supervisor.RestartExplicit(settings));
+
+        Assert.Equal(2, factory.StartInfos.Count);
+        Assert.True(first.Killed);
+        Assert.True(first.Disposed);
+        Assert.True(supervisor.IsRunning);
+
+        first.SignalExit();
+        Assert.True(supervisor.IsRunning);
+
+        Assert.Equal(ConnectionRestartOutcome.NoChildRequired,
+            supervisor.RestartExplicit(ClientSettings.Default));
+        Assert.False(supervisor.IsRunning);
+    }
+
+    [Fact]
+    public void ExplicitRestartRejectsInvalidAndStartFailureWithoutARequestBoundary()
+    {
+        var failed = new FakeChildProcess { StartResult = false };
+        using var supervisor = new ConnectionSupervisor(new FakeChildProcessFactory(failed));
+
+        Assert.Equal(ConnectionRestartOutcome.InvalidSettings,
+            supervisor.RestartExplicit(new ClientSettings("xx", true)));
+        Assert.Equal(ConnectionRestartOutcome.StartFailed,
+            supervisor.RestartExplicit(WslSettings()));
+        Assert.True(failed.Disposed);
+    }
+
     private static ClientSettings WslSettings() => new("ja", true)
     {
         ConnectionConfigured = true,

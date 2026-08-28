@@ -15,11 +15,69 @@ require_text() {
     local file="$1" pattern="$2"
     rg -q --fixed-strings -- "$pattern" "$file" || fail "missing: $file: $pattern"
 }
+require_function_text() {
+    local file="$1" function_name="$2" pattern="$3" function_text
+    function_text="$(
+        awk -v target="$function_name" '
+            $0 ~ "^function " target "[[:space:]]*\\{" {
+                capturing = 1
+                start = NR
+            }
+            capturing && NR > start && $0 ~ "^function " { exit }
+            capturing { print }
+        ' "$file"
+    )"
+    [[ -n "$function_text" ]] || fail "missing function boundary: $file: $function_name"
+    rg -q --fixed-strings -- "$pattern" <<<"$function_text" ||
+        fail "missing in function boundary: $file: $function_name: $pattern"
+}
 require_window_text() {
     local file="$1" pattern="$2"
     if ! sed -n '/<Window /,/Background=/p' "$file" | rg -q --fixed-strings -- "$pattern"; then
         fail "missing top-level Window geometry: $file: $pattern"
     fi
+}
+require_update_property_contract() {
+    local file="$1" property="$2" update_member="$3"
+    local property_text
+    property_text="$(
+        awk -v property="$property" '
+            !capturing && $0 ~ "^[[:space:]]*public bool " property "[[:space:]]*$" {
+                capturing = 1
+            }
+            capturing {
+                print
+                line = $0
+                opening = gsub(/\{/, "", line)
+                closing = gsub(/\}/, "", line)
+                depth += opening - closing
+                if (opening > 0) saw_open = 1
+                if (saw_open && depth == 0) exit
+            }
+        ' "$file"
+    )"
+    [[ -n "$property_text" ]] || fail "missing property boundary: $file: $property"
+
+    for required in \
+        '!IsAuthRequired' \
+        '!hasConnectionFailure' \
+        '!initialLoadPending' \
+        '!refreshing' \
+        "update?.${update_member} == true"; do
+        if ! awk -v required="$required" '
+            index($0, required) {
+                start = index($0, required)
+                before = start > 1 ? substr($0, start - 1, 1) : ""
+                after = substr($0, start + length(required), 1)
+                if (before !~ /[[:alnum:]_]/ && after !~ /[[:alnum:]_]/) {
+                    found = 1
+                }
+            }
+            END { exit !found }
+        ' <<<"$property_text"; then
+            fail "missing in $property property boundary: $required"
+        fi
+    done
 }
 
 require_text windows-client/src/CodexInfo.WindowsClient/MainWindow.axaml 'Click="OnOpenGraph"'
@@ -128,8 +186,13 @@ require_text windows-client/src/CodexInfo.WindowsClient/MainWindow.axaml.cs 'Set
 require_file windows-client/src/CodexInfo.WindowsClient.Core/WindowsUpdateClient.cs
 require_file windows-client/src/CodexInfo.WindowsClient/Infrastructure/WindowsUpdateCoordinator.cs
 require_text windows-client/src/CodexInfo.WindowsClient/MainWindow.axaml 'IsVisible="{Binding IsUpdateNotificationVisible}"'
+require_text windows-client/src/CodexInfo.WindowsClient/MainWindow.axaml 'IsVisible="{Binding IsUpdateActionVisible}"'
 require_text windows-client/src/CodexInfo.WindowsClient/MainWindow.axaml 'Command="{Binding UpdateCommand}"'
-require_text windows-client/src/CodexInfo.WindowsClient/ViewModels/MainWindowViewModel.cs 'public bool IsUpdateNotificationVisible => !IsAuthRequired'
+require_text windows-client/src/CodexInfo.WindowsClient/MainWindow.axaml 'AutomationProperties.AutomationId="Main.Status.Update"'
+main_window_view_model=windows-client/src/CodexInfo.WindowsClient/ViewModels/MainWindowViewModel.cs
+require_file "$main_window_view_model"
+require_update_property_contract "$main_window_view_model" IsUpdateNotificationVisible IsNotificationVisible
+require_update_property_contract "$main_window_view_model" IsUpdateActionVisible IsUpdateActionVisible
 require_text windows-client/src/CodexInfo.WindowsClient/ViewModels/MainWindowViewModel.cs 'public bool IsStartupLoading => initialLoadPending'
 require_text windows-client/src/CodexInfo.WindowsClient/ViewModels/MainWindowViewModel.cs 'public bool ShowAuthenticatedContent => IsAuthenticated && !IsStartupLoading'
 require_text windows-client/src/CodexInfo.WindowsClient.Core/WindowsUpdateClient.cs 'https://api.github.com/repos/salty919/codex_info_v2/releases?per_page=20'
@@ -341,12 +404,80 @@ require_text windows-client/tools/Measure-WindowsGraphLatency.ps1 'SendInput'
 require_text windows-client/tools/Run-WindowsClientE2E.ps1 'Assert-E2EQuotaGaugePalette'
 require_text windows-client/tools/Run-WindowsClientE2E.ps1 'Assert-E2EGraphHasModelData'
 require_text windows-client/tools/Run-WindowsClientE2E.ps1 'Assert-E2EGraphHasModelData $plot $graph.Handle $graphPast'
+require_text windows-client/tools/Run-WindowsClientE2E.ps1 'public static extern bool PrintWindow'
+require_function_text windows-client/tools/Run-WindowsClientE2E.ps1 Capture-E2EWindow 'PrintWindow'
+require_function_text windows-client/tools/Run-WindowsClientE2E.ps1 Capture-E2EWindow 'PW_RENDERFULLCONTENT'
+require_function_text windows-client/tools/Run-WindowsClientE2E.ps1 Capture-E2EWindow 'changedPixels'
+if rg -q --fixed-strings -- 'CopyFromScreen' windows-client/tools/Run-WindowsClientE2E.ps1; then
+    fail 'target HWND capture must not fall back to CopyFromScreen'
+fi
+require_function_text windows-client/tools/Run-WindowsClientE2E.ps1 Invoke-E2ECaptureSelfTest 'target-occluded'
+require_function_text windows-client/tools/Run-WindowsClientE2E.ps1 Invoke-E2ECaptureSelfTest 'invalid-hwnd'
+require_function_text windows-client/tools/Run-WindowsClientE2E.ps1 Invoke-E2ECaptureSelfTest 'capture-failure'
+require_function_text windows-client/tools/Run-WindowsClientE2E.ps1 Test-E2EGraphCompositedSeriesPixel 'alphas'
+require_function_text windows-client/tools/Run-WindowsClientE2E.ps1 Test-E2EGraphCompositedSeriesPixel 'minimumCompositedAlpha'
+require_function_text windows-client/tools/Run-WindowsClientE2E.ps1 Get-E2EGraphFlatLineCandidates 'rowCandidateThreshold'
+require_function_text windows-client/tools/Run-WindowsClientE2E.ps1 Get-E2EGraphFlatLineCandidates 'FlatCoverageThreshold'
+require_function_text windows-client/tools/Run-WindowsClientE2E.ps1 Find-E2EGraphSharedRisingSegment 'sourceColors'
+require_function_text windows-client/tools/Run-WindowsClientE2E.ps1 Find-E2EGraphSharedRisingSegment 'minimumSharedVerticalExtent'
+require_function_text windows-client/tools/Run-WindowsClientE2E.ps1 Find-E2EGraphSharedRisingSegment 'maxAllowedGap'
+require_function_text windows-client/tools/Run-WindowsClientE2E.ps1 Find-E2EGraphSharedRisingSegment 'contributions'
+require_function_text windows-client/tools/Run-WindowsClientE2E.ps1 Test-E2EGraphIdleBandPixel 'Get-E2EGraphIdleBackgroundColor'
+require_function_text windows-client/tools/Run-WindowsClientE2E.ps1 Assert-E2EGraphIdleBandBitmap 'sampleColumn25'
+require_function_text windows-client/tools/Run-WindowsClientE2E.ps1 Assert-E2EGraphIdleBandBitmap 'minimumSampleHits'
+require_function_text windows-client/tools/Run-WindowsClientE2E.ps1 Assert-E2EGraphIdleBandBitmap 'minimumCoveredColumns'
+require_function_text windows-client/tools/Run-WindowsClientE2E.ps1 Assert-E2EGraphHasIdleBand 'Assert-E2EGraphIdleBandBitmap'
+require_function_text windows-client/tools/Run-WindowsClientE2E.ps1 New-E2EGraphIdleBandSyntheticBitmap 'wrong-sample-columns'
+require_function_text windows-client/tools/Run-WindowsClientE2E.ps1 Invoke-E2EGraphIdleBandSelfTest 'wrong-interval'
+require_function_text windows-client/tools/Run-WindowsClientE2E.ps1 Assert-E2EGraphModelPixels 'flatStartFraction'
+require_function_text windows-client/tools/Run-WindowsClientE2E.ps1 Assert-E2EGraphModelPixels 'flatCoverageThreshold'
+require_function_text windows-client/tools/Run-WindowsClientE2E.ps1 Assert-E2EGraphModelPixels 'risingCenterFraction'
+require_function_text windows-client/tools/Run-WindowsClientE2E.ps1 Assert-E2EGraphModelPixels 'Get-E2EGraphFlatLineCandidates'
+require_function_text windows-client/tools/Run-WindowsClientE2E.ps1 Assert-E2EGraphModelPixels 'minimumSeparation'
+require_function_text windows-client/tools/Run-WindowsClientE2E.ps1 Assert-E2EGraphHasModelData 'Assert-E2EGraphModelPixels'
+require_function_text windows-client/tools/Run-WindowsClientE2E.ps1 Invoke-E2EGraphOracleSelfTest 'missing-flat'
+require_function_text windows-client/tools/Run-WindowsClientE2E.ps1 Invoke-E2EGraphOracleSelfTest 'valid-offset'
+require_function_text windows-client/tools/Run-WindowsClientE2E.ps1 Invoke-E2EGraphOracleSelfTest 'label-vertical-only'
+require_function_text windows-client/tools/Run-WindowsClientE2E.ps1 Invoke-E2EGraphOracleSelfTest 'wrong-geometry'
+require_function_text windows-client/tools/Run-WindowsClientE2E.ps1 Invoke-E2EGraphOracleSelfTest 'wrong-order'
+require_function_text windows-client/tools/Run-WindowsClientE2E.ps1 Invoke-E2EGraphOracleSelfTest 'sloped'
+require_function_text windows-client/tools/Run-WindowsClientE2E.ps1 Invoke-E2EGraphOracleSelfTest 'wrong-background'
+require_function_text windows-client/tools/Run-WindowsClientE2E.ps1 Invoke-E2EGraphOracleSelfTest 'axis-row-missing-terra'
+require_function_text windows-client/tools/Run-WindowsClientE2E.ps1 Invoke-E2EGraphOracleSelfTest 'axis-row-missing-sol'
+require_function_text windows-client/tools/Run-WindowsClientE2E.ps1 Invoke-E2EGraphOracleSelfTest 'wrong-endpoint'
+require_function_text windows-client/tools/Run-WindowsClientE2E.ps1 Invoke-E2EGraphOracleSelfTest 'short-rise'
+require_function_text windows-client/tools/Run-WindowsClientE2E.ps1 Invoke-E2EGraphOracleSelfTest 'detached-rise'
+require_function_text windows-client/tools/Run-WindowsClientE2E.ps1 Invoke-E2EGraphOracleSelfTest 'missing-series-contribution'
+require_function_text windows-client/tools/Run-WindowsClientE2E.ps1 Invoke-E2EGraphOracleSelfTest 'non-contiguous'
 require_text windows-client/tools/Run-WindowsClientE2E.ps1 'Main.DetailsStatus'
 require_text windows-client/tools/Run-WindowsClientE2E.ps1 'main-details-status: PASS (matching status/details generation accepted)'
 require_text windows-client/tools/Run-WindowsClientE2E.ps1 'main-startup-loading: PASS (first complete generation is visible)'
 require_text windows-client/tools/Run-WindowsClientE2E.ps1 'Main details status is not a complete accepted generation'
 require_text windows-client/tools/Run-WindowsClientE2E.ps1 'parts[1] == "/v1/health"'
 require_text windows-client/tools/Run-WindowsClientE2E.ps1 '\"service\":\"codex-info\"'
+require_text windows-client/tools/Run-WindowsClientE2E.ps1 'Codex-Info-Published-Pair'
+require_text windows-client/tools/Run-WindowsClientE2E.ps1 'includePublishedPair'
+require_text windows-client/tools/Run-WindowsClientE2E.ps1 'strict thirteen-field contract'
+require_file windows-client/tools/Test-WindowsClientFixtureContract.ps1
+require_function_text windows-client/tools/Run-WindowsClientE2E.ps1 Invoke-E2EFixtureRawRequest 'X-Codex-Info-E2E-Phase'
+require_function_text windows-client/tools/Run-WindowsClientE2E.ps1 Assert-E2EFixtureWireContract 'Assert-E2E ($Health.StatusCode -eq 200)'
+require_function_text windows-client/tools/Run-WindowsClientE2E.ps1 Assert-E2EFixtureWireContract 'Assert-E2E ($statusPair -cmatch'
+require_function_text windows-client/tools/Run-WindowsClientE2E.ps1 Assert-E2EFixtureWireContract 'Assert-E2EFixtureJsonKeys -Json $statusJson'
+require_function_text windows-client/tools/Run-WindowsClientE2E.ps1 Assert-E2EFixtureWireContract 'Assert-E2EFixtureJsonKeys -Json $detailsJson'
+require_function_text windows-client/tools/Run-WindowsClientE2E.ps1 Assert-E2EFixtureWireContract 'Assert-E2EFixtureHistorySamples'
+require_function_text windows-client/tools/Run-WindowsClientE2E.ps1 Assert-E2EFixtureHistorySamples 'expectedSampleKeys'
+require_function_text windows-client/tools/Run-WindowsClientE2E.ps1 Assert-E2EFixtureHistorySamples 'timestamp % 60'
+require_function_text windows-client/tools/Run-WindowsClientE2E.ps1 Assert-E2EFixtureHistorySamples 'periodRecords'
+require_function_text windows-client/tools/Run-WindowsClientE2E.ps1 Assert-E2EFixtureHistorySamples '$reset -eq $previousReset'
+require_function_text windows-client/tools/Run-WindowsClientE2E.ps1 Invoke-E2EFixturePreflight 'Invoke-E2EFixtureRawRequest'
+require_function_text windows-client/tools/Run-WindowsClientE2E.ps1 Invoke-E2EFixturePreflight 'Assert-E2EFixturePreflightResponses'
+require_function_text windows-client/tools/Run-WindowsClientE2E.ps1 Assert-E2EFixturePreflightResponses 'Assert-E2EFixtureWireContract'
+require_function_text windows-client/tools/Run-WindowsClientE2E.ps1 New-E2EFixtureDocuments 'orderedSampleObjects'
+require_function_text windows-client/tools/Run-WindowsClientE2E.ps1 Invoke-E2EFixtureContractTests 'pair-missing'
+require_function_text windows-client/tools/Run-WindowsClientE2E.ps1 Invoke-E2EFixtureContractTests 'pair-mismatch'
+require_function_text windows-client/tools/Run-WindowsClientE2E.ps1 Invoke-E2EFixtureContractTests 'history-gaps-missing'
+require_function_text windows-client/tools/Run-WindowsClientE2E.ps1 Invoke-E2EFixtureContractTests 'history-sample-order'
+require_function_text windows-client/tools/Run-WindowsClientE2E.ps1 Invoke-E2EFixtureContractTests 'history-sample-minute-bucket'
 require_text windows-client/tools/Run-WindowsClientE2E.ps1 "main-quota-gauge: seven cells, two X-authority surface colors, and half-period boundary PASS"
 require_text windows-client/tools/Run-WindowsClientE2E.ps1 'Assert-E2EMainProductVersion'
 require_text windows-client/tools/Run-WindowsClientE2E.ps1 'Assert-E2ENoChildProductVersion'

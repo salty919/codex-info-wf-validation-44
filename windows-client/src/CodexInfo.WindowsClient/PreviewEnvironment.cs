@@ -96,6 +96,10 @@ public static class PreviewEnvironment
 /// <summary>Stable authenticated data for graph/thread/visual fixture runs.</summary>
 public sealed class PreviewLoopbackClient : ILoopbackStatusClient, ILoopbackHealthClient, ILoopbackDetailsClient, IDisposable
 {
+    private const string PreviewPublishedPairValue =
+        "v1:00112233445566778899aabbccddeeff00000000000000000000000000000001";
+    private static readonly PublishedPairIdentity PreviewPublishedPair =
+        PublishedPairIdentity.Create(PreviewPublishedPairValue);
     private readonly ApiStatusSnapshot status;
     private readonly ApiDetailsSnapshot details;
 
@@ -111,6 +115,7 @@ public sealed class PreviewLoopbackClient : ILoopbackStatusClient, ILoopbackHeal
         var authenticated = previewState == ApiState.Ready;
         var remainingPercent = scenario switch
         {
+            "normal" => 48d,
             "zero" => 0d,
             "full" => 100d,
             // Keep the warning fixture inside the same <=10% threshold used by
@@ -205,7 +210,10 @@ public sealed class PreviewLoopbackClient : ILoopbackStatusClient, ILoopbackHeal
                 new ApiModelUsage("TERRA", 4_200, 900, 500),
                 new ApiModelUsage("LUNA", 2_100, 600, 240),
             ],
-            (ulong)threads.Length);
+            (ulong)threads.Length)
+        {
+            PublishedPair = PreviewPublishedPair,
+        };
         details = new ApiDetailsSnapshot(
             previewState,
             now,
@@ -221,7 +229,10 @@ public sealed class PreviewLoopbackClient : ILoopbackStatusClient, ILoopbackHeal
             [period, pastPeriod],
             [.. samples, .. pastSamples],
             threads,
-            "概算 $25.20");
+            "概算 $25.20")
+        {
+            PublishedPair = PreviewPublishedPair,
+        };
     }
 
     public Task<StatusFetchResult> FetchAsync(CancellationToken cancellationToken = default) =>

@@ -3,7 +3,7 @@
 
 [package]
 name = "codex_info"
-version = "1.0.6"
+version = "1.0.7"
 edition = "2021"
 default-run = "codex_info"
 license = "GPL-3.0-only"
@@ -15,6 +15,7 @@ chrono-tz = "0.10"
 iana-time-zone = "0.1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+getrandom = "0.3.4"
 # HTTPの解析・接続処理は実績のある実装へ委譲する。APIはloopback限定の
 # 読み取り専用スナップショットであり、UIやCodex RPCをHTTP workerから触らない。
 axum = "0.8.4"

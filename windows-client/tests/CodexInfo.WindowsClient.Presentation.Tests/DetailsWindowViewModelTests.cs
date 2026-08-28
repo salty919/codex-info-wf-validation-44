@@ -230,7 +230,10 @@ public sealed class DetailsWindowViewModelTests
         var details = new ApiDetailsSnapshot(
             ApiState.Ready, resetAt - 30, true, "Pro",
             new ApiQuota(75, resetAt, 604800, false), [], 0,
-            [period], period.Samples, [], "estimated");
+            [period], period.Samples, [], "estimated")
+        {
+            PublishedPair = PublishedPairTestFixtures.Canonical,
+        };
 
         using var main = new MainWindowViewModel(
             new SingleStatusClient(StatusFetchResult.Success(StatusFromDetails(details))),
@@ -285,7 +288,10 @@ public sealed class DetailsWindowViewModelTests
         };
         var details = new ApiDetailsSnapshot(
             ApiState.Ready, now, true, "Pro", null, [], 0,
-            [current, old], current.Samples.Concat(old.Samples).ToArray(), [], "estimated");
+            [current, old], current.Samples.Concat(old.Samples).ToArray(), [], "estimated")
+        {
+            PublishedPair = PublishedPairTestFixtures.Canonical,
+        };
         using var main = new MainWindowViewModel(
             new SingleStatusClient(StatusFetchResult.Success(StatusFromDetails(details))),
             new SingleDetailsClient(DetailsFetchResult.Success(details)));
@@ -326,7 +332,10 @@ public sealed class DetailsWindowViewModelTests
             new("root", "root", null, "gpt-5.6-terra", "TERRA", 900, 200, 1000, 10, 30, false, 0, false),
         };
         var details = new ApiDetailsSnapshot(
-            ApiState.Ready, 100, true, "Pro", null, [], 3, [], [], threads, "estimated");
+            ApiState.Ready, 100, true, "Pro", null, [], 3, [], [], threads, "estimated")
+        {
+            PublishedPair = PublishedPairTestFixtures.Canonical,
+        };
         using var main = new MainWindowViewModel(
             new SingleStatusClient(StatusFetchResult.Success(StatusFromDetails(details))),
             new SingleDetailsClient(DetailsFetchResult.Success(details)));
@@ -458,7 +467,10 @@ public sealed class DetailsWindowViewModelTests
             model.InputTokens,
             model.CachedInputTokens,
             model.OutputTokens)).ToArray(),
-        details.ActiveThreadCount);
+        details.ActiveThreadCount)
+    {
+        PublishedPair = details.PublishedPair,
+    };
 
     private static async Task EventuallyAsync(Func<bool> condition)
     {

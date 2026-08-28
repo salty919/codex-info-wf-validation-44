@@ -2,6 +2,9 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
 using System.Globalization;
+using System.Net;
+using System.Net.Http.Headers;
+using System.Text;
 using System.Text.Json;
 using CodexInfo.WindowsClient.Core;
 using CodexInfo.WindowsClient.Controls;
@@ -13,6 +16,10 @@ namespace CodexInfo.WindowsClient.Presentation.Tests;
 
 public sealed class GraphPlotControlTests
 {
+    private const string PublishedPairHeader = "Codex-Info-Published-Pair";
+    private const string CanonicalPublishedPair =
+        "v1:00112233445566778899aabbccddeeff00000000000000000000000000000001";
+
     [Fact]
     public void ContractMaximumReductionIsViewportBoundedAndPreservesExactEndpoints()
     {
@@ -208,33 +215,64 @@ public sealed class GraphPlotControlTests
     }
 
     [Fact]
-    public void PlotProjectionStartsAtFirstObservationWithoutSyntheticVerticalJump()
+    public void PlotProjectionUsesFlatVerticalAndContiguousSegmentsForFirstObservation()
     {
         var scene = Scene(
             [
                 Point(1_000, 100, 0, 0, 0),
-                Point(1_120, 90, 1, 0, 0),
-                Point(1_180, 80, 2, 0, 0),
+                Point(1_120, 90, 1, 2, 3),
+                Point(1_180, 80, 2, 3, 4),
             ]);
 
         var model = GraphPlotProjection.BuildModelLines(scene, scene.Sol);
         var remaining = GraphPlotProjection.BuildRemainingLine(scene);
 
-        Assert.Empty(model.Flat.X);
-        Assert.Equal([1_120d, 1_180d], model.Rising.X);
-        Assert.Equal([1d, 2d], model.Rising.Y);
+        Assert.Equal([1_000d, 1_120d], model.Flat.X);
+        Assert.Equal([0d, 0d], model.Flat.Y);
+        Assert.Equal([1_120d, 1_120d, 1_180d], model.Rising.X);
+        Assert.Equal([0d, 1d, 2d], model.Rising.Y);
+        Assert.Equal([1_000d, 1_120d, 1_120d, 1_180d], remaining.X);
+        Assert.Equal([100d, 100d, 90d, 80d], remaining.Y);
+        Assert.Equal((1_000L, 1_120L, true),
+            (Assert.Single(scene.IdleIntervals).StartAt,
+             scene.IdleIntervals[0].EndAt,
+             scene.IdleIntervals[0].PreserveBoundary));
         Assert.DoesNotContain(
-            model.Flat.X.Zip(model.Flat.X.Skip(1)),
-            pair => pair.First == pair.Second);
-        Assert.DoesNotContain(
-            model.Rising.X.Zip(model.Rising.X.Skip(1)),
-            pair => pair.First == pair.Second);
-        Assert.Equal([1_120d, 1_180d], remaining.X);
-        Assert.Equal([90d, 80d], remaining.Y);
-        Assert.DoesNotContain(
-            remaining.X.Zip(remaining.X.Skip(1)),
-            pair => pair.First == pair.Second);
-        Assert.True(Assert.Single(scene.IdleIntervals).PreserveBoundary);
+            model.Rising.X.Zip(model.Rising.X.Skip(1))
+                .Zip(model.Rising.Y.Zip(model.Rising.Y.Skip(1))),
+            pair => pair.First.First == 1_000d &&
+                pair.First.Second == 1_120d &&
+                pair.Second.First == 0d &&
+                pair.Second.Second == 1d);
+    }
+
+    [Fact]
+    public void PlotProjectionKeepsEachModelAndMetricIndependentAtTheFirstObservation()
+    {
+        var points = new[]
+        {
+            new ApiHistorySample(1_000, 2_000, 100, 0, 0, 0, 0, 0, 0),
+            new ApiHistorySample(1_120, 2_000, 90, 1, 2, 3, 10, 20, 30),
+            new ApiHistorySample(1_180, 2_000, 80, 2, 3, 4, 20, 30, 40),
+        };
+        var dollars = GraphScene.Create(points, GraphMetric.Dollars, 1_000, 1_180);
+        var tokens = GraphScene.Create(points, GraphMetric.Tokens, 1_000, 1_180);
+
+        Assert.Equal([0d, 1d, 2d], dollars.Sol);
+        Assert.Equal([0d, 2d, 3d], dollars.Terra);
+        Assert.Equal([0d, 3d, 4d], dollars.Luna);
+        Assert.Equal([0d, 10d, 20d], tokens.Sol);
+        Assert.Equal([0d, 20d, 30d], tokens.Terra);
+        Assert.Equal([0d, 30d, 40d], tokens.Luna);
+        Assert.Equal([100d, 90d, 80d], dollars.Remaining);
+        Assert.Equal(dollars.Remaining, tokens.Remaining);
+
+        AssertFirstObservationModel(GraphPlotProjection.BuildModelLines(dollars, dollars.Sol), 1, 2);
+        AssertFirstObservationModel(GraphPlotProjection.BuildModelLines(dollars, dollars.Terra), 2, 3);
+        AssertFirstObservationModel(GraphPlotProjection.BuildModelLines(dollars, dollars.Luna), 3, 4);
+        AssertFirstObservationModel(GraphPlotProjection.BuildModelLines(tokens, tokens.Sol), 10, 20);
+        AssertFirstObservationModel(GraphPlotProjection.BuildModelLines(tokens, tokens.Terra), 20, 30);
+        AssertFirstObservationModel(GraphPlotProjection.BuildModelLines(tokens, tokens.Luna), 30, 40);
     }
 
     [Fact]
@@ -264,7 +302,8 @@ public sealed class GraphPlotControlTests
             ],
             1_000,
             87_400);
-        Assert.True(Assert.Single(GraphPlotProjection.BuildVisibleIdleIntervals(boundaryScene)).PreserveBoundary);
+        var boundary = Assert.Single(GraphPlotProjection.BuildVisibleIdleIntervals(boundaryScene));
+        Assert.Equal((1_000L, 1_120L, true), (boundary.StartAt, boundary.EndAt, boundary.PreserveBoundary));
     }
 
     [Fact]
@@ -328,73 +367,116 @@ public sealed class GraphPlotControlTests
     }
 
     [Fact]
-    public void Graph_samples_use_minute_bucket_maxima_and_cumulative_values()
+    public void Graph_samples_preserve_valid_minute_rows_and_apply_only_cumulative_projection()
     {
-        var period = new ApiHistoryPeriod("2000", 1_000, 1_500, false, "history")
+        var period = new ApiHistoryPeriod("2000", 1_020, 1_200, false, "history")
         {
             Samples =
             [
-                new ApiHistorySample(1_201, 2_000, null, 2, 1, 0, 20, 10, 0),
-                new ApiHistorySample(1_229, 2_000, 90, 1, 3, 0, 10, 30, 0),
-                new ApiHistorySample(1_281, 2_000, 80, 3, 2, 0, 30, 20, 0),
+                new ApiHistorySample(1_080, 2_000, 90, 2, 1, 0, 20, 10, 0),
+                new ApiHistorySample(1_140, 2_000, 80, 3, 3, 1, 30, 30, 10),
+                new ApiHistorySample(1_200, 2_000, 70, 4, 2, 2, 40, 20, 20),
             ],
         };
 
-        var samples = GraphWindowViewModel.BuildGraphSamples(period, 1_400);
+        var samples = GraphWindowViewModel.BuildGraphSamples(period, 1_200);
 
-        Assert.Equal([1_000L, 1_200L, 1_260L, 1_500L], samples.Select(sample => sample.Timestamp));
-        Assert.Equal(2, samples[1].SolDollars);
-        Assert.Equal(3, samples[1].TerraDollars);
-        Assert.Equal(30UL, samples[1].TerraTokens);
-        Assert.Equal(3, samples[2].SolDollars);
-        Assert.Equal(3, samples[2].TerraDollars);
-        Assert.Equal(80, samples[^1].RemainingPercent);
+        Assert.Equal([1_020L, 1_080L, 1_140L, 1_200L], samples.Select(sample => sample.Timestamp));
+        Assert.Equal([0d, 2d, 3d, 4d], samples.Select(sample => sample.SolDollars));
+        Assert.Equal([0d, 1d, 3d, 3d], samples.Select(sample => sample.TerraDollars));
+        Assert.Equal([0d, 0d, 1d, 2d], samples.Select(sample => sample.LunaDollars));
+        Assert.Equal([0UL, 20UL, 30UL, 40UL], samples.Select(sample => sample.SolTokens));
+        Assert.Equal([0UL, 10UL, 30UL, 30UL], samples.Select(sample => sample.TerraTokens));
+        Assert.Equal([0UL, 0UL, 10UL, 20UL], samples.Select(sample => sample.LunaTokens));
+        Assert.Equal([100d, 90d, 80d, 70d], samples.Select(sample => sample.RemainingPercent!.Value));
     }
 
     [Fact]
-    public void Graph_samples_do_not_choose_a_conflicting_quota_row_by_order()
+    public void Graph_samples_admit_a_domain_valid_current_start_endpoint()
     {
-        var period = new ApiHistoryPeriod("2000", 1_000, 1_500, false, "history")
+        var period = new ApiHistoryPeriod("current", 1_020, 1_200, true, "current")
         {
             Samples =
             [
-                new ApiHistorySample(1_000, 2_000, 88, 1, 0, 0, 10, 0, 0),
-                // Same display minute, reset alias, and a contradictory
-                // quota value.  The graph must not render 88 -> 14 from row
-                // order; model maxima remain useful and deterministic.
-                new ApiHistorySample(1_000, 2_050, 14, 2, 0, 0, 20, 0, 0),
-                new ApiHistorySample(1_060, 2_050, 87, 3, 0, 0, 30, 0, 0),
+                // Domain-valid minute-start row at the exact degenerate
+                // current effective end.
+                new ApiHistorySample(1_020, 2_000, 100, 7, 0, 0, 70, 0, 0),
             ],
         };
 
-        var samples = GraphWindowViewModel.BuildGraphSamples(period, 1_400);
-        var scene = GraphScene.Create(samples, GraphMetric.Dollars, 1_000, 1_500);
+        var samples = GraphWindowViewModel.BuildGraphSamples(period, 1_020);
 
+        Assert.Equal([1_020L], samples.Select(sample => sample.Timestamp));
+        Assert.Equal(7, samples[0].SolDollars);
+        Assert.Equal(70UL, samples[0].SolTokens);
         Assert.Equal(100, samples[0].RemainingPercent);
-        Assert.DoesNotContain(samples, sample => sample.RemainingPercent == 14);
-        Assert.Equal(2, samples[0].SolDollars);
-        Assert.Equal(20UL, samples[0].SolTokens);
-        Assert.Equal(100d, scene.Remaining[0]);
-        Assert.True(scene.Remaining.All(value => !double.IsFinite(value) || value >= 87));
     }
 
     [Fact]
     public void Graph_samples_restore_the_native_100_percent_anchor_for_a_missing_first_quota()
     {
-        var period = new ApiHistoryPeriod("2000", 1_000, 1_500, false, "history")
+        var period = new ApiHistoryPeriod("2000", 1_020, 1_200, false, "history")
         {
             Samples =
             [
-                new ApiHistorySample(1_000, 2_000, null, 1, 0, 0, 10, 0, 0),
-                new ApiHistorySample(1_061, 2_000, 90, 2, 0, 0, 20, 0, 0),
+                new ApiHistorySample(1_020, 2_000, null, 1, 0, 0, 10, 0, 0),
+                new ApiHistorySample(1_080, 2_000, 90, 2, 0, 0, 20, 0, 0),
             ],
         };
 
-        var samples = GraphWindowViewModel.BuildGraphSamples(period, 1_400);
+        var samples = GraphWindowViewModel.BuildGraphSamples(period, 1_200);
 
-        Assert.Equal(1_000, samples[0].Timestamp);
+        Assert.Equal(1_020, samples[0].Timestamp);
         Assert.Equal(100, samples[0].RemainingPercent);
         Assert.Equal(90, samples[1].RemainingPercent);
+    }
+
+    [Fact]
+    public void Graph_samples_include_current_effective_end_and_exclude_the_next_row()
+    {
+        var period = new ApiHistoryPeriod("current", 1_020, 1_200, true, "current")
+        {
+            Samples =
+            [
+                new ApiHistorySample(1_020, 2_000, 100, 0, 0, 0, 0, 0, 0),
+                new ApiHistorySample(1_140, 2_000, 90, 7, 0, 0, 70, 0, 0),
+                // Adapter-only invalid injection: not minute-start and not
+                // admitted by Core; this row tests defensive end filtering.
+                new ApiHistorySample(1_141, 2_000, 89, 99, 0, 0, 990, 0, 0),
+            ],
+        };
+
+        var samples = GraphWindowViewModel.BuildGraphSamples(period, 1_140);
+
+        Assert.Equal(1_140, samples[^1].Timestamp);
+        Assert.Equal(7, samples[^1].SolDollars);
+        Assert.Equal(70UL, samples[^1].SolTokens);
+        Assert.DoesNotContain(samples, sample => sample.SolDollars == 99);
+        Assert.DoesNotContain(samples, sample => sample.SolTokens == 990);
+    }
+
+    [Fact]
+    public void Graph_samples_include_past_effective_end_and_exclude_the_next_row()
+    {
+        var period = new ApiHistoryPeriod("past", 1_020, 1_200, false, "past")
+        {
+            Samples =
+            [
+                new ApiHistorySample(1_020, 2_000, 100, 0, 0, 0, 0, 0, 0),
+                new ApiHistorySample(1_200, 2_000, 80, 7, 0, 0, 70, 0, 0),
+                // Adapter-only invalid injection: not minute-start and not
+                // admitted by Core; this row tests defensive end filtering.
+                new ApiHistorySample(1_201, 2_000, 79, 99, 0, 0, 990, 0, 0),
+            ],
+        };
+
+        var samples = GraphWindowViewModel.BuildGraphSamples(period, 1_200);
+
+        Assert.Equal(1_200, samples[^1].Timestamp);
+        Assert.Equal(7, samples[^1].SolDollars);
+        Assert.Equal(70UL, samples[^1].SolTokens);
+        Assert.DoesNotContain(samples, sample => sample.SolDollars == 99);
+        Assert.DoesNotContain(samples, sample => sample.SolTokens == 990);
     }
 
     [Fact]
@@ -468,60 +550,135 @@ public sealed class GraphPlotControlTests
     }
 
     [Fact]
-    public void Shared_graph_fixture_matches_the_native_history_oracle()
+    public async Task Shared_graph_fixture_matches_the_native_history_oracle_through_details_http_parser()
     {
-        var specRemaining = new[] { 87d, 44d, 1d, 1d, 1d };
-        const double specSolMax = 420.40d;
-        const int specPeriodCount = 1;
         var fixturePath = Path.Combine(
             AppContext.BaseDirectory,
             "Fixtures",
             "graph_delayed_quota.json");
         using var document = JsonDocument.Parse(File.ReadAllText(fixturePath));
         var root = document.RootElement;
-        var periodStart = root.GetProperty("period_start").GetInt64();
-        var periodEnd = root.GetProperty("period_end").GetInt64();
-        var samples = root.GetProperty("samples")
-            .EnumerateArray()
-            .Select(sample => new ApiHistorySample(
-                sample.GetProperty("timestamp").GetInt64(),
-                root.GetProperty("reset_at").GetInt64(),
-                sample.GetProperty("remaining_percent").ValueKind == JsonValueKind.Null
-                    ? null
-                    : sample.GetProperty("remaining_percent").GetDouble(),
-                sample.GetProperty("sol_dollars").GetDouble(),
-                sample.GetProperty("terra_dollars").GetDouble(),
-                sample.GetProperty("luna_dollars").GetDouble(),
-                0,
-                0,
-                0))
-            .ToArray();
+        var detailsResponse = root.GetProperty("details_response");
+        var detailsJson = detailsResponse.GetRawText();
+        var responseBytes = Encoding.UTF8.GetBytes(detailsJson);
+        var handler = new DetailsFixtureHandler(responseBytes);
 
-        var period = new ApiHistoryPeriod("shared", periodStart, periodEnd, false, "shared")
-        {
-            ResetAt = root.GetProperty("reset_at").GetInt64(),
-            Samples = samples,
-        };
-        var graphSamples = GraphWindowViewModel.BuildGraphSamples(period, periodEnd);
-        var scene = GraphScene.Create(graphSamples, GraphMetric.Dollars, periodStart, periodEnd);
-        var expected = root.GetProperty("expected_remaining")
+        using var client = new LoopbackStatusClient(handler);
+        var result = await client.FetchDetailsAsync(CancellationToken.None);
+
+        Assert.Equal(1, handler.RequestCount);
+        Assert.Equal(HttpStatusCode.OK, handler.StatusCode);
+        Assert.Equal(HttpMethod.Get, handler.LastRequest?.Method);
+        Assert.Equal(
+            "http://127.0.0.1:8787/v1/details",
+            handler.LastRequest?.RequestUri?.AbsoluteUri);
+        Assert.Equal(responseBytes, handler.ReturnedBytes);
+        Assert.Equal(responseBytes.LongLength, handler.ContentLength);
+        Assert.Equal("application/json; charset=utf-8", handler.ContentType);
+        Assert.True(handler.NoStore);
+        Assert.Equal([CanonicalPublishedPair], handler.PublishedPairValues);
+
+        Assert.True(result.IsSuccess);
+        Assert.Null(result.Failure);
+        var snapshot = Assert.IsType<ApiDetailsSnapshot>(result.Snapshot);
+        Assert.Equal(CanonicalPublishedPair, snapshot.PublishedPair?.ToString());
+
+        var expectedPeriodStart = root.GetProperty("expected_period_start").GetInt64();
+        var expectedPeriodEnd = root.GetProperty("expected_period_end").GetInt64();
+        var expectedResetAt = root.GetProperty("expected_reset_at").GetInt64();
+        var expectedRawTimestamps = root.GetProperty("expected_raw_timestamps")
+            .EnumerateArray()
+            .Select(value => value.GetInt64())
+            .ToArray();
+        var expectedGraphTimestamps = root.GetProperty("expected_graph_timestamps")
+            .EnumerateArray()
+            .Select(value => value.GetInt64())
+            .ToArray();
+        var expectedRemaining = root.GetProperty("expected_remaining")
             .EnumerateArray()
             .Select(value => value.GetDouble())
             .ToArray();
+        var expectedSolMax = root.GetProperty("expected_sol_max").GetDouble();
+        var expectedPeriodCount = root.GetProperty("expected_period_count").GetInt32();
 
-        // Reviewed literals are the acceptance oracle; do not derive these
-        // expected values from GraphScene/BuildGraphSamples.
-        Assert.Equal(specPeriodCount, root.GetProperty("expected_period_count").GetInt32());
-        Assert.Equal(specRemaining, expected);
-        Assert.Equal(specSolMax, root.GetProperty("expected_sol_max").GetDouble(), precision: 6);
-        Assert.Equal(periodStart, scene.PeriodStartAt);
-        Assert.Equal(periodEnd, scene.PeriodEndAt);
-        Assert.Equal(specRemaining.Length, scene.Remaining.Count);
-        for (var index = 0; index < specRemaining.Length; index++)
+        Assert.Equal(expectedPeriodCount, snapshot.HistoryPeriods.Count);
+        var period = Assert.Single(snapshot.HistoryPeriods);
+        Assert.True(period.Current);
+        Assert.Equal(expectedPeriodStart, period.StartAt);
+        Assert.Equal(expectedPeriodEnd, period.EndAt);
+        Assert.Equal(expectedResetAt, period.ResetAt);
+        Assert.Equal(expectedPeriodEnd, snapshot.ObservedAt);
+
+        var expectedRows = new[]
         {
-            Assert.Equal(specRemaining[index], scene.Remaining[index], precision: 6);
+            (Timestamp: 1_999_999_980L, Remaining: (double?)87d, SolDollars: 0d, TerraDollars: 30.50d, LunaDollars: 0d, SolTokens: 0UL, TerraTokens: 30UL, LunaTokens: 0UL),
+            (Timestamp: 2_000_000_040L, Remaining: (double?)null, SolDollars: 140.97d, TerraDollars: 30.50d, LunaDollars: 0d, SolTokens: 141UL, TerraTokens: 30UL, LunaTokens: 0UL),
+            (Timestamp: 2_000_000_100L, Remaining: (double?)null, SolDollars: 420.40d, TerraDollars: 30.50d, LunaDollars: 0d, SolTokens: 420UL, TerraTokens: 30UL, LunaTokens: 0UL),
+            (Timestamp: 2_000_000_220L, Remaining: (double?)1d, SolDollars: 420.40d, TerraDollars: 30.50d, LunaDollars: 0d, SolTokens: 420UL, TerraTokens: 30UL, LunaTokens: 0UL),
+            (Timestamp: 2_000_000_280L, Remaining: (double?)1d, SolDollars: 420.40d, TerraDollars: 30.50d, LunaDollars: 0d, SolTokens: 420UL, TerraTokens: 30UL, LunaTokens: 0UL),
+        };
+
+        var flatSamples = snapshot.HistorySamples;
+        var ownedSamples = period.Samples;
+        Assert.Equal(expectedRows.Length, flatSamples.Count);
+        Assert.Equal(expectedRows.Length, ownedSamples.Count);
+        Assert.Equal(expectedRawTimestamps, flatSamples.Select(sample => sample.Timestamp));
+        Assert.Equal(expectedRawTimestamps, ownedSamples.Select(sample => sample.Timestamp));
+        for (var index = 0; index < expectedRows.Length; index++)
+        {
+            Assert.Equal(flatSamples[index], ownedSamples[index]);
+            Assert.Equal(expectedResetAt, flatSamples[index].ResetAt);
+            AssertHistorySample(flatSamples[index], expectedRows[index]);
         }
-        Assert.Equal(specSolMax, scene.ModelMaximum, precision: 6);
+        Assert.Equal(expectedPeriodEnd, flatSamples[^1].Timestamp);
+        Assert.Equal(expectedPeriodEnd, ownedSamples[^1].Timestamp);
+
+        var graphSamples = GraphWindowViewModel.BuildGraphSamples(period, expectedPeriodEnd);
+        var scene = GraphScene.Create(
+            graphSamples,
+            GraphMetric.Dollars,
+            expectedPeriodStart,
+            expectedPeriodEnd);
+        var remainingLine = GraphPlotProjection.BuildRemainingLine(scene);
+        var solLines = GraphPlotProjection.BuildModelLines(scene, scene.Sol);
+        var terraLines = GraphPlotProjection.BuildModelLines(scene, scene.Terra);
+        var lunaLines = GraphPlotProjection.BuildModelLines(scene, scene.Luna);
+
+        Assert.Equal(expectedGraphTimestamps.Select(timestamp => (double)timestamp), scene.Timestamps);
+        Assert.Equal(expectedGraphTimestamps, graphSamples.Select(sample => sample.Timestamp));
+        Assert.Equal(expectedRemaining, scene.Remaining);
+        Assert.Equal([100d, 100d, 87d, 44d, 1d, 1d, 1d], remainingLine.Y);
+        Assert.Equal(expectedPeriodStart, scene.PeriodStartAt);
+        Assert.Equal(expectedPeriodEnd, scene.PeriodEndAt);
+        Assert.Equal(expectedSolMax, scene.ModelMaximum, precision: 6);
+        Assert.Equal(expectedRows.Length + 1, graphSamples.Count);
+        Assert.Equal(expectedPeriodStart, graphSamples[0].Timestamp);
+        Assert.Equal(0d, graphSamples[0].SolDollars);
+        Assert.Equal(0d, graphSamples[0].TerraDollars);
+        Assert.Equal(0d, graphSamples[0].LunaDollars);
+        Assert.Equal(100d, graphSamples[0].RemainingPercent);
+        Assert.Equal(expectedRawTimestamps, graphSamples.Skip(1).Select(sample => sample.Timestamp));
+        Assert.Equal(flatSamples[^1], graphSamples[^1]);
+        Assert.Equal(expectedPeriodEnd, graphSamples[^1].Timestamp);
+        Assert.Equal(expectedPeriodEnd, scene.Timestamps[^1]);
+
+        var firstObservation = expectedRawTimestamps[0];
+        Assert.Equal([expectedPeriodStart, firstObservation], terraLines.Flat.X.Take(2));
+        Assert.Equal([0d, 0d], terraLines.Flat.Y.Take(2));
+        Assert.Equal([firstObservation, firstObservation], terraLines.Rising.X);
+        Assert.Equal([0d, 30.50d], terraLines.Rising.Y);
+        Assert.DoesNotContain(expectedPeriodStart, terraLines.Rising.X);
+        Assert.Equal([expectedPeriodStart, firstObservation, firstObservation], remainingLine.X.Take(3));
+        Assert.Equal([100d, 100d, 87d], remainingLine.Y.Take(3));
+        Assert.DoesNotContain(
+            terraLines.Rising.X.Zip(terraLines.Rising.X.Skip(1))
+                .Zip(terraLines.Rising.Y.Zip(terraLines.Rising.Y.Skip(1))),
+            pair => pair.First.First == expectedPeriodStart &&
+                pair.First.Second == firstObservation &&
+                pair.Second.First == 0d &&
+                pair.Second.Second == 30.50d);
+        Assert.NotEmpty(solLines.Rising.X);
+        Assert.Empty(lunaLines.Rising.X);
     }
 
     [Fact]
@@ -636,6 +793,88 @@ public sealed class GraphPlotControlTests
 
     private static ApiHistorySample Point(long timestamp, double? remaining, double sol, double terra, double luna) =>
         new(timestamp, 2_000, remaining, sol, terra, luna, (ulong)sol, (ulong)terra, (ulong)luna);
+
+    private static void AssertFirstObservationModel(
+        GraphModelLineProjection lines,
+        double firstObserved,
+        double terminalObserved)
+    {
+        Assert.Equal([1_000d, 1_120d], lines.Flat.X);
+        Assert.Equal([0d, 0d], lines.Flat.Y);
+        Assert.Equal([1_120d, 1_120d, 1_180d], lines.Rising.X);
+        Assert.Equal([0d, firstObserved, terminalObserved], lines.Rising.Y);
+    }
+
+    private static void AssertHistorySample(
+        ApiHistorySample actual,
+        (long Timestamp, double? Remaining, double SolDollars, double TerraDollars, double LunaDollars,
+            ulong SolTokens, ulong TerraTokens, ulong LunaTokens) expected)
+    {
+        Assert.Equal(expected.Timestamp, actual.Timestamp);
+        Assert.Equal(expected.Remaining, actual.RemainingPercent);
+        Assert.Equal(expected.SolDollars, actual.SolDollars, precision: 6);
+        Assert.Equal(expected.TerraDollars, actual.TerraDollars, precision: 6);
+        Assert.Equal(expected.LunaDollars, actual.LunaDollars, precision: 6);
+        Assert.Equal(expected.SolTokens, actual.SolTokens);
+        Assert.Equal(expected.TerraTokens, actual.TerraTokens);
+        Assert.Equal(expected.LunaTokens, actual.LunaTokens);
+    }
+
+    private sealed class DetailsFixtureHandler(byte[] body) : HttpMessageHandler
+    {
+        private const string DetailsEndpoint = "http://127.0.0.1:8787/v1/details";
+        private readonly byte[] body = body.ToArray();
+
+        public int RequestCount { get; private set; }
+
+        public HttpRequestMessage? LastRequest { get; private set; }
+
+        public HttpStatusCode StatusCode { get; private set; }
+
+        public byte[] ReturnedBytes { get; private set; } = [];
+
+        public long? ContentLength { get; private set; }
+
+        public string? ContentType { get; private set; }
+
+        public bool NoStore { get; private set; }
+
+        public IReadOnlyList<string> PublishedPairValues { get; private set; } = [];
+
+        protected override Task<HttpResponseMessage> SendAsync(
+            HttpRequestMessage request,
+            CancellationToken cancellationToken)
+        {
+            RequestCount++;
+            Assert.Equal(HttpMethod.Get, request.Method);
+            Assert.Equal(DetailsEndpoint, request.RequestUri?.AbsoluteUri);
+            LastRequest = request;
+
+            var response = new HttpResponseMessage(HttpStatusCode.OK)
+            {
+                Content = new ByteArrayContent(body),
+            };
+            response.Content.Headers.ContentType = new MediaTypeHeaderValue("application/json")
+            {
+                CharSet = "utf-8",
+            };
+            response.Content.Headers.ContentLength = body.LongLength;
+            response.Headers.CacheControl = new CacheControlHeaderValue { NoStore = true };
+            response.Headers.TryAddWithoutValidation(
+                PublishedPairHeader,
+                CanonicalPublishedPair);
+
+            StatusCode = response.StatusCode;
+            ReturnedBytes = body;
+            ContentLength = response.Content.Headers.ContentLength;
+            ContentType = response.Content.Headers.ContentType?.ToString();
+            NoStore = response.Headers.CacheControl?.NoStore == true;
+            PublishedPairValues = response.Headers
+                .GetValues(PublishedPairHeader)
+                .ToArray();
+            return Task.FromResult(response);
+        }
+    }
 
     private static GraphScene Scene(IReadOnlyList<ApiHistorySample> points, long? start = null, long? end = null) =>
         GraphScene.Create(points, GraphMetric.Dollars, start ?? points[0].Timestamp, end ?? points[^1].Timestamp);

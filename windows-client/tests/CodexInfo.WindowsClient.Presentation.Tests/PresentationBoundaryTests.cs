@@ -369,11 +369,52 @@ public sealed class PresentationBoundaryTests
     {
         var source = LoadRepositoryFile(
             "windows-client", "src", "CodexInfo.WindowsClient", "ViewModels", "MainWindowViewModel.cs");
-        var start = source.IndexOf("private async Task TryRefreshAsync", StringComparison.Ordinal);
-        var end = source.IndexOf("private static bool HasSamePublicCore", start, StringComparison.Ordinal);
+        var start = source.IndexOf("private async Task FetchCycleAsync", StringComparison.Ordinal);
+        var end = source.IndexOf("private ExplicitOperation? BeginExplicitOperation", start, StringComparison.Ordinal);
         Assert.True(start >= 0 && end > start, "Main refresh method boundaries are missing.");
         var refresh = source[start..end];
         Assert.DoesNotContain("ConfigureAwait(false)", refresh, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void MainStatusBannerHasOneStablePrimaryCtaPerRecoveryRow()
+    {
+        var document = XDocument.Parse(LoadRepositoryFile(
+            "windows-client", "src", "CodexInfo.WindowsClient", "MainWindow.axaml"));
+        var buttons = document.Descendants()
+            .Where(element => element.Name.LocalName == "Button")
+            .ToArray();
+        var statusButtons = buttons
+            .Where(button => (button.Attribute("AutomationProperties.AutomationId")?.Value ?? "")
+                .StartsWith("Main.Status.", StringComparison.Ordinal))
+            .ToArray();
+
+        Assert.Equal(
+            ["Main.Status.AuthCheck", "Main.Status.AuthStart", "Main.Status.Refreshing", "Main.Status.Retry", "Main.Status.Update"],
+            statusButtons
+                .Select(button => button.Attribute("AutomationProperties.AutomationId")!.Value)
+                .OrderBy(value => value, StringComparer.Ordinal)
+                .ToArray());
+        Assert.All(statusButtons, button =>
+        {
+            Assert.NotEqual("{Binding IsAuthRequired}", button.Attribute("IsVisible")?.Value);
+            Assert.False(string.IsNullOrWhiteSpace(button.Attribute("AutomationProperties.Name")?.Value));
+        });
+
+        var visibleBindings = document.Descendants()
+            .Where(element => element.Name.LocalName == "StackPanel")
+            .Select(element => element.Attribute("IsVisible")?.Value)
+            .Where(value => value is "{Binding IsAuthStartVisible}" or
+                "{Binding IsAuthCheckVisible}" or
+                "{Binding IsRetryVisible}" or
+                "{Binding IsRefreshingVisible}" or
+                "{Binding IsUpdateNotificationVisible}")
+            .ToArray();
+        Assert.Contains("{Binding IsAuthStartVisible}", visibleBindings);
+        Assert.Contains("{Binding IsAuthCheckVisible}", visibleBindings);
+        Assert.Contains("{Binding IsRetryVisible}", visibleBindings);
+        Assert.Contains("{Binding IsRefreshingVisible}", visibleBindings);
+        Assert.Contains("{Binding IsUpdateNotificationVisible}", visibleBindings);
     }
 
     [Fact]
@@ -427,9 +468,15 @@ public sealed class PresentationBoundaryTests
             new("luna", "luna", null, "gpt-luna", "LUNA", null, null, null, null, null, false, null, false),
             new("other", "other", null, "gpt-sol-terra", "SOL TERRA", null, null, null, null, null, false, null, false),
         };
-        var details = new ApiDetailsSnapshot(ApiState.Ready, 1, true, "Pro", null, [], 4, [], [], threads, "概算 —");
+        var details = new ApiDetailsSnapshot(ApiState.Ready, 1, true, "Pro", null, [], 4, [], [], threads, "概算 —")
+        {
+            PublishedPair = PublishedPairTestFixtures.Canonical,
+        };
         using var viewModel = new MainWindowViewModel(
-            new SequenceStatusClient(StatusFetchResult.Success(new ApiStatusSnapshot(ApiState.Ready, 1, true, "Pro", null, [], 4))),
+            new SequenceStatusClient(StatusFetchResult.Success(new ApiStatusSnapshot(ApiState.Ready, 1, true, "Pro", null, [], 4)
+            {
+                PublishedPair = PublishedPairTestFixtures.Canonical,
+            })),
             new SequenceDetailsClient(DetailsFetchResult.Success(details)));
 
         viewModel.Start();
@@ -490,9 +537,15 @@ public sealed class PresentationBoundaryTests
             true,
             null,
             true);
-        var details = new ApiDetailsSnapshot(ApiState.Ready, 1, true, "Pro", null, [], 1, [], [], [thread], "概算 —");
+        var details = new ApiDetailsSnapshot(ApiState.Ready, 1, true, "Pro", null, [], 1, [], [], [thread], "概算 —")
+        {
+            PublishedPair = PublishedPairTestFixtures.Canonical,
+        };
         using var main = new MainWindowViewModel(
-            new SequenceStatusClient(StatusFetchResult.Success(new ApiStatusSnapshot(ApiState.Ready, 1, true, "Pro", null, [], 1))),
+            new SequenceStatusClient(StatusFetchResult.Success(new ApiStatusSnapshot(ApiState.Ready, 1, true, "Pro", null, [], 1)
+            {
+                PublishedPair = PublishedPairTestFixtures.Canonical,
+            })),
             new SequenceDetailsClient(DetailsFetchResult.Success(details)));
         main.Start();
         await EventuallyAsync(() => main.HasDetails);
