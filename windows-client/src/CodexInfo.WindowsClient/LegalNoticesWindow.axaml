@@ -74,18 +74,23 @@
     <Border Grid.Row="2" Classes="notice-card">
       <ScrollViewer IsVisible="{Binding HasNotices}" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
         <StackPanel Spacing="7">
-          <TextBlock FontSize="17" FontWeight="SemiBold" Text="{Binding CurrentNoticeName}" />
-          <TextBlock Classes="label" Text="{Binding CurrentNoticeText}" TextWrapping="Wrap" />
+          <TextBlock FontSize="17" FontWeight="SemiBold" Text="{Binding CurrentNoticeName}"
+                     AutomationProperties.AutomationId="Legal.Notice.Name" />
+          <TextBlock Classes="label" Text="{Binding CurrentNoticeText}" TextWrapping="Wrap"
+                     AutomationProperties.AutomationId="Legal.Notice.Text" />
         </StackPanel>
       </ScrollViewer>
     </Border>
     <Grid Grid.Row="3" ColumnDefinitions="*,Auto" ColumnSpacing="12">
-      <TextBlock Classes="label" VerticalAlignment="Center" Text="{Binding PagePositionText}" />
+      <TextBlock Classes="label" VerticalAlignment="Center" Text="{Binding PagePositionText}"
+                 AutomationProperties.AutomationId="Legal.Page.Position" />
       <StackPanel Grid.Column="1" Orientation="Horizontal" Spacing="8">
         <Button Classes="page-nav" Command="{Binding BackCommand}" IsEnabled="{Binding CanGoBack}"
-                AutomationProperties.Name="{Binding BackText}" ToolTip.Tip="{Binding BackText}" Content="{Binding BackText}" />
+                AutomationProperties.Name="{Binding BackText}" AutomationProperties.AutomationId="Legal.Page.Back"
+                ToolTip.Tip="{Binding BackText}" Content="{Binding BackText}" />
         <Button Classes="page-nav" Command="{Binding NextCommand}" IsEnabled="{Binding CanGoNext}"
-                AutomationProperties.Name="{Binding NextText}" ToolTip.Tip="{Binding NextText}" Content="{Binding NextText}" />
+                AutomationProperties.Name="{Binding NextText}" AutomationProperties.AutomationId="Legal.Page.Next"
+                ToolTip.Tip="{Binding NextText}" Content="{Binding NextText}" />
       </StackPanel>
     </Grid>
   </Grid>

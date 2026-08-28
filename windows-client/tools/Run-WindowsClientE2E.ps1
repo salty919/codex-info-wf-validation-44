@@ -124,6 +124,7 @@ public static class CodexInfoWindowsE2EWin32 {
     [DllImport("user32.dll", SetLastError = true)] public static extern bool IsWindow(IntPtr hWnd);
     [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr hWnd, int command);
     [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr hWnd);
+    [DllImport("user32.dll")] public static extern bool IsIconic(IntPtr hWnd);
     [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint processId);
     [DllImport("user32.dll")] public static extern int GetWindowText(IntPtr hWnd, StringBuilder text, int count);
     [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr hWnd, out RECT rect);
@@ -556,13 +557,24 @@ function Get-E2EUiaRoot {
 function Get-E2EAllDescendants {
     param([Parameter(Mandatory = $true)][System.Windows.Automation.AutomationElement]$Root)
 
-    $all = [System.Collections.Generic.List[object]]::new()
-    $all.Add($Root)
-    $descendants = $Root.FindAll(
-        [System.Windows.Automation.TreeScope]::Descendants,
-        [System.Windows.Automation.Condition]::TrueCondition)
-    foreach ($element in $descendants) { $all.Add($element) }
-    return $all
+    $lastFailure = $null
+    for ($attempt = 1; $attempt -le 5; $attempt++) {
+        try {
+            $all = [System.Collections.Generic.List[object]]::new()
+            $all.Add($Root)
+            $descendants = $Root.FindAll(
+                [System.Windows.Automation.TreeScope]::Descendants,
+                [System.Windows.Automation.Condition]::TrueCondition)
+            foreach ($element in $descendants) { $all.Add($element) }
+            return $all
+        }
+        catch [System.Runtime.InteropServices.COMException] {
+            $lastFailure = $_
+            if ($attempt -lt 5) { Start-Sleep -Milliseconds 100 }
+        }
+    }
+
+    throw $lastFailure
 }
 
 function Find-E2EElementByAutomationId {
@@ -2589,7 +2601,95 @@ try {
     $threadCapture = Capture-E2EWindow $threads.Handle '10-threads-rows'
     Assert-E2E ($threadCapture.Hash.Length -eq 64) 'Threads screenshot hash is missing.'
 
-    Write-E2E 'case-6: same PID and HWND records'
+    Write-E2E 'case-6: open Legal and assert plain-text legal notice'
+    $legal = Open-E2EChildWindow -MainRoot $mainRoot -ButtonName 'Legal' -ButtonAutomationId 'Main.OpenLegal' -Title 'Codex Info Legal' -Role 'Legal' -ProcessId $clientPid
+    $legalRoot = $legal.Root
+    Assert-E2ENoChildProductVersion $legalRoot 'Legal'
+    $legalNext = Find-E2EElementByAutomationId $legalRoot 'Legal.Page.Next'
+    Assert-E2E ($null -ne $legalNext) 'Legal Next button is missing.'
+    $legalPagePosition = Find-E2EElementByAutomationId $legalRoot 'Legal.Page.Position'
+    Assert-E2E ($null -ne $legalPagePosition) 'Legal page position is missing.'
+    $legalPageNames = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    $expectedLegalPageCount = 9
+    for ($legalPage = 1; $legalPage -le $expectedLegalPageCount; $legalPage++) {
+        $expectedPositionSuffix = "$legalPage / $expectedLegalPageCount"
+        Wait-E2E -Description "Legal page $legalPage position" -Probe {
+            $value = [string]$legalPagePosition.Current.Name
+            return $value.EndsWith($expectedPositionSuffix, [StringComparison]::Ordinal)
+        } | Out-Null
+        $legalText = Wait-E2E -Description "Legal plain-text notice page $legalPage" -Probe {
+            $candidate = Find-E2EElementByAutomationId $legalRoot 'Legal.Notice.Text'
+            if ($null -eq $candidate -or $candidate.Current.IsOffscreen) { return $false }
+            $value = [string]$candidate.Current.Name
+            if ([string]::IsNullOrWhiteSpace($value)) { return $false }
+            return $candidate
+        }
+        $legalName = Find-E2EElementByAutomationId $legalRoot 'Legal.Notice.Name'
+        Assert-E2E ($null -ne $legalName) "Legal notice name is missing on page $legalPage."
+        $null = $legalPageNames.Add([string]$legalName.Current.Name)
+        $legalValue = [string]$legalText.Current.Name
+        $scanMarkdown = $legalPage -notin @(2, 3, 6)
+        foreach ($legalRawLine in $legalValue -split "`n") {
+            $legalLine = $legalRawLine.TrimEnd("`r")
+            if ($legalLine.StartsWith([string][char]0xFF3B, [StringComparison]::Ordinal) -and
+                $legalLine.EndsWith([string][char]0xFF3D, [StringComparison]::Ordinal)) {
+                $scanMarkdown = $legalLine.EndsWith(".md$([char]0xFF3D)", [StringComparison]::OrdinalIgnoreCase)
+                continue
+            }
+            if (-not $scanMarkdown) { continue }
+            foreach ($forbidden in @('<!--', '-->', '```', '](', '`')) {
+                Assert-E2E ($legalLine.IndexOf($forbidden, [StringComparison]::Ordinal) -lt 0) "Legal page $legalPage exposes raw Markdown marker: $forbidden"
+            }
+            Assert-E2E (-not [regex]::IsMatch($legalLine, '<https?://[^>]+>')) "Legal page $legalPage exposes a raw Markdown autolink."
+            Assert-E2E (-not [regex]::IsMatch($legalLine, '\*\*[^*\r\n]+\*\*')) "Legal page $legalPage exposes raw Markdown strong emphasis."
+            Assert-E2E (-not [regex]::IsMatch($legalLine, '~~[^~\r\n]+~~')) "Legal page $legalPage exposes raw Markdown strikethrough."
+            Assert-E2E (-not [regex]::IsMatch($legalLine, '(?<!\w)_[^_\r\n]+_(?!\w)')) "Legal page $legalPage exposes raw Markdown emphasis."
+            Assert-E2E (-not [regex]::IsMatch($legalLine, '^\s*#{1,6}\s+')) "Legal page $legalPage exposes a raw Markdown heading."
+        }
+        if ($legalPage -eq 1) {
+            Assert-E2E ($legalValue.IndexOf('GPL', [StringComparison]::Ordinal) -ge 0) 'Legal notice lost the GPL legal content.'
+            $legalCapture = Capture-E2EWindow $legal.Handle '11-legal-plain-text-page-1'
+            Assert-E2E ($legalCapture.Hash.Length -eq 64) 'Legal page 1 screenshot hash is missing.'
+        }
+        elseif ($legalPage -eq 8) {
+            $legalCapture = Capture-E2EWindow $legal.Handle '12-legal-plain-text-page-8'
+            Assert-E2E ($legalCapture.Hash.Length -eq 64) 'Legal page 8 screenshot hash is missing.'
+        }
+        if ($legalPage -lt $expectedLegalPageCount) {
+            Assert-E2E ($legalNext.Current.IsEnabled) "Legal Next button is disabled before page $expectedLegalPageCount."
+            Invoke-E2EElement $legalNext
+        }
+    }
+    Assert-E2E ($legalPageNames.Count -eq $expectedLegalPageCount) "Legal page navigation did not expose $expectedLegalPageCount distinct chapters."
+    Assert-E2E (-not $legalNext.Current.IsEnabled) 'Legal Next button remains enabled on the final page.'
+    $legalBack = Find-E2EElementByAutomationId $legalRoot 'Legal.Page.Back'
+    Assert-E2E ($null -ne $legalBack -and $legalBack.Current.IsEnabled) 'Legal Back button is unavailable on the final page.'
+    Invoke-E2EElement $legalBack
+    Wait-E2E -Description 'Legal Back navigation from page 9 to page 8' -Probe {
+        return ([string]$legalPagePosition.Current.Name).EndsWith('8 / 9', [StringComparison]::Ordinal)
+    } | Out-Null
+
+    $legalMinimize = Find-E2EElementByAutomationId $legalRoot 'Legal.Window.Minimize'
+    Assert-E2E ($null -ne $legalMinimize -and $legalMinimize.Current.IsEnabled) 'Legal Minimize button is unavailable.'
+    Invoke-E2EElement $legalMinimize
+    Wait-E2E -Description 'Legal window minimize' -Probe {
+        return [CodexInfoWindowsE2EWin32]::IsIconic($legal.Handle)
+    } | Out-Null
+    [CodexInfoWindowsE2EWin32]::ShowWindow($legal.Handle, 9) | Out-Null
+    Wait-E2E -Description 'Legal window restore after minimize' -Probe {
+        return -not [CodexInfoWindowsE2EWin32]::IsIconic($legal.Handle)
+    } | Out-Null
+    $legalRoot = Get-E2EUiaRoot $legal.Handle
+    Write-E2E 'legal-plain-text: PASS (all 9 rendered notices, Back, Minimize, and Close are usable)'
+
+    $closeLegal = Find-E2ECloseButton $legalRoot
+    Assert-E2E ($null -ne $closeLegal) 'Legal Close button is missing.'
+    Invoke-E2EElement $closeLegal
+    Wait-E2E -Description 'Legal window close' -Probe {
+        return (Find-E2EWindow $clientPid 'Codex Info Legal') -eq [IntPtr]::Zero
+    } | Out-Null
+
+    Write-E2E 'case-7: same PID and HWND records'
     $allPids = @($script:e2eWindowRecords | ForEach-Object { $_.pid } | Select-Object -Unique)
     Assert-E2E ($allPids.Count -eq 1 -and $allPids[0] -eq $clientPid) "Window PID set is not singleton: $($allPids -join ',')."
     $allHwnds = @($script:e2eWindowRecords | ForEach-Object { $_.hwnd } | Select-Object -Unique)
@@ -2599,7 +2699,7 @@ try {
     Write-E2E "windows: PASS records=$($script:e2eWindowRecords.Count) pid=$clientPid records_path=$windowRecordPath"
 
     $graphEvidence = if ($Fixture) { 'past-period model and idle-band pixels' } else { 'past-period model pixels' }
-    Write-E2E ("windows-client-e2e: PASS (Graph open, {0}, period current/past/current, 2 metrics, 4 toggle OFF/ON cycles, Threads rows/columns, PID/HWND records)" -f $graphEvidence)
+    Write-E2E ("windows-client-e2e: PASS (Graph open, {0}, period current/past/current, 2 metrics, 4 toggle OFF/ON cycles, Threads rows/columns, Legal plain text, PID/HWND records)" -f $graphEvidence)
     $script:e2eSuccess = $true
 }
 catch {
