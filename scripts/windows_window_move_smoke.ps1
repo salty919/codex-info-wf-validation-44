@@ -211,3 +211,5 @@ foreach ($case in $cases) {
         if (-not $process.HasExited) { Stop-Process -Id $process.Id -Force }
     }
 }
+
+Write-Output 'window-move-smoke: PASS'

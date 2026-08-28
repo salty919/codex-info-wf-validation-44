@@ -7,7 +7,9 @@
 param(
     [string]$ClientPath = '',
     [string]$OutputDirectory = '',
-    [switch]$Fixture
+    [switch]$Fixture,
+    [switch]$FixtureContractTest,
+    [string]$SourceSha = ''
 )
 
 $ErrorActionPreference = 'Stop'
@@ -40,11 +42,20 @@ if ($script:e2eOutput.Equals($script:e2eRepositoryRoot, [StringComparison]::Ordi
     $script:e2eOutput.StartsWith($script:e2eRepositoryRoot + [IO.Path]::DirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase)) {
     throw 'E2E artifacts must be written outside the repository.'
 }
+if (Test-Path -LiteralPath $script:e2eOutput -PathType Container) {
+    # Evidence must belong to this invocation.  Never append to or reuse a
+    # prior run's log/screenshots, even when a hosted runner reuses its temp
+    # directory after a retry.
+    Remove-Item -LiteralPath $script:e2eOutput -Recurse -Force
+}
 New-Item -ItemType Directory -Path $script:e2eOutput -Force | Out-Null
 $script:e2eLogPath = Join-Path $script:e2eOutput 'windows-client-e2e.log'
+$script:e2eSourceSha = if (-not [string]::IsNullOrWhiteSpace($SourceSha)) { $SourceSha } elseif (-not [string]::IsNullOrWhiteSpace($env:GITHUB_SHA)) { $env:GITHUB_SHA } else { 'unknown' }
 $script:e2eWindowRecords = [System.Collections.Generic.List[object]]::new()
 $script:e2eProcess = $null
 $script:e2eFixtureRunning = $false
+$script:e2eFixturePort = 8787
+$script:e2ePreviewEnabled = -not [string]::IsNullOrWhiteSpace($env:CODEX_INFO_WINDOWS_PREVIEW)
 $script:e2eSettingsPath = Join-Path $env:LOCALAPPDATA 'CodexInfo\settings.json'
 $script:e2eSettingsBackup = Join-Path ([IO.Path]::GetTempPath()) ("codex-info-e2e-settings-" + [Guid]::NewGuid().ToString('N') + '.json')
 $script:e2eSettingsWasPresent = $false
@@ -109,12 +120,15 @@ public static class CodexInfoWindowsE2EWin32 {
     [DllImport("user32.dll")] public static extern bool SetProcessDPIAware();
     [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hWnd);
     [DllImport("user32.dll")] public static extern bool BringWindowToTop(IntPtr hWnd);
+    [DllImport("user32.dll", SetLastError = true)] public static extern bool PrintWindow(IntPtr hWnd, IntPtr hdcBlt, uint nFlags);
+    [DllImport("user32.dll", SetLastError = true)] public static extern bool IsWindow(IntPtr hWnd);
     [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr hWnd, int command);
     [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr hWnd);
     [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint processId);
     [DllImport("user32.dll")] public static extern int GetWindowText(IntPtr hWnd, StringBuilder text, int count);
     [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr hWnd, out RECT rect);
     [DllImport("user32.dll")] public static extern bool EnumWindows(EnumWindowsProc callback, IntPtr extra);
+    [DllImport("user32.dll")] public static extern bool SetWindowPos(IntPtr hWnd, IntPtr hWndInsertAfter, int x, int y, int cx, int cy, uint flags);
     public delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr extra);
     [StructLayout(LayoutKind.Sequential)] public struct RECT {
         public int Left;
@@ -123,9 +137,170 @@ public static class CodexInfoWindowsE2EWin32 {
         public int Bottom;
     }
 }
+
+public static class CodexInfoWindowsE2ECaptureTestWindow {
+    private const uint WS_POPUP = 0x80000000;
+    private const uint WS_VISIBLE = 0x10000000;
+    private const uint WS_EX_TOOLWINDOW = 0x00000080;
+    private const uint CS_HREDRAW = 0x00000002;
+    private const uint CS_VREDRAW = 0x00000001;
+    private const uint WM_PAINT = 0x000F;
+    private const uint WM_PRINT = 0x0317;
+    private const uint WM_PRINTCLIENT = 0x0318;
+    private const int ERROR_CLASS_ALREADY_EXISTS = 1410;
+    private static readonly string TargetClassName = "CodexInfoWindowsE2ECaptureSelfTestTarget";
+    private static readonly string DecoyClassName = "CodexInfoWindowsE2ECaptureSelfTestDecoy";
+    private static readonly WindowProc Callback = WindowProcedure;
+    private static bool targetClassRegistered;
+    private static bool decoyClassRegistered;
+
+    private delegate IntPtr WindowProc(IntPtr hWnd, uint message, IntPtr wParam, IntPtr lParam);
+
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    private struct WNDCLASS {
+        public uint style;
+        public WindowProc lpfnWndProc;
+        public int cbClsExtra;
+        public int cbWndExtra;
+        public IntPtr hInstance;
+        public IntPtr hIcon;
+        public IntPtr hCursor;
+        public IntPtr hbrBackground;
+        public string lpszMenuName;
+        public string lpszClassName;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct RECT {
+        public int Left;
+        public int Top;
+        public int Right;
+        public int Bottom;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct PAINTSTRUCT {
+        public IntPtr hdc;
+        public bool fErase;
+        public RECT rcPaint;
+        public bool fRestore;
+        public bool fIncUpdate;
+        [MarshalAs(UnmanagedType.ByValArray, SizeConst = 32)] public byte[] rgbReserved;
+    }
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode)]
+    private static extern IntPtr GetModuleHandle(string moduleName);
+
+    [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern ushort RegisterClass(ref WNDCLASS windowClass);
+
+    [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern IntPtr CreateWindowEx(
+        uint extendedStyle,
+        string className,
+        string windowName,
+        uint style,
+        int x,
+        int y,
+        int width,
+        int height,
+        IntPtr parent,
+        IntPtr menu,
+        IntPtr instance,
+        IntPtr parameter);
+
+    [DllImport("user32.dll", SetLastError = true)] private static extern bool DestroyWindow(IntPtr hWnd);
+    [DllImport("user32.dll")] private static extern bool UpdateWindow(IntPtr hWnd);
+    [DllImport("user32.dll")] private static extern IntPtr DefWindowProc(IntPtr hWnd, uint message, IntPtr wParam, IntPtr lParam);
+    [DllImport("user32.dll")] private static extern IntPtr BeginPaint(IntPtr hWnd, out PAINTSTRUCT paint);
+    [DllImport("user32.dll")] private static extern bool EndPaint(IntPtr hWnd, ref PAINTSTRUCT paint);
+    [DllImport("user32.dll")] private static extern bool GetClientRect(IntPtr hWnd, out RECT rect);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)] private static extern int GetClassName(IntPtr hWnd, StringBuilder className, int count);
+    [DllImport("gdi32.dll")] private static extern IntPtr CreateSolidBrush(uint colorRef);
+    [DllImport("gdi32.dll")] private static extern bool DeleteObject(IntPtr handle);
+    [DllImport("user32.dll")] private static extern int FillRect(IntPtr hdc, ref RECT rect, IntPtr brush);
+
+    private static void EnsureClass(string className, bool target) {
+        if (target ? targetClassRegistered : decoyClassRegistered) return;
+        var windowClass = new WNDCLASS {
+            style = CS_HREDRAW | CS_VREDRAW,
+            lpfnWndProc = Callback,
+            hInstance = GetModuleHandle(null),
+            lpszClassName = className
+        };
+        var atom = RegisterClass(ref windowClass);
+        if (atom == 0 && Marshal.GetLastWin32Error() != ERROR_CLASS_ALREADY_EXISTS) {
+            throw new InvalidOperationException("Capture self-test RegisterClass failed: " + Marshal.GetLastWin32Error());
+        }
+        if (target) targetClassRegistered = true;
+        else decoyClassRegistered = true;
+    }
+
+    public static IntPtr Create(string title, int x, int y, int width, int height) {
+        var target = title.StartsWith("TARGET", StringComparison.Ordinal);
+        var className = target ? TargetClassName : DecoyClassName;
+        EnsureClass(className, target);
+        return CreateWindowEx(
+            WS_EX_TOOLWINDOW,
+            className,
+            title,
+            WS_POPUP | WS_VISIBLE,
+            x,
+            y,
+            width,
+            height,
+            IntPtr.Zero,
+            IntPtr.Zero,
+            GetModuleHandle(null),
+            IntPtr.Zero);
+    }
+
+    public static void Show(IntPtr hWnd) {
+        if (hWnd == IntPtr.Zero) return;
+        CodexInfoWindowsE2EWin32.ShowWindow(hWnd, 5);
+        UpdateWindow(hWnd);
+    }
+
+    public static void Destroy(IntPtr hWnd) {
+        if (hWnd != IntPtr.Zero) DestroyWindow(hWnd);
+    }
+
+    private static IntPtr WindowProcedure(IntPtr hWnd, uint message, IntPtr wParam, IntPtr lParam) {
+        if (message == WM_PAINT) {
+            PAINTSTRUCT paint;
+            var hdc = BeginPaint(hWnd, out paint);
+            Paint(hWnd, hdc);
+            EndPaint(hWnd, ref paint);
+            return IntPtr.Zero;
+        }
+        if (message == WM_PRINT || message == WM_PRINTCLIENT) {
+            Paint(hWnd, wParam);
+            return IntPtr.Zero;
+        }
+        return DefWindowProc(hWnd, message, wParam, lParam);
+    }
+
+    private static void Paint(IntPtr hWnd, IntPtr hdc) {
+        if (hdc == IntPtr.Zero) return;
+        RECT rect;
+        if (!GetClientRect(hWnd, out rect)) return;
+        var className = new StringBuilder(96);
+        GetClassName(hWnd, className, className.Capacity);
+        // COLORREF is 0x00BBGGRR. The target class is blue and the decoy
+        // class is red so the self-test distinguishes requested HWND pixels.
+        var colorRef = className.ToString().Equals(TargetClassName, StringComparison.Ordinal)
+            ? 0x00C06020u
+            : 0x000000C0u;
+        var brush = CreateSolidBrush(colorRef);
+        if (brush != IntPtr.Zero) {
+            FillRect(hdc, ref rect, brush);
+            DeleteObject(brush);
+        }
+    }
+}
 '@
 
-if ($Fixture) {
+if ($Fixture -or $FixtureContractTest) {
     Add-Type -TypeDefinition @'
 using System;
 using System.IO;
@@ -140,18 +315,24 @@ public static class CodexInfoWindowsE2EFixtureServer {
     private static volatile bool running;
     private static string statusBody;
     private static string detailsBody;
+    private static string publishedPair;
     private static int healthRequests;
     private static int statusRequests;
     private static int detailsRequests;
+    private static int preflightRequests;
+    private static int clientRequests;
 
-    public static bool Start(string status, string details, int port) {
+    public static bool Start(string status, string details, string pair, int port) {
         if (running) return false;
         try {
             statusBody = status;
             detailsBody = details;
+            publishedPair = pair;
             healthRequests = 0;
             statusRequests = 0;
             detailsRequests = 0;
+            preflightRequests = 0;
+            clientRequests = 0;
             listener = new TcpListener(IPAddress.Loopback, port);
             listener.Start();
             running = true;
@@ -169,9 +350,14 @@ public static class CodexInfoWindowsE2EFixtureServer {
 
     public static bool IsRunning() { return running; }
 
+    public static int BoundPort() {
+        return listener == null ? 0 : ((IPEndPoint)listener.LocalEndpoint).Port;
+    }
+
     public static string RequestSummary() {
         return String.Format(
-            "health={0} status={1} details={2}", healthRequests, statusRequests, detailsRequests);
+            "health={0} status={1} details={2} preflight={3} client={4}",
+            healthRequests, statusRequests, detailsRequests, preflightRequests, clientRequests);
     }
 
     public static void Stop() {
@@ -220,24 +406,30 @@ public static class CodexInfoWindowsE2EFixtureServer {
             var code = 404;
             var reason = "Not Found";
             var body = "{\"api_version\":\"v1\",\"error\":\"not_found\"}";
+            var includePublishedPair = false;
             if (parts.Length >= 2 && parts[0] == "GET") {
                 if (parts[1] == "/v1/status") {
                     Interlocked.Increment(ref statusRequests);
+                    RecordRequestPhase(request);
                     code = 200;
                     reason = "OK";
                     body = statusBody;
+                    includePublishedPair = true;
                 }
                 else if (parts[1] == "/v1/health") {
                     Interlocked.Increment(ref healthRequests);
+                    RecordRequestPhase(request);
                     code = 200;
                     reason = "OK";
                     body = "{\"api_version\":\"v1\",\"service\":\"codex-info\"}";
                 }
                 else if (parts[1] == "/v1/details") {
                     Interlocked.Increment(ref detailsRequests);
+                    RecordRequestPhase(request);
                     code = 200;
                     reason = "OK";
                     body = detailsBody;
+                    includePublishedPair = true;
                 }
             }
             else if (parts.Length >= 2) {
@@ -247,12 +439,25 @@ public static class CodexInfoWindowsE2EFixtureServer {
             }
             var payload = Encoding.UTF8.GetBytes(body);
             var header = String.Format(
-                "HTTP/1.1 {0} {1}\r\nContent-Type: application/json; charset=utf-8\r\nCache-Control: no-store\r\nContent-Length: {2}\r\nConnection: close\r\n\r\n",
+                "HTTP/1.1 {0} {1}\r\nContent-Type: application/json; charset=utf-8\r\nCache-Control: no-store\r\nContent-Length: {2}\r\nConnection: close\r\n",
                 code, reason, payload.Length);
+            if (includePublishedPair) {
+                header += "Codex-Info-Published-Pair: " + publishedPair + "\r\n";
+            }
+            header += "\r\n";
             var headerBytes = Encoding.ASCII.GetBytes(header);
             stream.Write(headerBytes, 0, headerBytes.Length);
             stream.Write(payload, 0, payload.Length);
             stream.Flush();
+        }
+    }
+
+    private static void RecordRequestPhase(string request) {
+        if (request.IndexOf("X-Codex-Info-E2E-Phase: preflight", StringComparison.OrdinalIgnoreCase) >= 0) {
+            Interlocked.Increment(ref preflightRequests);
+        }
+        else {
+            Interlocked.Increment(ref clientRequests);
         }
     }
 }
@@ -370,6 +575,39 @@ function Find-E2EElementByAutomationId {
         [System.Windows.Automation.AutomationElement]::AutomationIdProperty,
         $AutomationId)
     return $Root.FindFirst([System.Windows.Automation.TreeScope]::Descendants, $condition)
+}
+
+function Get-E2EElementsByAutomationId {
+    param(
+        [Parameter(Mandatory = $true)][System.Windows.Automation.AutomationElement]$Root,
+        [Parameter(Mandatory = $true)][string]$AutomationId
+    )
+
+    $condition = [System.Windows.Automation.PropertyCondition]::new(
+        [System.Windows.Automation.AutomationElement]::AutomationIdProperty,
+        $AutomationId)
+    return @($Root.FindAll([System.Windows.Automation.TreeScope]::Descendants, $condition))
+}
+
+function Assert-E2EMainProductVersion {
+    param([Parameter(Mandatory = $true)][System.Windows.Automation.AutomationElement]$Root)
+
+    $versions = @(Get-E2EElementsByAutomationId $Root 'Main.ProductVersion')
+    Assert-E2E ($versions.Count -eq 1) "Main product version must have exactly one UIA element, found $($versions.Count)."
+    $value = [string]$versions[0].Current.Name
+    Assert-E2E ($value -match '^v[0-9]+\.[0-9]+\.[0-9]+$') "Main product version is malformed: '$value'."
+    Write-E2E "main-product-version: PASS value=$value count=$($versions.Count)"
+}
+
+function Assert-E2ENoChildProductVersion {
+    param(
+        [Parameter(Mandatory = $true)][System.Windows.Automation.AutomationElement]$Root,
+        [Parameter(Mandatory = $true)][string]$Role
+    )
+
+    $versions = @(Get-E2EElementsByAutomationId $Root 'Main.ProductVersion')
+    Assert-E2E ($versions.Count -eq 0) "$Role child window must not expose Main.ProductVersion, found $($versions.Count)."
+    Write-E2E "child-product-version: PASS role=$Role count=$($versions.Count)"
 }
 
 function Find-E2EButtonByName {
@@ -569,13 +807,41 @@ function Capture-E2EWindow {
     $path = Join-Path $script:e2eOutput "$safeName.png"
     # UIA state is published before the compositor necessarily presents the
     # corresponding frame.  Allow one bounded paint interval before taking
-    # the independent screen observation.
+    # the independent target-window observation.
     Start-Sleep -Milliseconds 250
     $bounds = Get-E2EWindowBounds $Handle
     $bitmap = New-Object System.Drawing.Bitmap($bounds.Width, $bounds.Height)
     $graphics = [System.Drawing.Graphics]::FromImage($bitmap)
     try {
-        $graphics.CopyFromScreen($bounds.Left, $bounds.Top, 0, 0, $bitmap.Size)
+        # Capture the requested HWND directly.  PrintWindow is deliberately
+        # used instead of a desktop-coordinate copy so another foreground or
+        # occluding window can never replace the requested window's pixels.
+        $graphics.Clear([System.Drawing.Color]::Magenta)
+        $hdc = $graphics.GetHdc()
+        try {
+            $printWindowFlags = 2 # PW_RENDERFULLCONTENT
+            $printed = [CodexInfoWindowsE2EWin32]::PrintWindow(
+                $Handle,
+                $hdc,
+                [uint32]$printWindowFlags)
+            $printWindowError = [Runtime.InteropServices.Marshal]::GetLastWin32Error()
+        }
+        finally {
+            $graphics.ReleaseHdc($hdc)
+        }
+        Assert-E2E $printed "PrintWindow failed for HWND 0x$('{0:X}' -f $Handle.ToInt64()) (last-error=$printWindowError)."
+        Assert-E2E ($bitmap.Width -eq $bounds.Width -and $bitmap.Height -eq $bounds.Height) 'Target HWND capture dimensions changed.'
+        $sentinelArgb = [System.Drawing.Color]::Magenta.ToArgb()
+        $changedPixels = 0
+        for ($x = 0; $x -lt $bitmap.Width -and $changedPixels -eq 0; $x++) {
+            for ($y = 0; $y -lt $bitmap.Height; $y++) {
+                if ($bitmap.GetPixel($x, $y).ToArgb() -ne $sentinelArgb) {
+                    $changedPixels++
+                    break
+                }
+            }
+        }
+        Assert-E2E ($changedPixels -gt 0) 'PrintWindow returned empty/unchanged target content.'
         $bitmap.Save($path, [System.Drawing.Imaging.ImageFormat]::Png)
     }
     finally {
@@ -587,6 +853,99 @@ function Capture-E2EWindow {
     return [pscustomobject]@{ Path = $path; Hash = $hash }
 }
 
+function Assert-E2ECaptureColor {
+    param(
+        [Parameter(Mandatory = $true)][psobject]$Capture,
+        [Parameter(Mandatory = $true)][System.Drawing.Color]$Expected,
+        [Parameter(Mandatory = $true)][string]$Description
+    )
+
+    $bitmap = [System.Drawing.Bitmap]::FromFile($Capture.Path)
+    try {
+        Assert-E2E ($bitmap.Width -gt 0 -and $bitmap.Height -gt 0) "$Description produced an empty bitmap."
+        $pixel = $bitmap.GetPixel([int]($bitmap.Width / 2), [int]($bitmap.Height / 2))
+        $dr = $pixel.R - $Expected.R
+        $dg = $pixel.G - $Expected.G
+        $db = $pixel.B - $Expected.B
+        $distance = ($dr * $dr) + ($dg * $dg) + ($db * $db)
+        Assert-E2E ($distance -le (4 * 4)) "$Description returned unexpected target pixels: actual=#$('{0:X2}{1:X2}{2:X2}' -f $pixel.R, $pixel.G, $pixel.B) expected=#$('{0:X2}{1:X2}{2:X2}' -f $Expected.R, $Expected.G, $Expected.B)."
+    }
+    finally {
+        $bitmap.Dispose()
+    }
+}
+
+function Assert-E2ECaptureExpectedFailure {
+    param(
+        [Parameter(Mandatory = $true)][string]$Name,
+        [Parameter(Mandatory = $true)][scriptblock]$Action
+    )
+
+    $failure = $null
+    try {
+        & $Action | Out-Null
+    }
+    catch {
+        $failure = $_.Exception.Message
+    }
+    Assert-E2E ($null -ne $failure) "Capture self-test case=$Name unexpectedly passed."
+    Write-E2E "capture-self-test: PASS case=$Name rejected=$failure"
+}
+
+function Invoke-E2ECaptureSelfTest {
+    $target = [IntPtr]::Zero
+    $decoy = [IntPtr]::Zero
+    $capturedPaths = [System.Collections.Generic.List[string]]::new()
+    try {
+        $target = [CodexInfoWindowsE2ECaptureTestWindow]::Create('TARGET', 40, 40, 160, 100)
+        $decoy = [CodexInfoWindowsE2ECaptureTestWindow]::Create('DECOY', 40, 40, 160, 100)
+        Assert-E2E ($target -ne [IntPtr]::Zero -and $decoy -ne [IntPtr]::Zero) 'Capture self-test could not create target and decoy HWNDs.'
+        [CodexInfoWindowsE2ECaptureTestWindow]::Show($target)
+        [CodexInfoWindowsE2ECaptureTestWindow]::Show($decoy)
+        $topmost = [IntPtr](-1)
+        Assert-E2E ([CodexInfoWindowsE2EWin32]::SetWindowPos($decoy, $topmost, 40, 40, 160, 100, [uint32]0x0043)) 'Capture self-test could not place the decoy above the target HWND.'
+        [CodexInfoWindowsE2EWin32]::BringWindowToTop($decoy) | Out-Null
+        [CodexInfoWindowsE2EWin32]::SetForegroundWindow($decoy) | Out-Null
+        Start-Sleep -Milliseconds 100
+
+        $targetWhileOccluded = Capture-E2EWindow -Handle $target -Name 'capture-self-test-target-occluded'
+        $capturedPaths.Add($targetWhileOccluded.Path)
+        Assert-E2ECaptureColor -Capture $targetWhileOccluded -Expected ([System.Drawing.ColorTranslator]::FromHtml('#2060C0')) -Description 'target HWND while decoy is topmost'
+
+        $decoyCapture = Capture-E2EWindow -Handle $decoy -Name 'capture-self-test-decoy'
+        $capturedPaths.Add($decoyCapture.Path)
+        Assert-E2ECaptureColor -Capture $decoyCapture -Expected ([System.Drawing.ColorTranslator]::FromHtml('#C00000')) -Description 'decoy HWND'
+        Write-E2E 'capture-self-test: PASS target HWND content remained target-colored while the red decoy was topmost'
+
+        [CodexInfoWindowsE2EWin32]::ShowWindow($decoy, 0) | Out-Null
+        $targetAfterOccluder = Capture-E2EWindow -Handle $target -Name 'capture-self-test-target-after-occluder'
+        $capturedPaths.Add($targetAfterOccluder.Path)
+        Assert-E2ECaptureColor -Capture $targetAfterOccluder -Expected ([System.Drawing.ColorTranslator]::FromHtml('#2060C0')) -Description 'target HWND after decoy removal'
+        Write-E2E 'capture-self-test: PASS requested HWND capture is stable before and after occluder removal'
+
+        Assert-E2ECaptureExpectedFailure -Name 'invalid-hwnd' -Action {
+            Capture-E2EWindow -Handle ([IntPtr]::Zero) -Name 'capture-self-test-invalid'
+        }
+
+        $destroyedTarget = $target
+        [CodexInfoWindowsE2ECaptureTestWindow]::Destroy($target)
+        $target = [IntPtr]::Zero
+        Assert-E2ECaptureExpectedFailure -Name 'capture-failure' -Action {
+            Capture-E2EWindow -Handle $destroyedTarget -Name 'capture-self-test-destroyed'
+        }
+    }
+    finally {
+        [CodexInfoWindowsE2ECaptureTestWindow]::Destroy($target)
+        [CodexInfoWindowsE2ECaptureTestWindow]::Destroy($decoy)
+        foreach ($path in $capturedPaths) {
+            if (Test-Path -LiteralPath $path -PathType Leaf) {
+                Remove-Item -LiteralPath $path -Force
+            }
+        }
+    }
+    Write-E2E 'capture-self-test: PASS target, occluding decoy, and invalid/failure cases'
+}
+
 function Assert-E2EImageChanged {
     param(
         [Parameter(Mandatory = $true)][psobject]$Before,
@@ -594,6 +953,532 @@ function Assert-E2EImageChanged {
         [Parameter(Mandatory = $true)][string]$Description
     )
     Assert-E2E ($Before.Hash -ne $After.Hash) "$Description did not change the rendered window."
+}
+
+function Get-E2EGraphOracleSeries {
+    return @(
+        [pscustomobject]@{
+            Name = 'LUNA'
+            Color = [System.Drawing.ColorTranslator]::FromHtml('#E6A23C')
+        },
+        [pscustomobject]@{
+            Name = 'TERRA'
+            Color = [System.Drawing.ColorTranslator]::FromHtml('#5DC98A')
+        },
+        [pscustomobject]@{
+            Name = 'SOL'
+            Color = [System.Drawing.ColorTranslator]::FromHtml('#A88CF5')
+        }
+    )
+}
+
+function Get-E2EGraphIdleBackgroundColor {
+    $plotBackground = [System.Drawing.ColorTranslator]::FromHtml('#101925')
+    $idleBand = [System.Drawing.ColorTranslator]::FromHtml('#3F5D7C')
+    $opacity = 0.22
+    return [System.Drawing.Color]::FromArgb(
+        255,
+        [int][Math]::Round($plotBackground.R + (($idleBand.R - $plotBackground.R) * $opacity)),
+        [int][Math]::Round($plotBackground.G + (($idleBand.G - $plotBackground.G) * $opacity)),
+        [int][Math]::Round($plotBackground.B + (($idleBand.B - $plotBackground.B) * $opacity)))
+}
+
+function Get-E2EGraphCompositedColor {
+    param(
+        [Parameter(Mandatory = $true)][System.Drawing.Color]$Background,
+        [Parameter(Mandatory = $true)][System.Drawing.Color]$Series,
+        [Parameter(Mandatory = $true)][double]$Alpha
+    )
+    return [System.Drawing.Color]::FromArgb(
+        255,
+        [int][Math]::Round($Background.R + (($Series.R - $Background.R) * $Alpha)),
+        [int][Math]::Round($Background.G + (($Series.G - $Background.G) * $Alpha)),
+        [int][Math]::Round($Background.B + (($Series.B - $Background.B) * $Alpha)))
+}
+
+function Test-E2EGraphCompositedSeriesPixel {
+    param(
+        [Parameter(Mandatory = $true)][System.Drawing.Color]$Pixel,
+        [Parameter(Mandatory = $true)][System.Drawing.Color]$Background,
+        [Parameter(Mandatory = $true)][System.Drawing.Color]$Series
+    )
+
+    $pixelChannels = @($Pixel.R, $Pixel.G, $Pixel.B)
+    $backgroundChannels = @($Background.R, $Background.G, $Background.B)
+    $seriesChannels = @($Series.R, $Series.G, $Series.B)
+    # The weakest observed real series row (TERRA #274748 over #1A2838)
+    # implies alpha ~= 0.19. Keep a small rounding margin while rejecting
+    # the plot axis (#263548), whose strongest implied alpha is below 0.18.
+    $minimumCompositedAlpha = 0.18
+    $alphas = @()
+    for ($channel = 0; $channel -lt 3; $channel++) {
+        $delta = $seriesChannels[$channel] - $backgroundChannels[$channel]
+        if ([Math]::Abs($delta) -lt 16) {
+            # A weak source channel must remain near the idle background; a
+            # large excursion here belongs to a different series color.
+            if ([Math]::Abs($pixelChannels[$channel] - $backgroundChannels[$channel]) -gt 12) {
+                return $false
+            }
+            continue
+        }
+        $alpha = ($pixelChannels[$channel] - $backgroundChannels[$channel]) / [double]$delta
+        if ($alpha -lt $minimumCompositedAlpha -or $alpha -gt 0.72) {
+            return $false
+        }
+        $alphas += $alpha
+    }
+    if ($alphas.Count -lt 2) {
+        return $false
+    }
+    $minimum = ($alphas | Measure-Object -Minimum).Minimum
+    $maximum = ($alphas | Measure-Object -Maximum).Maximum
+    return ($maximum - $minimum -le 0.22)
+}
+
+function Get-E2EGraphFlatLineCandidates {
+    param(
+        [Parameter(Mandatory = $true)][System.Drawing.Bitmap]$Bitmap,
+        [Parameter(Mandatory = $true)][int]$Left,
+        [Parameter(Mandatory = $true)][int]$Top,
+        [Parameter(Mandatory = $true)][int]$Right,
+        [Parameter(Mandatory = $true)][int]$Bottom,
+        [Parameter(Mandatory = $true)][psobject]$Series,
+        [Parameter(Mandatory = $true)][System.Drawing.Color]$Background,
+        [double]$FlatStartFraction = 0.06,
+        [double]$FlatEndFraction = 0.84,
+        [double]$FlatCoverageThreshold = 0.90
+    )
+
+    $width = $Right - $Left
+    $height = $Bottom - $Top
+    $flatLeft = $Left + [int][Math]::Floor($width * $FlatStartFraction)
+    $flatRight = $Left + [int][Math]::Floor($width * $FlatEndFraction)
+    $flatWidth = $flatRight - $flatLeft
+    if ($flatWidth -le 0) { return @() }
+
+    # First find rows with meaningful compositor-aware coverage.  A sloped
+    # line distributes its pixels across many rows and cannot form a strong
+    # contiguous row candidate here.
+    $rowCoverage = @{}
+    $rowCandidateThreshold = 0.20
+    for ($y = $Top; $y -lt $Bottom; $y++) {
+        $matchedColumns = 0
+        for ($x = $flatLeft; $x -lt $flatRight; $x++) {
+            if (Test-E2EGraphCompositedSeriesPixel -Pixel $Bitmap.GetPixel($x, $y) -Background $Background -Series $Series.Color) {
+                $matchedColumns++
+            }
+        }
+        $coverage = $matchedColumns / [double]$flatWidth
+        if ($coverage -ge $rowCandidateThreshold) {
+            $rowCoverage[$y] = $coverage
+        }
+    }
+
+    $groups = [System.Collections.Generic.List[object]]::new()
+    $groupStart = $null
+    $previousRow = $null
+    for ($y = $Top; $y -lt $Bottom; $y++) {
+        if (-not $rowCoverage.ContainsKey($y)) { continue }
+        if ($null -eq $groupStart) {
+            $groupStart = $y
+        }
+        elseif ($y -ne ($previousRow + 1)) {
+            $groups.Add([pscustomobject]@{ Top = $groupStart; Bottom = $previousRow })
+            $groupStart = $y
+        }
+        $previousRow = $y
+    }
+    if ($null -ne $groupStart) {
+        $groups.Add([pscustomobject]@{ Top = $groupStart; Bottom = $previousRow })
+    }
+
+    $candidates = [System.Collections.Generic.List[object]]::new()
+    $maximumRowSpan = [Math]::Max(6, [int][Math]::Ceiling($height * 0.04))
+    foreach ($group in $groups) {
+        $matchedColumns = [System.Collections.Generic.HashSet[int]]::new()
+        $minimumMatchedRow = $Bottom
+        $maximumMatchedRow = $Top
+        for ($x = $flatLeft; $x -lt $flatRight; $x++) {
+            for ($y = $group.Top; $y -le $group.Bottom; $y++) {
+                if (Test-E2EGraphCompositedSeriesPixel -Pixel $Bitmap.GetPixel($x, $y) -Background $Background -Series $Series.Color) {
+                    $null = $matchedColumns.Add($x)
+                    if ($y -lt $minimumMatchedRow) { $minimumMatchedRow = $y }
+                    if ($y -gt $maximumMatchedRow) { $maximumMatchedRow = $y }
+                }
+            }
+        }
+        if ($matchedColumns.Count -eq 0) { continue }
+        $coverage = $matchedColumns.Count / [double]$flatWidth
+        $rowSpan = $maximumMatchedRow - $minimumMatchedRow + 1
+        if ($coverage -ge $FlatCoverageThreshold -and $rowSpan -le $maximumRowSpan) {
+            $candidates.Add([pscustomobject]@{
+                RowTop = $minimumMatchedRow
+                RowBottom = $maximumMatchedRow
+                Center = [int][Math]::Round(($minimumMatchedRow + $maximumMatchedRow) / 2.0)
+                CoverageColumns = $matchedColumns.Count
+                Width = $flatWidth
+                Coverage = $coverage
+                RowSpan = $rowSpan
+            })
+        }
+    }
+    return @($candidates)
+}
+
+function Find-E2EGraphSharedRisingSegment {
+    param(
+        [Parameter(Mandatory = $true)][System.Drawing.Bitmap]$Bitmap,
+        [Parameter(Mandatory = $true)][int]$Left,
+        [Parameter(Mandatory = $true)][int]$Top,
+        [Parameter(Mandatory = $true)][int]$Right,
+        [Parameter(Mandatory = $true)][int]$Bottom,
+        [Parameter(Mandatory = $true)][psobject[]]$Series,
+        [Parameter(Mandatory = $true)][System.Collections.IDictionary]$FlatRows,
+        [double]$RisingCenterFraction = 0.84
+    )
+
+    $width = $Right - $Left
+    $height = $Bottom - $Top
+    $risingCenter = $Left + [int][Math]::Floor($width * $RisingCenterFraction)
+    $risingHalfWidth = [Math]::Max(3, [int][Math]::Ceiling($width * 0.015))
+    $risingLeft = [Math]::Max($Left, $risingCenter - $risingHalfWidth)
+    $risingRight = [Math]::Min($Right, $risingCenter + $risingHalfWidth + 1)
+    $connectionTolerance = [Math]::Max(4, [int][Math]::Ceiling($height * 0.02))
+    $minimumVerticalExtent = [Math]::Max(12, [int][Math]::Ceiling($height * 0.08))
+    $lunaCenter = [int]$FlatRows['LUNA'].Center
+    $terraCenter = [int]$FlatRows['TERRA'].Center
+    $solCenter = [int]$FlatRows['SOL'].Center
+    $minimumSharedVerticalExtent = [Math]::Max(20, ($solCenter - $lunaCenter) + $minimumVerticalExtent)
+    $maxAllowedGap = 2
+    $candidateColumns = [System.Collections.Generic.List[object]]::new()
+    $sourceColors = @($Series | ForEach-Object { $_.Color })
+    for ($x = $risingLeft; $x -lt $risingRight; $x++) {
+        $matchedRows = [System.Collections.Generic.List[int]]::new()
+        for ($y = $Top; $y -lt $Bottom; $y++) {
+            $pixel = $Bitmap.GetPixel($x, $y)
+            foreach ($sourceColor in $sourceColors) {
+                $dr = $pixel.R - $sourceColor.R
+                $dg = $pixel.G - $sourceColor.G
+                $db = $pixel.B - $sourceColor.B
+                if ((($dr * $dr) + ($dg * $dg) + ($db * $db)) -le (24 * 24)) {
+                    $matchedRows.Add($y)
+                    break
+                }
+            }
+        }
+        if ($matchedRows.Count -eq 0) { continue }
+        $runs = [System.Collections.Generic.List[object]]::new()
+        $runStart = $null
+        $lastRow = $null
+        $runHits = 0
+        foreach ($row in $matchedRows) {
+            if ($null -eq $runStart) {
+                $runStart = $row
+                $runHits = 1
+            }
+            elseif (($row - $lastRow - 1) -le $maxAllowedGap) {
+                $runHits++
+            }
+            else {
+                $runs.Add([pscustomobject]@{ Top = $runStart; Bottom = $lastRow; Hits = $runHits })
+                $runStart = $row
+                $runHits = 1
+            }
+            $lastRow = $row
+        }
+        if ($null -ne $runStart) {
+            $runs.Add([pscustomobject]@{ Top = $runStart; Bottom = $lastRow; Hits = $runHits })
+        }
+        foreach ($run in $runs) {
+            $runSpan = $run.Bottom - $run.Top + 1
+            $runDensity = $run.Hits / [double]$runSpan
+            $touchesLowestFlat = $run.Bottom -ge ($solCenter - $connectionTolerance) -and
+                $run.Bottom -le ($solCenter + $connectionTolerance)
+            $passesUpperFlat = $run.Top -le ($lunaCenter - $connectionTolerance)
+            if ($touchesLowestFlat -and $passesUpperFlat -and
+                $runSpan -ge $minimumSharedVerticalExtent -and $runDensity -ge 0.75) {
+                $candidateColumns.Add([pscustomobject]@{
+                    X = $x
+                    Top = $run.Top
+                    Bottom = $run.Bottom
+                    Hits = $run.Hits
+                    Span = $runSpan
+                    Density = $runDensity
+                })
+                break
+            }
+        }
+    }
+    Assert-E2E ($candidateColumns.Count -ge 1) "Past graph shared right-edge rising step is missing, detached, short, or non-contiguous: columns=$($candidateColumns.Count) expected-x=$risingCenter."
+    $bestRun = $candidateColumns | Sort-Object Density, Span -Descending | Select-Object -First 1
+    $minimumContributionPixels = 4
+    $minimumContributionExtent = [Math]::Max(4, [int][Math]::Ceiling($height * 0.02))
+    $contributions = @{}
+    foreach ($item in $Series) {
+        $contributionHits = 0
+        $minimumContributionRow = $Bottom
+        $maximumContributionRow = $Top
+        foreach ($column in $candidateColumns) {
+            for ($y = $column.Top; $y -le $column.Bottom; $y++) {
+                $pixel = $Bitmap.GetPixel($column.X, $y)
+                $dr = $pixel.R - $item.Color.R
+                $dg = $pixel.G - $item.Color.G
+                $db = $pixel.B - $item.Color.B
+                if ((($dr * $dr) + ($dg * $dg) + ($db * $db)) -le (24 * 24)) {
+                    $contributionHits++
+                    if ($y -lt $minimumContributionRow) { $minimumContributionRow = $y }
+                    if ($y -gt $maximumContributionRow) { $maximumContributionRow = $y }
+                }
+            }
+        }
+        $contributionExtent = if ($contributionHits -gt 0) { $maximumContributionRow - $minimumContributionRow + 1 } else { 0 }
+        Assert-E2E ($contributionHits -ge $minimumContributionPixels -and $contributionExtent -ge $minimumContributionExtent) "Past graph shared right-edge step has insufficient $($item.Name) source contribution under overdraw: pixels=$contributionHits extent=$contributionExtent."
+        $contributions[$item.Name] = [pscustomobject]@{
+            Pixels = $contributionHits
+            Top = $minimumContributionRow
+            Bottom = $maximumContributionRow
+            Extent = $contributionExtent
+        }
+    }
+    return [pscustomobject]@{
+        Columns = $candidateColumns.Count
+        PixelHits = ($candidateColumns | Measure-Object -Property Hits -Sum).Sum
+        Top = $bestRun.Top
+        Bottom = $bestRun.Bottom
+        Center = $risingCenter
+        Density = $bestRun.Density
+        ConnectionTolerance = $connectionTolerance
+        MinimumVerticalExtent = $minimumSharedVerticalExtent
+        Contributions = $contributions
+    }
+}
+
+function Assert-E2EGraphModelPixels {
+    param(
+        [Parameter(Mandatory = $true)][System.Drawing.Bitmap]$Bitmap,
+        [Parameter(Mandatory = $true)][int]$Left,
+        [Parameter(Mandatory = $true)][int]$Top,
+        [Parameter(Mandatory = $true)][int]$Right,
+        [Parameter(Mandatory = $true)][int]$Bottom
+    )
+
+    $width = $Right - $Left
+    $height = $Bottom - $Top
+    Assert-E2E ($width -gt 0 -and $height -gt 0) 'Graph oracle bounds are empty.'
+    $idleBackground = Get-E2EGraphIdleBackgroundColor
+    $flatStartFraction = 0.06
+    $flatEndFraction = 0.84
+    $risingCenterFraction = 0.84
+    $flatCoverageThreshold = 0.90
+    $flatLeft = $Left + [int][Math]::Floor($width * $flatStartFraction)
+    $flatRight = $Left + [int][Math]::Floor($width * $flatEndFraction)
+    Assert-E2E ($flatRight -gt $flatLeft) 'Graph oracle expected flat interval is empty.'
+    $series = @(Get-E2EGraphOracleSeries)
+    $selected = @{}
+    foreach ($item in $series) {
+        $candidates = @(Get-E2EGraphFlatLineCandidates -Bitmap $Bitmap -Left $Left -Top $Top -Right $Right -Bottom $Bottom -Series $item -Background $idleBackground -FlatStartFraction $flatStartFraction -FlatEndFraction $flatEndFraction -FlatCoverageThreshold $flatCoverageThreshold)
+        Assert-E2E ($candidates.Count -gt 0) "Past graph $($item.Name) has no compositor-aware horizontal flat corridor with $([int]($flatCoverageThreshold * 100))% coverage."
+        $selected[$item.Name] = $candidates | Sort-Object Coverage, RowSpan -Descending | Select-Object -First 1
+    }
+
+    $minimumSeparation = [Math]::Max(4, [int][Math]::Ceiling($height * 0.02))
+    $lunaCenter = [int]$selected['LUNA'].Center
+    $terraCenter = [int]$selected['TERRA'].Center
+    $solCenter = [int]$selected['SOL'].Center
+    Assert-E2E ($lunaCenter + $minimumSeparation -le $terraCenter -and
+        $terraCenter + $minimumSeparation -le $solCenter) "Past graph discovered model rows have invalid vertical order/separation: LUNA=$lunaCenter TERRA=$terraCenter SOL=$solCenter minimum-separation=$minimumSeparation."
+    $uniqueCenters = @(@($lunaCenter, $terraCenter, $solCenter) | Select-Object -Unique)
+    Assert-E2E ($uniqueCenters.Count -eq 3) "Past graph model rows share one physical y group: LUNA=$lunaCenter TERRA=$terraCenter SOL=$solCenter."
+    foreach ($name in @('LUNA', 'TERRA', 'SOL')) {
+        $center = [int]$selected[$name].Center
+        Assert-E2E ($center -ge $Top -and $center -lt $Bottom) "Past graph $name discovered flat row is outside plot bounds: row=$center bounds=$Top..$($Bottom - 1)."
+    }
+
+    $sharedStep = Find-E2EGraphSharedRisingSegment -Bitmap $Bitmap -Left $Left -Top $Top -Right $Right -Bottom $Bottom -Series $series -FlatRows $selected -RisingCenterFraction $risingCenterFraction
+    $results = @()
+    foreach ($item in $series) {
+        $flat = $selected[$item.Name]
+        $contribution = $sharedStep.Contributions[$item.Name]
+        $results += [pscustomobject]@{
+            Name = $item.Name
+            FlatCoverageColumns = $flat.CoverageColumns
+            FlatWidth = $flat.Width
+            FlatCoverage = $flat.Coverage
+            FlatRowTop = $flat.RowTop
+            FlatRowBottom = $flat.RowBottom
+            FlatCenter = $flat.Center
+            RisingColumns = $sharedStep.Columns
+            RisingPixelHits = $sharedStep.PixelHits
+            RisingTop = $sharedStep.Top
+            RisingBottom = $sharedStep.Bottom
+            RisingDensity = $sharedStep.Density
+            RisingContributionPixels = $contribution.Pixels
+            RisingContributionExtent = $contribution.Extent
+        }
+    }
+    return $results
+}
+
+function Assert-E2EGraphHasModelData {
+    param(
+        [Parameter(Mandatory = $true)][System.Windows.Automation.AutomationElement]$Plot,
+        [Parameter(Mandatory = $true)][IntPtr]$Handle,
+        [Parameter(Mandatory = $true)][psobject]$Capture
+    )
+
+    $window = Get-E2EWindowBounds $Handle
+    $plotBounds = $Plot.Current.BoundingRectangle
+    $bitmap = [System.Drawing.Bitmap]::FromFile($Capture.Path)
+    try {
+        [int]$left = [Math]::Max(0, [int]($plotBounds.Left - $window.Left))
+        [int]$top = [Math]::Max(0, [int]($plotBounds.Top - $window.Top))
+        [int]$right = [Math]::Min($bitmap.Width, [int]($plotBounds.Right - $window.Left))
+        [int]$bottom = [Math]::Min($bitmap.Height, [int]($plotBounds.Bottom - $window.Top))
+        Assert-E2E ($right -gt $left -and $bottom -gt $top) 'Graph plot bounds are outside the captured window.'
+        $results = @(Assert-E2EGraphModelPixels -Bitmap $bitmap -Left $left -Top $top -Right $right -Bottom $bottom)
+    }
+    finally {
+        $bitmap.Dispose()
+    }
+    $terra = $results | Where-Object { $_.Name -eq 'TERRA' }
+    Write-E2E ("graph-past-model-data: PASS flat coverage LUNA={0}/{1}({2:P1}) TERRA={3}/{4}({5:P1}) SOL={6}/{7}({8:P1}); rising columns LUNA={9} TERRA={10} SOL={11}" -f
+        ($results | Where-Object { $_.Name -eq 'LUNA' }).FlatCoverageColumns,
+        ($results | Where-Object { $_.Name -eq 'LUNA' }).FlatWidth,
+        ($results | Where-Object { $_.Name -eq 'LUNA' }).FlatCoverage,
+        $terra.FlatCoverageColumns, $terra.FlatWidth, $terra.FlatCoverage,
+        ($results | Where-Object { $_.Name -eq 'SOL' }).FlatCoverageColumns,
+        ($results | Where-Object { $_.Name -eq 'SOL' }).FlatWidth,
+        ($results | Where-Object { $_.Name -eq 'SOL' }).FlatCoverage,
+        ($results | Where-Object { $_.Name -eq 'LUNA' }).RisingColumns,
+        $terra.RisingColumns,
+        ($results | Where-Object { $_.Name -eq 'SOL' }).RisingColumns)
+}
+
+function Test-E2EGraphIdleBandPixel {
+    param(
+        [Parameter(Mandatory = $true)][System.Drawing.Color]$Pixel
+    )
+
+    # #3F5D7C at opacity .22 over #101925 composites to #1A2838.  Compare
+    # each channel against that computed composite so the plot surface
+    # (#101925) and grid/axis (#263548) cannot satisfy the idle-band oracle.
+    $expected = Get-E2EGraphIdleBackgroundColor
+    $tolerance = 8
+    $redDelta = [Math]::Abs([int]$Pixel.R - [int]$expected.R)
+    $greenDelta = [Math]::Abs([int]$Pixel.G - [int]$expected.G)
+    $blueDelta = [Math]::Abs([int]$Pixel.B - [int]$expected.B)
+    return $redDelta -le $tolerance -and $greenDelta -le $tolerance -and $blueDelta -le $tolerance
+}
+
+function Assert-E2EGraphIdleBandBitmap {
+    param(
+        [Parameter(Mandatory = $true)][System.Drawing.Bitmap]$Bitmap,
+        [Parameter(Mandatory = $true)][int]$Left,
+        [Parameter(Mandatory = $true)][int]$Top,
+        [Parameter(Mandatory = $true)][int]$Right,
+        [Parameter(Mandatory = $true)][int]$Bottom,
+        [double]$ExpectedStartFraction = 0.01,
+        [double]$ExpectedEndFraction = 0.35,
+        [int]$VerticalInset = 20
+    )
+
+    Assert-E2E ($Left -ge 0 -and $Top -ge 0 -and $Right -le $Bitmap.Width -and $Bottom -le $Bitmap.Height) `
+        'Idle-band bitmap bounds are outside the captured bitmap.'
+    Assert-E2E ($Right -gt $Left -and $Bottom -gt $Top) 'Idle-band bitmap bounds are empty.'
+    Assert-E2E ($ExpectedStartFraction -ge 0 -and $ExpectedEndFraction -le 1 -and
+        $ExpectedEndFraction -gt $ExpectedStartFraction) 'Idle-band expected range is invalid.'
+
+    [int]$plotWidth = $Right - $Left
+    [int]$plotHeight = $Bottom - $Top
+    Assert-E2E ($VerticalInset -ge 0 -and ($plotHeight - (2 * $VerticalInset)) -gt 0) `
+        'Idle-band vertical scan corridor is empty.'
+    [int]$expectedLeft = $Left + [int][Math]::Floor($plotWidth * $ExpectedStartFraction)
+    [int]$expectedRight = $Left + [int][Math]::Floor($plotWidth * $ExpectedEndFraction)
+    Assert-E2E ($expectedRight -gt $expectedLeft) 'Idle-band expected range is sub-pixel.'
+    [int]$expectedWidth = $expectedRight - $expectedLeft
+    [int]$scanTop = $Top + $VerticalInset
+    [int]$scanBottom = $Bottom - $VerticalInset
+    [int]$scanHeight = $scanBottom - $scanTop
+    [int]$minimumColumnHits = [Math]::Max(4, [int][Math]::Ceiling($scanHeight * 0.10))
+    [int]$minimumSampleHits = [Math]::Max(20, [int][Math]::Ceiling($scanHeight * 0.10))
+    [int]$minimumCoveredColumns = [int][Math]::Ceiling($expectedWidth * 0.80)
+
+    [int]$hits = 0
+    [int]$coveredColumns = 0
+    $columnHits = @{}
+    for ($x = $expectedLeft; $x -lt $expectedRight; $x++) {
+        [int]$columnHitCount = 0
+        for ($y = $scanTop; $y -lt $scanBottom; $y++) {
+            $pixel = $Bitmap.GetPixel($x, $y)
+            if (Test-E2EGraphIdleBandPixel -Pixel $pixel) {
+                $hits = $hits + 1
+                $columnHitCount = $columnHitCount + 1
+            }
+        }
+        $columnHits[$x] = $columnHitCount
+        if ($columnHitCount -ge $minimumColumnHits) {
+            $coveredColumns = $coveredColumns + 1
+        }
+    }
+
+    # Keep every sample expression scalar.  A comma-terminated expression in
+    # an @(...) literal is an Object[] in Windows PowerShell and can make the
+    # subsequent addition fail with "does not contain op_Addition".
+    [int]$sampleOffset25 = [int][Math]::Floor($expectedWidth * 0.25)
+    [int]$sampleOffset50 = [int][Math]::Floor($expectedWidth * 0.50)
+    [int]$sampleOffset75 = [int][Math]::Floor($expectedWidth * 0.75)
+    [int]$sampleColumn25 = $expectedLeft + $sampleOffset25
+    [int]$sampleColumn50 = $expectedLeft + $sampleOffset50
+    [int]$sampleColumn75 = $expectedLeft + $sampleOffset75
+    foreach ($column in @($sampleColumn25, $sampleColumn50, $sampleColumn75)) {
+        [int]$columnHitCount = [int]$columnHits[[int]$column]
+        Assert-E2E ($columnHitCount -ge $minimumSampleHits) `
+            "Past graph idle-band color is missing at expected x=$column (hits=$columnHitCount minimum=$minimumSampleHits)."
+    }
+    Assert-E2E ($coveredColumns -ge $minimumCoveredColumns) `
+        "Past graph idle-band has insufficient horizontal coverage (columns=$coveredColumns expected>=$minimumCoveredColumns)."
+    [int]$minimumTotalHits = [Math]::Max(100, $minimumCoveredColumns * $minimumColumnHits)
+    Assert-E2E ($hits -ge $minimumTotalHits) `
+        "Past graph has insufficient idle-band color pixels in the expected interval (hits=$hits expected>=$minimumTotalHits)."
+
+    return [pscustomobject]@{
+        Hits = $hits
+        CoveredColumns = $coveredColumns
+        ExpectedColumns = $expectedWidth
+        SampleColumns = @($sampleColumn25, $sampleColumn50, $sampleColumn75)
+        MinimumColumnHits = $minimumColumnHits
+        MinimumSampleHits = $minimumSampleHits
+        ScanHeight = $scanHeight
+    }
+}
+
+function Assert-E2EGraphHasIdleBand {
+    param(
+        [Parameter(Mandatory = $true)][System.Windows.Automation.AutomationElement]$Plot,
+        [Parameter(Mandatory = $true)][IntPtr]$Handle,
+        [Parameter(Mandatory = $true)][psobject]$Capture,
+        [double]$ExpectedStartFraction = 0.01,
+        [double]$ExpectedEndFraction = 0.35
+    )
+
+    # UIA is responsible only for locating the plot rectangle.  The bounded
+    # pixel contract is shared with the finite bitmap self-test below.
+    $window = Get-E2EWindowBounds $Handle
+    $plotBounds = $Plot.Current.BoundingRectangle
+    $bitmap = [System.Drawing.Bitmap]::FromFile($Capture.Path)
+    try {
+        [int]$left = [Math]::Max(0, [int]($plotBounds.Left - $window.Left))
+        [int]$top = [Math]::Max(0, [int]($plotBounds.Top - $window.Top))
+        [int]$right = [Math]::Min($bitmap.Width, [int]($plotBounds.Right - $window.Left))
+        [int]$bottom = [Math]::Min($bitmap.Height, [int]($plotBounds.Bottom - $window.Top))
+        $result = Assert-E2EGraphIdleBandBitmap -Bitmap $bitmap -Left $left -Top $top -Right $right -Bottom $bottom `
+            -ExpectedStartFraction $ExpectedStartFraction -ExpectedEndFraction $ExpectedEndFraction
+    }
+    finally {
+        $bitmap.Dispose()
+    }
+    Write-E2E ("graph-past-idle-band: PASS pixels={0} columns={1}/{2} range={3}-{4} color=#3F5D7C opacity=0.22" -f
+        $result.Hits, $result.CoveredColumns, $result.ExpectedColumns, $ExpectedStartFraction, $ExpectedEndFraction)
 }
 
 function Assert-E2EQuotaGaugePalette {
@@ -641,24 +1526,324 @@ function Assert-E2EQuotaGaugePalette {
     Write-E2E 'main-quota-gauge: seven cells, two X-authority surface colors, and half-period boundary PASS'
 }
 
+function Get-E2EFixtureHeaderValues {
+    param(
+        [Parameter(Mandatory = $true)][psobject]$Response,
+        [Parameter(Mandatory = $true)][string]$Name
+    )
+
+    if ($null -eq $Response.Headers) {
+        return @()
+    }
+    foreach ($key in $Response.Headers.Keys) {
+        if ([StringComparer]::OrdinalIgnoreCase.Equals([string]$key, $Name)) {
+            return @($Response.Headers[$key])
+        }
+    }
+    return @()
+}
+
+function Invoke-E2EFixtureRawRequest {
+    param(
+        [Parameter(Mandatory = $true)]
+        [ValidateSet('/v1/health', '/v1/status', '/v1/details')]
+        [string]$Path
+    )
+
+    $request = [System.Net.HttpWebRequest]::Create("http://127.0.0.1:$($script:e2eFixturePort)$Path")
+    $request.Method = 'GET'
+    $request.KeepAlive = $false
+    $request.Headers.Add('X-Codex-Info-E2E-Phase', 'preflight')
+    $response = $null
+    $stream = $null
+    $reader = $null
+    try {
+        try {
+            $response = [System.Net.HttpWebResponse]$request.GetResponse()
+        }
+        catch [System.Net.WebException] {
+            if ($null -eq $_.Exception.Response) {
+                throw
+            }
+            $response = [System.Net.HttpWebResponse]$_.Exception.Response
+        }
+        $stream = $response.GetResponseStream()
+        $reader = [System.IO.StreamReader]::new($stream, [System.Text.Encoding]::UTF8)
+        $body = $reader.ReadToEnd()
+        $headers = [ordered]@{}
+        foreach ($headerName in $response.Headers.AllKeys) {
+            $headers[$headerName] = @($response.Headers.GetValues($headerName))
+        }
+        return [pscustomobject]@{
+            Path = $Path
+            StatusCode = [int]$response.StatusCode
+            StatusDescription = [string]$response.StatusDescription
+            Headers = $headers
+            Body = $body
+        }
+    }
+    finally {
+        if ($null -ne $reader) { $reader.Dispose() }
+        if ($null -ne $stream) { $stream.Dispose() }
+        if ($null -ne $response) { $response.Dispose() }
+    }
+}
+
+function Assert-E2EFixtureJsonKeys {
+    param(
+        [Parameter(Mandatory = $true)][psobject]$Json,
+        [Parameter(Mandatory = $true)][string[]]$Expected,
+        [Parameter(Mandatory = $true)][string]$Endpoint
+    )
+
+    $actual = @($Json.PSObject.Properties | ForEach-Object { [string]$_.Name })
+    $missing = @($Expected | Where-Object { $actual -notcontains $_ })
+    $unexpected = @($actual | Where-Object { $Expected -notcontains $_ })
+    Assert-E2E ($actual.Count -eq $Expected.Count -and $missing.Count -eq 0 -and $unexpected.Count -eq 0) "$Endpoint top-level keys are not exact: actual=$($actual -join ',') missing=$($missing -join ',') unexpected=$($unexpected -join ',')"
+}
+
+function Assert-E2EFixtureNumericProperty {
+    param(
+        [Parameter(Mandatory = $true)][psobject]$Json,
+        [Parameter(Mandatory = $true)][string]$Name,
+        [switch]$Integer,
+        [double]$Minimum = 0,
+        [double]$Maximum = [double]::PositiveInfinity
+    )
+
+    $property = $Json.PSObject.Properties[$Name]
+    Assert-E2E ($null -ne $property) "Fixture numeric property is missing: $Name."
+    $value = $property.Value
+    $isNumeric = $value -is [System.Byte] -or $value -is [System.SByte] -or
+        $value -is [System.Int16] -or $value -is [System.UInt16] -or
+        $value -is [System.Int32] -or $value -is [System.UInt32] -or
+        $value -is [System.Int64] -or $value -is [System.UInt64] -or
+        $value -is [System.Single] -or $value -is [System.Double] -or
+        $value -is [System.Decimal]
+    Assert-E2E $isNumeric "Fixture numeric property has an invalid JSON number kind: $Name."
+    $number = [double]$value
+    Assert-E2E (-not [double]::IsNaN($number) -and -not [double]::IsInfinity($number)) "Fixture numeric property is not finite: $Name."
+    Assert-E2E ($number -ge $Minimum -and $number -le $Maximum) "Fixture numeric property is outside its range: $Name=$number."
+    if ($Integer) {
+        Assert-E2E ($number -le [double][Int64]::MaxValue) "Fixture integer property exceeds Int64 range: $Name=$number."
+        Assert-E2E ($number -eq [Math]::Truncate($number)) "Fixture integer property is not integral: $Name=$number."
+        return [Int64]$number
+    }
+    return $number
+}
+
+function Assert-E2EFixtureHistorySamples {
+    param([Parameter(Mandatory = $true)][psobject]$DetailsJson)
+
+    $historyGapsProperty = @($DetailsJson.PSObject.Properties | Where-Object { $_.Name -eq 'history_gaps' })
+    Assert-E2E ($historyGapsProperty.Count -eq 1 -and $historyGapsProperty[0].Value -is [System.Array]) 'Fixture details history_gaps must be an array.'
+    $periodsProperty = @($DetailsJson.PSObject.Properties | Where-Object { $_.Name -eq 'history_periods' })
+    Assert-E2E ($periodsProperty.Count -eq 1 -and $periodsProperty[0].Value -is [System.Array]) 'Fixture details history_periods must be an array.'
+    $periods = @($DetailsJson.history_periods)
+    Assert-E2E ($periods.Count -eq 2) "Fixture details history_periods count changed: $($periods.Count)."
+    $expectedPeriodKeys = @('id', 'start_at', 'end_at', 'reset_at', 'label', 'current')
+    $periodRecords = @()
+    $periodIds = @{}
+    $periodResets = @{}
+    $currentPeriodCount = 0
+    foreach ($period in $periods) {
+        Assert-E2EFixtureJsonKeys -Json $period -Expected $expectedPeriodKeys -Endpoint 'Fixture history period'
+        $idProperty = $period.PSObject.Properties['id']
+        $labelProperty = $period.PSObject.Properties['label']
+        $currentProperty = $period.PSObject.Properties['current']
+        Assert-E2E ($null -ne $idProperty -and $idProperty.Value -is [string] -and -not [string]::IsNullOrWhiteSpace([string]$idProperty.Value)) 'Fixture history period id must be a non-empty string.'
+        Assert-E2E ($null -ne $labelProperty -and $labelProperty.Value -is [string] -and -not [string]::IsNullOrWhiteSpace([string]$labelProperty.Value)) 'Fixture history period label must be a non-empty string.'
+        Assert-E2E ($null -ne $currentProperty -and $currentProperty.Value -is [bool]) 'Fixture history period current must be boolean.'
+        $periodId = [string]$idProperty.Value
+        Assert-E2E (-not $periodIds.ContainsKey($periodId)) "Fixture history period id is duplicated: $periodId."
+        $periodIds[$periodId] = $true
+        $periodStart = Assert-E2EFixtureNumericProperty -Json $period -Name 'start_at' -Integer
+        $periodEnd = Assert-E2EFixtureNumericProperty -Json $period -Name 'end_at' -Integer
+        $periodReset = Assert-E2EFixtureNumericProperty -Json $period -Name 'reset_at' -Integer
+        Assert-E2E ($periodEnd -ge $periodStart) "Fixture history period bounds are inverted: $periodId."
+        Assert-E2E ($periodReset -gt $periodStart) "Fixture history period reset_at is not after start_at: $periodId."
+        Assert-E2E (-not $periodResets.ContainsKey([string]$periodReset)) "Fixture history period reset identity is duplicated: $periodReset."
+        $periodResets[[string]$periodReset] = $true
+        if ([bool]$currentProperty.Value) { $currentPeriodCount++ }
+        $periodRecords += [pscustomobject]@{
+            Id = $periodId
+            StartAt = $periodStart
+            EndAt = $periodEnd
+            ResetAt = $periodReset
+        }
+    }
+    Assert-E2E ($currentPeriodCount -eq 1) "Fixture history periods must have exactly one current period: count=$currentPeriodCount."
+
+    $samplesProperty = @($DetailsJson.PSObject.Properties | Where-Object { $_.Name -eq 'history_samples' })
+    Assert-E2E ($samplesProperty.Count -eq 1 -and $samplesProperty[0].Value -is [System.Array]) 'Fixture details history_samples must be an array.'
+    $samples = @($DetailsJson.history_samples)
+    Assert-E2E ($samples.Count -eq 5) "Fixture details history_samples count changed: $($samples.Count)."
+    $expectedSampleKeys = @(
+        'timestamp', 'reset_at', 'remaining_percent',
+        'sol_dollars', 'terra_dollars', 'luna_dollars',
+        'sol_tokens', 'terra_tokens', 'luna_tokens'
+    )
+    $seenSampleKeys = @{}
+    $hasPreviousSample = $false
+    $previousReset = [Int64]::MinValue
+    $previousTimestamp = [Int64]::MinValue
+    foreach ($sample in $samples) {
+        Assert-E2EFixtureJsonKeys -Json $sample -Expected $expectedSampleKeys -Endpoint 'Fixture history sample'
+        $timestamp = Assert-E2EFixtureNumericProperty -Json $sample -Name 'timestamp' -Integer
+        $reset = Assert-E2EFixtureNumericProperty -Json $sample -Name 'reset_at' -Integer
+        $null = Assert-E2EFixtureNumericProperty -Json $sample -Name 'remaining_percent' -Minimum 0 -Maximum 100
+        $null = Assert-E2EFixtureNumericProperty -Json $sample -Name 'sol_dollars' -Minimum 0
+        $null = Assert-E2EFixtureNumericProperty -Json $sample -Name 'terra_dollars' -Minimum 0
+        $null = Assert-E2EFixtureNumericProperty -Json $sample -Name 'luna_dollars' -Minimum 0
+        $null = Assert-E2EFixtureNumericProperty -Json $sample -Name 'sol_tokens' -Integer
+        $null = Assert-E2EFixtureNumericProperty -Json $sample -Name 'terra_tokens' -Integer
+        $null = Assert-E2EFixtureNumericProperty -Json $sample -Name 'luna_tokens' -Integer
+        Assert-E2E (($timestamp % 60) -eq 0) "Fixture history sample timestamp must be minute bucket aligned (timestamp % 60 == 0): $timestamp."
+        $matchingPeriods = @($periodRecords | Where-Object { $_.ResetAt -eq $reset })
+        Assert-E2E ($matchingPeriods.Count -eq 1) "Fixture history sample reset_at has no unique period identity: $reset."
+        $period = $matchingPeriods[0]
+        Assert-E2E ($timestamp -ge $period.StartAt -and $timestamp -le $period.EndAt) "Fixture history sample timestamp is outside its period bounds: period=$($period.Id) timestamp=$timestamp."
+        $sampleKey = '{0}:{1}' -f $reset, $timestamp
+        Assert-E2E (-not $seenSampleKeys.ContainsKey($sampleKey)) "Fixture history sample identity is duplicated: $sampleKey."
+        $seenSampleKeys[$sampleKey] = $true
+        if ($hasPreviousSample) {
+            Assert-E2E ($reset -gt $previousReset -or ($reset -eq $previousReset -and $timestamp -ge $previousTimestamp)) "Fixture history_samples are not ordered by (reset_at,timestamp): previous=($previousReset,$previousTimestamp) current=($reset,$timestamp)."
+        }
+        $previousReset = $reset
+        $previousTimestamp = $timestamp
+        $hasPreviousSample = $true
+    }
+    return $true
+}
+
+function Assert-E2EFixtureWireContract {
+    param(
+        [Parameter(Mandatory = $true)][psobject]$Health,
+        [Parameter(Mandatory = $true)][psobject]$Status,
+        [Parameter(Mandatory = $true)][psobject]$Details
+    )
+
+    Assert-E2E ($Health.StatusCode -eq 200) "Fixture health status is not HTTP 200: $($Health.StatusCode)."
+    Assert-E2E ($Status.StatusCode -eq 200) "Fixture status status is not HTTP 200: $($Status.StatusCode)."
+    Assert-E2E ($Details.StatusCode -eq 200) "Fixture details status is not HTTP 200: $($Details.StatusCode)."
+
+    $healthPairs = @(Get-E2EFixtureHeaderValues -Response $Health -Name 'Codex-Info-Published-Pair')
+    $statusPairs = @(Get-E2EFixtureHeaderValues -Response $Status -Name 'Codex-Info-Published-Pair')
+    $detailsPairs = @(Get-E2EFixtureHeaderValues -Response $Details -Name 'Codex-Info-Published-Pair')
+    Assert-E2E ($healthPairs.Count -eq 0) "Fixture health must not expose Codex-Info-Published-Pair: count=$($healthPairs.Count)."
+    Assert-E2E ($statusPairs.Count -eq 1) "Fixture status must expose exactly one Codex-Info-Published-Pair: count=$($statusPairs.Count)."
+    Assert-E2E ($detailsPairs.Count -eq 1) "Fixture details must expose exactly one Codex-Info-Published-Pair: count=$($detailsPairs.Count)."
+    $statusPair = [string]$statusPairs[0]
+    $detailsPair = [string]$detailsPairs[0]
+    Assert-E2E ($statusPair -cmatch '^v1:[0-9a-f]{64}$') "Fixture status published pair is not canonical lowercase v1/sha256: '$statusPair'."
+    Assert-E2E ($detailsPair -cmatch '^v1:[0-9a-f]{64}$') "Fixture details published pair is not canonical lowercase v1/sha256: '$detailsPair'."
+    Assert-E2E ($statusPair -ceq $detailsPair) 'Fixture status/details published pair mismatch.'
+
+    try {
+        $statusJson = ConvertFrom-Json -InputObject ([string]$Status.Body)
+    }
+    catch {
+        throw "Fixture status body is not valid JSON: $($_.Exception.Message)"
+    }
+    try {
+        $detailsJson = ConvertFrom-Json -InputObject ([string]$Details.Body)
+    }
+    catch {
+        throw "Fixture details body is not valid JSON: $($_.Exception.Message)"
+    }
+    $expectedStatusKeys = @(
+        'api_version', 'state', 'observed_at', 'authenticated',
+        'plan_label', 'quota', 'models', 'active_thread_count'
+    )
+    $expectedDetailsKeys = @(
+        'api_version', 'state', 'observed_at', 'authenticated',
+        'plan_label', 'quota', 'models', 'active_thread_count',
+        'history_periods', 'history_gaps', 'history_samples',
+        'threads', 'estimated_cost_label'
+    )
+    Assert-E2EFixtureJsonKeys -Json $statusJson -Expected $expectedStatusKeys -Endpoint 'Fixture status'
+    Assert-E2EFixtureJsonKeys -Json $detailsJson -Expected $expectedDetailsKeys -Endpoint 'Fixture details'
+
+    Assert-E2EFixtureHistorySamples -DetailsJson $detailsJson | Out-Null
+    return $true
+}
+
+function Assert-E2EFixturePreflightResponses {
+    param(
+        [Parameter(Mandatory = $true)][psobject]$Health,
+        [Parameter(Mandatory = $true)][psobject]$Status,
+        [Parameter(Mandatory = $true)][psobject]$Details
+    )
+    Assert-E2EFixtureWireContract -Health $Health -Status $Status -Details $Details | Out-Null
+    return $true
+}
+
+function Invoke-E2EFixturePreflight {
+    $responses = [ordered]@{}
+    foreach ($requestSpec in @(
+            @{ Name = 'health'; Path = '/v1/health' },
+            @{ Name = 'status'; Path = '/v1/status' },
+            @{ Name = 'details'; Path = '/v1/details' })) {
+        $response = Invoke-E2EFixtureRawRequest -Path $requestSpec.Path
+        $responses[$requestSpec.Name] = $response
+        $pairCount = @(Get-E2EFixtureHeaderValues -Response $response -Name 'Codex-Info-Published-Pair').Count
+        $rawPath = Join-Path $script:e2eOutput ("fixture-preflight-{0}.raw.json" -f $requestSpec.Name)
+        [IO.File]::WriteAllText($rawPath, [string]$response.Body, [Text.UTF8Encoding]::new($false))
+        Write-E2E ("fixture-preflight: request={0} status={1} pair-count={2} body-bytes={3} raw={4}" -f
+            $requestSpec.Name, $response.StatusCode, $pairCount, ([Text.Encoding]::UTF8.GetByteCount([string]$response.Body)), $rawPath)
+    }
+    Assert-E2EFixturePreflightResponses -Health $responses['health'] -Status $responses['status'] -Details $responses['details'] | Out-Null
+    Write-E2E 'fixture-preflight: PASS (health/status/details raw responses satisfy strict wire contract)'
+    return [pscustomobject]@{
+        Health = $responses['health']
+        Status = $responses['status']
+        Details = $responses['details']
+    }
+}
+
 function New-E2EFixtureDocuments {
-    $now = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+    $rawNow = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+    $now = $rawNow - ($rawNow % 60)
     $currentStart = $now - 7200
     $currentReset = $now + 7200
     $pastStart = $now - 25200
     $pastReset = $now - 14400
+    $publishedPair = 'v1:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef'
     $status = @"
 {"api_version":"v1","state":"ready","observed_at":$now,"authenticated":true,"plan_label":"Pro","quota":{"remaining_percent":72.0,"reset_at":$currentReset,"window_seconds":14400,"monthly":false},"models":[{"name":"SOL","input_tokens":1200,"cached_input_tokens":200,"output_tokens":400},{"name":"TERRA","input_tokens":2400,"cached_input_tokens":500,"output_tokens":800},{"name":"LUNA","input_tokens":3600,"cached_input_tokens":700,"output_tokens":1100}],"active_thread_count":3}
 "@
     # Keep this wire fixture as explicit JSON.  The details endpoint is a
-    # strict twelve-field contract; serializing nested PowerShell dictionaries
+    # strict thirteen-field contract; serializing nested PowerShell dictionaries
     # can silently change null/number kinds between Windows PowerShell builds.
     $details = @"
-{"api_version":"v1","state":"ready","observed_at":$now,"authenticated":true,"plan_label":"Pro","quota":{"remaining_percent":72.0,"reset_at":$currentReset,"window_seconds":14400,"monthly":false},"models":[{"name":"SOL","input_tokens":1200,"cached_input_tokens":200,"output_tokens":400,"input_dollars":1.20,"cached_input_dollars":0.20,"output_dollars":0.40},{"name":"TERRA","input_tokens":2400,"cached_input_tokens":500,"output_tokens":800,"input_dollars":2.40,"cached_input_dollars":0.50,"output_dollars":0.80},{"name":"LUNA","input_tokens":3600,"cached_input_tokens":700,"output_tokens":1100,"input_dollars":3.60,"cached_input_dollars":0.70,"output_dollars":1.10}],"active_thread_count":3,"history_periods":[{"id":"e2e-current","start_at":$currentStart,"end_at":$now,"reset_at":$currentReset,"label":"Current period","current":true},{"id":"e2e-past","start_at":$pastStart,"end_at":$pastReset,"reset_at":$pastReset,"label":"Past period","current":false}],"history_samples":[{"timestamp":$($currentStart + 60),"reset_at":$currentReset,"remaining_percent":92.0,"sol_dollars":0.25,"terra_dollars":0.50,"luna_dollars":0.75,"sol_tokens":100,"terra_tokens":200,"luna_tokens":300},{"timestamp":$($now - 60),"reset_at":$currentReset,"remaining_percent":72.0,"sol_dollars":1.20,"terra_dollars":2.40,"luna_dollars":3.60,"sol_tokens":1200,"terra_tokens":2400,"luna_tokens":3600},{"timestamp":$($pastStart + 60),"reset_at":$pastReset,"remaining_percent":98.0,"sol_dollars":0.10,"terra_dollars":0.20,"luna_dollars":0.30,"sol_tokens":50,"terra_tokens":100,"luna_tokens":150},{"timestamp":$($pastReset - 60),"reset_at":$pastReset,"remaining_percent":84.0,"sol_dollars":0.60,"terra_dollars":1.20,"luna_dollars":1.80,"sol_tokens":600,"terra_tokens":1200,"luna_tokens":1800}],"threads":[{"id":"e2e-root","title":"E2E root task","parent_thread_id":null,"model":"TERRA","model_label":"TERRA","total_tokens":2400,"context_usage_tokens":800,"context_window_tokens":16000,"created_at":$($now - 3600),"last_user_message_at":$($now - 300),"is_subagent":false,"depth":0},{"id":"e2e-child","title":"E2E child task","parent_thread_id":"e2e-root","model":"LUNA","model_label":"LUNA","total_tokens":1200,"context_usage_tokens":400,"context_window_tokens":16000,"created_at":$($now - 2400),"last_user_message_at":$($now - 600),"is_subagent":true,"depth":1},{"id":"e2e-orphan","title":"E2E orphan task","parent_thread_id":"missing-parent","model":"SOL","model_label":"SOL","total_tokens":600,"context_usage_tokens":null,"context_window_tokens":null,"created_at":$($now - 1200),"last_user_message_at":null,"is_subagent":true,"depth":null}],"estimated_cost_label":"USD 12.34"}
+{"api_version":"v1","state":"ready","observed_at":$now,"authenticated":true,"plan_label":"Pro","quota":{"remaining_percent":72.0,"reset_at":$currentReset,"window_seconds":14400,"monthly":false},"models":[{"name":"SOL","input_tokens":1200,"cached_input_tokens":200,"output_tokens":400,"input_dollars":1.20,"cached_input_dollars":0.20,"output_dollars":0.40},{"name":"TERRA","input_tokens":2400,"cached_input_tokens":500,"output_tokens":800,"input_dollars":2.40,"cached_input_dollars":0.50,"output_dollars":0.80},{"name":"LUNA","input_tokens":3600,"cached_input_tokens":700,"output_tokens":1100,"input_dollars":3.60,"cached_input_dollars":0.70,"output_dollars":1.10}],"active_thread_count":3,"history_periods":[{"id":"e2e-current","start_at":$currentStart,"end_at":$now,"reset_at":$currentReset,"label":"Current period","current":true},{"id":"e2e-past","start_at":$pastStart,"end_at":$pastReset,"reset_at":$pastReset,"label":"Past period","current":false}],"history_samples":[{"timestamp":$($currentStart + 60),"reset_at":$currentReset,"remaining_percent":92.0,"sol_dollars":0.25,"terra_dollars":0.50,"luna_dollars":0.75,"sol_tokens":100,"terra_tokens":200,"luna_tokens":300},{"timestamp":$($now - 60),"reset_at":$currentReset,"remaining_percent":72.0,"sol_dollars":1.20,"terra_dollars":2.40,"luna_dollars":3.60,"sol_tokens":1200,"terra_tokens":2400,"luna_tokens":3600},{"timestamp":$($pastStart + 60),"reset_at":$pastReset,"remaining_percent":98.0,"sol_dollars":0.10,"terra_dollars":0.20,"luna_dollars":0.30,"sol_tokens":50,"terra_tokens":100,"luna_tokens":150},{"timestamp":$($pastStart + 3600),"reset_at":$pastReset,"remaining_percent":98.0,"sol_dollars":0.10,"terra_dollars":0.20,"luna_dollars":0.30,"sol_tokens":50,"terra_tokens":100,"luna_tokens":150},{"timestamp":$($pastReset - 60),"reset_at":$pastReset,"remaining_percent":84.0,"sol_dollars":0.60,"terra_dollars":1.20,"luna_dollars":1.80,"sol_tokens":600,"terra_tokens":1200,"luna_tokens":1800}],"threads":[{"id":"e2e-root","title":"E2E root task","parent_thread_id":null,"model":"TERRA","model_label":"TERRA","total_tokens":2400,"context_usage_tokens":800,"context_window_tokens":16000,"created_at":$($now - 3600),"last_user_message_at":$($now - 300),"is_subagent":false,"depth":0},{"id":"e2e-child","title":"E2E child task","parent_thread_id":"e2e-root","model":"LUNA","model_label":"LUNA","total_tokens":1200,"context_usage_tokens":400,"context_window_tokens":16000,"created_at":$($now - 2400),"last_user_message_at":$($now - 600),"is_subagent":true,"depth":1},{"id":"e2e-orphan","title":"E2E orphan task","parent_thread_id":"missing-parent","model":"SOL","model_label":"SOL","total_tokens":600,"context_usage_tokens":null,"context_window_tokens":null,"created_at":$($now - 1200),"last_user_message_at":null,"is_subagent":true,"depth":null}],"estimated_cost_label":"USD 12.34"}
 "@
+    # Keep the explicit sample values above while enforcing the wire order
+    # independently of PowerShell object serialization: past -> current.
+    $details = $details.Replace(',"history_samples":[', ',"history_gaps":[],"history_samples":[')
+    $historySamplesMarker = '"history_samples":['
+    $historySamplesStart = $details.IndexOf($historySamplesMarker)
+    $historySamplesEnd = $details.IndexOf('],"threads"', $historySamplesStart)
+    if ($historySamplesStart -lt 0 -or $historySamplesEnd -lt 0) {
+        throw 'Fixture details history_samples boundary is missing.'
+    }
+    $historySamplesBodyStart = $historySamplesStart + $historySamplesMarker.Length
+    $historySamplesBody = $details.Substring($historySamplesBodyStart, $historySamplesEnd - $historySamplesBodyStart)
+    $sampleObjects = @([regex]::Matches($historySamplesBody, '\{[^{}]+\}') | ForEach-Object { $_.Value })
+    if ($sampleObjects.Count -ne 5) {
+        throw "Fixture details history_samples expected five objects, found $($sampleObjects.Count)."
+    }
+    $orderedSampleObjects = @(
+        $sampleObjects[2], $sampleObjects[3], $sampleObjects[4],
+        $sampleObjects[0], $sampleObjects[1]
+    )
+    $details = $details.Substring(0, $historySamplesBodyStart) +
+        ($orderedSampleObjects -join ',') +
+        $details.Substring($historySamplesEnd)
     return [pscustomobject]@{
         Status = $status.Trim()
         Details = $details.Trim()
+        PublishedPair = $publishedPair
         Now = $now
     }
 }
@@ -681,9 +1866,9 @@ function Enter-E2EFixture {
     New-Item -ItemType Directory -Path $settingsDirectory -Force | Out-Null
     $settingsJson = '{"language":"en","setupCompleted":true,"connectionConfigured":true,"timeZoneId":"UTC","connectionProfile":"none","connectionSelector":"none"}'
     [IO.File]::WriteAllText($script:e2eSettingsPath, $settingsJson, [Text.UTF8Encoding]::new($false))
-    Assert-E2E ([CodexInfoWindowsE2EFixtureServer]::Start($documents.Status, $documents.Details, 8787)) 'Could not bind the fixture to loopback port 8787.'
+    Assert-E2E ([CodexInfoWindowsE2EFixtureServer]::Start($documents.Status, $documents.Details, $documents.PublishedPair, $script:e2eFixturePort)) "Could not bind the fixture to loopback port $script:e2eFixturePort."
     $script:e2eFixtureRunning = $true
-    Write-E2E "fixture: PASS periods=2 threads=3 endpoint=http://127.0.0.1:8787"
+    Write-E2E "fixture: PASS periods=2 threads=3 endpoint=http://127.0.0.1:$script:e2eFixturePort"
 }
 
 function Exit-E2EFixture {
@@ -700,6 +1885,353 @@ function Exit-E2EFixture {
     if (Test-Path -LiteralPath $script:e2eSettingsBackup -PathType Leaf) {
         Remove-Item -LiteralPath $script:e2eSettingsBackup -Force
     }
+}
+
+function New-E2EContractTestResponse {
+    param(
+        [Parameter(Mandatory = $true)][int]$StatusCode,
+        [Parameter(Mandatory = $true)][string]$Body,
+        [Parameter(Mandatory = $true)][System.Collections.IDictionary]$Headers
+    )
+    return [pscustomobject]@{
+        StatusCode = $StatusCode
+        Headers = $Headers
+        Body = $Body
+    }
+}
+
+function Assert-E2EExpectedContractFailure {
+    param(
+        [Parameter(Mandatory = $true)][string]$Name,
+        [Parameter(Mandatory = $true)][psobject]$Health,
+        [Parameter(Mandatory = $true)][psobject]$Status,
+        [Parameter(Mandatory = $true)][psobject]$Details,
+        [string]$ExpectedReason = ''
+    )
+    try {
+        Assert-E2EFixturePreflightResponses -Health $Health -Status $Status -Details $Details | Out-Null
+    }
+    catch {
+        if (-not [string]::IsNullOrWhiteSpace($ExpectedReason) -and $_.Exception.Message -notlike "*$ExpectedReason*") {
+            throw "fixture-contract-negative: FAIL case=$Name returned an unexpected reason: $($_.Exception.Message)"
+        }
+        Write-E2E "fixture-contract-negative: PASS case=$Name failure=$($_.Exception.Message)"
+        return
+    }
+    throw "fixture-contract-negative: FAIL case=$Name unexpectedly passed."
+}
+
+function New-E2EGraphOracleSyntheticBitmap {
+    param(
+        [ValidateSet('valid', 'valid-offset', 'missing-flat', 'label-vertical-only', 'wrong-geometry', 'wrong-order', 'sloped', 'wrong-background', 'axis-row-missing-terra', 'axis-row-missing-sol', 'wrong-endpoint', 'short-rise', 'detached-rise', 'missing-series-contribution', 'non-contiguous')]
+        [string]$Variant = 'valid'
+    )
+
+    $width = 120
+    $height = 100
+    $bitmap = [System.Drawing.Bitmap]::new($width, $height)
+    $idleBackground = Get-E2EGraphIdleBackgroundColor
+    for ($x = 0; $x -lt $width; $x++) {
+        for ($y = 0; $y -lt $height; $y++) {
+            $bitmap.SetPixel($x, $y, $idleBackground)
+        }
+    }
+    $flatLeft = [int][Math]::Floor($width * 0.06)
+    $flatRight = [int][Math]::Floor($width * 0.84)
+    $risingCenter = [int][Math]::Floor($width * 0.84)
+    $syntheticLayout = @{
+        LUNA = [pscustomobject]@{ FlatCenterFraction = 0.728; RiseTopFraction = 0.140 }
+        TERRA = [pscustomobject]@{ FlatCenterFraction = 0.766; RiseTopFraction = 0.375 }
+        SOL = [pscustomobject]@{ FlatCenterFraction = 0.806; RiseTopFraction = 0.610 }
+    }
+    $seriesIndex = 0
+    foreach ($item in (Get-E2EGraphOracleSeries)) {
+        $layout = $syntheticLayout[$item.Name]
+        $flatCenter = [int][Math]::Round($height * $layout.FlatCenterFraction)
+        if ($Variant -eq 'valid-offset') {
+            $flatCenter += 14
+        }
+        if ($Variant -eq 'wrong-order') {
+            if ($item.Name -eq 'LUNA') { $flatCenter = [int][Math]::Round($height * $syntheticLayout.SOL.FlatCenterFraction) }
+            elseif ($item.Name -eq 'SOL') { $flatCenter = [int][Math]::Round($height * $syntheticLayout.LUNA.FlatCenterFraction) }
+        }
+        $drawFlat = $Variant -notin @('missing-flat', 'label-vertical-only')
+        if ($Variant -eq 'wrong-geometry') {
+            if ($item.Name -eq 'LUNA') { $flatCenter = [int][Math]::Round($height * 0.79) }
+            elseif ($item.Name -eq 'TERRA') { $flatCenter = [int][Math]::Round($height * 0.80) }
+            else { $flatCenter = [int][Math]::Round($height * 0.81) }
+        }
+        if ($drawFlat) {
+            $flatColor = if ($Variant -eq 'wrong-background') {
+                [System.Drawing.Color]::White
+            }
+            elseif ($Variant -eq 'axis-row-missing-terra' -and $item.Name -eq 'TERRA') {
+                [System.Drawing.ColorTranslator]::FromHtml('#263548')
+            }
+            elseif ($Variant -eq 'axis-row-missing-sol' -and $item.Name -eq 'SOL') {
+                [System.Drawing.ColorTranslator]::FromHtml('#263548')
+            }
+            elseif ($item.Name -eq 'TERRA') {
+                Get-E2EGraphCompositedColor -Background $idleBackground -Series $item.Color -Alpha 0.25
+            }
+            else {
+                Get-E2EGraphCompositedColor -Background $idleBackground -Series $item.Color -Alpha 0.45
+            }
+            for ($x = $flatLeft; $x -lt $flatRight; $x++) {
+                if ($Variant -eq 'sloped') {
+                    $lineCenter = $flatCenter + [int][Math]::Round((($x - $flatLeft) / [double]($flatRight - $flatLeft)) * 24)
+                }
+                else {
+                    $lineCenter = $flatCenter
+                }
+                for ($offset = -1; $offset -le 1; $offset++) {
+                    $lineY = $lineCenter + $offset
+                    if ($lineY -ge 0 -and $lineY -lt $height) {
+                        $bitmap.SetPixel($x, $lineY, $flatColor)
+                    }
+                }
+            }
+        }
+        $drawRise = $Variant -ne 'missing-series-contribution' -or $item.Name -ne 'TERRA'
+        $riseX = $risingCenter
+        if ($Variant -in @('wrong-geometry', 'wrong-endpoint')) {
+            $riseX = $flatLeft - 20 + $seriesIndex
+        }
+        $riseTop = [int][Math]::Floor($height * $layout.RiseTopFraction)
+        if ($Variant -eq 'valid-offset') {
+            $riseTop += 14
+        }
+        if ($Variant -eq 'short-rise') {
+            $riseTop = $flatCenter - 8
+        }
+        if ($Variant -eq 'wrong-endpoint') {
+            $riseTop = [int][Math]::Floor($height * $layout.RiseTopFraction)
+        }
+        $riseBottom = $flatCenter + 2
+        if ($Variant -eq 'detached-rise') {
+            $riseBottom = $flatCenter - 8
+        }
+        if ($drawRise) {
+            for ($y = $riseTop; $y -le $riseBottom; $y++) {
+                if ($riseX -ge 0 -and $riseX -lt $width -and $y -ge 0 -and $y -lt $height) {
+                    $bitmap.SetPixel($riseX, $y, $item.Color)
+                }
+            }
+            if ($riseX + 1 -ge 0 -and $riseX + 1 -lt $width) {
+                for ($y = $riseTop; $y -le $riseBottom; $y++) {
+                    if ($y -ge 0 -and $y -lt $height) {
+                        $bitmap.SetPixel($riseX + 1, $y, $item.Color)
+                    }
+                }
+            }
+        }
+        $seriesIndex++
+    }
+    if ($Variant -eq 'non-contiguous') {
+        for ($x = $risingCenter; $x -le ($risingCenter + 1); $x++) {
+            for ($y = 60; $y -le 70; $y++) {
+                $bitmap.SetPixel($x, $y, $idleBackground)
+            }
+        }
+    }
+    return $bitmap
+}
+
+function New-E2EGraphIdleBandSyntheticBitmap {
+    param(
+        [ValidateSet('valid', 'no-band', 'wrong-color', 'too-short', 'narrow-band', 'wrong-interval', 'wrong-sample-columns')]
+        [string]$Variant = 'valid'
+    )
+
+    [int]$width = 120
+    [int]$height = 100
+    $bitmap = [System.Drawing.Bitmap]::new($width, $height)
+    $plotBackground = [System.Drawing.ColorTranslator]::FromHtml('#101925')
+    $idleComposite = Get-E2EGraphIdleBackgroundColor
+    $wrongColor = [System.Drawing.ColorTranslator]::FromHtml('#263548')
+    for ($x = 0; $x -lt $width; $x++) {
+        for ($y = 0; $y -lt $height; $y++) {
+            $bitmap.SetPixel($x, $y, $plotBackground)
+        }
+    }
+
+    [int]$expectedLeft = [int][Math]::Floor($width * 0.01)
+    [int]$expectedRight = [int][Math]::Floor($width * 0.35)
+    [int]$expectedWidth = $expectedRight - $expectedLeft
+    [int]$scanTop = 20
+    [int]$scanBottom = $height - 20
+    [int]$sampleOffset25 = [int][Math]::Floor($expectedWidth * 0.25)
+    [int]$sampleOffset50 = [int][Math]::Floor($expectedWidth * 0.50)
+    [int]$sampleOffset75 = [int][Math]::Floor($expectedWidth * 0.75)
+    [int]$sampleColumn25 = $expectedLeft + $sampleOffset25
+    [int]$sampleColumn50 = $expectedLeft + $sampleOffset50
+    [int]$sampleColumn75 = $expectedLeft + $sampleOffset75
+
+    [bool]$drawBand = $Variant -ne 'no-band'
+    [int]$bandLeft = $expectedLeft
+    [int]$bandRight = $expectedRight
+    [int]$bandTop = $scanTop
+    [int]$bandBottom = $scanBottom
+    $bandColor = $idleComposite
+    switch ($Variant) {
+        'wrong-color' {
+            $bandColor = $wrongColor
+        }
+        'too-short' {
+            $bandTop = $scanTop + 10
+            $bandBottom = $bandTop + 4
+        }
+        'narrow-band' {
+            $bandRight = $expectedLeft + [Math]::Max(1, [int][Math]::Floor($expectedWidth * 0.15))
+        }
+        'wrong-interval' {
+            $bandLeft = [int][Math]::Floor($width * 0.55)
+            $bandRight = [int][Math]::Floor($width * 0.90)
+        }
+    }
+    if ($drawBand) {
+        for ($x = $bandLeft; $x -lt $bandRight; $x++) {
+            for ($y = $bandTop; $y -lt $bandBottom; $y++) {
+                $bitmap.SetPixel($x, $y, $bandColor)
+            }
+        }
+    }
+    if ($Variant -eq 'wrong-sample-columns') {
+        foreach ($sampleColumn in @($sampleColumn25, $sampleColumn50, $sampleColumn75)) {
+            for ($y = $scanTop; $y -lt $scanBottom; $y++) {
+                $bitmap.SetPixel([int]$sampleColumn, $y, $plotBackground)
+            }
+        }
+    }
+    return $bitmap
+}
+
+function Assert-E2EGraphIdleBandExpectedFailure {
+    param(
+        [Parameter(Mandatory = $true)][string]$Name,
+        [Parameter(Mandatory = $true)][System.Drawing.Bitmap]$Bitmap
+    )
+    try {
+        $null = Assert-E2EGraphIdleBandBitmap -Bitmap $Bitmap -Left 0 -Top 0 -Right $Bitmap.Width -Bottom $Bitmap.Height
+    }
+    catch {
+        Write-E2E "graph-idle-band-self-test: PASS case=$Name failure=$($_.Exception.Message)"
+        return
+    }
+    throw "graph-idle-band-self-test: FAIL case=$Name unexpectedly passed."
+}
+
+function Invoke-E2EGraphIdleBandSelfTest {
+    $validBitmap = New-E2EGraphIdleBandSyntheticBitmap -Variant 'valid'
+    try {
+        $validResult = Assert-E2EGraphIdleBandBitmap -Bitmap $validBitmap -Left 0 -Top 0 -Right $validBitmap.Width -Bottom $validBitmap.Height
+        Assert-E2E ($validResult.CoveredColumns -ge 32) 'Graph idle-band self-test did not establish meaningful column coverage.'
+        Assert-E2E ($validResult.ScanHeight -ge 40) 'Graph idle-band self-test did not establish meaningful vertical coverage.'
+        Write-E2E ("graph-idle-band-self-test: PASS valid composite=#1A2838 tolerance=8 pixels={0} columns={1}/{2} vertical={3}" -f
+            $validResult.Hits, $validResult.CoveredColumns, $validResult.ExpectedColumns, $validResult.ScanHeight)
+    }
+    finally {
+        $validBitmap.Dispose()
+    }
+    foreach ($variant in @('no-band', 'wrong-color', 'too-short', 'narrow-band', 'wrong-interval', 'wrong-sample-columns')) {
+        $bitmap = New-E2EGraphIdleBandSyntheticBitmap -Variant $variant
+        try {
+            Assert-E2EGraphIdleBandExpectedFailure -Name $variant -Bitmap $bitmap
+        }
+        finally {
+            $bitmap.Dispose()
+        }
+    }
+    Write-E2E 'graph-idle-band-self-test: PASS one valid composite/range and six finite negative bitmap cases'
+}
+
+function Assert-E2EGraphOracleExpectedFailure {
+    param(
+        [Parameter(Mandatory = $true)][string]$Name,
+        [Parameter(Mandatory = $true)][System.Drawing.Bitmap]$Bitmap
+    )
+    try {
+        $null = @(Assert-E2EGraphModelPixels -Bitmap $Bitmap -Left 0 -Top 0 -Right $Bitmap.Width -Bottom $Bitmap.Height)
+    }
+    catch {
+        Write-E2E "graph-oracle-self-test: PASS case=$Name failure=$($_.Exception.Message)"
+        return
+    }
+    throw "graph-oracle-self-test: FAIL case=$Name unexpectedly passed."
+}
+
+function Invoke-E2EGraphOracleSelfTest {
+    $validBitmap = New-E2EGraphOracleSyntheticBitmap -Variant 'valid'
+    try {
+        $validResults = @(Assert-E2EGraphModelPixels -Bitmap $validBitmap -Left 0 -Top 0 -Right $validBitmap.Width -Bottom $validBitmap.Height)
+        Assert-E2E ($validResults.Count -eq 3) "Graph oracle self-test returned unexpected series count: $($validResults.Count)."
+        Write-E2E ("graph-oracle-self-test: PASS valid series={0} flat-threshold=90% compositor=idle-background-to-series-alpha" -f $validResults.Count)
+    }
+    finally {
+        $validBitmap.Dispose()
+    }
+    $offsetBitmap = New-E2EGraphOracleSyntheticBitmap -Variant 'valid-offset'
+    try {
+        $offsetResults = @(Assert-E2EGraphModelPixels -Bitmap $offsetBitmap -Left 0 -Top 0 -Right $offsetBitmap.Width -Bottom $offsetBitmap.Height)
+        Assert-E2E ($offsetResults.Count -eq 3) "Graph oracle offset self-test returned unexpected series count: $($offsetResults.Count)."
+        Write-E2E ("graph-oracle-self-test: PASS valid-offset series={0} y-origin-independent" -f $offsetResults.Count)
+    }
+    finally {
+        $offsetBitmap.Dispose()
+    }
+    foreach ($variant in @('missing-flat', 'label-vertical-only', 'wrong-geometry', 'wrong-order', 'sloped', 'wrong-background', 'axis-row-missing-terra', 'axis-row-missing-sol', 'wrong-endpoint', 'short-rise', 'detached-rise', 'missing-series-contribution', 'non-contiguous')) {
+        $bitmap = New-E2EGraphOracleSyntheticBitmap -Variant $variant
+        try {
+            Assert-E2EGraphOracleExpectedFailure -Name $variant -Bitmap $bitmap
+        }
+        finally {
+            $bitmap.Dispose()
+        }
+    }
+    Write-E2E 'graph-oracle-self-test: PASS valid painter-order overlap + valid-offset + thirteen finite negative bitmap cases'
+}
+
+function Invoke-E2EFixtureContractTests {
+    $documents = New-E2EFixtureDocuments
+    $health = New-E2EContractTestResponse -StatusCode 200 -Body '{"api_version":"v1","service":"codex-info"}' -Headers ([ordered]@{})
+    $pairHeaders = [ordered]@{
+        'Codex-Info-Published-Pair' = @($documents.PublishedPair)
+    }
+    $status = New-E2EContractTestResponse -StatusCode 200 -Body $documents.Status -Headers $pairHeaders
+    $details = New-E2EContractTestResponse -StatusCode 200 -Body $documents.Details -Headers $pairHeaders
+    Assert-E2EFixturePreflightResponses -Health $health -Status $status -Details $details | Out-Null
+    Write-E2E 'fixture-contract: PASS valid response'
+
+    $missingPairStatus = New-E2EContractTestResponse -StatusCode 200 -Body $documents.Status -Headers ([ordered]@{})
+    Assert-E2EExpectedContractFailure -Name 'pair-missing' -Health $health -Status $missingPairStatus -Details $details
+
+    $mismatchedDetailsHeaders = [ordered]@{
+        'Codex-Info-Published-Pair' = @('v1:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff')
+    }
+    $mismatchedDetails = New-E2EContractTestResponse -StatusCode 200 -Body $documents.Details -Headers $mismatchedDetailsHeaders
+    Assert-E2EExpectedContractFailure -Name 'pair-mismatch' -Health $health -Status $status -Details $mismatchedDetails
+
+    $detailsWithoutGapsBody = $documents.Details.Replace(',"history_gaps":[]', '')
+    $detailsWithoutGaps = New-E2EContractTestResponse -StatusCode 200 -Body $detailsWithoutGapsBody -Headers $pairHeaders
+    Assert-E2EExpectedContractFailure -Name 'history-gaps-missing' -Health $health -Status $status -Details $detailsWithoutGaps
+
+    $detailsJson = ConvertFrom-Json -InputObject $documents.Details
+    $unorderedSamples = @($detailsJson.history_samples)
+    $firstSample = $unorderedSamples[0]
+    $unorderedSamples[0] = $unorderedSamples[2]
+    $unorderedSamples[2] = $firstSample
+    $detailsJson.history_samples = $unorderedSamples
+    $unorderedDetails = New-E2EContractTestResponse -StatusCode 200 -Body ($detailsJson | ConvertTo-Json -Compress -Depth 10) -Headers $pairHeaders
+    Assert-E2EExpectedContractFailure -Name 'history-sample-order' -Health $health -Status $status -Details $unorderedDetails
+
+    $minuteMisalignedJson = ConvertFrom-Json -InputObject $documents.Details
+    $minuteMisalignedJson.history_samples[0].timestamp = [Int64]$minuteMisalignedJson.history_samples[0].timestamp + 35
+    $minuteMisalignedDetails = New-E2EContractTestResponse -StatusCode 200 -Body ($minuteMisalignedJson | ConvertTo-Json -Compress -Depth 10) -Headers $pairHeaders
+    Assert-E2EExpectedContractFailure -Name 'history-sample-minute-bucket' -Health $health -Status $status -Details $minuteMisalignedDetails -ExpectedReason 'minute bucket'
+    Invoke-E2EGraphIdleBandSelfTest
+    Invoke-E2ECaptureSelfTest
+    Invoke-E2EGraphOracleSelfTest
+    Write-E2E 'fixture-contract: PASS five negative cases rejected individually'
 }
 
 function Open-E2EChildWindow {
@@ -786,14 +2318,29 @@ function Find-E2ECloseButton {
 }
 
 try {
+    if ($FixtureContractTest) {
+        Write-E2E 'fixture-contract-test: start'
+        $contractDocuments = New-E2EFixtureDocuments
+        Assert-E2E ([CodexInfoWindowsE2EFixtureServer]::Start($contractDocuments.Status, $contractDocuments.Details, $contractDocuments.PublishedPair, 0)) 'Could not bind the fixture contract test to an ephemeral loopback port.'
+        $script:e2eFixturePort = [CodexInfoWindowsE2EFixtureServer]::BoundPort()
+        $script:e2eFixtureRunning = $true
+        Write-E2E 'fixture-contract-test: fixture server started without launching the client'
+        Invoke-E2EFixturePreflight | Out-Null
+        Invoke-E2EFixtureContractTests
+        return
+    }
     $resolvedClientPath = if ([string]::IsNullOrWhiteSpace($ClientPath)) {
         Join-Path $env:LOCALAPPDATA 'Programs\Codex Info Monitor\CodexInfo.WindowsClient.exe'
     }
     else { [IO.Path]::GetFullPath($ClientPath) }
     Assert-E2E (Test-Path -LiteralPath $resolvedClientPath -PathType Leaf) "Installed client not found: $resolvedClientPath"
     Write-E2E "start: client=$resolvedClientPath fixture=$Fixture output=$script:e2eOutput"
+    Write-E2E "source-sha: $script:e2eSourceSha"
 
     if ($Fixture) { Enter-E2EFixture }
+    if ($Fixture) {
+        Invoke-E2EFixturePreflight | Out-Null
+    }
     $script:e2eProcess = Start-Process -FilePath $resolvedClientPath -PassThru
     $clientPid = $script:e2eProcess.Id
     Write-E2E "process: pid=$clientPid"
@@ -818,7 +2365,8 @@ try {
     }
     $mainCapture = Capture-E2EWindow $mainHandle '01-main-ready'
     Assert-E2E ($mainCapture.Hash.Length -eq 64) 'Main screenshot hash is missing.'
-    if ($Fixture) {
+    Assert-E2EMainProductVersion $mainRoot
+    if ($Fixture -or $script:e2ePreviewEnabled) {
         Assert-E2EQuotaGaugePalette -Root $mainRoot -Handle $mainHandle -Capture $mainCapture
     }
     else {
@@ -836,10 +2384,28 @@ try {
     # period options, metrics, and rows directly; a mutable summary TextBlock
     # peer is deliberately not used as a proxy for those surfaces.
     Start-Sleep -Seconds 5
+    $startupLoading = Find-E2EElementByAutomationId $mainRoot 'Main.StartupLoading'
+    Assert-E2E ($null -eq $startupLoading -or $startupLoading.Current.IsOffscreen -or -not $startupLoading.Current.IsEnabled) `
+        'Startup loading surface is still visible after the first refresh window.'
+    Write-E2E 'main-startup-loading: PASS (first complete generation is visible)'
     $detailsStatus = Find-E2EElementByAutomationId $mainRoot 'Main.DetailsStatus'
-    if ($null -ne $detailsStatus) {
-        Write-E2E ("main: details status='{0}' observed" -f $detailsStatus.Current.Name)
-    }
+    Assert-E2E ($null -ne $detailsStatus) 'Main details status is missing.'
+    $detailsStatusText = [string]$detailsStatus.Current.Name
+    Write-E2E ("main: details status='{0}' observed" -f $detailsStatusText)
+    # A screenshot or a successful status request is not sufficient evidence:
+    # the main surface must have accepted the matching details generation.
+    # Consume the locale-independent AutomationProperties.Name contract rather
+    # than attempting to decode localized rendered text.
+    $detailsContract = Find-E2EElementByAutomationId $mainRoot 'Main.DetailsGenerationContract'
+    Assert-E2E ($null -ne $detailsContract) 'Main details generation contract is missing.'
+    $detailsContractText = [string]$detailsContract.Current.Name
+    $detailsIsLatest = $detailsContractText -eq 'ready'
+    $detailsHasFailure = $detailsContractText -eq 'error'
+    Write-E2E ("main: details contract value='{0}'" -f $detailsContractText)
+    Write-E2E ("main: details contract latest={0} failure={1} length={2}" -f $detailsIsLatest, $detailsHasFailure, $detailsStatusText.Length)
+    Assert-E2E ($detailsIsLatest -and -not $detailsHasFailure) `
+        "Main details status is not a complete accepted generation: '$detailsStatusText'"
+    Write-E2E 'main-details-status: PASS (matching status/details generation accepted)'
 
     # Finite path: one Graph window, one period round-trip, two metrics, then
     # one OFF/ON cycle for each of four independent series.  No combinations
@@ -847,6 +2413,7 @@ try {
     Write-E2E 'case-1: open Graph'
     $graph = Open-E2EChildWindow -MainRoot $mainRoot -ButtonName 'Graph' -ButtonAutomationId 'Main.OpenGraph' -Title 'Codex Info Graph' -Role 'Graph' -ProcessId $clientPid
     $graphRoot = $graph.Root
+    Assert-E2ENoChildProductVersion $graphRoot 'Graph'
     $plot = Wait-E2E -Description 'Graph plot' -Probe {
         $candidate = Find-E2EElementByAutomationId $graphRoot 'Graph.Plot'
         if ($null -eq $candidate) { return $false }
@@ -883,6 +2450,12 @@ try {
     Wait-E2ESelectorLabel $graphRoot 'Graph.PeriodSelector' $pastLabel
     $graphPast = Capture-E2EWindow $graph.Handle '03-graph-past'
     Assert-E2EImageChanged $graphCurrent $graphPast 'Current-to-past period selection'
+    if ($Fixture -or $script:e2ePreviewEnabled) {
+        Assert-E2EGraphHasModelData $plot $graph.Handle $graphPast
+    }
+    if ($Fixture) {
+        Assert-E2EGraphHasIdleBand $plot $graph.Handle $graphPast
+    }
 
     $periodSelector = Find-E2EElementByAutomationId $graphRoot 'Graph.PeriodSelector'
     Toggle-E2EElement $periodSelector
@@ -970,6 +2543,7 @@ try {
     Write-E2E 'case-5: open Threads and assert root/child/orphan rows and columns'
     $threads = Open-E2EChildWindow -MainRoot $mainRoot -ButtonName 'Threads' -ButtonAutomationId 'Main.OpenThreads' -Title 'Codex Info Threads' -Role 'Threads' -ProcessId $clientPid
     $threadsRoot = $threads.Root
+    Assert-E2ENoChildProductVersion $threadsRoot 'Threads'
     $threadTexts = Wait-E2E -Description 'Threads rows' -Probe {
         $values = @(Get-E2ETextValues $threadsRoot)
         if ($values.Count -ge 8) { return $values }
@@ -1024,7 +2598,8 @@ try {
     $script:e2eWindowRecords | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $windowRecordPath -Encoding utf8
     Write-E2E "windows: PASS records=$($script:e2eWindowRecords.Count) pid=$clientPid records_path=$windowRecordPath"
 
-    Write-E2E 'windows-client-e2e: PASS (Graph open, period current/past/current, 2 metrics, 4 toggle OFF/ON cycles, Threads rows/columns, PID/HWND records)'
+    $graphEvidence = if ($Fixture) { 'past-period model and idle-band pixels' } else { 'past-period model pixels' }
+    Write-E2E ("windows-client-e2e: PASS (Graph open, {0}, period current/past/current, 2 metrics, 4 toggle OFF/ON cycles, Threads rows/columns, PID/HWND records)" -f $graphEvidence)
     $script:e2eSuccess = $true
 }
 catch {

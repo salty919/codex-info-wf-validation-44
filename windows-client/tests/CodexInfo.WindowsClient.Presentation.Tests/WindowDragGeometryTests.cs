@@ -44,39 +44,42 @@ public sealed class WindowDragGeometryTests
     [Fact]
     public void Graph_samples_anchor_at_period_start_and_current_right_edge()
     {
-        var period = new ApiHistoryPeriod("2000", 1_000, 2_000, true, "current")
+        var period = new ApiHistoryPeriod("2040", 1_020, 2_040, true, "current")
         {
             Samples =
             [
-                new ApiHistorySample(1_400, 2_000, 80, 1, 2, 3, 10, 20, 30),
+                new ApiHistorySample(1_380, 2_040, 80, 1, 2, 3, 10, 20, 30),
             ],
         };
 
-        var samples = GraphWindowViewModel.BuildGraphSamples(period, 1_600);
+        var samples = GraphWindowViewModel.BuildGraphSamples(period, 1_620);
 
-        // Graph history is rendered at minute-bucket boundaries; the 1,400s
-        // observation belongs to the 1,380s bucket before the current-end
-        // anchor is appended.
-        Assert.Equal([1_000L, 1_380L, 1_600L], samples.Select(sample => sample.Timestamp));
+        // The admitted row is already a UTC minute-start. The graph preserves
+        // it and appends only the documented current right-edge anchor.
+        Assert.Equal([1_020L, 1_380L, 1_620L], samples.Select(sample => sample.Timestamp));
         Assert.Equal(100, samples[0].RemainingPercent);
         Assert.Equal(0UL, samples[0].SolTokens);
         Assert.Equal(1, samples[^1].SolDollars);
     }
 
     [Theory]
-    [InlineData(999L)]
-    [InlineData(1_000L)]
-    public void Graph_samples_have_no_observation_before_or_at_current_period_start(long now)
+    [InlineData(1_019L)]
+    [InlineData(1_020L)]
+    public void Graph_samples_preserve_admitted_exact_start_at_clamped_current_end(long now)
     {
-        var period = new ApiHistoryPeriod("2000", 1_000, 2_000, true, "current")
+        var period = new ApiHistoryPeriod("2040", 1_020, 2_040, true, "current")
         {
             Samples =
             [
-                new ApiHistorySample(1_000, 2_000, 80, 1, 0, 0, 10, 0, 0),
+                new ApiHistorySample(1_020, 2_040, 80, 1, 0, 0, 10, 0, 0),
             ],
         };
 
-        Assert.Empty(GraphWindowViewModel.BuildGraphSamples(period, now));
+        var samples = GraphWindowViewModel.BuildGraphSamples(period, now);
+
+        Assert.Equal([1_020L], samples.Select(sample => sample.Timestamp));
+        Assert.Equal(1, samples[0].SolDollars);
+        Assert.Equal(80, samples[0].RemainingPercent);
     }
 
     [Fact]
@@ -88,23 +91,26 @@ public sealed class WindowDragGeometryTests
     }
 
     [Fact]
-    public void Graph_samples_keep_the_historical_reset_boundary_observation()
+    public void Graph_samples_keep_historical_rows_and_filter_outside_minute_rows()
     {
-        var period = new ApiHistoryPeriod("2000", 1_000, 2_000, false, "historical")
+        var period = new ApiHistoryPeriod("2040", 1_020, 2_040, false, "historical")
         {
             Samples =
             [
-                new ApiHistorySample(999, 2_000, 1, 1, 0, 0, 1, 0, 0),
-                new ApiHistorySample(1_000, 2_000, 80, 2, 0, 0, 2, 0, 0),
-                new ApiHistorySample(1_500, 2_000, 70, 3, 0, 0, 3, 0, 0),
-                new ApiHistorySample(2_000, 2_000, 60, 99, 0, 0, 99, 0, 0),
-                new ApiHistorySample(2_001, 2_000, 50, 100, 0, 0, 100, 0, 0),
+                // Adapter-only defensive injections: these minute-aligned
+                // rows are outside the admitted period and never reach the
+                // graph through Core strict admission.
+                new ApiHistorySample(960, 2_040, 1, 1, 0, 0, 1, 0, 0),
+                new ApiHistorySample(1_020, 2_040, 80, 2, 0, 0, 2, 0, 0),
+                new ApiHistorySample(1_500, 2_040, 70, 3, 0, 0, 3, 0, 0),
+                new ApiHistorySample(2_040, 2_040, 60, 99, 0, 0, 99, 0, 0),
+                new ApiHistorySample(2_100, 2_040, 50, 100, 0, 0, 100, 0, 0),
             ],
         };
 
         var samples = GraphWindowViewModel.BuildGraphSamples(period, 1_500);
 
-        Assert.Equal([1_000L, 1_500L, 1_980L, 2_000L], samples.Select(sample => sample.Timestamp));
+        Assert.Equal([1_020L, 1_500L, 2_040L], samples.Select(sample => sample.Timestamp));
         Assert.Equal(2, samples[0].SolDollars);
         Assert.Equal(3, samples[1].SolDollars);
         Assert.Equal(99, samples[^1].SolDollars);
@@ -113,19 +119,19 @@ public sealed class WindowDragGeometryTests
     [Fact]
     public void Graph_samples_include_the_historical_reset_boundary_observation()
     {
-        var period = new ApiHistoryPeriod("2000", 1_000, 2_000, false, "historical")
+        var period = new ApiHistoryPeriod("2040", 1_020, 2_040, false, "historical")
         {
             Samples =
             [
-                new ApiHistorySample(1_000, 2_000, 80, 1, 0, 0, 10, 0, 0),
-                new ApiHistorySample(1_980, 2_000, 70, 2, 0, 0, 20, 0, 0),
-                new ApiHistorySample(2_000, 2_000, 60, 99, 0, 0, 99, 0, 0),
+                new ApiHistorySample(1_020, 2_040, 80, 1, 0, 0, 10, 0, 0),
+                new ApiHistorySample(1_980, 2_040, 70, 2, 0, 0, 20, 0, 0),
+                new ApiHistorySample(2_040, 2_040, 60, 99, 0, 0, 99, 0, 0),
             ],
         };
 
-        var samples = GraphWindowViewModel.BuildGraphSamples(period, 2_000);
+        var samples = GraphWindowViewModel.BuildGraphSamples(period, 2_040);
 
-        Assert.Equal([1_000L, 1_980L, 2_000L], samples.Select(sample => sample.Timestamp));
+        Assert.Equal([1_020L, 1_980L, 2_040L], samples.Select(sample => sample.Timestamp));
         Assert.Equal(99, samples[^1].SolDollars);
         Assert.Equal(99UL, samples[^1].SolTokens);
         Assert.Equal(60, samples[^1].RemainingPercent);
@@ -134,17 +140,20 @@ public sealed class WindowDragGeometryTests
     [Fact]
     public void Historical_period_with_only_reset_boundary_sample_keeps_sol_series()
     {
-        var period = new ApiHistoryPeriod("2000", 1_000, 2_000, false, "historical")
+        var period = new ApiHistoryPeriod("2040", 1_020, 2_040, false, "historical")
         {
             Samples =
             [
-                new ApiHistorySample(2_000, 2_000, 60, 9, 0, 0, 90, 0, 0),
+                // One admitted source row at the canonical period end; the
+                // graph may add only its documented synthetic start anchor.
+                new ApiHistorySample(2_040, 2_040, 60, 9, 0, 0, 90, 0, 0),
             ],
         };
 
         var samples = GraphWindowViewModel.BuildGraphSamples(period, 2_500);
 
-        Assert.Equal([1_000L, 1_980L, 2_000L], samples.Select(sample => sample.Timestamp));
+        Assert.Equal([1_020L, 2_040L], samples.Select(sample => sample.Timestamp));
+        Assert.Equal(0, samples[0].SolDollars);
         Assert.Equal(9, samples[^1].SolDollars);
         Assert.Equal(90UL, samples[^1].SolTokens);
     }
@@ -152,20 +161,20 @@ public sealed class WindowDragGeometryTests
     [Fact]
     public void Historical_period_keeps_canonicalized_moving_reset_samples()
     {
-        var period = new ApiHistoryPeriod("1800605040", 1_000, 1_240, false, "historical")
+        var period = new ApiHistoryPeriod("2040", 1_020, 1_260, false, "historical")
         {
-            ResetAt = 1_240,
+            ResetAt = 1_260,
             Samples =
             [
-                new ApiHistorySample(1_000, 1_240, 80, 3, 0, 0, 30, 0, 0),
-                new ApiHistorySample(1_120, 1_240, 70, 9, 0, 0, 90, 0, 0),
-                new ApiHistorySample(1_240, 1_240, 60, 12, 0, 0, 120, 0, 0),
+                new ApiHistorySample(1_020, 1_260, 80, 3, 0, 0, 30, 0, 0),
+                new ApiHistorySample(1_080, 1_260, 70, 9, 0, 0, 90, 0, 0),
+                new ApiHistorySample(1_260, 1_260, 60, 12, 0, 0, 120, 0, 0),
             ],
         };
 
         var samples = GraphWindowViewModel.BuildGraphSamples(period, 2_000);
 
-        Assert.Equal([1_000L, 1_080L, 1_200L, 1_240L], samples.Select(sample => sample.Timestamp));
+        Assert.Equal([1_020L, 1_080L, 1_260L], samples.Select(sample => sample.Timestamp));
         Assert.Equal(3, samples[0].SolDollars);
         Assert.Equal(9, samples[1].SolDollars);
         Assert.Equal(12, samples[^1].SolDollars);
@@ -173,25 +182,26 @@ public sealed class WindowDragGeometryTests
     }
 
     [Fact]
-    public void Graph_samples_keep_maximum_cumulative_snapshot_within_a_minute_bucket()
+    public void Graph_samples_keep_distinct_valid_minute_snapshots_and_project_cumulatively()
     {
-        var period = new ApiHistoryPeriod("2000", 1_000, 2_000, false, "historical")
+        var period = new ApiHistoryPeriod("2040", 1_020, 1_200, false, "historical")
         {
             Samples =
             [
-                new ApiHistorySample(1_200, 2_000, 90, 2, 1, 0, 20, 10, 0),
-                new ApiHistorySample(1_229, 2_000, null, 1, 3, 0, 10, 30, 0),
+                new ApiHistorySample(1_080, 2_000, 90, 2, 1, 0, 20, 10, 0),
+                new ApiHistorySample(1_140, 2_000, 80, 1, 3, 0, 10, 30, 0),
+                new ApiHistorySample(1_200, 2_000, 70, 4, 2, 1, 40, 20, 10),
             ],
         };
 
-        var samples = GraphWindowViewModel.BuildGraphSamples(period, 1_500);
+        var samples = GraphWindowViewModel.BuildGraphSamples(period, 1_200);
 
-        var observed = Assert.Single(samples, sample => sample.Timestamp == 1_200);
-        Assert.Equal(2, observed.SolDollars);
-        Assert.Equal(3, observed.TerraDollars);
-        Assert.Equal(20UL, observed.SolTokens);
-        Assert.Equal(30UL, observed.TerraTokens);
-        Assert.Equal(90, observed.RemainingPercent);
+        Assert.Equal([1_020L, 1_080L, 1_140L, 1_200L], samples.Select(sample => sample.Timestamp));
+        Assert.Equal([0d, 2d, 2d, 4d], samples.Select(sample => sample.SolDollars));
+        Assert.Equal([0d, 1d, 3d, 3d], samples.Select(sample => sample.TerraDollars));
+        Assert.Equal([0UL, 20UL, 20UL, 40UL], samples.Select(sample => sample.SolTokens));
+        Assert.Equal([0UL, 10UL, 30UL, 30UL], samples.Select(sample => sample.TerraTokens));
+        Assert.Equal([100d, 90d, 80d, 70d], samples.Select(sample => sample.RemainingPercent!.Value));
     }
 
     [Fact]

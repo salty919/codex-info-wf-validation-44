@@ -7,7 +7,7 @@ StartLimitBurst=5
 
 [Service]
 Type=simple
-ExecStart=%h/.local/bin/codex_info --service --listen 127.0.0.1:8787
+ExecStart=%h/.local/bin/codex_info --port 8787
 Restart=on-failure
 RestartSec=15s
 KillSignal=SIGTERM

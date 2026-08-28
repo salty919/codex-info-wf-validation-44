@@ -19,7 +19,7 @@ BINARY="$ROOT_DIR/target/release/codex_info"
 [[ -x "$BINARY" ]] || fail "build target/release/codex_info first"
 
 for contract in \
-    'ExecStart=%h/.local/bin/codex_info --service --listen 127.0.0.1:8787' \
+    'ExecStart=%h/.local/bin/codex_info --port 8787' \
     'Restart=on-failure' \
     'NoNewPrivileges=true'; do
     rg -q --fixed-strings -- "$contract" packaging/codex-info.service \
@@ -93,10 +93,11 @@ process_matches_scope() {
     cmdline="$(process_cmdline "$pid")"
     case "$kind" in
         service)
-            [[ "$cmdline" == *"--service --listen 127.0.0.1:$case_port"* ]]
+            [[ "$cmdline" == *"--port $case_port"* \
+                && "$cmdline" != *"--ui"* ]]
             ;;
         ui)
-            [[ "$cmdline" != *"--service --listen"* ]]
+            [[ "$cmdline" == *"--ui"* ]]
             ;;
         *)
             return 1
@@ -245,25 +246,15 @@ setup_case() {
 
 launch_service() {
     local log_name="$1"
-    env "${common_env[@]}" "$BINARY" --service --listen "127.0.0.1:$case_port" \
+    env "${common_env[@]}" "$BINARY" --port "$case_port" \
         >"$case_root/$log_name.log" 2>&1 &
     service_pid="$!"
 }
 
 launch_ui() {
-    local mode="$1" log_name="$2"
-    env "${common_env[@]}" \
-        "CODEX_INFO_API_LISTEN=127.0.0.1:$case_alt_port" \
-        CODEX_INFO_PREVIEW=normal "$BINARY" "$mode" \
-        >"$case_root/$log_name.log" 2>&1 &
-    ui_pid="$!"
-}
-
-launch_all() {
     local log_name="$1"
     env "${common_env[@]}" \
-        "CODEX_INFO_API_LISTEN=127.0.0.1:$case_port" \
-        CODEX_INFO_PREVIEW=normal "$BINARY" --all \
+        CODEX_INFO_PREVIEW=normal "$BINARY" --ui --port "$case_port" \
         >"$case_root/$log_name.log" 2>&1 &
     ui_pid="$!"
 }
@@ -469,103 +460,45 @@ run_service_cold_start() {
         "$case_label" "$before" "$after" "$idle_cpu_ticks" "$clk_tck"
 }
 
-run_ui_only_without_service() {
-    setup_case ui-only-without-service
-    if [[ "$ui_display_available" != 1 ]]; then
-        mark_ui_hold "$case_label" 'X11 display is unavailable; UI was not rendered'
-        return
-    fi
-    launch_ui --ui-only ui-only
-    if ! wait_for_ui_window "$ui_pid"; then
-        if ! xdpyinfo >/dev/null 2>&1; then
-            stop_ui
-            mark_ui_hold "$case_label" 'X11 display became unavailable; UI was not rendered'
-            return
-        fi
-        sed -n '1,120p' "$case_root/ui-only.log" >&2 || true
-        fail "$case_label: UI process did not render a preview window"
-    fi
-    require_no_service
-    stop_ui
-    require_no_service
-    printf 'CASE %s: PASS (rendered UI-only window, no daemon/lock/listener)\n' "$case_label"
-}
-
-run_ui_only_with_service() {
-    local owner
-    setup_case ui-only-with-service
-    write_fixture
-    launch_service ui-service
-    require_ready
-    require_one_service "$service_pid"
-    owner="$service_pid"
-    if [[ "$ui_display_available" != 1 ]]; then
-        stop_current_service
-        mark_ui_hold "$case_label" 'X11 display is unavailable; UI was not rendered'
-        return
-    fi
-    launch_ui --ui-only ui-only-existing-service
-    if ! wait_for_ui_window "$ui_pid"; then
-        if ! xdpyinfo >/dev/null 2>&1; then
-            stop_ui
-            stop_current_service
-            mark_ui_hold "$case_label" 'X11 display became unavailable; UI was not rendered'
-            return
-        fi
-        sed -n '1,120p' "$case_root/ui-only-existing-service.log" >&2 || true
-        fail "$case_label: UI process did not render a preview window"
-    fi
-    require_one_service "$owner"
-    [[ "$(listener_count "$case_alt_port")" == 0 ]] \
-        || fail "$case_label: ui-only created an additional REST listener"
-    service_health || fail "$case_label: existing service became unavailable"
-    stop_ui
-    require_one_service "$owner"
-    stop_current_service
-    require_no_service
-    printf 'CASE %s: PASS (rendered UI reusing service PID %s, no additional resident/listener)\n' \
-        "$case_label" "$owner"
-}
-
-run_all_without_service() {
-    local owner all_pid
-    setup_case all-without-service
+run_ui_without_service() {
+    local owner launcher_pid
+    setup_case ui-without-service
     write_fixture
     if [[ "$ui_display_available" != 1 ]]; then
         mark_ui_hold "$case_label" 'X11 display is unavailable; UI was not rendered'
         return
     fi
-    launch_all all-new-service
-    all_pid="$ui_pid"
+    launch_ui ui-new-service
+    launcher_pid="$ui_pid"
     require_ready
     owner="$(lock_owner)"
-    [[ "$owner" != "$all_pid" ]] \
-        || fail "$case_label: --all became a resident service instead of adding UI"
+    [[ "$owner" != "$launcher_pid" ]] \
+        || fail "$case_label: --ui became the resident service instead of adding UI"
     require_one_service
-    if ! wait_for_ui_window "$all_pid"; then
+    if ! wait_for_ui_window "$launcher_pid"; then
         if ! xdpyinfo >/dev/null 2>&1; then
             stop_ui
             stop_current_service
             mark_ui_hold "$case_label" 'X11 display became unavailable; UI was not rendered'
             return
         fi
-        sed -n '1,120p' "$case_root/all-new-service.log" >&2 || true
-        fail "$case_label: --all UI process did not render a preview window"
+        sed -n '1,120p' "$case_root/ui-new-service.log" >&2 || true
+        fail "$case_label: --ui process did not render a preview window"
     fi
     require_one_service "$owner"
-    service_health || fail "$case_label: --all-created service became unavailable"
+    service_health || fail "$case_label: --ui-created service became unavailable"
     stop_ui
     require_one_service "$owner"
     stop_current_service
     require_no_service
-    printf 'CASE %s: PASS (rendered --all UI, one newly-created service owner/listener)\n' "$case_label"
+    printf 'CASE %s: PASS (rendered --ui, one newly-created service owner/listener)\n' "$case_label"
 }
 
-run_all_with_service() {
-    local owner all_pid
-    setup_case all-with-service
+run_ui_with_service() {
+    local owner launcher_pid
+    setup_case ui-with-service
     write_fixture
-    launch_service all-existing-service
+    launch_service ui-existing-service
     require_ready
     require_one_service "$service_pid"
     owner="$service_pid"
@@ -574,50 +507,50 @@ run_all_with_service() {
         mark_ui_hold "$case_label" 'X11 display is unavailable; UI was not rendered'
         return
     fi
-    launch_all all-existing-service-ui
-    all_pid="$ui_pid"
-    if ! wait_for_ui_window "$all_pid"; then
+    launch_ui ui-existing-service-window
+    launcher_pid="$ui_pid"
+    if ! wait_for_ui_window "$launcher_pid"; then
         if ! xdpyinfo >/dev/null 2>&1; then
             stop_ui
             stop_current_service
             mark_ui_hold "$case_label" 'X11 display became unavailable; UI was not rendered'
             return
         fi
-        sed -n '1,120p' "$case_root/all-existing-service-ui.log" >&2 || true
-        fail "$case_label: --all UI process did not render a preview window"
+        sed -n '1,120p' "$case_root/ui-existing-service-window.log" >&2 || true
+        fail "$case_label: --ui process did not render a preview window"
     fi
     require_one_service "$owner"
-    [[ "$all_pid" != "$owner" ]] \
-        || fail "$case_label: --all replaced the existing service with its UI process"
+    [[ "$launcher_pid" != "$owner" ]] \
+        || fail "$case_label: --ui replaced the existing service with its UI process"
     stop_ui
     require_one_service "$owner"
     stop_current_service
     require_no_service
-    printf 'CASE %s: PASS (rendered --all UI reusing service PID %s, no additional resident)\n' \
+    printf 'CASE %s: PASS (rendered --ui reusing service PID %s, no additional resident)\n' \
         "$case_label" "$owner"
 }
 
-run_simultaneous_all_without_service() {
+run_simultaneous_ui_without_service() {
     local first_ui second_ui owner pids=() zombies=()
-    setup_case simultaneous-all-without-service
+    setup_case simultaneous-ui-without-service
     write_fixture
     if [[ "$ui_display_available" != 1 ]]; then
         mark_ui_hold "$case_label" 'X11 display is unavailable; UI was not rendered'
         return
     fi
-    launch_all all-concurrent-first
+    launch_ui ui-concurrent-first
     first_ui="$ui_pid"
-    launch_all all-concurrent-second
+    launch_ui ui-concurrent-second
     second_ui="$ui_pid"
     require_ready
     require_one_service
     owner="$service_pid"
     [[ "$owner" != "$first_ui" && "$owner" != "$second_ui" ]] \
-        || fail "$case_label: --all UI PID became the service owner"
+        || fail "$case_label: --ui process became the service owner"
     process_matches_scope "$first_ui" ui \
-        || fail "$case_label: first --all launcher is not a scoped UI"
+        || fail "$case_label: first --ui launcher is not a scoped UI"
     process_matches_scope "$second_ui" ui \
-        || fail "$case_label: second --all launcher is not a scoped UI"
+        || fail "$case_label: second --ui launcher is not a scoped UI"
     if ! wait_for_two_ui_windows "$first_ui" "$second_ui"; then
         if ! xdpyinfo >/dev/null 2>&1; then
             stop_ui
@@ -625,28 +558,28 @@ run_simultaneous_all_without_service() {
             mark_ui_hold "$case_label" 'X11 display became unavailable; UI was not rendered'
             return
         fi
-        sed -n '1,120p' "$case_root"/all-concurrent-*.log >&2 2>/dev/null || true
-        fail "$case_label: concurrent --all launchers did not render two preview windows"
+        sed -n '1,120p' "$case_root"/ui-concurrent-*.log >&2 2>/dev/null || true
+        fail "$case_label: concurrent --ui launchers did not render two preview windows"
     fi
     require_one_service "$owner"
     mapfile -t pids < <(find_service_pids)
     [[ "${#pids[@]}" -eq 1 && "${pids[0]}" == "$owner" ]] \
-        || fail "$case_label: concurrent --all launchers left extra service processes"
+        || fail "$case_label: concurrent --ui launchers left extra service processes"
     mapfile -t zombies < <(find_service_zombies "$first_ui" "$second_ui")
     [[ "${#zombies[@]}" -eq 0 ]] \
-        || fail "$case_label: losing --all service zombie remains (${zombies[*]})"
-    service_health || fail "$case_label: concurrent --all service became unavailable"
+        || fail "$case_label: losing --ui service zombie remains (${zombies[*]})"
+    service_health || fail "$case_label: concurrent --ui service became unavailable"
 
-    terminate_scoped_pid "$first_ui" ui 'first concurrent --all UI'
-    terminate_scoped_pid "$second_ui" ui 'second concurrent --all UI'
+    terminate_scoped_pid "$first_ui" ui 'first concurrent --ui process'
+    terminate_scoped_pid "$second_ui" ui 'second concurrent --ui process'
     ui_pid=""
     [[ ! -e "/proc/$first_ui" && ! -e "/proc/$second_ui" ]] \
-        || fail "$case_label: one of the concurrent --all UIs remained resident"
+        || fail "$case_label: one of the concurrent --ui processes remained resident"
     require_one_service "$owner"
     service_health || fail "$case_label: sole service did not survive both UI exits"
     stop_current_service
     require_no_service
-    printf 'CASE %s: PASS (simultaneous --all UIs=%s,%s, sole service owner/listener=%s, clean stop)\n' \
+    printf 'CASE %s: PASS (simultaneous --ui processes=%s,%s, sole service owner/listener=%s, clean stop)\n' \
         "$case_label" "$first_ui" "$second_ui" "$owner"
 }
 
@@ -654,10 +587,10 @@ run_simultaneous_service_launches() {
     local first second owner loser pids=()
     setup_case simultaneous-service-launches
     write_fixture
-    env "${common_env[@]}" "$BINARY" --service --listen "127.0.0.1:$case_port" \
+    env "${common_env[@]}" "$BINARY" --port "$case_port" \
         >"$case_root/simultaneous-first.log" 2>&1 &
     first="$!"
-    env "${common_env[@]}" "$BINARY" --service --listen "127.0.0.1:$case_port" \
+    env "${common_env[@]}" "$BINARY" --port "$case_port" \
         >"$case_root/simultaneous-second.log" 2>&1 &
     second="$!"
     require_ready
@@ -696,11 +629,9 @@ run_simultaneous_service_launches() {
 }
 
 run_service_cold_start
-run_ui_only_without_service
-run_ui_only_with_service
-run_all_without_service
-run_all_with_service
-run_simultaneous_all_without_service
+run_ui_without_service
+run_ui_with_service
+run_simultaneous_ui_without_service
 run_simultaneous_service_launches
 
 if ((hold_count > 0)); then
@@ -708,4 +639,4 @@ if ((hold_count > 0)); then
         "$hold_count"
     exit 2
 fi
-printf 'record-daemon-e2e: PASS (finite service/ui-only/all/concurrent cases verified with isolated HOME/XDG/data/ports)\n'
+printf 'record-daemon-e2e: PASS (finite service/ui/concurrent cases verified with isolated HOME/XDG/data/ports)\n'

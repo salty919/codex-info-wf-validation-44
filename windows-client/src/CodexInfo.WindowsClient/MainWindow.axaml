@@ -149,7 +149,7 @@
                   HorizontalAlignment="Right"
                   VerticalAlignment="Center">
         <Button Classes="command"
-                IsVisible="{Binding IsAuthenticated}"
+                IsVisible="{Binding ShowAuthenticatedContent}"
                 Click="OnOpenGraph"
                 AutomationProperties.Name="{Binding Texts.Graph}"
                 AutomationProperties.AutomationId="Main.OpenGraph"
@@ -157,7 +157,7 @@
           <StackPanel Orientation="Horizontal" Spacing="4"><TextBlock Text="▥" /><TextBlock Text="{Binding Texts.Graph}" /></StackPanel>
         </Button>
         <Button Classes="command"
-                IsVisible="{Binding IsAuthenticated}"
+                IsVisible="{Binding ShowAuthenticatedContent}"
                 Click="OnOpenThreads"
                 AutomationProperties.Name="{Binding Texts.Threads}"
                 AutomationProperties.AutomationId="Main.OpenThreads"
@@ -195,7 +195,7 @@
 
     <!-- RemainingQuota owns the current percentage and the current-period
          local cost estimate.  The bar is absent until a quota is validated. -->
-    <Border Grid.Row="1" Classes="section" Padding="14,6" IsVisible="{Binding IsAuthenticated}">
+    <Border Grid.Row="1" Classes="section" Padding="14,6" IsVisible="{Binding ShowAuthenticatedContent}">
       <Grid ColumnDefinitions="*,210" ColumnSpacing="14">
         <StackPanel Spacing="2" VerticalAlignment="Center">
           <TextBlock Classes="label" Text="{Binding Texts.RemainingQuota}" />
@@ -222,7 +222,7 @@
 
     <!-- WeekGauge owns the seven-cell weekly/monthly period gauge, the
          remaining countdown, and the exact reset/observation timestamps. -->
-    <Border Grid.Row="2" Classes="section" Padding="12,6" IsVisible="{Binding IsAuthenticated}">
+    <Border Grid.Row="2" Classes="section" Padding="12,6" IsVisible="{Binding ShowAuthenticatedContent}">
       <Grid RowDefinitions="24,20" RowSpacing="4">
         <Grid ColumnDefinitions="Auto,*,Auto" ColumnSpacing="10">
           <TextBlock Classes="label"
@@ -288,7 +288,7 @@
 
     <!-- AccountActivity owns only live activity: total count, model
          classification counts, and the one Details entry point. -->
-    <Border Grid.Row="3" Classes="section" Padding="12,5" IsVisible="{Binding IsAuthenticated}">
+    <Border Grid.Row="3" Classes="section" Padding="12,5" IsVisible="{Binding ShowAuthenticatedContent}">
       <Grid ColumnDefinitions="180,*,68" ColumnSpacing="8">
         <StackPanel Spacing="1" VerticalAlignment="Center">
           <TextBlock Classes="metric-label" Text="{Binding Texts.RunningThreads}" />
@@ -335,7 +335,7 @@
     <!-- ModelUsage is a compact table rather than one card per model.  The
          fixed row budget displays the expected three model rows without a
          nested scroll surface. -->
-    <Border Grid.Row="4" Classes="section" Padding="12,5" IsVisible="{Binding IsAuthenticated}">
+    <Border Grid.Row="4" Classes="section" Padding="12,5" IsVisible="{Binding ShowAuthenticatedContent}">
       <Grid RowDefinitions="22,20,*">
         <Grid ColumnDefinitions="Auto,*,Auto" ColumnSpacing="10">
           <TextBlock FontSize="17" FontWeight="SemiBold" Text="{Binding Texts.ModelUsage}" />
@@ -350,6 +350,14 @@
                      AutomationProperties.AutomationId="Main.DetailsStatus"
                      Text="{Binding DetailsStatusText}"
                      TextWrapping="NoWrap" />
+          <!-- Keep UI Automation independent from localized glyph decoding. -->
+          <TextBlock Grid.Column="2"
+                     Width="1"
+                     Height="1"
+                     Opacity="0"
+                     IsHitTestVisible="False"
+                     AutomationProperties.AutomationId="Main.DetailsGenerationContract"
+                     Text="{Binding DetailsStatusAutomationText}" />
         </Grid>
         <Grid Grid.Row="1"
               ColumnDefinitions="2.4*,*,*,*,*,*,*"
@@ -406,25 +414,49 @@
           <TextBlock FontSize="13" FontWeight="SemiBold" Text="{Binding StatusTitle}" TextWrapping="NoWrap" />
           <TextBlock Classes="label" FontSize="11" Text="{Binding StatusDetail}" TextWrapping="NoWrap" />
         </StackPanel>
-        <StackPanel Grid.Column="2" Orientation="Horizontal" Spacing="6" VerticalAlignment="Center" IsVisible="{Binding IsAuthRequired}">
+        <StackPanel Grid.Column="2" Orientation="Horizontal" Spacing="6" VerticalAlignment="Center" IsVisible="{Binding IsAuthStartVisible}">
           <Button Classes="refresh"
                   MinWidth="112"
                   Height="28"
                   Padding="6,2"
-                  IsVisible="{Binding IsAuthRequired}"
                   Command="{Binding AuthCommand}"
                   AutomationProperties.Name="{Binding Texts.AuthStart}"
+                  AutomationProperties.AutomationId="Main.Status.AuthStart"
                   ToolTip.Tip="{Binding Texts.AuthStart}"
                   Content="{Binding Texts.AuthStart}" />
+        </StackPanel>
+        <StackPanel Grid.Column="2" Orientation="Horizontal" Spacing="6" VerticalAlignment="Center" IsVisible="{Binding IsAuthCheckVisible}">
           <Button Classes="refresh"
                   MinWidth="112"
                   Height="28"
                   Padding="6,2"
-                  IsVisible="{Binding IsAuthRequired}"
                   Command="{Binding CheckAuthCommand}"
                   AutomationProperties.Name="{Binding Texts.AuthCheck}"
+                  AutomationProperties.AutomationId="Main.Status.AuthCheck"
                   ToolTip.Tip="{Binding Texts.AuthCheck}"
                   Content="{Binding Texts.AuthCheck}" />
+        </StackPanel>
+        <StackPanel Grid.Column="2" Orientation="Horizontal" Spacing="6" VerticalAlignment="Center" IsVisible="{Binding IsRetryVisible}">
+          <Button Classes="refresh"
+                  MinWidth="92"
+                  Height="28"
+                  Padding="6,2"
+                  Command="{Binding RetryCommand}"
+                  AutomationProperties.Name="{Binding Texts.Retry}"
+                  AutomationProperties.AutomationId="Main.Status.Retry"
+                  ToolTip.Tip="{Binding Texts.Retry}"
+                  Content="{Binding Texts.Retry}" />
+        </StackPanel>
+        <StackPanel Grid.Column="2" Orientation="Horizontal" Spacing="6" VerticalAlignment="Center" IsVisible="{Binding IsRefreshingVisible}">
+          <Button Classes="refresh"
+                  MinWidth="112"
+                  Height="28"
+                  Padding="6,2"
+                  IsEnabled="False"
+                  AutomationProperties.Name="{Binding Texts.Refreshing}"
+                  AutomationProperties.AutomationId="Main.Status.Refreshing"
+                  ToolTip.Tip="{Binding Texts.Refreshing}"
+                  Content="{Binding Texts.Refreshing}" />
         </StackPanel>
         <StackPanel Grid.Column="2" Orientation="Horizontal" Spacing="6" VerticalAlignment="Center" IsVisible="{Binding IsUpdateNotificationVisible}">
           <TextBlock Classes="label" FontSize="11" VerticalAlignment="Center" Text="{Binding UpdateNotificationText}" TextWrapping="NoWrap" />
@@ -435,6 +467,7 @@
                   IsVisible="{Binding IsUpdateActionVisible}"
                   Command="{Binding UpdateCommand}"
                   AutomationProperties.Name="{Binding UpdateButtonText}"
+                  AutomationProperties.AutomationId="Main.Status.Update"
                   ToolTip.Tip="{Binding UpdateButtonText}"
                   Content="{Binding UpdateButtonText}" />
         </StackPanel>
@@ -442,6 +475,23 @@
           <TextBlock Classes="label" FontSize="11" HorizontalAlignment="Right" Text="{Binding LastReceivedText}" TextWrapping="NoWrap" />
         </StackPanel>
       </Grid>
+    </Border>
+
+    <!-- The first frame is intentionally held behind one stable loading
+         surface.  Status/details are published atomically from the view
+         model, then this spinner is removed once the generation is ready. -->
+    <Border Grid.Row="1"
+            Grid.RowSpan="5"
+            Background="#0E141E"
+            IsVisible="{Binding IsStartupLoading}"
+            AutomationProperties.AutomationId="Main.StartupLoading">
+      <StackPanel HorizontalAlignment="Center" VerticalAlignment="Center" Spacing="12">
+        <ProgressBar Width="180" Height="6" IsIndeterminate="True" />
+        <TextBlock Classes="label"
+                   HorizontalAlignment="Center"
+                   Text="{Binding Texts.Connecting}"
+                   AutomationProperties.AutomationId="Main.StartupLoadingText" />
+      </StackPanel>
     </Border>
   </Grid>
 </Window>

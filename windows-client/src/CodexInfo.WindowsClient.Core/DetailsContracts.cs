@@ -28,7 +28,13 @@ public sealed record ApiDetailsSnapshot(
     IReadOnlyList<ApiThreadDetails> Threads,
     string EstimatedCostLabel)
 {
+    /// <summary>The opaque identity of the accepted details response pair.</summary>
+    public PublishedPairIdentity? PublishedPair { get; init; }
+
     public IReadOnlyList<ApiHistoryPeriod> History => HistoryPeriods;
+
+    /// <summary>Confirmed, redacted recorder gaps for the history periods.</summary>
+    public IReadOnlyList<ApiHistoryGap> HistoryGaps { get; init; } = [];
 
     /// <summary>Compatibility view for callers that provide bundled notices.</summary>
     public IReadOnlyList<ApiLegalNotice> LegalNotices { get; init; } = [];
@@ -88,6 +94,14 @@ public sealed record ApiHistoryPeriod(
 
     public IReadOnlyList<ApiHistorySample> Samples { get; init; } = [];
 }
+
+/// <summary>A confirmed, redacted gap in one canonical history period.</summary>
+public sealed record ApiHistoryGap(
+    string GapId,
+    long ResetAt,
+    long StartAt,
+    long EndAt,
+    string Reason);
 
 /// <summary>A single validated history point.</summary>
 public sealed record ApiHistorySample(

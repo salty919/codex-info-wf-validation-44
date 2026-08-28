@@ -26,10 +26,10 @@ UIありの起動契約は次のとおりです。
 ./run.sh
 ```
 
-UIなしsilent RESTの起動契約は次のとおりです。
+UIなしsilent REST（installed service）の起動契約は次のとおりです。
 
 ```bash
-CODEX_INFO_API_LISTEN=127.0.0.1:8787 ./run.sh
+codex_info --port 8787
 ```
 
 期待値はSlint component/window/event-loop生成=0、`DISPLAY`/Wayland/X11依存=0、Slint HWND=0
@@ -138,7 +138,7 @@ profileではliteral Host aliasを含む`ssh.exe` ArgumentListを一回だけ起
 connectedにせず、明示CTAの一回のOpenSSH-owned interactiveだけを許可する。
 
 コピー用の表示文字列をlaunch inputへ再利用せず、shell/cmd/PowerShell経由の実行は行わない。
-Linux / WSL側の起動契約は`CODEX_INFO_API_LISTEN=127.0.0.1:8787 ./run.sh`である。
+Linux / WSL側のinstalled service起動契約は`codex_info --port 8787`である。
 
 HTTPS はここで必要としない。HTTP が使われるのは二つの loopback 終点と SSH トンネルの
 内側だけであり、端末間の暗号化と相手認証は SSH が担当する。インターネット経由の利用は

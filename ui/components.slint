@@ -405,7 +405,7 @@ export component Header inherits Rectangle {
             x: 8px;
             width: parent.width - 16px;
             height: parent.height;
-            text: root.strings.legal-notices + " · " + root.strings.product-version;
+            text: root.strings.legal-notices;
             color: DesignTokens.text-primary;
             font-size: DesignTokens.text-body;
             font-weight: 700;
@@ -840,7 +840,7 @@ export component LegalNoticeWindow inherits Window {
             y: 16px;
             width: parent.width - 136px;
             height: 30px;
-            text: root.strings.legal-notices + " · " + root.strings.product-version;
+            text: root.strings.legal-notices;
             color: DesignTokens.text-primary;
             font-size: 22px;
             font-weight: 700;
@@ -998,7 +998,7 @@ export component ThreadsWindow inherits Window {
             y: 0px;
             width: parent.width - 188px;
             height: 48px;
-            text: root.strings.active-threads + " · " + root.strings.product-version;
+            text: root.strings.active-threads;
             color: DesignTokens.text-primary;
             font-size: 22px;
             font-weight: 700;
@@ -1670,7 +1670,7 @@ export component GraphWindow inherits Window {
             y: 0px;
             width: parent.width - 252px;
             height: 36px;
-            text: root.strings.usage-trend + " · " + root.strings.product-version;
+            text: root.strings.usage-trend;
             color: DesignTokens.text-primary;
             font-size: 24px;
             font-weight: 700;
@@ -1756,8 +1756,8 @@ export component GraphWindow inherits Window {
                 y: 28px;
                 width: root.plot-width * interval.width / 100;
                 height: parent.height - 52px;
-                background: DesignTokens.text-muted;
-                opacity: 0.10;
+                background: DesignTokens.graph-idle-band;
+                opacity: 0.22;
                 visible: root.has-graph-data && interval.width > 0.0;
             }
 

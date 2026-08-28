@@ -15,11 +15,69 @@ require_text() {
     local file="$1" pattern="$2"
     rg -q --fixed-strings -- "$pattern" "$file" || fail "missing: $file: $pattern"
 }
+require_function_text() {
+    local file="$1" function_name="$2" pattern="$3" function_text
+    function_text="$(
+        awk -v target="$function_name" '
+            $0 ~ "^function " target "[[:space:]]*\\{" {
+                capturing = 1
+                start = NR
+            }
+            capturing && NR > start && $0 ~ "^function " { exit }
+            capturing { print }
+        ' "$file"
+    )"
+    [[ -n "$function_text" ]] || fail "missing function boundary: $file: $function_name"
+    rg -q --fixed-strings -- "$pattern" <<<"$function_text" ||
+        fail "missing in function boundary: $file: $function_name: $pattern"
+}
 require_window_text() {
     local file="$1" pattern="$2"
     if ! sed -n '/<Window /,/Background=/p' "$file" | rg -q --fixed-strings -- "$pattern"; then
         fail "missing top-level Window geometry: $file: $pattern"
     fi
+}
+require_update_property_contract() {
+    local file="$1" property="$2" update_member="$3"
+    local property_text
+    property_text="$(
+        awk -v property="$property" '
+            !capturing && $0 ~ "^[[:space:]]*public bool " property "[[:space:]]*$" {
+                capturing = 1
+            }
+            capturing {
+                print
+                line = $0
+                opening = gsub(/\{/, "", line)
+                closing = gsub(/\}/, "", line)
+                depth += opening - closing
+                if (opening > 0) saw_open = 1
+                if (saw_open && depth == 0) exit
+            }
+        ' "$file"
+    )"
+    [[ -n "$property_text" ]] || fail "missing property boundary: $file: $property"
+
+    for required in \
+        '!IsAuthRequired' \
+        '!hasConnectionFailure' \
+        '!initialLoadPending' \
+        '!refreshing' \
+        "update?.${update_member} == true"; do
+        if ! awk -v required="$required" '
+            index($0, required) {
+                start = index($0, required)
+                before = start > 1 ? substr($0, start - 1, 1) : ""
+                after = substr($0, start + length(required), 1)
+                if (before !~ /[[:alnum:]_]/ && after !~ /[[:alnum:]_]/) {
+                    found = 1
+                }
+            }
+            END { exit !found }
+        ' <<<"$property_text"; then
+            fail "missing in $property property boundary: $required"
+        fi
+    done
 }
 
 require_text windows-client/src/CodexInfo.WindowsClient/MainWindow.axaml 'Click="OnOpenGraph"'
@@ -27,6 +85,9 @@ require_text windows-client/src/CodexInfo.WindowsClient/MainWindow.axaml 'Click=
 require_text windows-client/src/CodexInfo.WindowsClient/MainWindow.axaml 'Click="OnOpenLegal"'
 require_text windows-client/src/CodexInfo.WindowsClient/MainWindow.axaml 'Click="OnOpenSettings"'
 require_text windows-client/src/CodexInfo.WindowsClient/MainWindow.axaml 'AutomationProperties.AutomationId="Main.QuotaPeriodGauge"'
+require_text windows-client/src/CodexInfo.WindowsClient/MainWindow.axaml 'AutomationProperties.AutomationId="Main.StartupLoading"'
+require_text windows-client/src/CodexInfo.WindowsClient/MainWindow.axaml 'AutomationProperties.AutomationId="Main.DetailsGenerationContract"'
+require_text windows-client/src/CodexInfo.WindowsClient/MainWindow.axaml 'IsVisible="{Binding ShowAuthenticatedContent}"'
 require_window_text windows-client/src/CodexInfo.WindowsClient/MainWindow.axaml 'Width="900"'
 require_window_text windows-client/src/CodexInfo.WindowsClient/MainWindow.axaml 'Height="480"'
 require_window_text windows-client/src/CodexInfo.WindowsClient/SetupWindow.axaml 'Width="900"'
@@ -99,6 +160,9 @@ require_text windows-client/src/CodexInfo.WindowsClient/Infrastructure/WindowsPa
 require_text windows-client/src/CodexInfo.WindowsClient/Infrastructure/WindowsUpdateCoordinator.cs 'WindowsPathSafety.ContainsReparsePoint'
 require_text windows-client/src/CodexInfo.WindowsClient/Settings/ClientSettings.cs 'WindowsPathSafety.EnsureDirectoryTreeWithoutReparse'
 require_text docs/WINDOWS_CLIENT.md '%USERPROFILE%\.ssh\config'
+require_text docs/PRODUCT_REQUIREMENTS.md '製品バージョンはメイン画面に一度だけ表示し'
+require_text docs/PRODUCT_REQUIREMENTS.md '初回起動では、health・status・detailsの最初の完全な世代が揃うまで'
+require_text docs/REGRESSION_PREVENTION_POLICY.md 'REG-STARTUP-FRAME'
 require_text windows-client/src/CodexInfo.WindowsClient/SetupWindow.axaml 'AutomationProperties.Name="{Binding Texts.Copy}"'
 require_text windows-client/src/CodexInfo.WindowsClient/SetupWindow.axaml 'Background="Transparent" PointerPressed="OnTitlePointerPressed"'
 require_text windows-client/src/CodexInfo.WindowsClient/SetupWindow.axaml.cs 'WindowDragBehavior.Begin(this, e)'
@@ -122,33 +186,62 @@ require_text windows-client/src/CodexInfo.WindowsClient/MainWindow.axaml.cs 'Set
 require_file windows-client/src/CodexInfo.WindowsClient.Core/WindowsUpdateClient.cs
 require_file windows-client/src/CodexInfo.WindowsClient/Infrastructure/WindowsUpdateCoordinator.cs
 require_text windows-client/src/CodexInfo.WindowsClient/MainWindow.axaml 'IsVisible="{Binding IsUpdateNotificationVisible}"'
+require_text windows-client/src/CodexInfo.WindowsClient/MainWindow.axaml 'IsVisible="{Binding IsUpdateActionVisible}"'
 require_text windows-client/src/CodexInfo.WindowsClient/MainWindow.axaml 'Command="{Binding UpdateCommand}"'
-require_text windows-client/src/CodexInfo.WindowsClient/ViewModels/MainWindowViewModel.cs 'public bool IsUpdateNotificationVisible => !IsAuthRequired'
+require_text windows-client/src/CodexInfo.WindowsClient/MainWindow.axaml 'AutomationProperties.AutomationId="Main.Status.Update"'
+main_window_view_model=windows-client/src/CodexInfo.WindowsClient/ViewModels/MainWindowViewModel.cs
+require_file "$main_window_view_model"
+require_update_property_contract "$main_window_view_model" IsUpdateNotificationVisible IsNotificationVisible
+require_update_property_contract "$main_window_view_model" IsUpdateActionVisible IsUpdateActionVisible
+require_text windows-client/src/CodexInfo.WindowsClient/ViewModels/MainWindowViewModel.cs 'public bool IsStartupLoading => initialLoadPending'
+require_text windows-client/src/CodexInfo.WindowsClient/ViewModels/MainWindowViewModel.cs 'public bool ShowAuthenticatedContent => IsAuthenticated && !IsStartupLoading'
 require_text windows-client/src/CodexInfo.WindowsClient.Core/WindowsUpdateClient.cs 'https://api.github.com/repos/salty919/codex_info_v2/releases?per_page=20'
 require_text windows-client/src/CodexInfo.WindowsClient/Infrastructure/WindowsUpdateCoordinator.cs 'StartAvailableUpdateAsync'
 require_text windows-client/Directory.Build.props '<Version>'
 require_file windows-client/src/CodexInfo.WindowsClient.Core/ProductInfo.cs
 require_text windows-client/src/CodexInfo.WindowsClient.Core/ProductInfo.cs 'public static string DisplayVersion'
 require_text windows-client/src/CodexInfo.WindowsClient.Core/ProductInfo.cs 'Assembly.GetName().Version'
-for version_surface in Main Setup Settings Graph Threads Legal; do
-    case "$version_surface" in
-        Main) version_path='windows-client/src/CodexInfo.WindowsClient/MainWindow.axaml' ;;
-        Setup) version_path='windows-client/src/CodexInfo.WindowsClient/SetupWindow.axaml' ;;
-        Settings) version_path='windows-client/src/CodexInfo.WindowsClient/SettingsWindow.axaml' ;;
-        Graph) version_path='windows-client/src/CodexInfo.WindowsClient/GraphWindow.axaml' ;;
-        Threads) version_path='windows-client/src/CodexInfo.WindowsClient/ThreadsWindow.axaml' ;;
-        Legal) version_path='windows-client/src/CodexInfo.WindowsClient/LegalNoticesWindow.axaml' ;;
-    esac
-    require_text "$version_path" 'ProductVersionText'
-    require_text "$version_path" "AutomationProperties.AutomationId=\"$version_surface.ProductVersion\""
+require_text windows-client/src/CodexInfo.WindowsClient/MainWindow.axaml 'ProductVersionText'
+require_text windows-client/src/CodexInfo.WindowsClient/MainWindow.axaml 'AutomationProperties.AutomationId="Main.ProductVersion"'
+require_text windows-client/src/CodexInfo.WindowsClient/Settings/ConnectionProcessFactory.cs 'codex_info'
+require_text windows-client/src/CodexInfo.WindowsClient/Settings/ConnectionProcessFactory.cs '--port'
+main_version_marker_count="$(rg -o --fixed-strings 'AutomationProperties.AutomationId="Main.ProductVersion"' windows-client/src/CodexInfo.WindowsClient/MainWindow.axaml | wc -l)"
+[[ "$main_version_marker_count" -eq 1 ]] ||
+    fail "main version automation marker must appear exactly once: count=$main_version_marker_count"
+main_version_binding_count="$(rg -o --fixed-strings 'Text="{Binding ProductVersionText}"' windows-client/src/CodexInfo.WindowsClient/MainWindow.axaml | wc -l)"
+[[ "$main_version_binding_count" -eq 1 ]] ||
+    fail "main version binding must appear exactly once: count=$main_version_binding_count"
+for child_window in SetupWindow SettingsWindow GraphWindow ThreadsWindow LegalNoticesWindow; do
+    child_path="windows-client/src/CodexInfo.WindowsClient/${child_window}.axaml"
+    if rg -q --fixed-strings 'ProductVersion' "$child_path"; then
+        fail "child window must not render a product version: $child_path"
+    fi
+done
+for redundant_version_marker in \
+    'Setup.ProductVersion' \
+    'Settings.ProductVersion' \
+    'Graph.ProductVersion' \
+    'Threads.ProductVersion' \
+    'Legal.ProductVersion'; do
+    if rg -q --fixed-strings -- "$redundant_version_marker" windows-client/src/CodexInfo.WindowsClient; then
+        fail "redundant child-window version marker remains: $redundant_version_marker"
+    fi
 done
 native_version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n 1)"
 windows_version="$(sed -n 's/.*<Version>\([^<]*\)<\/Version>.*/\1/p' windows-client/Directory.Build.props | head -n 1)"
 [[ -n "$native_version" && "$native_version" == "$windows_version" ]] ||
     fail "native and Windows versions differ: native=$native_version windows=$windows_version"
 require_text ui/components.slint 'product-version: string'
+require_text ui/app.slint 'startup-loading: false'
+require_text ui/app.slint 'text: "◌  " + root.strings.checking;'
+require_text src/main.rs '"startup-loading"'
+require_text src/main.rs 'native_startup_failure_releases_loading_surface'
 require_text ui/components.slint 'root.strings.usage-status + " · " + root.strings.product-version'
-require_text ui/components.slint 'root.strings.usage-trend + " · " + root.strings.product-version'
+if rg -q --fixed-strings -- 'root.strings.usage-trend + " · " + root.strings.product-version' ui/components.slint ||
+   rg -q --fixed-strings -- 'root.strings.active-threads + " · " + root.strings.product-version' ui/components.slint ||
+   rg -q --fixed-strings -- 'root.strings.legal-notices + " · " + root.strings.product-version' ui/components.slint; then
+    fail 'redundant native child-window version title remains'
+fi
 require_text ui/components.slint 'legal-page-names: [string]'
 require_text ui/components.slint 'legal-pages: [string]'
 require_text ui/components.slint 'legal-protocol: string'
@@ -163,8 +256,83 @@ require_text src/main.rs 'include_str!("../LICENSE")'
 require_text src/main.rs 'include_str!("../THIRD_PARTY_NOTICES.md")'
 require_text src/main.rs 'i18n.text(TextKey::LegalProtocol)'
 require_text src/main.rs 'i18n.text(TextKey::LegalThirdParty)'
-require_text .github/workflows/windows-client.yml 'needs: [version-policy, core-tests, windows-build]'
+require_text .github/workflows/windows-client.yml 'needs: [version-policy, core-tests, windows-build, acceptance]'
+require_text .github/workflows/windows-client.yml 'Run final acceptance gate before merge'
+require_text .github/workflows/windows-client.yml 'windows_window_move_smoke.ps1 -ClientPath $exe -AllowPhysicalInput'
+require_text .github/workflows/windows-client.yml "--logger 'trx;LogFilePrefix=windows-client'"
+require_text .github/workflows/windows-client.yml 'Expected exactly two Windows TRX reports'
+require_text .github/workflows/windows-client.yml 'TRX counters are missing'
+require_text .github/workflows/windows-client.yml 'Windows test counts are not release-safe:'
+require_text .github/workflows/windows-client.yml 'bash scripts/final_acceptance_gate.sh artifacts/windows-ui-e2e'
+require_text .github/workflows/windows-client.yml '-SourceSha $env:GITHUB_SHA'
+require_text .github/workflows/windows-client.yml 'EXPECTED_E2E_SOURCE_SHA: ${{ github.sha }}'
+require_file scripts/final_acceptance_gate.sh
+require_text scripts/final_acceptance_gate.sh 'expected E2E source SHA is required'
+require_text scripts/final_acceptance_gate.sh 'source tree is dirty; release evidence must match a clean committed revision'
+require_text scripts/final_acceptance_gate.sh 'source-sha: $expected_sha'
+require_text scripts/final_acceptance_gate.sh 'capture: name=$capture_name '
+require_text scripts/final_acceptance_gate.sh 'sha256sum "$capture_path"'
+require_text scripts/final_acceptance_gate.sh 'window-move-smoke: PASS'
 require_text .github/workflows/windows-client.yml 'cancel-in-progress: false'
+for native_trigger in 'Cargo.toml' 'Cargo.lock' 'build.rs' 'run.sh' 'src/**' 'protocol/**' 'tests/**' 'ui/**' 'assets/**' 'LICENSE' 'LICENSE.ja.md' 'deny.toml' '.cargo/config.toml' 'scripts/**' 'docs/**'; do
+    require_text .github/workflows/windows-client.yml "      - \"$native_trigger\""
+done
+require_text .github/workflows/windows-client.yml 'dtolnay/rust-toolchain@stable'
+require_text .github/workflows/windows-client.yml 'x11-apps'
+regression_step_line="$(rg -n 'name: Enforce regression checks' .github/workflows/windows-client.yml | head -n 1 | cut -d: -f1)"
+windows_contract_step_line="$(rg -n 'name: Enforce Windows feature contract' .github/workflows/windows-client.yml | head -n 1 | cut -d: -f1)"
+[[ -n "$regression_step_line" && -n "$windows_contract_step_line" &&
+    "$regression_step_line" -lt "$windows_contract_step_line" ]] ||
+    fail 'X/native regression checks must run before the Windows feature contract gate'
+final_gate_line="$(rg -n 'bash scripts/final_acceptance_gate.sh artifacts/windows-ui-e2e' .github/workflows/windows-client.yml | cut -d: -f1 | tail -n 1)"
+[[ -n "$final_gate_line" ]] || fail 'final acceptance gate invocation is missing'
+if ! sed -n "$((final_gate_line - 4)),${final_gate_line}p" .github/workflows/windows-client.yml |
+    rg -q --fixed-strings 'dtolnay/rust-toolchain@stable'; then
+    fail 'final acceptance gate must install the pinned Rust toolchain before running'
+fi
+require_text scripts/regression_guard.sh 'cargo check --locked --all-targets'
+require_text scripts/regression_guard.sh 'cargo test --locked --all-targets'
+require_text scripts/regression_guard.sh 'cargo build --release --locked'
+require_text scripts/regression_guard.sh '--exact --nocapture'
+require_text scripts/regression_guard.sh 'Rust all-target test set contains a zero-test target'
+require_text scripts/regression_guard.sh 'X11 graph visual gate unverified (DISPLAY unavailable)'
+require_text .github/workflows/rust.yml 'xvfb-run --auto-servernum'
+require_text .github/workflows/windows-client.yml 'xvfb-run --auto-servernum'
+for required_history_test in \
+    historical_week_fixture_preserves_each_period_and_graph_samples \
+    observed_moving_reset_sequence_keeps_the_spend_in_the_selected_graph \
+    long_rolling_reset_sequence_stays_in_one_period_after_a_real_boundary \
+    quota_only_reset_fragments_stay_with_the_adjacent_spend_period \
+    live_rolling_quota_chain_does_not_expose_an_empty_past_period \
+    affected_period_keeps_sol_spend_and_unobserved_quota_distinct \
+    shared_graph_fixture_is_the_x_history_oracle \
+    model_graph_does_not_invent_spend_during_an_unobserved_gap \
+    unused_intervals_mark_long_gap_before_observed_spend \
+    graph_controls_use_one_visual_boundary_and_show_short_histories \
+    remaining_graph_does_not_infer_quota_loss_from_model_spend \
+    affected_timestamp_does_not_mix_a_singleton_reset_period_into_history \
+    ambiguous_missing_quota_row_at_a_spend_timestamp_is_not_a_period \
+    singleton_reset_snapshot_overlapping_a_spend_period_stays_separate \
+    graph_collision_preview_matches_the_historical_singleton_oracle \
+    moving_reset_collision_at_30_and_60_seconds_fails_closed \
+    record_rejects_alias_quota_collision_before_canonical_merge \
+    same_timestamp_reset_drift_above_jitter_fails_closed \
+    startup_load_sanitizes_legacy_same_timestamp_quota_collision \
+    periodic_quota_refresh_retains_last_good_main_snapshot \
+    product_version_is_visible_once_on_native_main_surface; do
+    require_text scripts/regression_guard.sh "run_required_rust_test $required_history_test"
+done
+require_text scripts/regression_guard.sh 'run_required_rust_lib_test recoverable_rollout_parser_skips_only_malformed_token_count_records'
+require_text scripts/regression_guard.sh 'run_required_rust_test public_snapshot_is_whitelisted_and_tracks_auth_state'
+for required_thread_failure_test in \
+    thread_c_all_current_cycle_failure_classes_return_no_partial_snapshot \
+    thread_c_candidate_failure_rejects_the_complete_cycle \
+    thread_c_known_token_invalid_event_rejects_entire_rollout \
+    thread_c_no_thread_and_all_candidate_failure_are_distinct \
+    thread_c_private_accumulator_abort_never_yields_partial_snapshot \
+    thread_c_snapshot_rejects_partial_candidate_reads; do
+    require_text scripts/regression_guard.sh "run_required_rust_lib_test \"\$required_thread_failure_test\""
+done
 require_text .github/workflows/windows-client.yml 'Get-GitHubResourceStatus'
 require_text .github/workflows/windows-client.yml 'gh api --method POST "repos/$repository/git/refs"'
 require_text .github/workflows/windows-client.yml 'gh api --method POST "repos/$repository/releases"'
@@ -174,7 +342,18 @@ require_text .github/workflows/windows-client.yml '-F draft=false'
 require_file windows-client/src/CodexInfo.WindowsClient/Settings/ClientSettingsSession.cs
 require_text windows-client/src/CodexInfo.WindowsClient/Settings/ClientSettingsSession.cs 'SettingsCorrupt = false'
 require_file windows-client/src/CodexInfo.WindowsClient/Graphing/GraphPlotProjection.cs
+require_text src/main.rs 'const MODEL_CONTIGUOUS_SAMPLE_MAX_GAP_SECONDS: i64 = 60;'
+require_text windows-client/src/CodexInfo.WindowsClient/Graphing/GraphPlotProjection.cs 'private const long ModelContiguousSampleMaxGapSeconds = 60;'
 require_text windows-client/src/CodexInfo.WindowsClient/Controls/GraphPlotControl.cs 'GraphPlotProjection.BuildAxes('
+require_text windows-client/src/CodexInfo.WindowsClient/Controls/GraphPlotControl.cs 'internal const string IdleBandColorHex = "#3F5D7C";'
+require_text windows-client/src/CodexInfo.WindowsClient/Controls/GraphPlotControl.cs 'internal const double IdleBandOpacity = 0.22;'
+require_text windows-client/src/CodexInfo.WindowsClient/Controls/GraphPlotControl.cs 'IdleBandColor.WithOpacity(IdleBandOpacity)'
+require_text windows-client/tests/CodexInfo.WindowsClient.Presentation.Tests/GraphPlotControlTests.cs 'PlotProjectionDoesNotInventSpendDuringAnUnobservedGap'
+require_text windows-client/tests/CodexInfo.WindowsClient.Presentation.Tests/GraphPlotControlTests.cs 'Remaining_accepts_a_delayed_lower_quota_after_unobserved_sol_usage'
+require_text windows-client/tests/CodexInfo.WindowsClient.Presentation.Tests/GraphPlotControlTests.cs 'Shared_graph_fixture_matches_the_native_history_oracle'
+require_file tests/fixtures/graph_delayed_quota.json
+require_text windows-client/tests/CodexInfo.WindowsClient.Presentation.Tests/CodexInfo.WindowsClient.Presentation.Tests.csproj 'graph_delayed_quota.json'
+require_text windows-client/tests/CodexInfo.WindowsClient.Presentation.Tests/GraphPlotControlTests.cs 'IdleBandsUseTheDedicatedVisibleNeutralColor'
 require_text windows-client/src/CodexInfo.WindowsClient/SettingsWindow.axaml 'AutomationProperties.Name="{Binding Texts.Save}"'
 require_text windows-client/src/CodexInfo.WindowsClient/SettingsWindow.axaml 'LanguageOptions'
 require_text windows-client/src/CodexInfo.WindowsClient/SettingsWindow.axaml 'SelectedValueBinding="{Binding Id}"'
@@ -223,10 +402,94 @@ require_text windows-client/tools/Measure-WindowsGraphLatency.ps1 'Graph.MetricS
 require_text windows-client/tools/Measure-WindowsGraphLatency.ps1 'CopyFromScreen'
 require_text windows-client/tools/Measure-WindowsGraphLatency.ps1 'SendInput'
 require_text windows-client/tools/Run-WindowsClientE2E.ps1 'Assert-E2EQuotaGaugePalette'
+require_text windows-client/tools/Run-WindowsClientE2E.ps1 'Assert-E2EGraphHasModelData'
+require_text windows-client/tools/Run-WindowsClientE2E.ps1 'Assert-E2EGraphHasModelData $plot $graph.Handle $graphPast'
+require_text windows-client/tools/Run-WindowsClientE2E.ps1 'public static extern bool PrintWindow'
+require_function_text windows-client/tools/Run-WindowsClientE2E.ps1 Capture-E2EWindow 'PrintWindow'
+require_function_text windows-client/tools/Run-WindowsClientE2E.ps1 Capture-E2EWindow 'PW_RENDERFULLCONTENT'
+require_function_text windows-client/tools/Run-WindowsClientE2E.ps1 Capture-E2EWindow 'changedPixels'
+if rg -q --fixed-strings -- 'CopyFromScreen' windows-client/tools/Run-WindowsClientE2E.ps1; then
+    fail 'target HWND capture must not fall back to CopyFromScreen'
+fi
+require_function_text windows-client/tools/Run-WindowsClientE2E.ps1 Invoke-E2ECaptureSelfTest 'target-occluded'
+require_function_text windows-client/tools/Run-WindowsClientE2E.ps1 Invoke-E2ECaptureSelfTest 'invalid-hwnd'
+require_function_text windows-client/tools/Run-WindowsClientE2E.ps1 Invoke-E2ECaptureSelfTest 'capture-failure'
+require_function_text windows-client/tools/Run-WindowsClientE2E.ps1 Test-E2EGraphCompositedSeriesPixel 'alphas'
+require_function_text windows-client/tools/Run-WindowsClientE2E.ps1 Test-E2EGraphCompositedSeriesPixel 'minimumCompositedAlpha'
+require_function_text windows-client/tools/Run-WindowsClientE2E.ps1 Get-E2EGraphFlatLineCandidates 'rowCandidateThreshold'
+require_function_text windows-client/tools/Run-WindowsClientE2E.ps1 Get-E2EGraphFlatLineCandidates 'FlatCoverageThreshold'
+require_function_text windows-client/tools/Run-WindowsClientE2E.ps1 Find-E2EGraphSharedRisingSegment 'sourceColors'
+require_function_text windows-client/tools/Run-WindowsClientE2E.ps1 Find-E2EGraphSharedRisingSegment 'minimumSharedVerticalExtent'
+require_function_text windows-client/tools/Run-WindowsClientE2E.ps1 Find-E2EGraphSharedRisingSegment 'maxAllowedGap'
+require_function_text windows-client/tools/Run-WindowsClientE2E.ps1 Find-E2EGraphSharedRisingSegment 'contributions'
+require_function_text windows-client/tools/Run-WindowsClientE2E.ps1 Test-E2EGraphIdleBandPixel 'Get-E2EGraphIdleBackgroundColor'
+require_function_text windows-client/tools/Run-WindowsClientE2E.ps1 Assert-E2EGraphIdleBandBitmap 'sampleColumn25'
+require_function_text windows-client/tools/Run-WindowsClientE2E.ps1 Assert-E2EGraphIdleBandBitmap 'minimumSampleHits'
+require_function_text windows-client/tools/Run-WindowsClientE2E.ps1 Assert-E2EGraphIdleBandBitmap 'minimumCoveredColumns'
+require_function_text windows-client/tools/Run-WindowsClientE2E.ps1 Assert-E2EGraphHasIdleBand 'Assert-E2EGraphIdleBandBitmap'
+require_function_text windows-client/tools/Run-WindowsClientE2E.ps1 New-E2EGraphIdleBandSyntheticBitmap 'wrong-sample-columns'
+require_function_text windows-client/tools/Run-WindowsClientE2E.ps1 Invoke-E2EGraphIdleBandSelfTest 'wrong-interval'
+require_function_text windows-client/tools/Run-WindowsClientE2E.ps1 Assert-E2EGraphModelPixels 'flatStartFraction'
+require_function_text windows-client/tools/Run-WindowsClientE2E.ps1 Assert-E2EGraphModelPixels 'flatCoverageThreshold'
+require_function_text windows-client/tools/Run-WindowsClientE2E.ps1 Assert-E2EGraphModelPixels 'risingCenterFraction'
+require_function_text windows-client/tools/Run-WindowsClientE2E.ps1 Assert-E2EGraphModelPixels 'Get-E2EGraphFlatLineCandidates'
+require_function_text windows-client/tools/Run-WindowsClientE2E.ps1 Assert-E2EGraphModelPixels 'minimumSeparation'
+require_function_text windows-client/tools/Run-WindowsClientE2E.ps1 Assert-E2EGraphHasModelData 'Assert-E2EGraphModelPixels'
+require_function_text windows-client/tools/Run-WindowsClientE2E.ps1 Invoke-E2EGraphOracleSelfTest 'missing-flat'
+require_function_text windows-client/tools/Run-WindowsClientE2E.ps1 Invoke-E2EGraphOracleSelfTest 'valid-offset'
+require_function_text windows-client/tools/Run-WindowsClientE2E.ps1 Invoke-E2EGraphOracleSelfTest 'label-vertical-only'
+require_function_text windows-client/tools/Run-WindowsClientE2E.ps1 Invoke-E2EGraphOracleSelfTest 'wrong-geometry'
+require_function_text windows-client/tools/Run-WindowsClientE2E.ps1 Invoke-E2EGraphOracleSelfTest 'wrong-order'
+require_function_text windows-client/tools/Run-WindowsClientE2E.ps1 Invoke-E2EGraphOracleSelfTest 'sloped'
+require_function_text windows-client/tools/Run-WindowsClientE2E.ps1 Invoke-E2EGraphOracleSelfTest 'wrong-background'
+require_function_text windows-client/tools/Run-WindowsClientE2E.ps1 Invoke-E2EGraphOracleSelfTest 'axis-row-missing-terra'
+require_function_text windows-client/tools/Run-WindowsClientE2E.ps1 Invoke-E2EGraphOracleSelfTest 'axis-row-missing-sol'
+require_function_text windows-client/tools/Run-WindowsClientE2E.ps1 Invoke-E2EGraphOracleSelfTest 'wrong-endpoint'
+require_function_text windows-client/tools/Run-WindowsClientE2E.ps1 Invoke-E2EGraphOracleSelfTest 'short-rise'
+require_function_text windows-client/tools/Run-WindowsClientE2E.ps1 Invoke-E2EGraphOracleSelfTest 'detached-rise'
+require_function_text windows-client/tools/Run-WindowsClientE2E.ps1 Invoke-E2EGraphOracleSelfTest 'missing-series-contribution'
+require_function_text windows-client/tools/Run-WindowsClientE2E.ps1 Invoke-E2EGraphOracleSelfTest 'non-contiguous'
 require_text windows-client/tools/Run-WindowsClientE2E.ps1 'Main.DetailsStatus'
+require_text windows-client/tools/Run-WindowsClientE2E.ps1 'main-details-status: PASS (matching status/details generation accepted)'
+require_text windows-client/tools/Run-WindowsClientE2E.ps1 'main-startup-loading: PASS (first complete generation is visible)'
+require_text windows-client/tools/Run-WindowsClientE2E.ps1 'Main details status is not a complete accepted generation'
 require_text windows-client/tools/Run-WindowsClientE2E.ps1 'parts[1] == "/v1/health"'
 require_text windows-client/tools/Run-WindowsClientE2E.ps1 '\"service\":\"codex-info\"'
+require_text windows-client/tools/Run-WindowsClientE2E.ps1 'Codex-Info-Published-Pair'
+require_text windows-client/tools/Run-WindowsClientE2E.ps1 'includePublishedPair'
+require_text windows-client/tools/Run-WindowsClientE2E.ps1 'strict thirteen-field contract'
+require_file windows-client/tools/Test-WindowsClientFixtureContract.ps1
+require_function_text windows-client/tools/Run-WindowsClientE2E.ps1 Invoke-E2EFixtureRawRequest 'X-Codex-Info-E2E-Phase'
+require_function_text windows-client/tools/Run-WindowsClientE2E.ps1 Assert-E2EFixtureWireContract 'Assert-E2E ($Health.StatusCode -eq 200)'
+require_function_text windows-client/tools/Run-WindowsClientE2E.ps1 Assert-E2EFixtureWireContract 'Assert-E2E ($statusPair -cmatch'
+require_function_text windows-client/tools/Run-WindowsClientE2E.ps1 Assert-E2EFixtureWireContract 'Assert-E2EFixtureJsonKeys -Json $statusJson'
+require_function_text windows-client/tools/Run-WindowsClientE2E.ps1 Assert-E2EFixtureWireContract 'Assert-E2EFixtureJsonKeys -Json $detailsJson'
+require_function_text windows-client/tools/Run-WindowsClientE2E.ps1 Assert-E2EFixtureWireContract 'Assert-E2EFixtureHistorySamples'
+require_function_text windows-client/tools/Run-WindowsClientE2E.ps1 Assert-E2EFixtureHistorySamples 'expectedSampleKeys'
+require_function_text windows-client/tools/Run-WindowsClientE2E.ps1 Assert-E2EFixtureHistorySamples 'timestamp % 60'
+require_function_text windows-client/tools/Run-WindowsClientE2E.ps1 Assert-E2EFixtureHistorySamples 'periodRecords'
+require_function_text windows-client/tools/Run-WindowsClientE2E.ps1 Assert-E2EFixtureHistorySamples '$reset -eq $previousReset'
+require_function_text windows-client/tools/Run-WindowsClientE2E.ps1 Invoke-E2EFixturePreflight 'Invoke-E2EFixtureRawRequest'
+require_function_text windows-client/tools/Run-WindowsClientE2E.ps1 Invoke-E2EFixturePreflight 'Assert-E2EFixturePreflightResponses'
+require_function_text windows-client/tools/Run-WindowsClientE2E.ps1 Assert-E2EFixturePreflightResponses 'Assert-E2EFixtureWireContract'
+require_function_text windows-client/tools/Run-WindowsClientE2E.ps1 New-E2EFixtureDocuments 'orderedSampleObjects'
+require_function_text windows-client/tools/Run-WindowsClientE2E.ps1 Invoke-E2EFixtureContractTests 'pair-missing'
+require_function_text windows-client/tools/Run-WindowsClientE2E.ps1 Invoke-E2EFixtureContractTests 'pair-mismatch'
+require_function_text windows-client/tools/Run-WindowsClientE2E.ps1 Invoke-E2EFixtureContractTests 'history-gaps-missing'
+require_function_text windows-client/tools/Run-WindowsClientE2E.ps1 Invoke-E2EFixtureContractTests 'history-sample-order'
+require_function_text windows-client/tools/Run-WindowsClientE2E.ps1 Invoke-E2EFixtureContractTests 'history-sample-minute-bucket'
 require_text windows-client/tools/Run-WindowsClientE2E.ps1 "main-quota-gauge: seven cells, two X-authority surface colors, and half-period boundary PASS"
+require_text windows-client/tools/Run-WindowsClientE2E.ps1 'Assert-E2EMainProductVersion'
+require_text windows-client/tools/Run-WindowsClientE2E.ps1 'Assert-E2ENoChildProductVersion'
+require_text scripts/final_acceptance_gate.sh 'main-product-version: PASS'
+require_text scripts/final_acceptance_gate.sh 'child-product-version: PASS role=Graph count=0'
+require_text scripts/final_acceptance_gate.sh 'child-product-version: PASS role=Threads count=0'
+require_text windows-client/tools/Run-WindowsClientE2E.ps1 'graph-past-model-data: PASS'
+require_text windows-client/tools/Run-WindowsClientE2E.ps1 'Assert-E2EGraphHasIdleBand $plot $graph.Handle $graphPast'
+require_text windows-client/tools/Run-WindowsClientE2E.ps1 'graph-past-idle-band: PASS'
+require_text windows-client/tools/Run-WindowsClientE2E.ps1 'ExpectedStartFraction = 0.01'
+require_text windows-client/tools/Run-WindowsClientE2E.ps1 'ExpectedEndFraction = 0.35'
+require_text windows-client/tools/Run-WindowsClientE2E.ps1 '"timestamp":$($pastStart + 3600)'
 require_text windows-client/src/CodexInfo.WindowsClient/GraphWindow.axaml 'AutomationProperties.AutomationId="Graph.Window.Close"'
 require_text windows-client/src/CodexInfo.WindowsClient/ThreadsWindow.axaml 'AutomationProperties.AutomationId="Threads.Window.Close"'
 require_text windows-client/src/CodexInfo.WindowsClient/LegalNoticesWindow.axaml 'AutomationProperties.AutomationId="Legal.Window.Close"'
@@ -259,6 +522,22 @@ if rg -q --fixed-strings 'Start-Sleep' windows-client/tools/Measure-WindowsGraph
 fi
 require_text docs/WINDOWS_CLIENT_REQUIREMENTS.md 'WIN-PAR-13'
 require_text docs/WINDOWS_CLIENT_REQUIREMENTS.md 'WIN-INSTALL-01'
+require_text docs/REGRESSION_PREVENTION_POLICY.md 'windows_window_move_smoke.ps1 -AllowPhysicalInput'
+require_text .github/workflows/windows-client.yml '$moveSmokeOutput = @(& ./scripts/windows_window_move_smoke.ps1'
+require_text .github/workflows/windows-client.yml "[string]\$moveSmokeOutput[-1] -ne 'window-move-smoke: PASS'"
+if rg -q --fixed-strings 'if ($LASTEXITCODE -ne 0) { throw '\''Physical window move smoke failed.'\'' }' .github/workflows/windows-client.yml; then
+    fail 'physical move smoke must not inherit a stale native LASTEXITCODE from its caller'
+fi
+require_file scripts/x11_graph_visual_gate.sh
+require_file scripts/x11_startup_visual_gate.sh
+require_file docs/REQUIREMENTS_LEDGER.md
+for required_ledger_id in X-START-01 X-START-02 X-START-03 X-GRAPH-01 X-THREAD-01 WIN-START-01 WIN-GRAPH-01 WIN-VERSION-01 PROC-LEDGER-01; do
+    require_text docs/REQUIREMENTS_LEDGER.md "| $required_ledger_id |"
+done
+require_text scripts/regression_guard.sh 'bash scripts/requirements_ledger_gate.sh --final'
+require_text scripts/requirements_ledger_gate.sh 'final gate requires verified status'
+require_text scripts/x11_graph_visual_gate.sh 'dedicated idle-band pixels are missing'
+require_text scripts/x11_graph_visual_gate.sh 'implausible vertical stroke'
 require_text docs/PRODUCT_REQUIREMENTS.md '# Codex Info 製品要件'
 require_file windows-client/CodeCoverage.runsettings
 
@@ -266,19 +545,72 @@ if command -v dotnet >/dev/null 2>&1; then
     coverage_results="$(mktemp -d "${TMPDIR:-/tmp}/codex-info-windows-coverage.XXXXXX")"
     trap 'rm -rf -- "$coverage_results"' EXIT
     dotnet restore windows-client/CodexInfo.WindowsClient.sln --locked-mode
-    dotnet test windows-client/CodexInfo.WindowsClient.sln \
+    dotnet_test_output="$(dotnet test windows-client/CodexInfo.WindowsClient.sln \
         --no-restore \
         --configuration Release \
         --settings windows-client/CodeCoverage.runsettings \
         --collect 'Code Coverage' \
-        --results-directory "$coverage_results"
+        --results-directory "$coverage_results" \
+        --logger 'trx;LogFilePrefix=windows-client' \
+        --logger 'console;verbosity=normal' 2>&1)" || {
+        printf '%s\n' "$dotnet_test_output" >&2
+        fail 'Windows Core/Presentation tests failed'
+    }
+    printf '%s\n' "$dotnet_test_output"
+    mapfile -t trx_reports < <(find "$coverage_results" -type f -name '*.trx' -print | sort)
+    [[ "${#trx_reports[@]}" -eq 2 ]] ||
+        fail "expected exactly two Windows test result reports, found ${#trx_reports[@]}"
+    test_total=0
+    passed_total=0
+    failed_total=0
+    not_executed_total=0
+    for trx_report in "${trx_reports[@]}"; do
+        counters_line="$(rg -o '<Counters[^>]+' "$trx_report" | tail -n 1 || true)"
+        [[ -n "$counters_line" ]] || fail "TRX counters are missing: $trx_report"
+        trx_attr() {
+            local name="$1"
+            sed -n "s/.* $name=\"\([0-9][0-9]*\)\".*/\1/p" <<<"$counters_line"
+        }
+        total="$(trx_attr total)"
+        executed="$(trx_attr executed)"
+        passed="$(trx_attr passed)"
+        failed="$(trx_attr failed)"
+        not_executed="$(trx_attr notExecuted)"
+        [[ "$total" =~ ^[1-9][0-9]*$ && "$executed" == "$total" &&
+            "$passed" == "$total" && "$failed" == "0" && "$not_executed" == "0" ]] ||
+            fail "Windows TRX result is not release-safe: $trx_report total=${total:-missing} executed=${executed:-missing} passed=${passed:-missing} failed=${failed:-missing} notExecuted=${not_executed:-missing}"
+        test_total=$((test_total + total))
+        passed_total=$((passed_total + passed))
+        failed_total=$((failed_total + failed))
+        not_executed_total=$((not_executed_total + not_executed))
+    done
+    minimum_expected_tests=310
+    [[ "$test_total" -ge "$minimum_expected_tests" && "$passed_total" -eq "$test_total" &&
+        "$failed_total" -eq 0 && "$not_executed_total" -eq 0 ]] ||
+        fail "Windows aggregate test counts are not release-safe: total=$test_total minimum=$minimum_expected_tests passed=$passed_total failed=$failed_total notExecuted=$not_executed_total"
+    echo "windows-client-contract-gate: Windows tests executed: $test_total"
     mapfile -t coverage_reports < <(find "$coverage_results" -type f -name '*.cobertura.xml' -print)
-    [[ "${#coverage_reports[@]}" -eq 1 ]] || fail "expected one Cobertura report, found ${#coverage_reports[@]}"
-    coverage_rate="$(sed -n 's/.*<coverage line-rate="\([^"]*\)".*/\1/p' "${coverage_reports[0]}" | head -n 1)"
-    [[ -n "$coverage_rate" ]] || fail 'Cobertura report has no line-rate'
-    awk -v rate="$coverage_rate" 'BEGIN { exit !((rate + 0) >= 0.90) }' ||
-        fail "unit-testable product logic line coverage is below 90%: $coverage_rate"
-    awk -v rate="$coverage_rate" 'BEGIN { printf "windows-client-contract-gate: unit coverage %.2f%%\n", rate * 100 }'
+    [[ "${#coverage_reports[@]}" -gt 0 ]] || fail 'Cobertura report is missing'
+    # The coverage collector may emit per-test-process reports as well as a
+    # merged report.  Accept only a fresh report that covers both production
+    # assemblies; never use a high-rate partial report as a substitute.
+    coverage_rate=''
+    coverage_source=''
+    for coverage_report in "${coverage_reports[@]}"; do
+        if ! rg -q --fixed-strings 'name="CodexInfo.WindowsClient.Core"' "$coverage_report" ||
+           ! rg -q --fixed-strings 'name="CodexInfo.WindowsClient"' "$coverage_report"; then
+            continue
+        fi
+        candidate_rate="$(sed -n 's/.*<coverage line-rate="\([^"]*\)".*/\1/p' "$coverage_report" | head -n 1)"
+        if [[ -n "$candidate_rate" ]] && awk -v rate="$candidate_rate" 'BEGIN { exit !((rate + 0) >= 0.92) }'; then
+            coverage_rate="$candidate_rate"
+            coverage_source="$coverage_report"
+            break
+        fi
+    done
+    [[ -n "$coverage_rate" ]] ||
+        fail 'no merged Cobertura report covers both production assemblies at >=92% line coverage'
+    awk -v rate="$coverage_rate" -v source="$coverage_source" 'BEGIN { printf "windows-client-contract-gate: unit coverage %.2f%% (%s)\n", rate * 100, source }'
 else
     echo 'windows-client-contract-gate: UNVERIFIED: dotnet unavailable; Windows tests were not executed' >&2
     exit 2

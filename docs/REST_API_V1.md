@@ -6,7 +6,7 @@
 ## 目的と境界
 
 Linux / WSL 上で起動する Codex Info のdaemonと、Windows クライアント向け読み取り専用 APIを、
-`codex_info --service`の1プロセスで所有する。このservice modeはSlint WindowやX event loopを生成せず、
+`codex_info`の1プロセスで所有する。このdaemon modeはSlint WindowやX event loopを生成せず、
 X UIを表示しない。`RecorderDaemon`はservice process内のbounded workerとしてsource JSONLを検証しSQLiteへ書く。
 `SnapshotPublisher`がcommit済みの完全な`DataGeneration/DataHash`と現行 admission tuple
 `(ProfileScopeId, AccountScopeId, StorageEpoch, SupervisorLeaseIdentity, CollectorEpoch, CycleSeq)`からimmutableなstatus/details
@@ -26,27 +26,27 @@ saved selectorのauto reconnectは`ArgumentList`＋`BatchMode=yes`で起動し�
 
 | 要望 | v1での対応 |
 | --- | --- |
-| Linux / WSL をサーバー化する | `codex_info --service --listen 127.0.0.1:8787`でdaemon+RESTを1プロセスとして起動する。Windowは生成しない。 |
+| Linux / WSL をサーバー化する | 引数なしまたは`codex_info --port 8787`でdaemon+RESTを1プロセスとして起動する。Windowは生成しない。 |
 | Windowsから監視する | SSHローカルポート転送先の固定JSONを、`windows-client/` の Windows 監視クライアントが表示する。 |
-| Linuxネイティブ環境を残す | `--ui-only`はX UIだけを起動し、daemon/RESTを生成・残留させない。`--all`は既存serviceを再利用する。 |
+| Linuxネイティブ環境を残す | 引数なし/`--port PORT`はdaemon+RESTのみ、`--ui`はdaemon+REST+X UI、`--ui --port PORT`は指定portで起動する。 |
 | イントラネットだけを対象にする | loopbackだけへ束縛し、SSHを暗号化・認証境界にする。 |
 | インターネット経由は別設定にする | v1の設定や認証を再利用せず、今回の対象外として分離する。 |
 
 ## 起動と SSH トンネル
 
 user-systemdを使うprofileでは`codex-info.service`が
-`codex_info --service --listen 127.0.0.1:8787`を開始する。手動時も同じcommandを使う。`0.0.0.0`、`::`、LAN アドレス、
-ホスト名は受け付けない。
+`codex_info --port 8787`を開始する。手動時も同じcommandを使う。待受アドレスは`127.0.0.1`に固定する。
 
 ```bash
-codex_info --service --listen 127.0.0.1:8787
-codex_info --ui-only
-codex_info --all
+codex_info --port 8787
+codex_info
+codex_info --ui
+codex_info --ui --port 9876
 ```
 
-`--service`はWindowを表示せず、recorder lockとREST listenerを同じprocess lifetimeで所有する。
-`--ui-only`は環境変数`CODEX_INFO_API_LISTEN`を継承していてもserviceへ変化しない。
-引数なしで`CODEX_INFO_API_LISTEN`だけを指定した後方互換起動はservice modeになり、明示的な`--all`は同じ環境変数のaddressでもX UIを保持する。`--all`は`/v1/health`で既存loopback serviceを確認し、存在しない場合だけ同一実行ファイルの`--service`を開始する。
+引数なしまたは`--port`はWindowを表示せず、recorder lockとREST listenerを同じprocess lifetimeで所有する。
+`--ui`は既存serviceを再利用し、無ければ同じloopback addressのserviceを一つだけ開始する。
+引数なしはdaemon+RESTのみであり、UIを追加する場合は`--ui`を明示する。待受addressは指定できず、`--port PORT`でloopbackのportだけを変更できる。
 systemd自動起動の解除は`bash scripts/install_systemd_recorder.sh --remove`で行い、DB/historyを保持する。
 
 Windows からは SSH のローカルポート転送を使う。
@@ -93,8 +93,8 @@ SQLite transaction、WAL/SHM、migration、prune、backup、DB row/hash、Publis
 | request | method | result | response / side effect |
 | --- | --- | --- | --- |
 | `/v1/health` | `GET` | `200` | JSON health object、required `Content-Type`/`Cache-Control` headers、DB write/transaction=0 |
-| `/v1/status` | `GET` | `200` | current `PublishedPair` status、同上header、DB write/transaction=0 |
-| `/v1/details` | `GET` | `200` | current `PublishedPair` details、同上header、DB write/transaction=0 |
+| `/v1/status` | `GET` | `200` | current `PublishedPair` status、共通headerに加えて必須`Codex-Info-Published-Pair`、DB write/transaction=0 |
+| `/v1/details` | `GET` | `200` | current `PublishedPair` details、共通headerに加えて必須`Codex-Info-Published-Pair`、DB write/transaction=0 |
 | 上記known path | `HEAD/POST/PUT/PATCH/DELETE/OPTIONS`等全non-GET | `405` | 固定JSON error、同上header、DB/WAL/SHM/migration/prune/backup=0 |
 | unknown、case-altered、末尾slash、query付きpath（methodを問わない） | any | `404` | 固定JSON error、同上header、DB/WAL/SHM/migration/prune/backup=0 |
 
@@ -192,7 +192,11 @@ dollarは有限かつ0以上のJSON numberである。ドルはcreditや為替�
 `reset_at`はperiod groupのcanonical reset境界であり、sampleの所属判定に使う。`end_at`は現在期間では
 観測時刻、途中で次期間へ切り替わった過去期間では次期間開始へclipできるため、`end_at`をcanonical
 reset境界として代用してはならない。clientは`id`をparseせず、sampleの`reset_at`がperiodの
-`reset_at - 60 <= sample.reset_at <= reset_at`に入るものだけを同periodへcanonicalizeする。
+`reset_at - 60 <= sample.reset_at <= reset_at`に入るものだけを同periodへcanonicalizeする。各sampleは
+exactly one periodへ所属し、そのperiodの`start_at <= timestamp <= end_at`を満たす。raw
+`(sample.reset_at,timestamp)`が一意でも、canonicalize後の`(period.id,timestamp)`が衝突するcandidateは
+同一分に異なる残量・累積値を並べて垂直変化を作り得るため全体rejectする。merge、max、last-row、null化、
+array順選択で衝突を隠さない。
 
 `label`はLinux/X側が同じperiod groupの表示に用いたreference labelであり、selection keyでもWindowsの
 日時parse入力でもない。serverは`DESIGN.md`のcanonical period ID、start/end、起動時timezone、DST offset、
@@ -257,16 +261,19 @@ rootとsiblingの相対rankを保ったまま親先行depth-first・subtree-cont
 
 全objectは上記キーを全て必須とし、未知、大小文字違い、同一object内の重複、型違い、
 配列上限超過が1件でもあればcandidate全体を拒否する。status/detailsはサーバー側で一つの
-write lockにより同じ`PublishedPair`からatomic publishする。Windowsが別々のHTTP requestで
-同一cycleの表示を更新する場合は、現行`(ProfileScopeId, AccountScopeId, StorageEpoch, SupervisorLeaseIdentity, CollectorEpoch, CycleSeq)`、
-共通core field、`DataGeneration`、canonical fingerprint、`RootHash`が一致した組だけをcommitする。
+write lockにより同じ`PublishedPair`からatomic publishする。serverの`SnapshotPublisher`は現行
+`(ProfileScopeId, AccountScopeId, StorageEpoch, SupervisorLeaseIdentity, CollectorEpoch, CycleSeq)`、
+`DataGeneration`、`DataHash`、canonical fingerprint、`RootHash`が一致する内部candidateだけをpublishし、
+その成功publishへ一つの`Codex-Info-Published-Pair`を割り当てる。Windowsが別々のHTTP requestで同一cycleの
+表示を更新する場合は、両bodyのstrict schema/domain、共通core fieldのfield-by-field一致、両headerのexact一致を
+全て満たす組だけをcommitする。wireに存在しないserver内部値をWindowsが推測または再計算しない。
 片側失敗、更新競合、一致しない組、stale lease/epoch/cycleは架空の世代番号を補わず、DB、memory、REST、UIを
 変更せず両方のlast-good pairを保持して次cycleで再取得する。statusだけS1へ進みdetails D0を
 残す混合世代、detailsだけを先行更新する混合世代、片側のDB read/writeは許可しない。
 
 ## 段階的な移行
 
-v1 は Linux ネイティブ UI と別プロセスの`codex_info --service --listen 127.0.0.1:8787`で起動する監視 API である。
+v1 は Linux ネイティブ UI と別プロセスの、引数なしまたは`codex_info --port 8787`で起動する監視 API である。
 Windows 側には `windows-client/` の Avalonia / .NET 10 クライアントを用意し、Visual
 Studio Community から solution を開いて、この固定 JSON 契約を表示できる。詳細な
 接続・検証・表示仕様は[Windows クライアント](WINDOWS_CLIENT.md)を参照する。
@@ -293,12 +300,49 @@ healthはlistener到達性だけで、認証、ready、DB健全性、PublishedPa
 - `Content-Type`は`application/json; charset=utf-8`。parameter追加、charset欠落、別charsetを生成しない。
 - `Cache-Control`は`no-store`。
 - fixed bodyでは`Content-Length`をUTF-8 bytesと一致させる。
+- `/v1/status`と`/v1/details`の200応答は`Codex-Info-Published-Pair`をexactly one持つ。値は
+  ASCII `v1:`に128-bit server epochの32桁lowercase hex、続けて128-bit publish counterの
+  32桁lowercase hexを置いた67 bytesだけとする。同じimmutable `PublishedPair`から生成した両応答は
+  同じ値になる。clientはprefix/length/lowercase hexだけを検証し、epoch/counterを業務値としてparse、sort、
+  永続化、表示せず、同一candidate内のopaque equality tokenとしてだけ扱う。
+  `/v1/health`、error、unknown/method拒否応答はこのheaderを持たない。
 - response header aggregateは8 KiB以下。`Set-Cookie`、`Location`、`Content-Encoding`、
   `WWW-Authenticate`、authentication/proxy headerは0件。
 
 clientはContent-Typeをcase-insensitive tokenとしてparseするが、media type=`application/json`かつ
 唯一のparameter charset=`utf-8`を両方要求する。charsetなしを受理しない。body key順やJSON insignificant
-whitespaceはidentityに使わず、parse後のexact key/value集合とcanonical再serialization SHAをoracleにする。
+whitespaceはidentityに使わず、parse後のexact key/value集合、型、値、配列順をfield-by-fieldで検査する。
+clientはbodyのcanonical再serialization SHA、未公開のadmission tuple、`DataGeneration`、`DataHash`、
+canonical fingerprint、`RootHash`を再計算または推測しない。それらはserver内部のpublisher admissionであり、
+wire上では`Codex-Info-Published-Pair`が同じimmutable pairの比較専用identityを所有する。
+
+server epochはprocess起動時、listener bindより前にOS CSPRNGからexact 16 bytesを一度取得し、all-zeroなら
+再試行せず起動を非0終了する。credential、profile/account値、path、admission tuple、body hashをepochへ混ぜない。
+epochはprocess lifetime中不変で、単独ではwire・log・永続領域へ出さない。publish counterのownerは
+`SnapshotPublisher`一つで、初期値0、最初の成功publishを1とする。完全candidateのschema/domain/admission検証後、
+一つのpublisher write lock内でcounterをchecked-addし、epoch+counter tokenをpairへ設定してからrootを一度だけ
+交換する。reject、cancel、read、HTTP request、同じpairの再応答はcounterとrootを変更しない。公開bodyが同じでも
+新しい成功publishはcounterを増やす。同時publishはlock取得順に別counterを持つ。counterがu128::MAXなら旧pairを
+変更せず、publisherをpermanent-failedとしてlistenerを閉じprocessを非0終了する。OS CSPRNGのcollision resistanceを
+process再起動間の分離境界とし、同一process内のgeneration一意性はcounterで決定的に保証する。このheaderは外部が
+bodyから再計算するcontent proofではなく、同じpublisher pairを結ぶ比較専用identityである。
+
+server起動時はlistenerがrequestをacceptする前に、schema-validなdefault `initializing` status/detailsを最初の
+成功publishとしてcounter=1へ構築する。従って起動直後からstatus/detailsにはpair identityが存在し、最初の実data
+publishはcounter=2となる。default pairのserializationまたはidentity構築に失敗した場合はbind済みsocketを公開せず
+起動を非0終了し、pairなしの200応答を返さない。test用の未publish publisherはcounter=0から最初の明示publishを1として
+固定vectorを検査できるが、production listenerは未publish stateを外部へ公開しない。
+
+固定oracleは次のとおりとする。testではCSPRNG sourceを注入し、production CSPRNGを置換しない。
+
+| server epoch (hex) | successful publish counter | exact header value |
+| --- | ---: | --- |
+| `00112233445566778899aabbccddeeff` | 1 | `v1:00112233445566778899aabbccddeeff00000000000000000000000000000001` |
+| `00112233445566778899aabbccddeeff` | 2 | `v1:00112233445566778899aabbccddeeff00000000000000000000000000000002` |
+| `00112233445566778899aabbccddeef0` | 1 | `v1:00112233445566778899aabbccddeef000000000000000000000000000000001` |
+
+counter=1のpairをpublish後にinvalid candidateをrejectした場合、次のstatus/detailsもcounter=1のexact headerを返す。
+counter=1のpairを再度HTTP取得するだけでも同じ値を返し、counter=2へ進めない。
 
 ### Server error response
 
@@ -356,10 +400,13 @@ product syscall traceを検査する。同一request再入で副作用countが�
 
 ### Atomic status/details client admission
 
-client cycleはhealth受理後にstatusとdetailsを各1回取得し、両方のschema/domain/common coreが一致した場合だけ
+client cycleはhealth受理後にstatusとdetailsを各1回取得し、両方のschema/domain/common coreがfield-by-fieldで一致した場合だけ
 同じroot generationとして一括commitする。statusだけvalid、detailsだけvalid、片側timeout/non-200/invalid、
-common field不一致では両方をdiscardし、直前の完全pairを保持する。wireにgeneration fieldを追加せず、client内部の
-request cycle IDとcanonical common-core hashで同一候補を結ぶ。`WIN-I-016`を含む具体契約はこの規則と異なる
+common field不一致では両方をdiscardし、直前の完全pairを保持する。wireにJSON generation fieldを追加せず、client内部の
+request cycle IDと両応答のexactな`Codex-Info-Published-Pair`一致で同一候補を結ぶ。common-core hashやbody SHAを
+別のidentityとして作らず、同名fieldの型と値を直接比較する。
+header欠落、重複、値の大小文字差、prefix/長さ/hex不正、不一致はcandidate全体をrejectし、次cycleまで自動再取得を
+繰り返さない。`WIN-I-016`を含む具体契約はこの規則と異なる
 status-only commitを許可しない。
 ただし`auth_required`のsecurity visibility transitionはdata pairのcommitではない。
 schema-validな`state=auth_required,authenticated=false`を受理した場合、detailsがinvalidでも

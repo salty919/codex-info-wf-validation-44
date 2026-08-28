@@ -124,8 +124,6 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
 
     public UiText Texts => LocalizationService.Current;
 
-    public string ProductVersionText => ProductInfo.DisplayVersion;
-
     public IReadOnlyList<string> MetricOptions => metricOptions;
 
     public string SelectedMetric
@@ -195,15 +193,12 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
     {
         var end = EffectiveGraphEnd(period, now);
         var observed = period.Samples
-            // A historical period owns its canonical reset-boundary sample.
-            // The native/X graph keeps that terminal observation as the
-            // endpoint; dropping it here made a period whose last (or only)
-            // sample was recorded at reset render without its SOL/TERRA/LUNA
-            // totals.  The active period remains clipped to the observation
-            // time, so future rows cannot fabricate usage.
+            // Both current and historical periods own their effective-end
+            // sample.  The active period is clipped to the observation time,
+            // so rows after that endpoint remain excluded without dropping
+            // the exact endpoint itself.
             .Where(sample => sample.Timestamp >= period.StartAt &&
-                             (sample.Timestamp < end ||
-                              (!period.Current && sample.Timestamp == end)))
+                             sample.Timestamp <= end)
             .OrderBy(sample => sample.Timestamp)
             .ToList();
         if (observed.Count == 0)
@@ -211,42 +206,15 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
             return [];
         }
 
-        // The native client treats history rows as cumulative snapshots.  A
-        // stale/out-of-order reread must therefore never make a later graph
-        // segment move backwards.  Keep the latest remaining observation but
-        // take the greatest model/token value for duplicate timestamps.
-        var normalized = observed
-            // Native history is rendered in sixty-second buckets.  Keep the
-            // bucket anchored at the period start when a first sample falls
-            // before that boundary, then merge cumulative snapshots by max.
-            .GroupBy(sample => Math.Max(period.StartAt, sample.Timestamp - sample.Timestamp % 60))
-            .Select(group =>
-            {
-                var rows = group.ToList();
-                var latestRemaining = rows
-                    .Where(sample => sample.RemainingPercent is { } value && double.IsFinite(value))
-                    .Select(sample => sample.RemainingPercent)
-                    .LastOrDefault();
-                var latest = rows[^1];
-                return new ApiHistorySample(
-                    group.Key,
-                    latest.ResetAt,
-                    latestRemaining,
-                    rows.Max(sample => sample.SolDollars),
-                    rows.Max(sample => sample.TerraDollars),
-                    rows.Max(sample => sample.LunaDollars),
-                    rows.Max(sample => sample.SolTokens),
-                    rows.Max(sample => sample.TerraTokens),
-                    rows.Max(sample => sample.LunaTokens));
-            })
-            .OrderBy(sample => sample.Timestamp)
-            .ToList();
+        // Core admission supplies strictly increasing minute-start rows with
+        // one canonical owner for each period/timestamp.  Preserve those
+        // source rows as-is; graph code only applies the cross-time
+        // cumulative projection below and documented synthetic anchors.
+        var normalized = observed.ToList();
 
-        // Each history row is a cumulative snapshot, not a per-minute
-        // increment.  Carry the greatest value through later buckets as the
-        // native client does; this keeps both the model paths and the
-        // activity-aware remaining interpolation monotonic after a stale
-        // reread or an out-of-order API response.
+        // Each history row is a cumulative snapshot, not an increment. Carry
+        // the greatest value through later source rows so the model paths and
+        // remaining interpolation stay monotonic without regrouping rows.
         var cumulativeDollars = new double[3];
         var cumulativeTokens = new ulong[3];
         for (var index = 0; index < normalized.Count; index++)
@@ -608,8 +576,6 @@ public sealed class ThreadsWindowViewModel : INotifyPropertyChanged, IDisposable
 
     public UiText Texts => LocalizationService.Current;
 
-    public string ProductVersionText => ProductInfo.DisplayVersion;
-
     public bool HasThreads => threads.Count > 0;
 
     public bool HasNoThreads => !HasThreads;
@@ -839,8 +805,6 @@ public sealed class LegalNoticesWindowViewModel : INotifyPropertyChanged, IDispo
     public ReadOnlyObservableCollection<ApiLegalNotice> Notices { get; }
 
     public UiText Texts => LocalizationService.Current;
-
-    public string ProductVersionText => ProductInfo.DisplayVersion;
 
     public bool HasNotices => notices.Count > 0;
 

@@ -30,6 +30,7 @@ pub const MAX_PUBLIC_MODELS: usize = 3;
 /// limited to one calendar month of minute buckets.
 pub const MAX_PUBLIC_HISTORY_PERIODS: usize = 128;
 pub const MAX_PUBLIC_HISTORY_SAMPLES: usize = 31 * 24 * 60;
+pub const MAX_PUBLIC_HISTORY_GAPS: usize = 4_096;
 pub const MAX_PUBLIC_THREADS: usize = 256;
 const API_START_TIMEOUT: Duration = Duration::from_secs(1);
 const MAX_PUBLIC_UNIX_SECONDS: i64 = 253_402_300_799; // 9999-12-31T23:59:59Z
@@ -120,6 +121,15 @@ pub struct PublicHistorySample {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct PublicHistoryGap {
+    pub gap_id: String,
+    pub reset_at: i64,
+    pub start_at: i64,
+    pub end_at: i64,
+    pub reason: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct PublicThread {
     pub id: String,
     pub title: String,
@@ -164,6 +174,7 @@ pub struct PublicDetails {
     pub active_thread_count: u64,
     pub history_periods: Vec<PublicHistoryPeriod>,
     pub history_samples: Vec<PublicHistorySample>,
+    pub history_gaps: Vec<PublicHistoryGap>,
     pub threads: Vec<PublicThread>,
     pub estimated_cost_label: String,
 }
@@ -180,6 +191,7 @@ impl Default for PublicDetails {
             active_thread_count: 0,
             history_periods: Vec::new(),
             history_samples: Vec::new(),
+            history_gaps: Vec::new(),
             threads: Vec::new(),
             estimated_cost_label: "概算 —".to_owned(),
         }
@@ -245,7 +257,7 @@ impl PublicDetails {
         if self.history_samples.len() > MAX_PUBLIC_HISTORY_SAMPLES {
             return Err(ApiSnapshotError::ListTooLong);
         }
-        if self.threads.len() > MAX_PUBLIC_THREADS {
+        if self.history_gaps.len() > MAX_PUBLIC_HISTORY_GAPS {
             return Err(ApiSnapshotError::ListTooLong);
         }
         if self.models.len() > MAX_PUBLIC_MODELS {
@@ -262,10 +274,12 @@ impl PublicDetails {
         }
 
         let mut period_ids = HashSet::with_capacity(self.history_periods.len());
+        let mut period_resets = HashSet::with_capacity(self.history_periods.len());
         let mut current_periods = 0usize;
         for period in &self.history_periods {
             if !valid_text(&period.id, MAX_PUBLIC_ID_SCALARS)
                 || !period_ids.insert(period.id.as_str())
+                || !period_resets.insert(period.reset_at)
                 || !valid_timestamp(period.start_at)
                 || !valid_timestamp(period.end_at)
                 || !valid_timestamp(period.reset_at)
@@ -284,8 +298,23 @@ impl PublicDetails {
             return Err(ApiSnapshotError::InvalidHistoryPeriod);
         }
 
+        for period in &self.history_periods {
+            if period.current {
+                let Some(observed_at) = self.observed_at else {
+                    return Err(ApiSnapshotError::InvalidHistoryPeriod);
+                };
+                if period.end_at != period.reset_at.min(observed_at) {
+                    return Err(ApiSnapshotError::InvalidHistoryPeriod);
+                }
+            }
+        }
+
+        let mut sample_ids = HashSet::with_capacity(self.history_samples.len());
+        let mut canonical_sample_ids = HashSet::with_capacity(self.history_samples.len());
+        let mut previous_sample_key = None;
         for sample in &self.history_samples {
             if !valid_timestamp(sample.timestamp)
+                || sample.timestamp.rem_euclid(60) != 0
                 || !valid_timestamp(sample.reset_at)
                 || sample
                     .remaining_percent
@@ -296,32 +325,78 @@ impl PublicDetails {
             {
                 return Err(ApiSnapshotError::InvalidHistorySample);
             }
+            if !sample_ids.insert((sample.reset_at, sample.timestamp)) {
+                return Err(ApiSnapshotError::InvalidHistorySample);
+            }
+            let matching_periods = self
+                .history_periods
+                .iter()
+                .filter(|period| {
+                    sample.reset_at >= period.reset_at.saturating_sub(60)
+                        && sample.reset_at <= period.reset_at
+                        && sample.timestamp >= period.start_at
+                        && sample.timestamp <= period.end_at
+                })
+                .collect::<Vec<_>>();
+            if matching_periods.len() != 1 {
+                return Err(ApiSnapshotError::InvalidHistorySample);
+            }
+            let period = matching_periods[0];
+            if !canonical_sample_ids.insert((period.id.as_str(), sample.timestamp)) {
+                return Err(ApiSnapshotError::InvalidHistorySample);
+            }
+            let sample_key = (sample.reset_at, sample.timestamp);
+            if previous_sample_key.is_some_and(|previous| previous > sample_key) {
+                return Err(ApiSnapshotError::InvalidHistorySample);
+            }
+            previous_sample_key = Some(sample_key);
         }
 
-        let mut thread_ids = HashSet::with_capacity(self.threads.len());
-        for thread in &self.threads {
-            if !valid_text(&thread.id, MAX_PUBLIC_ID_SCALARS)
-                || !thread_ids.insert(thread.id.as_str())
-                || !valid_text(&thread.title, security::MAX_THREAD_TITLE_SCALARS)
-                || thread.title.is_empty()
-                || !valid_text(&thread.model, security::MAX_MODEL_SCALARS)
-                || thread.model.is_empty()
-                || !valid_text(
-                    &thread.model_label,
-                    security::MAX_ACCOUNT_ACTIVITY_LABEL_SCALARS,
+        let mut gap_ids = HashSet::with_capacity(self.history_gaps.len());
+        let mut previous_gap_key = None;
+        let mut gap_ranges = Vec::with_capacity(self.history_gaps.len());
+        for gap in &self.history_gaps {
+            if !valid_lower_hex32(&gap.gap_id)
+                || !gap_ids.insert(gap.gap_id.as_str())
+                || !valid_timestamp(gap.reset_at)
+                || !valid_timestamp(gap.start_at)
+                || !valid_timestamp(gap.end_at)
+                || gap.start_at > gap.end_at
+                || !matches!(
+                    gap.reason.as_str(),
+                    "daemon_stop_unrecoverable" | "reset_hint_expired" | "auth_epoch_tombstoned"
                 )
-                || thread.model_label.is_empty()
-                || !thread
-                    .parent_thread_id
-                    .as_deref()
-                    .is_none_or(|id| valid_text(id, MAX_PUBLIC_ID_SCALARS) && !id.is_empty())
-                || !thread.created_at.is_none_or(valid_timestamp)
-                || !thread.last_user_message_at.is_none_or(valid_timestamp)
-                || !thread.depth.is_none_or(|depth| (0..=1024).contains(&depth))
             {
-                return Err(ApiSnapshotError::InvalidThread);
+                return Err(ApiSnapshotError::InvalidHistoryGap);
             }
+            let matching_periods = self
+                .history_periods
+                .iter()
+                .filter(|period| {
+                    gap.reset_at >= period.reset_at.saturating_sub(60)
+                        && gap.reset_at <= period.reset_at
+                        && gap.start_at >= period.start_at
+                        && gap.end_at <= period.end_at
+                })
+                .collect::<Vec<_>>();
+            if matching_periods.len() != 1 {
+                return Err(ApiSnapshotError::InvalidHistoryGap);
+            }
+            let period = matching_periods[0];
+            let gap_key = (gap.reset_at, gap.start_at, gap.end_at, gap.gap_id.as_str());
+            if previous_gap_key.is_some_and(|previous| previous > gap_key) {
+                return Err(ApiSnapshotError::InvalidHistoryGap);
+            }
+            previous_gap_key = Some(gap_key);
+            if gap_ranges.iter().any(|(period_id, start_at, end_at)| {
+                period_id == &period.id && gap.start_at <= *end_at && *start_at <= gap.end_at
+            }) {
+                return Err(ApiSnapshotError::InvalidHistoryGap);
+            }
+            gap_ranges.push((period.id.clone(), gap.start_at, gap.end_at));
         }
+
+        validate_public_threads(&self.threads)?;
         if !valid_text(&self.estimated_cost_label, security::MAX_STATUS_SCALARS)
             || self.estimated_cost_label.is_empty()
         {
@@ -329,6 +404,45 @@ impl PublicDetails {
         }
         Ok(())
     }
+}
+
+/// Validate the complete bounded thread slice before it can cross any public
+/// or local presentation boundary.  This is the single owner for the REST
+/// thread schema/domain, capacity, and duplicate rules; callers must not
+/// reproduce these checks.
+/// Public because the binary target owns the local state/admission path while
+/// this module belongs to the library target; the implementation remains the
+/// sole server-side thread validation owner.
+pub fn validate_public_threads(threads: &[PublicThread]) -> Result<(), ApiSnapshotError> {
+    if threads.len() > MAX_PUBLIC_THREADS {
+        return Err(ApiSnapshotError::ListTooLong);
+    }
+
+    let mut thread_ids = HashSet::with_capacity(threads.len());
+    for thread in threads {
+        if !valid_text(&thread.id, MAX_PUBLIC_ID_SCALARS)
+            || !thread_ids.insert(thread.id.as_str())
+            || !valid_text(&thread.title, security::MAX_THREAD_TITLE_SCALARS)
+            || thread.title.is_empty()
+            || !valid_text(&thread.model, security::MAX_MODEL_SCALARS)
+            || thread.model.is_empty()
+            || !valid_text(
+                &thread.model_label,
+                security::MAX_ACCOUNT_ACTIVITY_LABEL_SCALARS,
+            )
+            || thread.model_label.is_empty()
+            || !thread
+                .parent_thread_id
+                .as_deref()
+                .is_none_or(|id| valid_text(id, MAX_PUBLIC_ID_SCALARS) && !id.is_empty())
+            || !thread.created_at.is_none_or(valid_timestamp)
+            || !thread.last_user_message_at.is_none_or(valid_timestamp)
+            || !thread.depth.is_none_or(|depth| (0..=1024).contains(&depth))
+        {
+            return Err(ApiSnapshotError::InvalidThread);
+        }
+    }
+    Ok(())
 }
 
 fn valid_timestamp(value: i64) -> bool {
@@ -342,7 +456,27 @@ fn valid_non_negative_rate(value: f64) -> bool {
 fn valid_text(value: &str, max_scalars: usize) -> bool {
     !value.is_empty()
         && value.chars().count() <= max_scalars
-        && !value.chars().any(char::is_control)
+        && !value
+            .chars()
+            .any(|character| character.is_control() || is_bidi_formatting(character))
+}
+
+fn is_bidi_formatting(value: char) -> bool {
+    matches!(
+        value,
+        '\u{061c}'
+            | '\u{200e}'
+            | '\u{200f}'
+            | '\u{202a}'..='\u{202e}'
+            | '\u{2066}'..='\u{2069}'
+    )
+}
+
+fn valid_lower_hex32(value: &str) -> bool {
+    value.len() == 32
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 impl PublicSnapshot {
@@ -392,9 +526,11 @@ pub enum ApiSnapshotError {
     InvalidLabel,
     InvalidHistoryPeriod,
     InvalidHistorySample,
+    InvalidHistoryGap,
     InvalidThread,
     ListTooLong,
     Serialization,
+    PublishedPairGenerationFailed,
 }
 
 impl fmt::Display for ApiSnapshotError {
@@ -406,9 +542,13 @@ impl fmt::Display for ApiSnapshotError {
             Self::InvalidLabel => "public snapshot has an invalid label",
             Self::InvalidHistoryPeriod => "public snapshot has an invalid history period",
             Self::InvalidHistorySample => "public snapshot has an invalid history sample",
+            Self::InvalidHistoryGap => "public snapshot has an invalid history gap",
             Self::InvalidThread => "public snapshot has an invalid thread",
             Self::ListTooLong => "public snapshot has too many rows",
             Self::Serialization => "public snapshot could not be serialized",
+            Self::PublishedPairGenerationFailed => {
+                "published pair generation is permanently unavailable"
+            }
         };
         formatter.write_str(message)
     }
@@ -446,19 +586,82 @@ fn serialize_details(details: &PublicDetails) -> Result<Vec<u8>, ApiSnapshotErro
     .map_err(|_| ApiSnapshotError::Serialization)
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PublishedPair {
+    identity: String,
+}
+
+impl PublishedPair {
+    pub fn as_str(&self) -> &str {
+        &self.identity
+    }
+
+    pub fn identity(&self) -> &str {
+        self.as_str()
+    }
+
+    fn from_epoch_counter(epoch: [u8; 16], counter: u128) -> Self {
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        let mut identity = String::with_capacity(67);
+        identity.push_str("v1:");
+        for byte in epoch {
+            identity.push(HEX[(byte >> 4) as usize] as char);
+            identity.push(HEX[(byte & 0x0f) as usize] as char);
+        }
+        for shift in (0..32).rev() {
+            let nibble = ((counter >> (shift * 4)) & 0x0f) as usize;
+            identity.push(HEX[nibble] as char);
+        }
+        Self { identity }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum PublishedPairGenerationState {
+    Uninitialized,
+    Active { epoch: [u8; 16], counter: u128 },
+    PermanentFailed,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 struct PublishedSnapshot {
     status_body: Vec<u8>,
     details_body: Vec<u8>,
+    pair: Option<PublishedPair>,
+    generation: PublishedPairGenerationState,
+}
+
+impl PublishedSnapshot {
+    fn with_unpublished_epoch(epoch: [u8; 16]) -> Self {
+        Self {
+            generation: PublishedPairGenerationState::Active { epoch, counter: 0 },
+            ..Self::default()
+        }
+    }
+
+    fn with_initial_pair(epoch: [u8; 16]) -> Self {
+        let mut snapshot = Self::with_unpublished_epoch(epoch);
+        snapshot.pair = Some(PublishedPair::from_epoch_counter(epoch, 1));
+        snapshot.generation = PublishedPairGenerationState::Active { epoch, counter: 1 };
+        snapshot
+    }
 }
 
 impl Default for PublishedSnapshot {
     fn default() -> Self {
         let status = PublicSnapshot::default();
         let details = PublicDetails::default();
+        status
+            .validate()
+            .expect("default status must validate before publication");
+        details
+            .validate()
+            .expect("default details must validate before publication");
         Self {
             status_body: serialize_status(&status).expect("default status must serialize"),
             details_body: serialize_details(&details).expect("default details must serialize"),
+            pair: None,
+            generation: PublishedPairGenerationState::Uninitialized,
         }
     }
 }
@@ -472,6 +675,23 @@ pub struct ApiSnapshotPublisher {
 }
 
 impl ApiSnapshotPublisher {
+    #[cfg(test)]
+    fn with_unpublished_epoch_for_test(epoch: [u8; 16]) -> Self {
+        Self {
+            snapshot: Arc::new(RwLock::new(PublishedSnapshot::with_unpublished_epoch(
+                epoch,
+            ))),
+        }
+    }
+
+    pub fn published_pair(&self) -> Option<PublishedPair> {
+        let current = self
+            .snapshot
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        current.pair.clone()
+    }
+
     /// Replaces the entire public snapshot only after its finite whitelist has
     /// been validated. The previous snapshot remains available on failure.
     pub fn publish(&self, snapshot: PublicSnapshot) -> Result<(), ApiSnapshotError> {
@@ -480,15 +700,8 @@ impl ApiSnapshotPublisher {
         details.validate()?;
         let status_body = serialize_status(&snapshot)?;
         let details_body = serialize_details(&details)?;
-        let mut current = self
-            .snapshot
-            .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        *current = PublishedSnapshot {
-            status_body,
-            details_body,
-        };
-        Ok(())
+        self.publish_serialized(status_body, details_body)
+            .map(|_| ())
     }
 
     /// Atomically publishes the status and all additive details. The status
@@ -499,15 +712,56 @@ impl ApiSnapshotPublisher {
         let status = details.status_snapshot();
         let status_body = serialize_status(&status)?;
         let details_body = serialize_details(&details)?;
+        self.publish_serialized(status_body, details_body)
+            .map(|_| ())
+    }
+
+    #[cfg(test)]
+    fn publish_for_test(
+        &self,
+        snapshot: PublicSnapshot,
+    ) -> Result<PublishedPair, ApiSnapshotError> {
+        snapshot.validate()?;
+        let details = PublicDetails::from_snapshot(&snapshot);
+        details.validate()?;
+        let status_body = serialize_status(&snapshot)?;
+        let details_body = serialize_details(&details)?;
+        self.publish_serialized(status_body, details_body)
+    }
+
+    fn publish_serialized(
+        &self,
+        status_body: Vec<u8>,
+        details_body: Vec<u8>,
+    ) -> Result<PublishedPair, ApiSnapshotError> {
         let mut current = self
             .snapshot
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let (epoch, next_counter) = match &current.generation {
+            PublishedPairGenerationState::Active { epoch, counter } => {
+                let Some(next_counter) = counter.checked_add(1) else {
+                    current.generation = PublishedPairGenerationState::PermanentFailed;
+                    return Err(ApiSnapshotError::PublishedPairGenerationFailed);
+                };
+                (*epoch, next_counter)
+            }
+            PublishedPairGenerationState::Uninitialized
+            | PublishedPairGenerationState::PermanentFailed => {
+                return Err(ApiSnapshotError::PublishedPairGenerationFailed);
+            }
+        };
+        let pair = PublishedPair::from_epoch_counter(epoch, next_counter);
         *current = PublishedSnapshot {
             status_body,
             details_body,
+            pair: Some(pair.clone()),
+            generation: PublishedPairGenerationState::Active {
+                epoch,
+                counter: next_counter,
+            },
         };
-        Ok(())
+        Ok(pair)
     }
 }
 
@@ -548,11 +802,28 @@ fn is_loopback(address: IpAddr) -> bool {
     address.is_loopback()
 }
 
+fn server_epoch_from_source<F>(source: F) -> Result<[u8; 16], ApiServerError>
+where
+    F: FnOnce(&mut [u8; 16]) -> Result<(), ()>,
+{
+    let mut epoch = [0_u8; 16];
+    source(&mut epoch).map_err(|_| ApiServerError::EntropyUnavailable)?;
+    if epoch == [0_u8; 16] {
+        return Err(ApiServerError::EntropyUnavailable);
+    }
+    Ok(epoch)
+}
+
+fn random_server_epoch() -> Result<[u8; 16], ApiServerError> {
+    server_epoch_from_source(|epoch| getrandom::fill(epoch).map_err(|_| ()))
+}
+
 /// Redacted errors for starting the optional API listener.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ApiServerError {
     InvalidListenConfiguration,
     NonLoopbackAddress,
+    EntropyUnavailable,
     BindFailed,
     RuntimeFailed,
     WorkerStartFailed,
@@ -563,6 +834,7 @@ impl fmt::Display for ApiServerError {
         let message = match self {
             Self::InvalidListenConfiguration => "API listen configuration is invalid",
             Self::NonLoopbackAddress => "API listener must use a loopback address",
+            Self::EntropyUnavailable => "API listener entropy source unavailable",
             Self::BindFailed => "API listener could not bind safely",
             Self::RuntimeFailed => "API runtime could not start",
             Self::WorkerStartFailed => "API worker could not start",
@@ -590,6 +862,11 @@ impl ApiServer {
     }
 
     pub fn start(config: ApiServerConfig) -> Result<Self, ApiServerError> {
+        let epoch = random_server_epoch()?;
+        Self::start_with_epoch(config, epoch)
+    }
+
+    fn start_with_epoch(config: ApiServerConfig, epoch: [u8; 16]) -> Result<Self, ApiServerError> {
         let listener =
             TcpListener::bind(config.listen_addr).map_err(|_| ApiServerError::BindFailed)?;
         listener
@@ -599,7 +876,7 @@ impl ApiServer {
             .local_addr()
             .map_err(|_| ApiServerError::BindFailed)?;
         let publisher = ApiSnapshotPublisher {
-            snapshot: Arc::new(RwLock::new(PublishedSnapshot::default())),
+            snapshot: Arc::new(RwLock::new(PublishedSnapshot::with_initial_pair(epoch))),
         };
         let snapshot = Arc::clone(&publisher.snapshot);
         let (shutdown, shutdown_receiver) = oneshot::channel();
@@ -657,6 +934,18 @@ impl ApiServer {
                 Err(ApiServerError::WorkerStartFailed)
             }
         }
+    }
+
+    #[cfg(test)]
+    fn start_with_epoch_source<F>(
+        config: ApiServerConfig,
+        source: F,
+    ) -> Result<Self, ApiServerError>
+    where
+        F: FnOnce(&mut [u8; 16]) -> Result<(), ()>,
+    {
+        let epoch = server_epoch_from_source(source)?;
+        Self::start_with_epoch(config, epoch)
     }
 
     pub fn publisher(&self) -> ApiSnapshotPublisher {
@@ -828,6 +1117,29 @@ fn try_admit_connection(active: &AtomicUsize) -> bool {
     }
 }
 
+type HttpResponse = (u16, Vec<u8>, Option<PublishedPair>);
+
+fn snapshot_response(snapshot: &SharedSnapshot, route: ApiRoute) -> HttpResponse {
+    let current = snapshot
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let Some(pair) = current.pair.clone() else {
+        return (503, error_body("snapshot_unavailable"), None);
+    };
+    if !matches!(
+        current.generation,
+        PublishedPairGenerationState::Active { .. }
+    ) {
+        return (503, error_body("snapshot_unavailable"), None);
+    }
+    let body = match route {
+        ApiRoute::Status => current.status_body.clone(),
+        ApiRoute::Details => current.details_body.clone(),
+        ApiRoute::Health => return (503, error_body("snapshot_unavailable"), None),
+    };
+    (200, body, Some(pair))
+}
+
 fn handle_connection(
     mut stream: TcpStream,
     snapshot: SharedSnapshot,
@@ -850,42 +1162,30 @@ fn handle_connection(
             trailing_data,
         } => match parse_request(&data, line_end, terminator, trailing_data, &authority) {
             Ok(request) => match request.route {
-                None => (404, error_body("not_found")),
-                Some(_) if !request.is_get => (405, error_body("method_not_allowed")),
+                None => (404, error_body("not_found"), None),
+                Some(_) if !request.is_get => (405, error_body("method_not_allowed"), None),
                 Some(_) if request.body_not_allowed => {
-                    (413, error_body("request_body_not_allowed"))
+                    (413, error_body("request_body_not_allowed"), None)
                 }
-                Some(ApiRoute::Health) => (200, health_body()),
-                Some(ApiRoute::Status) => {
-                    let body = snapshot
-                        .read()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner())
-                        .status_body
-                        .clone();
-                    (200, body)
-                }
-                Some(ApiRoute::Details) => {
-                    let body = snapshot
-                        .read()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner())
-                        .details_body
-                        .clone();
-                    (200, body)
-                }
+                Some(ApiRoute::Health) => (200, health_body(), None),
+                Some(ApiRoute::Status) => snapshot_response(&snapshot, ApiRoute::Status),
+                Some(ApiRoute::Details) => snapshot_response(&snapshot, ApiRoute::Details),
             },
-            Err(ParseFailure::BadRequest) => (400, error_body("bad_request")),
-            Err(ParseFailure::HeadersTooLarge) => (431, error_body("request_headers_too_large")),
+            Err(ParseFailure::BadRequest) => (400, error_body("bad_request"), None),
+            Err(ParseFailure::HeadersTooLarge) => {
+                (431, error_body("request_headers_too_large"), None)
+            }
         },
-        HeaderRead::Timeout => (408, error_body("request_timeout")),
-        HeaderRead::BadRequest => (400, error_body("bad_request")),
-        HeaderRead::HeadersTooLarge => (431, error_body("request_headers_too_large")),
+        HeaderRead::Timeout => (408, error_body("request_timeout"), None),
+        HeaderRead::BadRequest => (400, error_body("bad_request"), None),
+        HeaderRead::HeadersTooLarge => (431, error_body("request_headers_too_large"), None),
         HeaderRead::Closed => {
             let _ = stream.shutdown(Shutdown::Both);
             return;
         }
     };
 
-    write_json_response(&mut stream, response.0, &response.1);
+    write_json_response(&mut stream, response.0, &response.1, response.2.as_ref());
     let _ = stream.shutdown(Shutdown::Both);
 }
 
@@ -1147,10 +1447,15 @@ fn error_body(error: &'static str) -> Vec<u8> {
 
 fn write_error_response(stream: &mut TcpStream, status: u16, error: &'static str) {
     let body = error_body(error);
-    write_json_response(stream, status, &body);
+    write_json_response(stream, status, &body, None);
 }
 
-fn write_json_response(stream: &mut TcpStream, status: u16, body: &[u8]) {
+fn write_json_response(
+    stream: &mut TcpStream,
+    status: u16,
+    body: &[u8],
+    pair: Option<&PublishedPair>,
+) {
     let reason = match status {
         200 => "OK",
         400 => "Bad Request",
@@ -1164,8 +1469,15 @@ fn write_json_response(stream: &mut TcpStream, status: u16, body: &[u8]) {
         503 => "Service Unavailable",
         _ => "Error",
     };
+    let pair_header = if status == 200 {
+        pair.map_or_else(String::new, |pair| {
+            format!("Codex-Info-Published-Pair: {}\r\n", pair.as_str())
+        })
+    } else {
+        String::new()
+    };
     let header = format!(
-        "HTTP/1.1 {status} {reason}\r\ncontent-type: application/json; charset=utf-8\r\ncache-control: no-store\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+        "HTTP/1.1 {status} {reason}\r\n{pair_header}content-type: application/json; charset=utf-8\r\ncache-control: no-store\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
         body.len()
     );
     let _ = stream.write_all(header.as_bytes());
@@ -1194,6 +1506,164 @@ mod tests {
 
     fn loopback_config() -> ApiServerConfig {
         ApiServerConfig::new(SocketAddr::from(([127, 0, 0, 1], 0))).unwrap()
+    }
+
+    #[test]
+    fn production_server_starts_with_initial_pair_before_first_publish() {
+        let epoch = [
+            0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd,
+            0xee, 0xff,
+        ];
+        let mut server = ApiServer::start_with_epoch_source(loopback_config(), |target| {
+            target.copy_from_slice(&epoch);
+            Ok(())
+        })
+        .unwrap();
+        let publisher = server.publisher();
+        assert_eq!(
+            publisher.published_pair().unwrap().as_str(),
+            "v1:00112233445566778899aabbccddeeff00000000000000000000000000000001"
+        );
+        publisher.publish(PublicSnapshot::default()).unwrap();
+        assert_eq!(
+            publisher.published_pair().unwrap().as_str(),
+            "v1:00112233445566778899aabbccddeeff00000000000000000000000000000002"
+        );
+        server.shutdown();
+    }
+
+    #[test]
+    fn published_pair_generation_matches_fixed_vectors() {
+        let epoch = [
+            0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd,
+            0xee, 0xff,
+        ];
+        let publisher = ApiSnapshotPublisher::with_unpublished_epoch_for_test(epoch);
+        publisher.publish(PublicSnapshot::default()).unwrap();
+        assert_eq!(
+            publisher.published_pair().unwrap().as_str(),
+            "v1:00112233445566778899aabbccddeeff00000000000000000000000000000001"
+        );
+        publisher.publish(PublicSnapshot::default()).unwrap();
+        assert_eq!(
+            publisher.published_pair().unwrap().as_str(),
+            "v1:00112233445566778899aabbccddeeff00000000000000000000000000000002"
+        );
+
+        let epoch = [
+            0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd,
+            0xee, 0xf0,
+        ];
+        let publisher = ApiSnapshotPublisher::with_unpublished_epoch_for_test(epoch);
+        publisher.publish(PublicSnapshot::default()).unwrap();
+        assert_eq!(
+            publisher.published_pair().unwrap().as_str(),
+            "v1:00112233445566778899aabbccddeef000000000000000000000000000000001"
+        );
+    }
+
+    #[test]
+    fn same_body_successful_publish_allocates_a_new_pair() {
+        let publisher = ApiSnapshotPublisher::with_unpublished_epoch_for_test([0x11; 16]);
+        publisher.publish(PublicSnapshot::default()).unwrap();
+        let first = publisher.published_pair().unwrap();
+        publisher.publish(PublicSnapshot::default()).unwrap();
+        let second = publisher.published_pair().unwrap();
+        assert_ne!(first, second);
+        assert!(second.as_str().ends_with("2"));
+    }
+
+    #[test]
+    fn invalid_publish_and_reads_leave_pair_unchanged() {
+        let publisher = ApiSnapshotPublisher::with_unpublished_epoch_for_test([0x22; 16]);
+        publisher.publish(PublicSnapshot::default()).unwrap();
+        let before = publisher.published_pair();
+
+        let invalid = PublicSnapshot {
+            observed_at: Some(-1),
+            ..PublicSnapshot::default()
+        };
+        assert_eq!(
+            publisher.publish(invalid),
+            Err(ApiSnapshotError::InvalidObservedAt)
+        );
+        assert_eq!(publisher.published_pair(), before);
+        assert_eq!(publisher.published_pair(), before);
+    }
+
+    #[test]
+    fn concurrent_successful_publishes_have_unique_pairs() {
+        let publisher = std::sync::Arc::new(ApiSnapshotPublisher::with_unpublished_epoch_for_test(
+            [0x33; 16],
+        ));
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(16));
+        let handles = (0..16)
+            .map(|_| {
+                let publisher = std::sync::Arc::clone(&publisher);
+                let barrier = std::sync::Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    publisher
+                        .publish_for_test(PublicSnapshot::default())
+                        .unwrap()
+                        .as_str()
+                        .to_owned()
+                })
+            })
+            .collect::<Vec<_>>();
+        let identities = handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(identities.len(), 16);
+    }
+
+    #[test]
+    fn counter_overflow_permanently_fails_without_replacing_old_pair() {
+        let epoch = [0x44; 16];
+        let publisher = ApiSnapshotPublisher::with_unpublished_epoch_for_test(epoch);
+        publisher.publish(PublicSnapshot::default()).unwrap();
+        let before = publisher.published_pair();
+        {
+            let mut state = publisher
+                .snapshot
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            state.generation = PublishedPairGenerationState::Active {
+                epoch,
+                counter: u128::MAX,
+            };
+        }
+
+        let expected = Err(ApiSnapshotError::PublishedPairGenerationFailed);
+        assert_eq!(publisher.publish(PublicSnapshot::default()), expected);
+        assert_eq!(publisher.published_pair(), before);
+        assert_eq!(publisher.publish(PublicSnapshot::default()), expected);
+        let state = publisher
+            .snapshot
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert_eq!(
+            state.generation,
+            PublishedPairGenerationState::PermanentFailed
+        );
+    }
+
+    #[test]
+    fn entropy_failure_and_all_zero_epoch_fail_before_bind() {
+        let occupied = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0))).unwrap();
+        let config = ApiServerConfig::new(occupied.local_addr().unwrap()).unwrap();
+        assert!(matches!(
+            ApiServer::start_with_epoch_source(config, |_| Err(())),
+            Err(ApiServerError::EntropyUnavailable)
+        ));
+        assert!(matches!(
+            ApiServer::start_with_epoch_source(config, |epoch| {
+                epoch.fill(0);
+                Ok(())
+            }),
+            Err(ApiServerError::EntropyUnavailable)
+        ));
     }
 
     fn wire_request(address: SocketAddr, request: &str) -> String {
@@ -1232,10 +1702,163 @@ mod tests {
         serde_json::from_str(body).unwrap()
     }
 
+    fn published_pair_headers(response: &str) -> Vec<String> {
+        response
+            .split("\r\n\r\n")
+            .next()
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("Codex-Info-Published-Pair")
+                    .then(|| value.trim().to_owned())
+            })
+            .collect()
+    }
+
+    #[test]
+    fn status_and_details_start_with_the_same_initial_pair_header() {
+        let epoch = [
+            0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd,
+            0xee, 0xff,
+        ];
+        let mut server = ApiServer::start_with_epoch_source(loopback_config(), |target| {
+            target.copy_from_slice(&epoch);
+            Ok(())
+        })
+        .unwrap();
+        let expected_initial =
+            "v1:00112233445566778899aabbccddeeff00000000000000000000000000000001";
+        let status = wire_request(
+            server.local_addr(),
+            "GET /v1/status HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        );
+        let details = wire_request(
+            server.local_addr(),
+            "GET /v1/details HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        );
+        assert_eq!(published_pair_headers(&status), vec![expected_initial]);
+        assert_eq!(published_pair_headers(&details), vec![expected_initial]);
+
+        server
+            .publisher()
+            .publish(PublicSnapshot::default())
+            .unwrap();
+        let expected_next = "v1:00112233445566778899aabbccddeeff00000000000000000000000000000002";
+        let status = wire_request(
+            server.local_addr(),
+            "GET /v1/status HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        );
+        let details = wire_request(
+            server.local_addr(),
+            "GET /v1/details HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        );
+        assert_eq!(published_pair_headers(&status), vec![expected_next]);
+        assert_eq!(published_pair_headers(&details), vec![expected_next]);
+        server.shutdown();
+    }
+
+    #[test]
+    fn non_success_and_unavailable_responses_have_no_pair_header() {
+        let _guard = api_server_test_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut server = ApiServer::start(loopback_config()).unwrap();
+        let address = server.local_addr();
+        let responses = [
+            wire_request(
+                address,
+                "GET /v1/health HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+            ),
+            wire_request(
+                address,
+                "GET /v1/missing HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+            ),
+            wire_request(
+                address,
+                "DELETE /v1/status HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+            ),
+            wire_request(
+                address,
+                "GET /v1/status HTTP/1.1\r\nHost: localhost\r\nmalformed\r\n\r\n",
+            ),
+            wire_request(
+                address,
+                "GET /v1/status HTTP/1.1\r\nHost: localhost\r\nContent-Length: 1\r\nConnection: close\r\n\r\n",
+            ),
+        ];
+        for response in responses {
+            assert!(published_pair_headers(&response).is_empty(), "{response:?}");
+        }
+
+        let authority = authority_for(address);
+        let oversized = format!(
+            "GET /v1/health HTTP/1.1\r\nHost: {authority}\r\nX-Fill: {}\r\n\r\n",
+            "x".repeat(MAX_HEADER_AGGREGATE_BYTES)
+        );
+        let response = wire_request_raw(address, oversized.as_bytes());
+        assert!(response.starts_with("HTTP/1.1 431"), "{response:?}");
+        assert!(published_pair_headers(&response).is_empty());
+        assert!(response.split_once("\r\n\r\n").unwrap().0.len() < MAX_HEADER_AGGREGATE_BYTES);
+
+        {
+            let publisher = server.publisher();
+            let mut state = publisher
+                .snapshot
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            state.generation = PublishedPairGenerationState::PermanentFailed;
+        }
+        let response = wire_request(
+            address,
+            "GET /v1/status HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        );
+        assert!(response.starts_with("HTTP/1.1 503"), "{response:?}");
+        assert_eq!(body(&response)["error"], "snapshot_unavailable");
+        assert!(published_pair_headers(&response).is_empty());
+        server.shutdown();
+    }
+
+    #[test]
+    fn too_many_active_connections_have_no_pair_header() {
+        let _guard = api_server_test_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut server = ApiServer::start(loopback_config()).unwrap();
+        let address = server.local_addr();
+        let authority = authority_for(address);
+        let partial = format!("GET /v1/health HTTP/1.1\r\nHost: {authority}\r\n");
+        let mut blockers = Vec::with_capacity(MAX_ACTIVE_CONNECTIONS);
+        for _ in 0..MAX_ACTIVE_CONNECTIONS {
+            let mut stream = TcpStream::connect(address).unwrap();
+            stream.write_all(partial.as_bytes()).unwrap();
+            blockers.push(stream);
+        }
+        // Connecting and writing the partial requests does not prove that the
+        // listener threads have accepted all blockers yet.  Wait for the
+        // externally observable saturation response instead of racing a fixed
+        // sleep against a loaded test host.
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let response = loop {
+            let response = wire_request(
+                address,
+                "GET /v1/health HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+            );
+            if response.starts_with("HTTP/1.1 429") || std::time::Instant::now() >= deadline {
+                break response;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        assert!(response.starts_with("HTTP/1.1 429"), "{response:?}");
+        assert!(published_pair_headers(&response).is_empty());
+        drop(blockers);
+        server.shutdown();
+    }
+
     fn detailed_fixture() -> PublicDetails {
         PublicDetails {
             state: PublicState::Ready,
-            observed_at: Some(1_780_000_000),
+            observed_at: Some(1_780_000_020),
             authenticated: true,
             plan_label: Some("Pro".into()),
             quota: Some(PublicQuota {
@@ -1257,13 +1880,13 @@ mod tests {
             history_periods: vec![PublicHistoryPeriod {
                 id: "1780400000".into(),
                 start_at: 1_779_395_200,
-                end_at: 1_780_400_000,
+                end_at: 1_780_000_020,
                 reset_at: 1_780_400_000,
                 label: "2026/06/01 — 2026/06/08".into(),
                 current: true,
             }],
             history_samples: vec![PublicHistorySample {
-                timestamp: 1_780_000_000,
+                timestamp: 1_780_000_020,
                 reset_at: 1_780_400_000,
                 remaining_percent: None,
                 sol_dollars: 0.01665,
@@ -1273,6 +1896,7 @@ mod tests {
                 terra_tokens: 0,
                 luna_tokens: 0,
             }],
+            history_gaps: Vec::new(),
             threads: vec![PublicThread {
                 id: "thread-1".into(),
                 title: "安全な読み取り確認".into(),
@@ -1305,7 +1929,7 @@ mod tests {
         details.history_periods = vec![PublicHistoryPeriod {
             id: "slo-period".into(),
             start_at: start,
-            end_at: end + 604_800,
+            end_at: end,
             reset_at: end + 604_800,
             label: "SLO fixture".into(),
             current: true,
@@ -1712,6 +2336,32 @@ mod tests {
         assert!(details.contains("cache-control: no-store"));
         let details_body = body(&details);
         assert_eq!(details_body["api_version"], "v1");
+        let mut top_level_keys = details_body
+            .as_object()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        top_level_keys.sort();
+        assert_eq!(
+            top_level_keys,
+            [
+                "active_thread_count",
+                "api_version",
+                "authenticated",
+                "estimated_cost_label",
+                "history_gaps",
+                "history_periods",
+                "history_samples",
+                "models",
+                "observed_at",
+                "plan_label",
+                "quota",
+                "state",
+                "threads",
+            ]
+        );
+        assert_eq!(details_body["history_gaps"], Value::Array(Vec::new()));
         assert_eq!(details_body["models"][0]["input_dollars"], 0.0045);
         assert!(details_body["history_samples"][0]["remaining_percent"].is_null());
         assert_eq!(details_body["history_periods"][0]["id"], "1780400000");
@@ -1836,6 +2486,49 @@ mod tests {
     }
 
     #[test]
+    fn duplicate_thread_details_keep_the_last_atomic_generation() {
+        let _guard = api_server_test_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut server = ApiServer::start(loopback_config()).unwrap();
+        let publisher = server.publisher();
+        let known_good = detailed_fixture();
+        publisher.publish_details(known_good.clone()).unwrap();
+        let before_pair = publisher.published_pair();
+        let before_status = wire_request(
+            server.local_addr(),
+            "GET /v1/status HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        );
+        let before_details = wire_request(
+            server.local_addr(),
+            "GET /v1/details HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        );
+
+        let mut duplicate = known_good;
+        duplicate.threads.push(duplicate.threads[0].clone());
+        assert_eq!(
+            publisher.publish_details(duplicate),
+            Err(ApiSnapshotError::InvalidThread)
+        );
+        assert_eq!(publisher.published_pair(), before_pair);
+        assert_eq!(
+            wire_request(
+                server.local_addr(),
+                "GET /v1/status HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+            ),
+            before_status
+        );
+        assert_eq!(
+            wire_request(
+                server.local_addr(),
+                "GET /v1/details HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+            ),
+            before_details
+        );
+        server.shutdown();
+    }
+
+    #[test]
     fn one_month_history_overflow_rejects_candidate_and_keeps_last_generation() {
         let _guard = api_server_test_lock()
             .lock()
@@ -1877,7 +2570,61 @@ mod tests {
         );
 
         let mut invalid = detailed_fixture();
+        invalid.history_samples[0].timestamp += 1;
+        assert_eq!(
+            invalid.validate(),
+            Err(ApiSnapshotError::InvalidHistorySample)
+        );
+
+        let mut invalid = detailed_fixture();
+        invalid.history_samples[0].timestamp = invalid.history_periods[0].end_at + 60;
+        assert_eq!(
+            invalid.validate(),
+            Err(ApiSnapshotError::InvalidHistorySample)
+        );
+
+        let mut invalid = detailed_fixture();
+        invalid
+            .history_samples
+            .push(invalid.history_samples[0].clone());
+        assert_eq!(
+            invalid.validate(),
+            Err(ApiSnapshotError::InvalidHistorySample)
+        );
+
+        let mut invalid = detailed_fixture();
+        let mut canonical_collision = invalid.history_samples[0].clone();
+        canonical_collision.reset_at -= 60;
+        invalid.history_samples.push(canonical_collision);
+        assert_eq!(
+            invalid.validate(),
+            Err(ApiSnapshotError::InvalidHistorySample)
+        );
+
+        let mut invalid = detailed_fixture();
         invalid.history_periods[0].label = "x".repeat(513);
+        assert_eq!(
+            invalid.validate(),
+            Err(ApiSnapshotError::InvalidHistoryPeriod)
+        );
+
+        let mut invalid = detailed_fixture();
+        invalid.history_periods[0].label.push('\u{202e}');
+        assert_eq!(
+            invalid.validate(),
+            Err(ApiSnapshotError::InvalidHistoryPeriod)
+        );
+
+        let mut invalid = detailed_fixture();
+        invalid.history_samples.clear();
+        invalid.history_periods.push(PublicHistoryPeriod {
+            id: "duplicate-reset".into(),
+            start_at: 1_779_395_200,
+            end_at: 1_780_000_020,
+            reset_at: 1_780_400_000,
+            label: "duplicate reset".into(),
+            current: false,
+        });
         assert_eq!(
             invalid.validate(),
             Err(ApiSnapshotError::InvalidHistoryPeriod)
@@ -1894,6 +2641,94 @@ mod tests {
         let mut invalid = detailed_fixture();
         invalid.models[0].name = "OTHER".into();
         assert_eq!(invalid.validate(), Err(ApiSnapshotError::InvalidModel));
+    }
+
+    #[test]
+    fn public_thread_slice_validation_keeps_exact_capacity_errors() {
+        let template = detailed_fixture()
+            .threads
+            .into_iter()
+            .next()
+            .expect("detailed fixture has one thread");
+        let make_threads = |count: usize| {
+            (0..count)
+                .map(|index| {
+                    let mut thread = template.clone();
+                    thread.id = format!("thread-{index}");
+                    thread.title = format!("title-{index}");
+                    thread
+                })
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(
+            validate_public_threads(&make_threads(MAX_PUBLIC_THREADS)),
+            Ok(())
+        );
+        assert_eq!(
+            validate_public_threads(&make_threads(MAX_PUBLIC_THREADS + 1)),
+            Err(ApiSnapshotError::ListTooLong)
+        );
+
+        let duplicate = vec![template.clone(), template.clone()];
+        assert_eq!(
+            validate_public_threads(&duplicate),
+            Err(ApiSnapshotError::InvalidThread)
+        );
+
+        let mut invalid_value = template;
+        invalid_value.title = "x".repeat(513);
+        assert_eq!(
+            validate_public_threads(&[invalid_value]),
+            Err(ApiSnapshotError::InvalidThread)
+        );
+    }
+
+    #[test]
+    fn history_gap_validation_is_exact_and_period_bounded() {
+        let mut details = detailed_fixture();
+        details.history_gaps = vec![PublicHistoryGap {
+            gap_id: "0123456789abcdef0123456789abcdef".into(),
+            reset_at: 1_780_400_000,
+            start_at: 1_779_500_000,
+            end_at: 1_779_500_060,
+            reason: "daemon_stop_unrecoverable".into(),
+        }];
+        details.validate().unwrap();
+
+        let serialized = serde_json::to_value(&details).unwrap();
+        let gap = serialized["history_gaps"][0].as_object().unwrap();
+        assert_eq!(gap.len(), 5);
+        assert_eq!(
+            gap.keys().cloned().collect::<Vec<_>>(),
+            vec!["end_at", "gap_id", "reason", "reset_at", "start_at"]
+        );
+
+        let mut invalid = details.clone();
+        invalid.history_gaps[0].gap_id = "0123456789ABCDEF0123456789abcdef".into();
+        assert_eq!(invalid.validate(), Err(ApiSnapshotError::InvalidHistoryGap));
+
+        let mut invalid = details.clone();
+        invalid.history_gaps[0].reason = "pending".into();
+        assert_eq!(invalid.validate(), Err(ApiSnapshotError::InvalidHistoryGap));
+
+        let mut invalid = details.clone();
+        invalid.history_gaps[0].start_at = 1_779_500_061;
+        assert_eq!(invalid.validate(), Err(ApiSnapshotError::InvalidHistoryGap));
+
+        let mut invalid = details.clone();
+        invalid.history_gaps.push(PublicHistoryGap {
+            gap_id: "fedcba9876543210fedcba9876543210".into(),
+            reset_at: 1_780_400_000,
+            start_at: 1_779_500_060,
+            end_at: 1_779_500_120,
+            reason: "reset_hint_expired".into(),
+        });
+        assert_eq!(invalid.validate(), Err(ApiSnapshotError::InvalidHistoryGap));
+
+        let mut invalid = details.clone();
+        invalid.history_gaps[0].end_at = 1_780_000_080;
+        assert_eq!(invalid.validate(), Err(ApiSnapshotError::InvalidHistoryGap));
     }
 
     #[test]

@@ -12,16 +12,16 @@ Codex App ServerからChatGPT/Codexアカウントのレート制限と週次ま
 ```bash
 git clone https://github.com/salty919/codex_info_v2.git
 cd codex_info_v2
-./run.sh
+./run.sh --ui
 ```
 
 別の場所へコピーして使う場合は、履歴の保存先を明示できます。
 
 ```bash
-CODEX_INFO_DATA_DIR="$PWD/data" ./run.sh
+CODEX_INFO_DATA_DIR="$PWD/data" ./run.sh --ui
 ```
 
-起動モードは3つです。`./run.sh --service`は記録daemonとloopback RESTを1プロセスで起動し、`./run.sh --ui-only`は既存サービスへ追加するX UIだけを起動してdaemon/RESTを生成しません。通常の引数なし`./run.sh`または明示的な`./run.sh --all`は既存サービスを再利用し、なければdaemon+RESTを起動してからX UIを表示します。後方互換の`CODEX_INFO_API_LISTEN=127.0.0.1:8787 ./run.sh`だけはWindowを作らないservice起動であり、同じ環境変数を使ってUIも追加するときは`./run.sh --all`を明示します。サービスを自動起動するには`bash scripts/install_systemd_recorder.sh`、自動起動から外すには`bash scripts/install_systemd_recorder.sh --remove`を使います。解除してもSQLite履歴、バックアップ、reset hint、実行ファイルは削除しません。収集周期`CODEX_INFO_DAEMON_INTERVAL_SECS`は5〜3600秒へ制限されます。
+公開起動契約は限定されています。引数なしの`./run.sh`は記録daemonとloopback RESTだけを`127.0.0.1:8787`で起動し、`./run.sh --port PORT`はloopbackのポートだけを変更します。X画面を使う場合は`./run.sh --ui`、ポートも指定する場合は`./run.sh --ui --port PORT`です。`./run.sh --stop`は同じprofileの検証済みdaemonだけを停止し、`./run.sh --help`は利用可能な形を表示します。任意アドレスの指定や旧起動オプションは受理しません。サービスを自動起動するには`bash scripts/install_systemd_recorder.sh`、自動起動から外すには`bash scripts/install_systemd_recorder.sh --remove`を使います。解除してもSQLite履歴、バックアップ、reset hint、実行ファイルは削除しません。収集周期`CODEX_INFO_DAEMON_INTERVAL_SECS`は5〜3600秒へ制限されます。
 
 初回起動時の画面内タイトルは`Codex Info`です。ネイティブタイトルバーは使わず、アプリ内では認証パネルが接続状態を案内します。
 
@@ -84,9 +84,10 @@ Linux / WSL 側でネイティブ画面を維持したまま、Windows クライ
 
 - 残り時間は日・時・分で読みやすく表示
 - レート制限は1分ごとに再取得
+- 定期再取得のquotaは中間イベントとして扱い、次のローカル集計が完了するまで前回確定済みのモデル・履歴・thread表示を保持します。rollingする`reset_at`の時刻差だけで画面を初期化しません。
 - ネイティブタイトルバーは使わず、各Windowの画面内タイトル領域に埋め込みフォントの見出しと自前の移動・最小化・閉じる操作を配置します。固定Windowには最大化操作を表示しません。
 - 認証済み画面の「グラフ」ボタンから1つのグラフウインドウを開きます。残り利用枠・LUNA/TERRA/SOLは凡例で個別に表示／非表示を切り替え、非表示系列は色とラベルのコントラストを下げて示します。初期状態は全系列表示です。各モデルの入力・キャッシュ・出力合計を独立した累積ラインで描き、表示中モデルの個別最大値をドル軸へ使います。全モデルの累積値が変化しない未使用区間は残量ラインを水平保持し、プロット下地の薄い帯で示します。モデルが進んでいるのに残量サンプルが同じ区間は、前後を実測された残量低下値で挟める場合だけ欠測サンプルとして線形補間し、`1→1→3` は `1→中点→3` として折返しや瞬間的な消費を描きません。次の実測値がない終端は最後の実測残量を保持します。右端の値は系列色のリーダー線で終端へ結びます。リセット直後（0）から現在時刻まで表示します
-- グラフの1分サンプルはSQLite（`history/usage_history.sqlite3`）へ過去3暦月分保存します。同一リセット期間・同一分は最大値を保持して再計測で減少しません。通常起動で削除されるのは3暦月より古い行だけです。1回の取得・REST応答・グラフ表示はその保持データ中の最長1暦月（最大44,640分点）に限定し、DB全体を読みません。グラフ上部の「ドル／トークン」で、ドルは累積額、トークンは各モデルの時間帯別使用量へ切り替えられます（初期値はドル）。
+- グラフの1分サンプルはSQLite（`history/usage_history.sqlite3`）へ過去3暦月分保存します。同一リセット期間・同一分は最大値を保持して再計測で減少しません。通常起動で削除されるのは3暦月より古い行だけです。1回の取得・REST応答・グラフ表示はその保持データ中の最長1暦月（最大44,640分点）に限定し、DB全体を読みません。グラフ上部の「ドル／トークン」で、ドルは累積額、トークンは各モデルの時間帯別使用量へ切り替えられます（初期値はドル）。モデル使用量と残量は別の観測値です。使用後に遅れて届いた残量観測は反映しますが、残量観測が無い区間を料金から推測しません。
 - `CODEX_INFO_DATA_DIR`を指定すると、そのディレクトリ配下へ履歴を保存します
 - 週次または月間の対象期間の残り時間は、端数も含めた7セルのゲージで表示
 - `~/.codex/sessions`に履歴がある場合は、週次または月間の対象期間を表示し、その期間内のSOL/TERRA/LUNAの入力（非キャッシュ）・キャッシュ入力・出力トークン数と、[OpenAI Developer Docsのモデル料金表](https://developers.openai.com/api/docs/models)に基づく予想ドル額（整数部のみ）を各カテゴリの独立したドル列に表示します。見出しはモデル・入力・キャッシュ・出力だけです。クレジット換算は行いません。連続する同一累積スナップショットは差分0として二重計上しません。その他のモデルは表示しません。
@@ -98,7 +99,7 @@ Linux / WSL 側でネイティブ画面を維持したまま、Windows クライ
 
 ## Windowサイズとプレビュー
 
-登録top-level surface inventoryはMain、Setup、Settings、Graph、Threads、Legalの正確な6個で、HelpはMain内surface（追加HWND=0）です。runtime open HWNDはMain=1＋open child subset 0..5、合計1..6で、各childはsingleton、5 childを全て開いた時だけ6となります。Main/Setup/Settings/Threads/Legalはlogical client `initial=min=max=900×480` fixed、Graphは`initial=940×640`、`min=700×480`、`max=unbounded`、resizableです。登録された6 surfaceはMinimize/Closeを持ち、native resize/maximize/restoreはGraphだけです。ネイティブタイトルバーは全Windowで無効にし、ボタン以外の画面領域をドラッグして移動できます。物理サイズはOSのDPI／拡大率に連動し、Graphの最大化／復元は現在モニターのwork areaへ適用します。状態別の確認には`CODEX_INFO_PREVIEW=initializing|auth|normal|warning|reset-warning|error|zero|full|monthly|unlimited|idle|legal`を使い、グラフ表示は`CODEX_INFO_PREVIEW=graph|graph-old`で確認できます。`CODEX_INFO_PREVIEW_SIZE`はGraphの初期サイズを上書きするレイアウト検証用です。メイン画面の指定例は`CODEX_INFO_PREVIEW=normal ./run.sh`です。
+登録top-level surface inventoryはMain、Setup、Settings、Graph、Threads、Legalの正確な6個で、HelpはMain内surface（追加HWND=0）です。runtime open HWNDはMain=1＋open child subset 0..5、合計1..6で、各childはsingleton、5 childを全て開いた時だけ6となります。Main/Setup/Settings/Threads/Legalはlogical client `initial=min=max=900×480` fixed、Graphは`initial=940×640`、`min=700×480`、`max=unbounded`、resizableです。登録された6 surfaceはMinimize/Closeを持ち、native resize/maximize/restoreはGraphだけです。ネイティブタイトルバーは全Windowで無効にし、ボタン以外の画面領域をドラッグして移動できます。物理サイズはOSのDPI／拡大率に連動し、Graphの最大化／復元は現在モニターのwork areaへ適用します。状態別の確認には`CODEX_INFO_PREVIEW=initializing|auth|normal|warning|reset-warning|error|zero|full|monthly|unlimited|idle|legal`を使い、グラフ表示は`CODEX_INFO_PREVIEW=graph|graph-old`で確認できます。`CODEX_INFO_PREVIEW_SIZE`はGraphの初期サイズを上書きするレイアウト検証用です。メイン画面の指定例は`CODEX_INFO_PREVIEW=normal ./run.sh --ui`です。
 
 ## UIを調整する場所
 

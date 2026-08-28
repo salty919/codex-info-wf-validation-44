@@ -23,7 +23,7 @@ jobs:
     steps:
     - uses: actions/checkout@v4
     - name: Install required test tools
-      run: sudo apt-get update && sudo apt-get install --no-install-recommends --yes ripgrep sqlite3 xvfb xauth x11-utils libxkbcommon-x11-0
+      run: sudo apt-get update && sudo apt-get install --no-install-recommends --yes ripgrep sqlite3 xvfb xauth x11-utils x11-apps libxkbcommon-x11-0
     - name: Build
       run: cargo build --verbose --locked
     - name: Format check
@@ -39,4 +39,4 @@ jobs:
     - name: Enforce data protection policy
       run: bash scripts/data_protection_gate.sh
     - name: Enforce cross-client regression checks
-      run: bash scripts/regression_guard.sh
+      run: xvfb-run --auto-servernum --server-args='-screen 0 1280x800x24' bash scripts/regression_guard.sh

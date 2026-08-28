@@ -75,9 +75,9 @@
 
   <Grid Margin="22" RowDefinitions="Auto,Auto,Auto,Auto,*" RowSpacing="10">
     <Grid ColumnDefinitions="*,Auto" Background="Transparent">
-      <StackPanel Spacing="2">
+        <StackPanel Spacing="2">
         <TextBlock FontSize="25" FontWeight="SemiBold" Text="{Binding Texts.Graph}" />
-        <StackPanel Orientation="Horizontal" Spacing="8"><TextBlock Classes="label" Text="{Binding Texts.ModelUsage}" /><TextBlock Classes="label" AutomationProperties.AutomationId="Graph.ProductVersion" Text="{Binding ProductVersionText}" /></StackPanel>
+        <TextBlock Classes="label" Text="{Binding Texts.ModelUsage}" />
       </StackPanel>
       <StackPanel Grid.Column="1" Orientation="Horizontal" Spacing="2">
         <Button Classes="window-control" Click="OnMinimizeWindow" AutomationProperties.Name="{Binding Texts.Minimize}" AutomationProperties.AutomationId="Graph.Window.Minimize" Content="—" ToolTip.Tip="{Binding Texts.Minimize}" />

@@ -24,6 +24,7 @@ public sealed class LoopbackStatusClient : ILoopbackStatusClient, ILoopbackHealt
     private const string Endpoint = "http://127.0.0.1:8787/v1/status";
     private const string DetailsEndpoint = "http://127.0.0.1:8787/v1/details";
     private const string HealthEndpoint = "http://127.0.0.1:8787/v1/health";
+    private const string PublishedPairHeader = "Codex-Info-Published-Pair";
     private const int MaxResponseHeaderBytes = 8 * 1024;
     private const int MaxBodyBytes = 64 * 1024;
     private const int MaxHealthBodyBytes = 1024;
@@ -33,6 +34,7 @@ public sealed class LoopbackStatusClient : ILoopbackStatusClient, ILoopbackHealt
     private const long MaxUnixSeconds = 253_402_300_799;
     private const int MaxHistoryPeriods = 128;
     private const int MaxHistorySamples = 31 * 24 * 60;
+    private const int MaxHistoryGaps = 4_096;
     private const int MaxThreads = 256;
     private const long ResetAtToleranceSeconds = 60;
 
@@ -73,6 +75,7 @@ public sealed class LoopbackStatusClient : ILoopbackStatusClient, ILoopbackHealt
         "active_thread_count",
         "history_periods",
         "history_samples",
+        "history_gaps",
         "threads",
         "estimated_cost_label");
 
@@ -103,6 +106,18 @@ public sealed class LoopbackStatusClient : ILoopbackStatusClient, ILoopbackHealt
         "sol_tokens",
         "terra_tokens",
         "luna_tokens");
+
+    private static readonly HashSet<string> HistoryGapProperties = CreatePropertySet(
+        "gap_id",
+        "reset_at",
+        "start_at",
+        "end_at",
+        "reason");
+
+    private static readonly HashSet<string> HistoryGapReasons = CreatePropertySet(
+        "daemon_stop_unrecoverable",
+        "reset_hint_expired",
+        "auth_epoch_tombstoned");
 
     private static readonly HashSet<string> ThreadProperties = CreatePropertySet(
         "id",
@@ -176,6 +191,11 @@ public sealed class LoopbackStatusClient : ILoopbackStatusClient, ILoopbackHealt
                 return Failure(StatusFetchFailure.Response);
             }
 
+            if (!TryGetPublishedPairIdentity(response, out var publishedPair))
+            {
+                return Failure(StatusFetchFailure.Response);
+            }
+
             if (!TryGetContentLength(response.Content, out var contentLength))
             {
                 return Failure(StatusFetchFailure.Response);
@@ -207,7 +227,7 @@ public sealed class LoopbackStatusClient : ILoopbackStatusClient, ILoopbackHealt
                 return Failure(StatusFetchFailure.Response);
             }
 
-            return StatusFetchResult.Success(snapshot);
+            return StatusFetchResult.Success(snapshot with { PublishedPair = publishedPair });
         }
         catch (OperationCanceledException)
         {
@@ -341,6 +361,11 @@ public sealed class LoopbackStatusClient : ILoopbackStatusClient, ILoopbackHealt
                 return DetailsFailure(DetailsFetchFailure.Response);
             }
 
+            if (!TryGetPublishedPairIdentity(response, out var publishedPair))
+            {
+                return DetailsFailure(DetailsFetchFailure.Response);
+            }
+
             if (contentLength is > MaxDetailsBodyBytes)
             {
                 return DetailsFailure(DetailsFetchFailure.Response);
@@ -368,7 +393,7 @@ public sealed class LoopbackStatusClient : ILoopbackStatusClient, ILoopbackHealt
                 return DetailsFailure(DetailsFetchFailure.Response);
             }
 
-            return DetailsFetchResult.Success(snapshot);
+            return DetailsFetchResult.Success(snapshot with { PublishedPair = publishedPair });
         }
         catch (OperationCanceledException)
         {
@@ -481,6 +506,30 @@ public sealed class LoopbackStatusClient : ILoopbackStatusClient, ILoopbackHealt
         }
         catch (Exception)
         {
+            return false;
+        }
+    }
+
+    private static bool TryGetPublishedPairIdentity(
+        HttpResponseMessage response,
+        out PublishedPairIdentity identity)
+    {
+        identity = default;
+
+        try
+        {
+            if (!response.Headers.TryGetValues(PublishedPairHeader, out var values))
+            {
+                return false;
+            }
+
+            var materializedValues = values.ToArray();
+            return materializedValues.Length == 1 &&
+                   PublishedPairIdentity.TryCreate(materializedValues[0], out identity);
+        }
+        catch (Exception)
+        {
+            identity = default;
             return false;
         }
     }
@@ -701,7 +750,7 @@ public sealed class LoopbackStatusClient : ILoopbackStatusClient, ILoopbackHealt
                 });
 
             var root = document.RootElement;
-            if (!HasExactlyProperties(root, DetailsTopLevelProperties, 12) ||
+            if (!HasExactlyProperties(root, DetailsTopLevelProperties, 13) ||
                 !TryGetString(root, "api_version", out var apiVersion) ||
                 apiVersion != "v1" ||
                 !TryGetState(root, out var state) ||
@@ -711,8 +760,9 @@ public sealed class LoopbackStatusClient : ILoopbackStatusClient, ILoopbackHealt
                 !TryGetQuota(root, out var quota) ||
                 !TryGetDetailsModels(root, out var models) ||
                 !TryGetUInt64(root, "active_thread_count", out var activeThreadCount) ||
-                !TryGetHistoryPeriods(root, out var historyPeriods) ||
-                !TryGetFlatHistorySamples(root, out var historySamples) ||
+                !TryGetHistoryPeriods(root, observedAt, out var historyPeriods) ||
+                !TryGetFlatHistorySamples(root, historyPeriods, out var historySamples) ||
+                !TryGetHistoryGaps(root, historyPeriods, out var historyGaps) ||
                 !TryGetThreads(root, out var threads) ||
                 !TryGetBoundedString(root, "estimated_cost_label", 1, 160, out var estimatedCostLabel))
             {
@@ -738,6 +788,10 @@ public sealed class LoopbackStatusClient : ILoopbackStatusClient, ILoopbackHealt
                 new System.Collections.ObjectModel.ReadOnlyCollection<ApiHistorySample>(historySamples),
                 new System.Collections.ObjectModel.ReadOnlyCollection<ApiThreadDetails>(threads),
                 estimatedCostLabel);
+            snapshot = snapshot with
+            {
+                HistoryGaps = new System.Collections.ObjectModel.ReadOnlyCollection<ApiHistoryGap>(historyGaps),
+            };
             return true;
         }
         catch (JsonException)
@@ -762,35 +816,12 @@ public sealed class LoopbackStatusClient : ILoopbackStatusClient, ILoopbackHealt
         ApiHistoryPeriod period,
         IReadOnlyList<ApiHistorySample> samples)
     {
-        var minimumResetAt = period.ResetAt - ResetAtToleranceSeconds;
-        var selected = samples
-            .Where(sample => sample.ResetAt >= minimumResetAt && sample.ResetAt <= period.ResetAt)
-            .OrderBy(sample => sample.Timestamp)
-            .ThenBy(sample => sample.ResetAt);
-        var merged = new List<ApiHistorySample>();
-        foreach (var sample in selected)
-        {
-            var canonical = sample with { ResetAt = period.ResetAt };
-            if (merged.Count == 0 || merged[^1].Timestamp != canonical.Timestamp)
-            {
-                merged.Add(canonical);
-                continue;
-            }
-
-            var previous = merged[^1];
-            merged[^1] = canonical with
-            {
-                RemainingPercent = canonical.RemainingPercent ?? previous.RemainingPercent,
-                SolDollars = Math.Max(previous.SolDollars, canonical.SolDollars),
-                TerraDollars = Math.Max(previous.TerraDollars, canonical.TerraDollars),
-                LunaDollars = Math.Max(previous.LunaDollars, canonical.LunaDollars),
-                SolTokens = Math.Max(previous.SolTokens, canonical.SolTokens),
-                TerraTokens = Math.Max(previous.TerraTokens, canonical.TerraTokens),
-                LunaTokens = Math.Max(previous.LunaTokens, canonical.LunaTokens),
-            };
-        }
-
-        return new System.Collections.ObjectModel.ReadOnlyCollection<ApiHistorySample>(merged);
+        return new System.Collections.ObjectModel.ReadOnlyCollection<ApiHistorySample>(
+            samples
+                .Where(sample => sample.ResetAt >= period.ResetAt - ResetAtToleranceSeconds &&
+                                 sample.ResetAt <= period.ResetAt)
+                .Select(sample => sample with { ResetAt = period.ResetAt })
+                .ToList());
     }
 
     private static bool TryGetDetailsModels(
@@ -837,6 +868,7 @@ public sealed class LoopbackStatusClient : ILoopbackStatusClient, ILoopbackHealt
 
     private static bool TryGetHistoryPeriods(
         JsonElement parent,
+        long? observedAt,
         out List<ApiHistoryPeriod> periods)
     {
         periods = new List<ApiHistoryPeriod>();
@@ -848,6 +880,9 @@ public sealed class LoopbackStatusClient : ILoopbackStatusClient, ILoopbackHealt
         }
 
         var periodIds = new HashSet<string>(StringComparer.Ordinal);
+        var resetAts = new HashSet<long>();
+        var currentCount = 0;
+        ApiHistoryPeriod? previous = null;
         foreach (var period in property.EnumerateArray())
         {
             if (!HasExactlyProperties(period, HistoryPeriodProperties, 6) ||
@@ -858,13 +893,14 @@ public sealed class LoopbackStatusClient : ILoopbackStatusClient, ILoopbackHealt
                 !TryGetUnixSeconds(period, "reset_at", out var resetAt) ||
                 endAt < startAt ||
                 resetAt < endAt ||
+                !resetAts.Add(resetAt) ||
                 !TryGetBoundedString(period, "label", 1, 512, out var label) ||
                 !TryGetBoolean(period, "current", out var current))
             {
                 return false;
             }
 
-            periods.Add(new ApiHistoryPeriod(
+            var candidate = new ApiHistoryPeriod(
                 id,
                 startAt,
                 endAt,
@@ -872,14 +908,35 @@ public sealed class LoopbackStatusClient : ILoopbackStatusClient, ILoopbackHealt
                 label)
             {
                 ResetAt = resetAt,
-            });
+            };
+            if (previous is not null &&
+                (candidate.StartAt > previous.StartAt ||
+                 (candidate.StartAt == previous.StartAt && candidate.ResetAt > previous.ResetAt) ||
+                 (candidate.StartAt == previous.StartAt && candidate.ResetAt == previous.ResetAt &&
+                  string.CompareOrdinal(candidate.Id, previous.Id) > 0)))
+            {
+                return false;
+            }
+
+            if (current)
+            {
+                currentCount++;
+                if (observedAt is not long observed || candidate.EndAt != Math.Min(candidate.ResetAt, observed))
+                {
+                    return false;
+                }
+            }
+
+            previous = candidate;
+            periods.Add(candidate);
         }
 
-        return true;
+        return currentCount <= 1;
     }
 
     private static bool TryGetFlatHistorySamples(
         JsonElement parent,
+        IReadOnlyList<ApiHistoryPeriod> periods,
         out List<ApiHistorySample> samples)
     {
         samples = new List<ApiHistorySample>();
@@ -890,13 +947,16 @@ public sealed class LoopbackStatusClient : ILoopbackStatusClient, ILoopbackHealt
             return false;
         }
 
-        var samplesSeen = new HashSet<(long ResetAt, long Timestamp)>();
+        long previousResetAt = 0;
+        long previousTimestamp = 0;
+        var identities = new HashSet<(long ResetAt, long Timestamp)>();
+        var canonicalIdentities = new HashSet<(string PeriodId, long Timestamp)>();
         foreach (var sample in property.EnumerateArray())
         {
             if (!HasExactlyProperties(sample, HistorySampleProperties, 9) ||
                 !TryGetUnixSeconds(sample, "timestamp", out var timestamp) ||
                 !TryGetUnixSeconds(sample, "reset_at", out var resetAt) ||
-                !samplesSeen.Add((resetAt, timestamp)) ||
+                timestamp % 60 != 0 ||
                 !TryGetNullableRemainingPercent(sample, out var remainingPercent) ||
                 !TryGetNonNegativeFiniteDouble(sample, "sol_dollars", out var solDollars) ||
                 !TryGetNonNegativeFiniteDouble(sample, "terra_dollars", out var terraDollars) ||
@@ -904,6 +964,26 @@ public sealed class LoopbackStatusClient : ILoopbackStatusClient, ILoopbackHealt
                 !TryGetUInt64(sample, "sol_tokens", out var solTokens) ||
                 !TryGetUInt64(sample, "terra_tokens", out var terraTokens) ||
                 !TryGetUInt64(sample, "luna_tokens", out var lunaTokens))
+            {
+                return false;
+            }
+
+            if (!identities.Add((resetAt, timestamp)) ||
+                (samples.Count > 0 &&
+                 (resetAt < previousResetAt ||
+                  (resetAt == previousResetAt && timestamp <= previousTimestamp))))
+            {
+                return false;
+            }
+
+            var matchingPeriods = periods
+                .Where(period => resetAt >= period.ResetAt - ResetAtToleranceSeconds &&
+                                 resetAt <= period.ResetAt)
+                .ToArray();
+            if (matchingPeriods.Length != 1 ||
+                timestamp < matchingPeriods[0].StartAt ||
+                timestamp > matchingPeriods[0].EndAt ||
+                !canonicalIdentities.Add((matchingPeriods[0].Id, timestamp)))
             {
                 return false;
             }
@@ -918,10 +998,91 @@ public sealed class LoopbackStatusClient : ILoopbackStatusClient, ILoopbackHealt
                 solTokens,
                 terraTokens,
                 lunaTokens));
+            previousResetAt = resetAt;
+            previousTimestamp = timestamp;
         }
 
         return true;
     }
+
+    private static bool TryGetHistoryGaps(
+        JsonElement parent,
+        IReadOnlyList<ApiHistoryPeriod> periods,
+        out List<ApiHistoryGap> gaps)
+    {
+        gaps = new List<ApiHistoryGap>();
+        if (!parent.TryGetProperty("history_gaps", out var property) ||
+            property.ValueKind != JsonValueKind.Array ||
+            property.GetArrayLength() > MaxHistoryGaps)
+        {
+            return false;
+        }
+
+        var gapIds = new HashSet<string>(StringComparer.Ordinal);
+        ApiHistoryGap? previous = null;
+        foreach (var gap in property.EnumerateArray())
+        {
+            if (!HasExactlyProperties(gap, HistoryGapProperties, 5) ||
+                !TryGetString(gap, "gap_id", out var gapId) ||
+                !IsLowercaseHexId(gapId) ||
+                !gapIds.Add(gapId) ||
+                !TryGetUnixSeconds(gap, "reset_at", out var resetAt) ||
+                !TryGetUnixSeconds(gap, "start_at", out var startAt) ||
+                !TryGetUnixSeconds(gap, "end_at", out var endAt) ||
+                startAt > endAt ||
+                !TryGetString(gap, "reason", out var reason) ||
+                !HistoryGapReasons.Contains(reason))
+            {
+                return false;
+            }
+
+            var matchingPeriods = periods.Where(period => period.ResetAt == resetAt).ToArray();
+            if (matchingPeriods.Length != 1 ||
+                startAt < matchingPeriods[0].StartAt ||
+                endAt > matchingPeriods[0].EndAt)
+            {
+                return false;
+            }
+
+            var candidate = new ApiHistoryGap(gapId, resetAt, startAt, endAt, reason);
+            if (previous is not null && CompareHistoryGaps(previous, candidate) >= 0)
+            {
+                return false;
+            }
+
+            if (previous is not null && previous.ResetAt == candidate.ResetAt &&
+                candidate.StartAt <= previous.EndAt)
+            {
+                return false;
+            }
+
+            previous = candidate;
+            gaps.Add(candidate);
+        }
+
+        return true;
+    }
+
+    private static int CompareHistoryGaps(ApiHistoryGap left, ApiHistoryGap right)
+    {
+        var comparison = left.ResetAt.CompareTo(right.ResetAt);
+        if (comparison != 0)
+        {
+            return comparison;
+        }
+
+        comparison = left.StartAt.CompareTo(right.StartAt);
+        if (comparison != 0)
+        {
+            return comparison;
+        }
+
+        comparison = left.EndAt.CompareTo(right.EndAt);
+        return comparison != 0 ? comparison : string.CompareOrdinal(left.GapId, right.GapId);
+    }
+
+    private static bool IsLowercaseHexId(string value) =>
+        value.Length == 32 && value.All(character => character is >= '0' and <= '9' or >= 'a' and <= 'f');
 
     private static bool TryGetThreads(
         JsonElement parent,

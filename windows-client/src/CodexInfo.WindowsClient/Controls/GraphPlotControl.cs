@@ -22,6 +22,9 @@ public sealed class GraphPlotControl : AvaPlot
     private static readonly ScottPlot.Color SolColor = new("#A88CF5");
     private static readonly ScottPlot.Color TerraColor = new("#5DC98A");
     private static readonly ScottPlot.Color LunaColor = new("#E6A23C");
+    internal const string IdleBandColorHex = "#3F5D7C";
+    internal const double IdleBandOpacity = 0.22;
+    private static readonly ScottPlot.Color IdleBandColor = new(IdleBandColorHex);
     private static readonly ScottPlot.Color MutedColor = new("#A8B7CA");
     private static readonly ScottPlot.Color GridColor = new("#263548");
     private static readonly ScottPlot.Color PlotColor = new("#101925");
@@ -122,7 +125,7 @@ public sealed class GraphPlotControl : AvaPlot
                 interval.EndAt,
                 axes.ModelDisplayMinimum,
                 axes.ModelDisplayMaximum);
-            band.FillColor = MutedColor.WithOpacity(0.08);
+            band.FillColor = IdleBandColor.WithOpacity(IdleBandOpacity);
             band.LineWidth = 0;
         }
         AddPlotGrid(scene, axes);

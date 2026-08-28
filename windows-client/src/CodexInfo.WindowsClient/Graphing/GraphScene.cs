@@ -154,15 +154,35 @@ public sealed class GraphScene
         values[0] = rawValues[0] is { } first && double.IsFinite(first)
             ? Math.Clamp(first, 0, 100)
             : 100;
+        var quotaObservedSinceModelChange = true;
         for (var index = 1; index < points.Count; index++)
         {
             var previous = values[index - 1] ?? 100;
             var modelAdvanced = ModelAdvanced(points[index - 1], points[index]);
             var syntheticGap = IsSyntheticRemainingGap(points, index, points[0].Timestamp);
             activeSegments[index - 1] = modelAdvanced && !syntheticGap;
-            values[index] = modelAdvanced && rawValues[index] is { } raw && double.IsFinite(raw)
-                ? Math.Min(previous, Math.Clamp(raw, 0, 100))
-                : previous;
+            var observed = rawValues[index] is { } raw && double.IsFinite(raw)
+                ? Math.Clamp(raw, 0, 100)
+                : (double?)null;
+            if (modelAdvanced)
+            {
+                values[index] = observed is { } activeRaw
+                    ? Math.Min(previous, activeRaw)
+                    : previous;
+                quotaObservedSinceModelChange = observed is not null;
+            }
+            else if (!quotaObservedSinceModelChange && observed is { } delayedRaw && delayedRaw < previous)
+            {
+                // The quota poll can lag behind session usage. Accept the
+                // first lower endpoint after that unobserved active interval,
+                // but keep a genuinely idle period horizontal.
+                values[index] = Math.Min(previous, delayedRaw);
+                quotaObservedSinceModelChange = true;
+            }
+            else
+            {
+                values[index] = previous;
+            }
         }
 
         var source = values.ToArray();
@@ -285,22 +305,31 @@ public sealed class GraphScene
             }
 
             var syntheticGap = IsSyntheticRemainingGap(points, index, periodStart);
-            if (!ModelsEqual(before, after) && !syntheticGap)
+            var unobservedGap = after.Timestamp - before.Timestamp > 60;
+            var modelChanged = !ModelsEqual(before, after);
+            if (modelChanged && !syntheticGap && !unobservedGap)
             {
                 continue;
             }
 
+            // A long interval between observations is not evidence of a
+            // continuous spend rate.  The native graph marks that interval
+            // as unused/unobserved and draws any cumulative increase at the
+            // observed endpoint.  Preserve the boundary so the remaining
+            // line does not turn the unknown interval into a diagonal.
+            var preserveBoundary = syntheticGap || (unobservedGap && modelChanged);
+
             if (intervals.Count > 0)
             {
                 var previous = intervals[^1];
-                if (!previous.PreserveBoundary && !syntheticGap && previous.EndAt == intervalStart)
+                if (!previous.PreserveBoundary && !preserveBoundary && previous.EndAt == intervalStart)
                 {
                     intervals[^1] = previous with { EndAt = intervalEnd };
                     continue;
                 }
             }
 
-            intervals.Add(new GraphIdleInterval(intervalStart, intervalEnd, syntheticGap));
+            intervals.Add(new GraphIdleInterval(intervalStart, intervalEnd, preserveBoundary));
         }
 
         return intervals;

@@ -12,13 +12,18 @@ The Japanese README is the primary setup guide: [README.md](README.md).
 ```bash
 git clone https://github.com/salty919/codex_info_v2.git
 cd codex_info_v2
-./run.sh
+./run.sh --ui
 ```
 
 The host needs Rust/Cargo (the launcher also checks the standard Rustup
 toolchain location), an X11 display (WSLg is supported), and a `codex`
 CLI that can run `codex app-server --stdio`. Authentication remains owned by
 the Codex CLI; this application does not save passwords, API keys, or tokens.
+
+Without arguments, `./run.sh` starts only the resident daemon and loopback
+REST service on `127.0.0.1:8787`. Use `--port PORT` to change only the port,
+`--ui` (optionally followed by `--port PORT`) to add the X11 UI, `--stop` to
+stop this profile's verified resident daemon, and `--help` for localized help.
 
 If Rustup is not installed, install it and load its environment before running
 the launcher:

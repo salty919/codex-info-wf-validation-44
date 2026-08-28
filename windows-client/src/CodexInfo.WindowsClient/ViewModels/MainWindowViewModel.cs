@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
 using System.Collections.ObjectModel;
+using System.Collections.Specialized;
 using System.ComponentModel;
 using System.Diagnostics;
 using System.Globalization;
@@ -38,15 +39,16 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
     private readonly ILoopbackStatusClient client;
     private readonly ILoopbackHealthClient healthClient;
     private readonly ILoopbackDetailsClient? detailsClient;
-    private readonly ConnectionSupervisor? connectionSupervisor;
+    private readonly IConnectionSupervisor? connectionSupervisor;
+    private readonly Func<bool> authenticationLauncher;
     private readonly UpdateViewModel? update;
+    private readonly object stateGate = new();
     private readonly CancellationTokenSource lifetime = new();
-    private readonly SemaphoreSlim refreshGate = new(1, 1);
     private readonly AsyncCommand refreshCommand;
     private readonly AsyncCommand authCommand;
     private readonly AsyncCommand checkAuthCommand;
-    private readonly ObservableCollection<ModelUsageViewModel> models = [];
-    private readonly ObservableCollection<QuotaSegmentViewModel> quotaSegments = [];
+    private readonly SnapshotCollection<ModelUsageViewModel> models = [];
+    private readonly SnapshotCollection<QuotaSegmentViewModel> quotaSegments = [];
     private ApiStatusSnapshot? snapshot;
     private ApiDetailsSnapshot? detailsSnapshot;
     private DetailsFetchFailure? detailsFailure;
@@ -54,14 +56,21 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
     private ClientPresentationState presentationState = ClientPresentationState.Connecting;
     private bool refreshing;
     private bool authLaunchFailed;
+    private bool authLaunchSucceeded;
+    private bool hasConnectionFailure;
     private bool disposed;
+    private bool initialLoadPending = true;
+    private bool explicitOperationActive;
+    private GenerationContext? currentContext;
+    private ClientSettings settingsSnapshot;
     private int started;
 
     public MainWindowViewModel(
         ILoopbackStatusClient client,
         ILoopbackDetailsClient? detailsClient = null,
-        ConnectionSupervisor? connectionSupervisor = null,
-        IWindowsUpdateCoordinator? updateCoordinator = null)
+        IConnectionSupervisor? connectionSupervisor = null,
+        IWindowsUpdateCoordinator? updateCoordinator = null,
+        Func<bool>? authenticationLauncher = null)
     {
         ArgumentNullException.ThrowIfNull(client);
         this.client = client;
@@ -71,11 +80,17 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
                 nameof(client));
         this.detailsClient = detailsClient;
         this.connectionSupervisor = connectionSupervisor;
+        this.authenticationLauncher = authenticationLauncher ?? StartLinuxAuthenticationProcess;
+        settingsSnapshot = App.CurrentSettings;
         update = updateCoordinator is null ? null : new UpdateViewModel(updateCoordinator);
         if (update is not null) update.PropertyChanged += OnUpdatePropertyChanged;
         refreshCommand = new AsyncCommand(RefreshManuallyAsync, () => CanRefresh);
-        authCommand = new AsyncCommand(LaunchLinuxAuthenticationAsync, () => IsAuthRequired && !disposed);
-        checkAuthCommand = new AsyncCommand(RefreshManuallyAsync, () => IsAuthRequired && CanRefresh);
+        authCommand = new AsyncCommand(
+            LaunchLinuxAuthenticationAsync,
+            () => IsAuthRequired && !authLaunchSucceeded && !disposed);
+        checkAuthCommand = new AsyncCommand(
+            CheckAuthenticationAsync,
+            () => IsAuthRequired && authLaunchSucceeded && CanRefresh);
         Models = new ReadOnlyObservableCollection<ModelUsageViewModel>(models);
         QuotaSegments = new ReadOnlyObservableCollection<QuotaSegmentViewModel>(quotaSegments);
         LocalizationService.LanguageChanged += OnLanguageChanged;
@@ -83,11 +98,19 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
 
     public event PropertyChangedEventHandler? PropertyChanged;
 
+    internal Task GenerationPipelineCompletionAsync(object context) =>
+        context is GenerationContext generation
+            ? generation.PipelineCompletion.Task
+            : Task.FromException(new ArgumentException("Unknown generation context.", nameof(context)));
+
     public UiText Texts => LocalizationService.Current;
 
     public string ProductVersionText => ProductInfo.DisplayVersion;
 
     public ICommand RefreshCommand => refreshCommand;
+
+    /// <summary>The StatusBanner's generic recovery command.</summary>
+    public ICommand RetryCommand => refreshCommand;
 
     public ICommand AuthCommand => authCommand;
 
@@ -97,9 +120,35 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
 
     public ICommand? UpdateCommand => update?.UpdateCommand;
 
-    public bool IsUpdateNotificationVisible => !IsAuthRequired && update?.IsNotificationVisible == true;
+    public bool IsUpdateNotificationVisible
+    {
+        get
+        {
+            lock (stateGate)
+            {
+                return !IsAuthRequired &&
+                    !hasConnectionFailure &&
+                    !initialLoadPending &&
+                    !refreshing &&
+                    update?.IsNotificationVisible == true;
+            }
+        }
+    }
 
-    public bool IsUpdateActionVisible => !IsAuthRequired && update?.IsUpdateActionVisible == true;
+    public bool IsUpdateActionVisible
+    {
+        get
+        {
+            lock (stateGate)
+            {
+                return !IsAuthRequired &&
+                    !hasConnectionFailure &&
+                    !initialLoadPending &&
+                    !refreshing &&
+                    update?.IsUpdateActionVisible == true;
+            }
+        }
+    }
 
     public string UpdateNotificationText => update?.NotificationText ?? string.Empty;
 
@@ -111,9 +160,72 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
 
     public ReadOnlyObservableCollection<QuotaSegmentViewModel> QuotaSegments { get; }
 
-    public bool CanRefresh => !refreshing && !disposed;
+    public bool CanRefresh
+    {
+        get
+        {
+            lock (stateGate)
+            {
+                return !refreshing && !explicitOperationActive && !disposed;
+            }
+        }
+    }
 
     public string RefreshButtonText => refreshing ? Texts.Refreshing : Texts.Refresh;
+
+    /// <summary>True when the generic recovery CTA is the sole primary action.</summary>
+    public bool IsRetryVisible
+    {
+        get
+        {
+            lock (stateGate)
+            {
+                return !disposed &&
+                    !initialLoadPending &&
+                    !refreshing &&
+                    hasConnectionFailure &&
+                    !IsAuthRequired;
+            }
+        }
+    }
+
+    /// <summary>True for an explicit retry in flight; the button is disabled.</summary>
+    public bool IsRefreshingVisible
+    {
+        get
+        {
+            lock (stateGate)
+            {
+                return !disposed &&
+                    !initialLoadPending &&
+                    refreshing &&
+                    explicitOperationActive &&
+                    !IsAuthRequired;
+            }
+        }
+    }
+
+    public bool IsAuthStartVisible
+    {
+        get
+        {
+            lock (stateGate)
+            {
+                return IsAuthRequired && !authLaunchSucceeded;
+            }
+        }
+    }
+
+    public bool IsAuthCheckVisible
+    {
+        get
+        {
+            lock (stateGate)
+            {
+                return IsAuthRequired && authLaunchSucceeded;
+            }
+        }
+    }
 
     public bool HasQuota => snapshot?.Quota is not null;
 
@@ -121,7 +233,16 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
 
     public bool HasNoModels => !HasModels;
 
-    public bool IsAuthRequired => presentationState == ClientPresentationState.AuthRequired;
+    public bool IsAuthRequired
+    {
+        get
+        {
+            lock (stateGate)
+            {
+                return presentationState == ClientPresentationState.AuthRequired;
+            }
+        }
+    }
 
     /// <summary>
     /// True only after the status owner has accepted an authenticated snapshot.
@@ -129,6 +250,15 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
     /// document as proof that the current account is ready.
     /// </summary>
     public bool IsAuthenticated => snapshot is { Authenticated: true } && !IsAuthRequired;
+
+    /// <summary>
+    /// Keeps the first frame stable while the health, status, and auxiliary
+    /// details generation is being assembled.  Subsequent polls update the
+    /// already-published generation without hiding the content.
+    /// </summary>
+    public bool IsStartupLoading => initialLoadPending;
+
+    public bool ShowAuthenticatedContent => IsAuthenticated && !IsStartupLoading;
 
     public bool HasActiveThreads => ActiveThreadCount > 0;
 
@@ -183,6 +313,17 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
             };
         }
     }
+
+    /// <summary>
+    /// Locale-independent UI Automation contract for the details generation.
+    /// The visible status remains localized, while UI tests consume this
+    /// stable value instead of decoding rendered text.
+    /// </summary>
+    public string DetailsStatusAutomationText => detailsSnapshot is not null && detailsFailure is null
+        ? "ready"
+        : detailsFailure is null
+            ? "pending"
+            : "error";
 
     public string RemainingPercentText
     {
@@ -292,36 +433,95 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
         _ => ErrorAccent,
     };
 
-    /// <summary>
-    /// Starts exactly one initial request and then one request ten seconds after
-    /// every completed polling request. Manual refreshes use the same gate and
-    /// are dropped while a request is active.
-    /// </summary>
+    /// <summary>Installs one startup context and starts the single polling timer.</summary>
     public void Start()
     {
-        if (Interlocked.Exchange(ref started, 1) != 0 || disposed)
+        GenerationContext? startupContext = null;
+        lock (stateGate)
         {
-            return;
+            if (started != 0 || disposed)
+            {
+                return;
+            }
+
+            started = 1;
+            if (currentContext is null)
+            {
+                settingsSnapshot = App.CurrentSettings;
+                startupContext = new GenerationContext(settingsSnapshot);
+                currentContext = startupContext;
+            }
         }
 
-        connectionSupervisor?.EnsureStarted(App.CurrentSettings);
         update?.Start();
+        if (startupContext is not null)
+        {
+            _ = RunStartupAsync(startupContext);
+        }
         _ = RunPollingAsync(lifetime.Token);
+    }
+
+    /// <summary>
+    /// Applies a newly saved connection profile and performs one explicit
+    /// health/status refresh. Setup uses this boundary after saving its
+    /// selector; without it the supervisor would retain the pre-setup
+    /// <c>none</c> profile for the lifetime of the process.
+    /// </summary>
+    internal bool ApplyConnectionSettings(ClientSettings settings)
+    {
+        ArgumentNullException.ThrowIfNull(settings);
+        if (!ConnectionSelectors.IsValid(settings) || connectionSupervisor is null)
+        {
+            return false;
+        }
+
+        var operation = BeginExplicitOperation(
+            settings,
+            ExplicitOperationKind.Restart,
+            adoptSettings: true);
+        if (operation is null)
+        {
+            return false;
+        }
+
+        _ = RunExplicitOperationAsync(operation);
+        return true;
     }
 
     public void Dispose()
     {
-        if (disposed)
+        RetiredContext? retirement;
+        lock (stateGate)
         {
-            return;
+            if (disposed)
+            {
+                return;
+            }
+
+            disposed = true;
+            explicitOperationActive = false;
+            retirement = RetireContextLocked(currentContext);
+            currentContext = null;
+            LocalizationService.LanguageChanged -= OnLanguageChanged;
+            if (update is not null)
+            {
+                update.PropertyChanged -= OnUpdatePropertyChanged;
+            }
+
+            // The availability transition is the only synchronous UI change
+            // owned by Dispose.  The post-Dispose baseline starts after this
+            // lock exits, so late generations cannot add notifications.
+            Notify(nameof(CanRefresh));
+            refreshCommand.RaiseCanExecuteChanged();
+            authCommand.RaiseCanExecuteChanged();
+            checkAuthCommand.RaiseCanExecuteChanged();
+            ClearModels();
         }
 
-        disposed = true;
-        LocalizationService.LanguageChanged -= OnLanguageChanged;
         lifetime.Cancel();
+        CancelRetirement(retirement);
         if (update is not null)
         {
-            update.PropertyChanged -= OnUpdatePropertyChanged;
             update.Dispose();
         }
         if (client is IDisposable disposableClient)
@@ -334,23 +534,16 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
             disposableDetailsClient.Dispose();
         }
         connectionSupervisor?.Dispose();
-        ClearModels();
-
-        Notify(nameof(CanRefresh));
-        refreshCommand.RaiseCanExecuteChanged();
-        authCommand.RaiseCanExecuteChanged();
-        checkAuthCommand.RaiseCanExecuteChanged();
     }
 
     private async Task RunPollingAsync(CancellationToken cancellationToken)
     {
         try
         {
-            await TryRefreshAsync(cancellationToken);
             using var timer = new PeriodicTimer(TimeSpan.FromSeconds(10));
             while (await timer.WaitForNextTickAsync(cancellationToken))
             {
-                await TryRefreshAsync(cancellationToken);
+                await RunPeriodicRefreshAsync();
             }
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
@@ -361,115 +554,235 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
 
     private Task RefreshManuallyAsync()
     {
-        return TryRefreshAsync(lifetime.Token);
+        ClientSettings settings;
+        lock (stateGate)
+        {
+            settings = settingsSnapshot;
+        }
+
+        var operation = BeginExplicitOperation(settings, ExplicitOperationKind.Restart);
+        return operation is null
+            ? Task.CompletedTask
+            : RunExplicitOperationAsync(operation);
+    }
+
+    private Task CheckAuthenticationAsync()
+    {
+        ClientSettings settings;
+        lock (stateGate)
+        {
+            settings = settingsSnapshot;
+        }
+
+        var operation = BeginExplicitOperation(settings, ExplicitOperationKind.Ensure);
+        return operation is null
+            ? Task.CompletedTask
+            : RunExplicitOperationAsync(operation);
     }
 
     private Task LaunchLinuxAuthenticationAsync()
     {
-        try
+        GenerationContext? context;
+        lock (stateGate)
         {
-            // The command contains no account data or credentials.  The Linux
-            // Codex CLI owns the browser flow and the server remains the sole
-            // authority for the resulting authenticated state.
-            var startInfo = new ProcessStartInfo
+            if (disposed)
             {
-                FileName = "wsl.exe",
-                UseShellExecute = false,
-                CreateNoWindow = false,
-            };
-            startInfo.ArgumentList.Add("--");
-            startInfo.ArgumentList.Add("codex");
-            startInfo.ArgumentList.Add("login");
-            Process.Start(startInfo);
-            authLaunchFailed = false;
-        }
-        catch
-        {
-            authLaunchFailed = true;
-            Notify(nameof(StatusDetail));
+                return Task.CompletedTask;
+            }
+            context = currentContext;
         }
 
+        bool launched;
+        try { launched = authenticationLauncher(); }
+        catch { launched = false; }
+
+        if (context is not null)
+        {
+            MutateIfCurrent(context, () =>
+            {
+                authLaunchFailed = !launched;
+                authLaunchSucceeded = launched;
+                Notify(nameof(StatusDetail));
+                Notify(nameof(IsAuthStartVisible));
+                Notify(nameof(IsAuthCheckVisible));
+                authCommand.RaiseCanExecuteChanged();
+                checkAuthCommand.RaiseCanExecuteChanged();
+            });
+        }
         return Task.CompletedTask;
     }
 
     private void OnLanguageChanged(object? sender, EventArgs eventArgs)
     {
-        Notify(nameof(Texts));
-        Notify(nameof(RefreshButtonText));
-        Notify(nameof(StatusTitle));
-        Notify(nameof(StatusDetail));
-        Notify(nameof(UpdateNotificationText));
-        Notify(nameof(UpdateButtonText));
-        Notify(nameof(LastReceivedText));
-        Notify(nameof(ShowLastReceived));
-        Notify(nameof(DetailsStatusText));
-        Notify(nameof(QuotaWindowText));
-        Notify(nameof(QuotaRemainingText));
-        Notify(nameof(RemainingPercentText));
-        Notify(nameof(ActiveThreadCountLabel));
-        Notify(nameof(AuthenticationText));
-        Notify(nameof(PlanText));
-        Notify(nameof(LastReceivedText));
-        Notify(nameof(ResetAtText));
-        Notify(nameof(ObservedAtText));
-        Notify(nameof(ActiveThreadCountText));
-        Notify(nameof(EstimatedCostText));
-        Notify(nameof(ModelUsageUnavailableText));
+        lock (stateGate)
+        {
+            if (disposed) return;
+            Notify(nameof(Texts));
+            Notify(nameof(RefreshButtonText));
+            Notify(nameof(StatusTitle));
+            Notify(nameof(StatusDetail));
+            Notify(nameof(UpdateNotificationText));
+            Notify(nameof(UpdateButtonText));
+            Notify(nameof(LastReceivedText));
+            Notify(nameof(ShowLastReceived));
+            Notify(nameof(DetailsStatusText));
+            Notify(nameof(DetailsStatusAutomationText));
+            Notify(nameof(QuotaWindowText));
+            Notify(nameof(QuotaRemainingText));
+            Notify(nameof(RemainingPercentText));
+            Notify(nameof(ActiveThreadCountLabel));
+            Notify(nameof(AuthenticationText));
+            Notify(nameof(PlanText));
+            Notify(nameof(ResetAtText));
+            Notify(nameof(ObservedAtText));
+            Notify(nameof(ActiveThreadCountText));
+            Notify(nameof(EstimatedCostText));
+            Notify(nameof(ModelUsageUnavailableText));
+        }
     }
 
-    private async Task TryRefreshAsync(CancellationToken cancellationToken)
+    private static bool StartLinuxAuthenticationProcess()
     {
-        bool acquired;
-        try
+        // The command contains no account data or credentials.  The Linux
+        // Codex CLI owns the browser flow and the server remains the sole
+        // authority for the resulting authenticated state.
+        var startInfo = new ProcessStartInfo
         {
-            acquired = await refreshGate.WaitAsync(0, cancellationToken);
-        }
-        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+            FileName = "wsl.exe",
+            UseShellExecute = false,
+            CreateNoWindow = false,
+        };
+        startInfo.ArgumentList.Add("--");
+        startInfo.ArgumentList.Add("codex");
+        startInfo.ArgumentList.Add("login");
+        Process.Start(startInfo);
+        return true;
+    }
+
+    private async Task RunStartupAsync(GenerationContext context)
+    {
+        var lease = TryLease(context);
+        if (lease is null)
         {
             return;
         }
 
-        if (!acquired)
-        {
-            return;
-        }
-
-        SetRefreshing(true);
         try
         {
-            // A client generation is admitted only after the fixed listener
-            // health document has passed its own schema and header boundary.
-            HealthFetchResult health = await healthClient
-                .FetchHealthAsync(cancellationToken);
-            if (cancellationToken.IsCancellationRequested)
+            bool ready = connectionSupervisor is null
+                ? ConnectionSelectors.IsValid(context.Settings)
+                : connectionSupervisor.EnsureStarted(context.Settings);
+            if (!ready)
             {
+                MutateIfCurrent(context, () => ApplyFailure(StatusFetchFailure.Transport));
                 return;
             }
 
+            await FetchCycleAsync(context, lease.Token);
+        }
+        catch (OperationCanceledException)
+        {
+            // Lifetime/context retirement owns cancellation.  A transport
+            // which ignores it is still fenced by MutateIfCurrent below.
+        }
+        catch
+        {
+            MutateIfCurrent(context, () => ApplyFailure(StatusFetchFailure.Transport));
+        }
+        finally
+        {
+            CompleteLease(context, lease, explicitOperation: false);
+        }
+    }
+
+    private async Task RunPeriodicRefreshAsync()
+    {
+        GenerationContext? context;
+        lock (stateGate)
+        {
+            context = currentContext;
+        }
+
+        if (context is null) return;
+        var lease = TryLease(context);
+        if (lease is null) return;
+        try
+        {
+            await FetchCycleAsync(context, lease.Token);
+        }
+        finally
+        {
+            CompleteLease(context, lease, explicitOperation: false);
+        }
+    }
+
+    private async Task RunExplicitOperationAsync(ExplicitOperation operation)
+    {
+        try
+        {
+            if (operation.Kind == ExplicitOperationKind.Restart)
+            {
+                var outcome = connectionSupervisor?.RestartExplicit(operation.Context.Settings)
+                    ?? (ConnectionSelectors.IsValid(operation.Context.Settings)
+                        ? ConnectionRestartOutcome.NoChildRequired
+                        : ConnectionRestartOutcome.InvalidSettings);
+                if (outcome is not ConnectionRestartOutcome.Started and
+                    not ConnectionRestartOutcome.NoChildRequired)
+                {
+                    MutateIfCurrent(operation.Context, () => ApplyFailure(StatusFetchFailure.Transport));
+                    return;
+                }
+            }
+            else
+            {
+                var ready = connectionSupervisor is null
+                    ? ConnectionSelectors.IsValid(operation.Context.Settings)
+                    : connectionSupervisor.EnsureStarted(operation.Context.Settings);
+                if (!ready)
+                {
+                    MutateIfCurrent(operation.Context, () => ApplyFailure(StatusFetchFailure.Transport));
+                    return;
+                }
+            }
+
+            await FetchCycleAsync(operation.Context, operation.Lease.Token);
+        }
+        catch (OperationCanceledException)
+        {
+            // Retired/disposed contexts are fenced by the state gate.
+        }
+        catch
+        {
+            MutateIfCurrent(operation.Context, () => ApplyFailure(StatusFetchFailure.Transport));
+        }
+        finally
+        {
+            CompleteLease(operation.Context, operation.Lease, explicitOperation: true);
+        }
+    }
+
+    private async Task FetchCycleAsync(GenerationContext context, CancellationToken cancellationToken)
+    {
+        try
+        {
+            var health = await healthClient.FetchHealthAsync(cancellationToken);
             if (!health.IsSuccess)
             {
-                ApplyFailure(health.Failure == HealthFetchFailure.Response
+                MutateIfCurrent(context, () => ApplyFailure(health.Failure == HealthFetchFailure.Response
                     ? StatusFetchFailure.Response
-                    : StatusFetchFailure.Transport);
+                    : StatusFetchFailure.Transport));
                 return;
             }
 
-            StatusFetchResult result = await client.FetchAsync(cancellationToken);
-            if (cancellationToken.IsCancellationRequested)
+            var result = await client.FetchAsync(cancellationToken);
+            if (!result.IsSuccess || result.Snapshot is not { } validatedSnapshot)
             {
+                MutateIfCurrent(context, () => ApplyFailure(result.Failure ?? StatusFetchFailure.Transport));
                 return;
             }
 
-            if (result.Snapshot is not { } validatedSnapshot)
-            {
-                ApplyFailure(result.Failure ?? StatusFetchFailure.Transport);
-                return;
-            }
-
-            // Details are account-scoped.  Never issue or apply an auxiliary
-            // snapshot after an unauthenticated status, otherwise a slower
-            // details response could repopulate cleared rows from the prior
-            // account generation.
+            // Details are account-scoped.  Never publish status alone while a
+            // details client exists; only a matching pair is a complete root.
             if (detailsClient is not null && validatedSnapshot.Authenticated &&
                 validatedSnapshot.State != ApiState.AuthRequired)
             {
@@ -478,63 +791,242 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
                 {
                     detailsResult = await detailsClient.FetchDetailsAsync(cancellationToken);
                 }
-                catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+                catch (OperationCanceledException)
                 {
-                    return;
+                    throw;
                 }
                 catch
                 {
                     detailsResult = DetailsFetchResult.FromFailure(DetailsFetchFailure.Transport);
                 }
 
-                if (cancellationToken.IsCancellationRequested)
-                {
-                    return;
-                }
-
-                if (detailsResult.Snapshot is { } validatedDetails &&
+                if (detailsResult.IsSuccess && detailsResult.Snapshot is { } validatedDetails &&
                     validatedDetails.Authenticated &&
                     validatedDetails.State != ApiState.AuthRequired &&
+                    HasSamePublishedPair(validatedSnapshot, validatedDetails) &&
                     HasSamePublicCore(validatedSnapshot, validatedDetails))
                 {
-                    // Commit the pair only after both documents have passed
-                    // validation and their shared projection is identical.
-                    // Until this point the last complete UI generation stays
-                    // untouched.
-                    ApplySnapshot(validatedSnapshot);
-                    ApplyDetails(validatedDetails);
+                    MutateIfCurrent(context, () => ApplyAuthenticatedPair(validatedSnapshot, validatedDetails));
                 }
                 else
                 {
-                    detailsFailure = detailsResult.Failure == DetailsFetchFailure.Transport
-                        ? DetailsFetchFailure.Transport
-                        : DetailsFetchFailure.Response;
-                    Notify(nameof(DetailsStatusText));
-                    ApplyFailure(detailsFailure == DetailsFetchFailure.Transport
-                        ? StatusFetchFailure.Transport
-                        : StatusFetchFailure.Response);
+                    MutateIfCurrent(context, () =>
+                    {
+                        detailsFailure = detailsResult.Failure == DetailsFetchFailure.Transport
+                            ? DetailsFetchFailure.Transport
+                            : DetailsFetchFailure.Response;
+                        Notify(nameof(DetailsStatusText));
+                        Notify(nameof(DetailsStatusAutomationText));
+                        ApplyFailure(detailsFailure == DetailsFetchFailure.Transport
+                            ? StatusFetchFailure.Transport
+                            : StatusFetchFailure.Response);
+                    });
                 }
             }
             else
             {
-                ApplySnapshot(validatedSnapshot);
+                MutateIfCurrent(context, () => ApplySnapshot(validatedSnapshot));
             }
         }
-        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        catch (OperationCanceledException)
         {
-            // The close path owns cancellation and does not change the UI.
+            // Cancellation is a lifecycle event.  No UI mutation belongs to
+            // this transaction, including its eventual finally path.
         }
         catch
         {
-            if (!cancellationToken.IsCancellationRequested)
+            MutateIfCurrent(context, () => ApplyFailure(StatusFetchFailure.Transport));
+        }
+    }
+
+    private ExplicitOperation? BeginExplicitOperation(
+        ClientSettings settings,
+        ExplicitOperationKind kind,
+        bool adoptSettings = false)
+    {
+        RetiredContext? retirement;
+        ExplicitOperation operation;
+        lock (stateGate)
+        {
+            if (disposed || explicitOperationActive)
             {
-                ApplyFailure(StatusFetchFailure.Transport);
+                return null;
             }
+
+            explicitOperationActive = true;
+            if (adoptSettings)
+            {
+                settingsSnapshot = settings;
+            }
+
+            var previous = currentContext;
+            var next = new GenerationContext(settings)
+            {
+                IsExplicitOperation = true,
+            };
+            currentContext = next;
+            retirement = RetireContextLocked(previous);
+            var lease = TryLeaseLocked(next);
+            if (lease is null)
+            {
+                // Linked-token creation can only fail during teardown. Keep
+                // the old context authoritative if that rare race wins.
+                currentContext = previous;
+                explicitOperationActive = false;
+                return null;
+            }
+
+            operation = new ExplicitOperation(next, lease, kind);
+        }
+
+        CancelRetirement(retirement);
+        return operation;
+    }
+
+    private RefreshLease? TryLease(GenerationContext context)
+    {
+        lock (stateGate)
+        {
+            return TryLeaseLocked(context);
+        }
+    }
+
+    private RefreshLease? TryLeaseLocked(GenerationContext context)
+    {
+        if (disposed || context.Retired || !ReferenceEquals(currentContext, context) ||
+            context.RefreshInFlight)
+        {
+            return null;
+        }
+
+        context.RefreshInFlight = true;
+        context.ActiveLeases++;
+        try
+        {
+            var linked = CancellationTokenSource.CreateLinkedTokenSource(
+                lifetime.Token,
+                context.Retirement.Token);
+            SetRefreshingLocked(true);
+            return new RefreshLease(linked);
+        }
+        catch
+        {
+            context.ActiveLeases--;
+            context.RefreshInFlight = false;
+            return null;
+        }
+    }
+
+    private void CompleteLease(
+        GenerationContext context,
+        RefreshLease lease,
+        bool explicitOperation)
+    {
+        lease.Dispose();
+        RetiredContext? retirement = null;
+        lock (stateGate)
+        {
+            context.RefreshInFlight = false;
+            if (context.ActiveLeases > 0)
+            {
+                context.ActiveLeases--;
+            }
+
+            if (ReferenceEquals(currentContext, context) && !context.Retired && !disposed)
+            {
+                if (explicitOperation && context.IsExplicitOperation)
+                {
+                    context.IsExplicitOperation = false;
+                    explicitOperationActive = false;
+                }
+
+                if (initialLoadPending)
+                {
+                    initialLoadPending = false;
+                    Notify(nameof(IsStartupLoading));
+                    Notify(nameof(ShowAuthenticatedContent));
+                }
+
+                SetRefreshingLocked(false);
+                Notify(nameof(IsRetryVisible));
+                Notify(nameof(IsRefreshingVisible));
+                Notify(nameof(IsUpdateNotificationVisible));
+                Notify(nameof(IsUpdateActionVisible));
+            }
+
+            retirement = ReleaseRetirementLocked(context);
+        }
+        CancelRetirement(retirement);
+        context.PipelineCompletion.TrySetResult(context);
+    }
+
+    private RetiredContext? RetireContextLocked(GenerationContext? context)
+    {
+        if (context is null || context.Retired)
+        {
+            return null;
+        }
+
+        context.Retired = true;
+        var disposeAfterCancel = context.ActiveLeases == 0;
+        if (disposeAfterCancel)
+        {
+            context.RetirementDisposed = true;
+        }
+        return new RetiredContext(context, disposeAfterCancel);
+    }
+
+    private RetiredContext? ReleaseRetirementLocked(GenerationContext context)
+    {
+        if (!context.Retired || context.ActiveLeases != 0 || context.RetirementDisposed)
+        {
+            return null;
+        }
+
+        context.RetirementDisposed = true;
+        return new RetiredContext(context, DisposeAfterCancel: true);
+    }
+
+    private static void CancelRetirement(RetiredContext? retirement)
+    {
+        if (retirement is null)
+        {
+            return;
+        }
+
+        try
+        {
+            retirement.Context.Retirement.Cancel();
+        }
+        catch (ObjectDisposedException)
+        {
+            return;
         }
         finally
         {
-            SetRefreshing(false);
-            refreshGate.Release();
+            if (retirement.DisposeAfterCancel)
+            {
+                retirement.Context.Retirement.Dispose();
+            }
+        }
+    }
+
+    /// <summary>
+    /// The only presentation commit gate.  The reference identity and
+    /// retirement check remain adjacent to every mutation and notification,
+    /// including late cancellation-ignoring continuations.
+    /// </summary>
+    private bool MutateIfCurrent(GenerationContext context, Action mutation)
+    {
+        lock (stateGate)
+        {
+            if (disposed || context.Retired || !ReferenceEquals(currentContext, context))
+            {
+                return false;
+            }
+
+            mutation();
+            return true;
         }
     }
 
@@ -569,10 +1061,18 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
         return true;
     }
 
+    private static bool HasSamePublishedPair(
+        ApiStatusSnapshot status,
+        ApiDetailsSnapshot details) =>
+        status.PublishedPair is { } statusPair &&
+        details.PublishedPair is { } detailsPair &&
+        statusPair == detailsPair;
+
     private void ApplySnapshot(ApiStatusSnapshot validatedSnapshot)
     {
         snapshot = validatedSnapshot;
         lastReceivedAt = DateTimeOffset.Now;
+        hasConnectionFailure = validatedSnapshot.State == ApiState.Error;
         presentationState = validatedSnapshot.State switch
         {
             ApiState.Ready => GetReadyPresentationState(validatedSnapshot),
@@ -584,6 +1084,8 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
 
         if (validatedSnapshot.State == ApiState.AuthRequired || !validatedSnapshot.Authenticated)
         {
+            authLaunchFailed = false;
+            authLaunchSucceeded = false;
             // A valid authentication transition is not an auxiliary fetch
             // failure: clear account-scoped details so old rows cannot remain
             // visible while Linux asks the user to authenticate.
@@ -593,77 +1095,112 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
             Notify(nameof(HasDetails));
             Notify(nameof(DetailsSnapshot));
             Notify(nameof(DetailsStatusText));
+            Notify(nameof(DetailsStatusAutomationText));
             Notify(nameof(EstimatedCostText));
             NotifyActiveThreadProperties();
         }
         else if (detailsSnapshot is null)
         {
-            ClearModels();
-            foreach (ApiModelUsage model in validatedSnapshot.Models.OrderBy(ModelOrder))
-            {
-                models.Add(new ModelUsageViewModel(model));
-            }
+            ReplaceStatusModels(validatedSnapshot.Models.OrderBy(ModelOrder));
         }
 
         NotifySnapshotProperties();
         authCommand.RaiseCanExecuteChanged();
         checkAuthCommand.RaiseCanExecuteChanged();
+        Notify(nameof(IsRetryVisible));
+        Notify(nameof(IsRefreshingVisible));
+        Notify(nameof(IsUpdateNotificationVisible));
+        Notify(nameof(IsUpdateActionVisible));
+    }
+
+    private void ApplyAuthenticatedPair(
+        ApiStatusSnapshot validatedSnapshot,
+        ApiDetailsSnapshot validatedDetails)
+    {
+        // All observable backing state is assigned before the first collection
+        // or property notification.  The commit itself is synchronous so an
+        // observer can never see status from one generation with details from
+        // another.
+        snapshot = validatedSnapshot;
+        detailsSnapshot = validatedDetails;
+        detailsFailure = null;
+        lastReceivedAt = DateTimeOffset.Now;
+        hasConnectionFailure = validatedSnapshot.State == ApiState.Error;
+        authLaunchFailed = false;
+        authLaunchSucceeded = false;
+        presentationState = validatedSnapshot.State switch
+        {
+            ApiState.Ready => GetReadyPresentationState(validatedSnapshot),
+            ApiState.Initializing => ClientPresentationState.Initializing,
+            ApiState.AuthRequired => ClientPresentationState.AuthRequired,
+            ApiState.Error => ClientPresentationState.ApiError,
+            _ => ClientPresentationState.ResponseError,
+        };
+
+        ReplaceModels(validatedDetails.Models.OrderBy(ModelOrder), notify: false);
+        RebuildQuotaSegments(notify: false);
+        models.NotifyReset();
+        quotaSegments.NotifyReset();
+
+        Notify(nameof(HasDetails));
+        Notify(nameof(DetailsSnapshot));
+        Notify(nameof(DetailsStatusText));
+        Notify(nameof(DetailsStatusAutomationText));
+        Notify(nameof(ModelUsagePeriodText));
+        Notify(nameof(EstimatedCostText));
+        NotifySnapshotProperties(quotaAlreadyRebuilt: true);
+        authCommand.RaiseCanExecuteChanged();
+        checkAuthCommand.RaiseCanExecuteChanged();
+        Notify(nameof(IsRetryVisible));
+        Notify(nameof(IsRefreshingVisible));
+        Notify(nameof(IsUpdateNotificationVisible));
+        Notify(nameof(IsUpdateActionVisible));
     }
 
     private void ApplyFailure(StatusFetchFailure failure)
     {
+        hasConnectionFailure = true;
         presentationState = failure == StatusFetchFailure.Response
             ? ClientPresentationState.ResponseError
             : ClientPresentationState.TransportError;
         NotifyStatusProperties();
         Notify(nameof(LastReceivedText));
+        Notify(nameof(ShowLastReceived));
         authCommand.RaiseCanExecuteChanged();
         checkAuthCommand.RaiseCanExecuteChanged();
+        Notify(nameof(IsAuthStartVisible));
+        Notify(nameof(IsAuthCheckVisible));
+        Notify(nameof(IsRetryVisible));
+        Notify(nameof(IsRefreshingVisible));
+        Notify(nameof(IsUpdateNotificationVisible));
+        Notify(nameof(IsUpdateActionVisible));
     }
 
-    private void ApplyDetails(ApiDetailsSnapshot validatedDetails)
-    {
-        detailsSnapshot = validatedDetails;
-        detailsFailure = null;
-
-        // Details are the only source for dollar columns.  Keep the existing
-        // status model rows until a valid details snapshot arrives; once it
-        // does, replace the entire collection so rows never mix generations.
-        ClearModels();
-        foreach (ApiDetailsModelUsage model in validatedDetails.Models.OrderBy(ModelOrder))
-        {
-            models.Add(new ModelUsageViewModel(model));
-        }
-
-        Notify(nameof(HasDetails));
-        Notify(nameof(DetailsSnapshot));
-        Notify(nameof(DetailsStatusText));
-        Notify(nameof(ModelUsagePeriodText));
-        Notify(nameof(EstimatedCostText));
-        Notify(nameof(HasModels));
-        Notify(nameof(HasNoModels));
-        NotifyActiveThreadProperties();
-    }
-
-    private void ApplyDetailsFailure(DetailsFetchFailure failure)
-    {
-        // Deliberately do not clear detailsSnapshot or Models.  This is the
-        // auxiliary owner fault and is independent of the status banner.
-        detailsFailure = failure;
-        Notify(nameof(DetailsStatusText));
-    }
-
-    private void SetRefreshing(bool value)
+    private void SetRefreshingLocked(bool value)
     {
         refreshing = value;
         Notify(nameof(CanRefresh));
         Notify(nameof(RefreshButtonText));
         refreshCommand.RaiseCanExecuteChanged();
+        checkAuthCommand.RaiseCanExecuteChanged();
+        Notify(nameof(IsRetryVisible));
+        Notify(nameof(IsRefreshingVisible));
+        Notify(nameof(IsUpdateNotificationVisible));
+        Notify(nameof(IsUpdateActionVisible));
+        Notify(nameof(ShowLastReceived));
     }
 
-    private void NotifySnapshotProperties()
+    private void NotifySnapshotProperties(bool quotaAlreadyRebuilt = false)
     {
-        RebuildQuotaSegments();
+        if (quotaAlreadyRebuilt)
+        {
+            Notify(nameof(QuotaSegments));
+        }
+        else
+        {
+            RebuildQuotaSegments();
+        }
+
         Notify(nameof(HasQuota));
         Notify(nameof(RemainingPercentText));
         Notify(nameof(RemainingPercentValue));
@@ -673,6 +1210,9 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
         Notify(nameof(AuthenticationText));
         Notify(nameof(IsAuthRequired));
         Notify(nameof(IsAuthenticated));
+        Notify(nameof(IsAuthStartVisible));
+        Notify(nameof(IsAuthCheckVisible));
+        Notify(nameof(ShowAuthenticatedContent));
         Notify(nameof(PlanText));
         Notify(nameof(ActiveThreadCountText));
         Notify(nameof(ResetAtText));
@@ -685,19 +1225,21 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
         NotifyActiveThreadProperties();
     }
 
-    private void RebuildQuotaSegments()
+    private void RebuildQuotaSegments(bool notify = true)
     {
-        quotaSegments.Clear();
         var fraction = snapshot?.Quota is { } quota
             ? Math.Clamp((quota.ResetAt - DateTimeOffset.UtcNow.ToUnixTimeSeconds()) /
                          (double)Math.Max(1, quota.WindowSeconds), 0, 1)
             : 0;
-        for (var index = 0; index < 7; index++)
-        {
-            quotaSegments.Add(new QuotaSegmentViewModel(Math.Clamp(fraction * 7 - index, 0, 1)));
-        }
+        quotaSegments.ReplaceAll(Enumerable.Range(0, 7)
+            .Select(index => new QuotaSegmentViewModel(Math.Clamp(fraction * 7 - index, 0, 1))),
+            notify: false);
 
-        Notify(nameof(QuotaSegments));
+        if (notify)
+        {
+            quotaSegments.NotifyReset();
+            Notify(nameof(QuotaSegments));
+        }
     }
 
     private void NotifyStatusProperties()
@@ -724,12 +1266,67 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
 
     private void ClearModels()
     {
-        foreach (var model in models)
+        var previous = models.ToArray();
+        models.ReplaceAll([]);
+        foreach (var model in previous)
         {
             model.Dispose();
         }
+    }
 
-        models.Clear();
+    private void ReplaceModels(IEnumerable<ApiDetailsModelUsage> source, bool notify = true)
+    {
+        var next = source.Select(static model => new ModelUsageViewModel(model)).ToArray();
+        var previous = models.ToArray();
+        models.ReplaceAll(next, notify);
+        foreach (var model in previous)
+        {
+            model.Dispose();
+        }
+    }
+
+    private void ReplaceStatusModels(IEnumerable<ApiModelUsage> source)
+    {
+        var next = source.Select(static model => new ModelUsageViewModel(model)).ToArray();
+        var previous = models.ToArray();
+        models.ReplaceAll(next);
+        foreach (var model in previous)
+        {
+            model.Dispose();
+        }
+    }
+
+    /// <summary>
+    /// Publishes a complete snapshot as one collection reset.  Clearing and
+    /// re-adding rows individually makes Avalonia remove and recreate the
+    /// whole model table during every poll, which is visible as a full-screen
+    /// flicker.  Items is mutated silently and one Reset is sent after the
+    /// new immutable row set is ready.
+    /// </summary>
+    private sealed class SnapshotCollection<T> : ObservableCollection<T>
+    {
+        public void ReplaceAll(IEnumerable<T> values, bool notify = true)
+        {
+            ArgumentNullException.ThrowIfNull(values);
+            CheckReentrancy();
+            Items.Clear();
+            foreach (var value in values)
+            {
+                Items.Add(value);
+            }
+
+            if (notify)
+            {
+                NotifyReset();
+            }
+        }
+
+        public void NotifyReset()
+        {
+            OnPropertyChanged(new PropertyChangedEventArgs(nameof(Count)));
+            OnPropertyChanged(new PropertyChangedEventArgs("Item[]"));
+            OnCollectionChanged(new NotifyCollectionChangedEventArgs(NotifyCollectionChangedAction.Reset));
+        }
     }
 
     private int CountThreads(string model)
@@ -842,12 +1439,58 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
 
     private void OnUpdatePropertyChanged(object? sender, PropertyChangedEventArgs eventArgs)
     {
-        Notify(nameof(IsUpdateNotificationVisible));
-        Notify(nameof(IsUpdateActionVisible));
-        Notify(nameof(UpdateNotificationText));
-        Notify(nameof(UpdateButtonText));
-        Notify(nameof(ShowLastReceived));
+        lock (stateGate)
+        {
+            if (disposed) return;
+            Notify(nameof(IsUpdateNotificationVisible));
+            Notify(nameof(IsUpdateActionVisible));
+            Notify(nameof(UpdateNotificationText));
+            Notify(nameof(UpdateButtonText));
+            Notify(nameof(ShowLastReceived));
+        }
     }
+
+    private enum ExplicitOperationKind
+    {
+        Restart,
+        Ensure,
+    }
+
+    private sealed class GenerationContext(ClientSettings settings)
+    {
+        public ClientSettings Settings { get; } = settings;
+
+        public CancellationTokenSource Retirement { get; } = new();
+
+        public TaskCompletionSource<object?> PipelineCompletion { get; } = new(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public bool Retired { get; set; }
+
+        public bool RetirementDisposed { get; set; }
+
+        public int ActiveLeases { get; set; }
+
+        public bool RefreshInFlight { get; set; }
+
+        public bool IsExplicitOperation { get; set; }
+    }
+
+    private sealed class RefreshLease(CancellationTokenSource linkedSource) : IDisposable
+    {
+        public CancellationToken Token => linkedSource.Token;
+
+        public void Dispose() => linkedSource.Dispose();
+    }
+
+    private sealed record ExplicitOperation(
+        GenerationContext Context,
+        RefreshLease Lease,
+        ExplicitOperationKind Kind);
+
+    private sealed record RetiredContext(
+        GenerationContext Context,
+        bool DisposeAfterCancel);
 
     private enum ClientPresentationState
     {

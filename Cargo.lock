@@ -726,15 +726,17 @@ dependencies = [
 
 [[package]]
 name = "codex_info"
-version = "1.0.5"
+version = "1.0.7"
 dependencies = [
  "axum",
  "chrono",
  "chrono-tz",
  "fontique",
+ "getrandom 0.3.4",
  "iana-time-zone",
  "raw-window-handle",
  "rusqlite",
+ "rustix 0.38.44",
  "serde",
  "serde_json",
  "slint",

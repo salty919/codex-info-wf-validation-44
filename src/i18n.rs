@@ -55,6 +55,24 @@ impl Language {
         }
     }
 
+    /// Localized command-line help.  Startup messages are product copy too;
+    /// keeping them here prevents the shell launcher and the binary from
+    /// silently diverging in language or launch semantics.
+    pub const fn launch_help(self) -> &'static str {
+        match self {
+            Self::Japanese => "使用法: codex_info [--ui] [--port PORT] | --stop | --help\n\n  (引数なし)       daemon+REST（127.0.0.1:8787）\n  --port PORT      daemon+RESTのポート（アドレスは127.0.0.1に固定）\n  --ui             daemon+REST + X UI\n  --ui --port PORT 指定ポートでdaemon+REST + X UI\n  --stop           常駐daemonを停止\n  --help, --h, -h  このヘルプを表示",
+            Self::English => "Usage: codex_info [--ui] [--port PORT] | --stop | --help\n\n  (no arguments)   daemon+REST (127.0.0.1:8787)\n  --port PORT      daemon+REST port (address fixed to 127.0.0.1)\n  --ui             daemon+REST + X UI\n  --ui --port PORT daemon+REST + X UI on the selected port\n  --stop           stop the resident daemon\n  --help, --h, -h  show this help",
+            Self::SimplifiedChinese => "用法: codex_info [--ui] [--port PORT] | --stop | --help\n\n  (无参数)         daemon+REST（127.0.0.1:8787）\n  --port PORT      daemon+REST端口（地址固定为127.0.0.1）\n  --ui             daemon+REST + X UI\n  --ui --port PORT 在指定端口启动daemon+REST + X UI\n  --stop           停止常驻daemon\n  --help, --h, -h  显示此帮助",
+            Self::Korean => "사용법: codex_info [--ui] [--port PORT] | --stop | --help\n\n  (인수 없음)      daemon+REST (127.0.0.1:8787)\n  --port PORT      daemon+REST 포트 (주소는 127.0.0.1로 고정)\n  --ui             daemon+REST + X UI\n  --ui --port PORT 지정 포트에서 daemon+REST + X UI\n  --stop           상주 daemon 중지\n  --help, --h, -h  이 도움말 표시",
+            Self::Spanish => "Uso: codex_info [--ui] [--port PORT] | --stop | --help\n\n  (sin argumentos) daemon+REST (127.0.0.1:8787)\n  --port PORT      puerto daemon+REST (dirección fija a 127.0.0.1)\n  --ui             daemon+REST + X UI\n  --ui --port PORT daemon+REST + X UI en el puerto indicado\n  --stop           detener el daemon residente\n  --help, --h, -h  mostrar esta ayuda",
+            Self::French => "Usage : codex_info [--ui] [--port PORT] | --stop | --help\n\n  (aucun argument) daemon+REST (127.0.0.1:8787)\n  --port PORT      port daemon+REST (adresse fixée à 127.0.0.1)\n  --ui             daemon+REST + X UI\n  --ui --port PORT daemon+REST + X UI sur le port choisi\n  --stop           arrêter le daemon résident\n  --help, --h, -h  afficher cette aide",
+            Self::German => "Aufruf: codex_info [--ui] [--port PORT] | --stop | --help\n\n  (keine Argumente) daemon+REST (127.0.0.1:8787)\n  --port PORT      daemon+REST-Port (Adresse fest auf 127.0.0.1)\n  --ui             daemon+REST + X UI\n  --ui --port PORT daemon+REST + X UI am gewählten Port\n  --stop           residenten Daemon stoppen\n  --help, --h, -h  diese Hilfe anzeigen",
+            Self::Portuguese => "Uso: codex_info [--ui] [--port PORT] | --stop | --help\n\n  (sem argumentos) daemon+REST (127.0.0.1:8787)\n  --port PORT      porta daemon+REST (endereço fixado em 127.0.0.1)\n  --ui             daemon+REST + X UI\n  --ui --port PORT daemon+REST + X UI na porta escolhida\n  --stop           parar o daemon residente\n  --help, --h, -h  mostrar esta ajuda",
+            Self::Italian => "Uso: codex_info [--ui] [--port PORT] | --stop | --help\n\n  (nessun argomento) daemon+REST (127.0.0.1:8787)\n  --port PORT      porta daemon+REST (indirizzo fissato a 127.0.0.1)\n  --ui             daemon+REST + X UI\n  --ui --port PORT daemon+REST + X UI sulla porta scelta\n  --stop           arresta il daemon residente\n  --help, --h, -h  mostra questo aiuto",
+            Self::Russian => "Использование: codex_info [--ui] [--port PORT] | --stop | --help\n\n  (без аргументов) daemon+REST (127.0.0.1:8787)\n  --port PORT      порт daemon+REST (адрес фиксирован: 127.0.0.1)\n  --ui             daemon+REST + X UI\n  --ui --port PORT daemon+REST + X UI на выбранном порту\n  --stop           остановить daemon\n  --help, --h, -h  показать эту справку",
+        }
+    }
+
     fn from_primary(primary: &str) -> Option<Self> {
         Some(match primary {
             "ja" => Self::Japanese,
@@ -307,6 +325,48 @@ impl TextKey {
     ];
 }
 
+/// Fixed command-line and service lifecycle copy. CLI messages are kept in a
+/// separate finite catalog because they are not rendered inside a window,
+/// while still sharing the same process locale authority as the UI.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CliTextKey {
+    InvalidPort,
+    ServiceExecutableUnavailable,
+    ServiceStartFailed,
+    ServiceCleanupFailed,
+    ServiceStateUnavailable,
+    ServiceExitedBeforeHealthy,
+    ServiceNotHealthy,
+    ServiceAlreadyOwned,
+    ServiceReused,
+    StopLockUnavailable,
+    StopLockInvalid,
+    StopSignalFailed,
+    StopOwnerChanged,
+    StopTimeout,
+    StopUnsupported,
+}
+
+impl CliTextKey {
+    pub const ALL: [Self; 15] = [
+        Self::InvalidPort,
+        Self::ServiceExecutableUnavailable,
+        Self::ServiceStartFailed,
+        Self::ServiceCleanupFailed,
+        Self::ServiceStateUnavailable,
+        Self::ServiceExitedBeforeHealthy,
+        Self::ServiceNotHealthy,
+        Self::ServiceAlreadyOwned,
+        Self::ServiceReused,
+        Self::StopLockUnavailable,
+        Self::StopLockInvalid,
+        Self::StopSignalFailed,
+        Self::StopOwnerChanged,
+        Self::StopTimeout,
+        Self::StopUnsupported,
+    ];
+}
+
 #[derive(Clone, Debug)]
 pub struct I18n {
     language: Language,
@@ -331,6 +391,25 @@ impl I18n {
 
     pub const fn timezone(&self) -> Tz {
         self.timezone
+    }
+
+    pub fn cli_text(&self, key: CliTextKey) -> &'static str {
+        let index = CliTextKey::ALL
+            .iter()
+            .position(|candidate| *candidate == key)
+            .expect("all CLI translation keys must be listed");
+        match self.language {
+            Language::Japanese => CLI_JA[index],
+            Language::English => CLI_EN[index],
+            Language::SimplifiedChinese => CLI_ZH[index],
+            Language::Korean => CLI_KO[index],
+            Language::Spanish => CLI_ES[index],
+            Language::French => CLI_FR[index],
+            Language::German => CLI_DE[index],
+            Language::Portuguese => CLI_PT[index],
+            Language::Italian => CLI_IT[index],
+            Language::Russian => CLI_RU[index],
+        }
     }
 
     pub fn text(&self, key: TextKey) -> &'static str {
@@ -800,6 +879,186 @@ impl I18n {
         }
     }
 }
+
+const CLI_JA: [&str; 15] = [
+    "--port には1〜65535の整数を指定してください。",
+    "サービス実行ファイルを利用できません。",
+    "サービスを起動できませんでした。",
+    "競合したサービスの後始末に失敗しました。",
+    "サービスの状態を確認できません。",
+    "サービスは正常になる前に終了しました。",
+    "サービスが正常状態になりませんでした。",
+    "サービスは別のプロセスが所有しています。",
+    "既存の正常なサービスを再利用します。",
+    "daemonのlockを利用できません。",
+    "daemonのlock所有者を検証できません。",
+    "daemonへ停止信号を送れませんでした。",
+    "停止中にdaemonの所有者が変わりました。",
+    "daemonがlockを解放する前にタイムアウトしました。",
+    "この環境ではdaemonを停止できません。",
+];
+
+const CLI_EN: [&str; 15] = [
+    "--port requires an integer from 1 to 65535.",
+    "The service executable is unavailable.",
+    "The service could not be started.",
+    "A competing service could not be cleaned up.",
+    "The service state is unavailable.",
+    "The service exited before becoming healthy.",
+    "The service did not become healthy.",
+    "The service is already owned by another process.",
+    "Reusing the existing healthy service.",
+    "The daemon lock is unavailable.",
+    "The daemon lock owner cannot be verified.",
+    "The daemon could not be sent a stop signal.",
+    "The daemon owner changed while stopping.",
+    "The daemon lock was not released before timeout.",
+    "Stopping the daemon is unsupported on this platform.",
+];
+
+const CLI_ZH: [&str; 15] = [
+    "--port 需要 1 到 65535 之间的整数。",
+    "无法使用服务可执行文件。",
+    "无法启动服务。",
+    "无法清理竞争的服务。",
+    "无法获取服务状态。",
+    "服务在变为健康前已退出。",
+    "服务未能变为健康状态。",
+    "服务已由其他进程拥有。",
+    "正在复用现有的健康服务。",
+    "无法使用 daemon lock。",
+    "无法验证 daemon lock 所有者。",
+    "无法向 daemon 发送停止信号。",
+    "停止期间 daemon 所有者已改变。",
+    "daemon lock 在超时前未释放。",
+    "此平台不支持停止 daemon。",
+];
+
+const CLI_KO: [&str; 15] = [
+    "--port에는 1에서 65535 사이의 정수가 필요합니다.",
+    "서비스 실행 파일을 사용할 수 없습니다.",
+    "서비스를 시작할 수 없습니다.",
+    "경쟁 서비스 정리에 실패했습니다.",
+    "서비스 상태를 확인할 수 없습니다.",
+    "서비스가 정상 상태가 되기 전에 종료되었습니다.",
+    "서비스가 정상 상태가 되지 않았습니다.",
+    "서비스는 이미 다른 프로세스가 소유하고 있습니다.",
+    "기존의 정상 서비스를 재사용합니다.",
+    "daemon lock을 사용할 수 없습니다.",
+    "daemon lock 소유자를 확인할 수 없습니다.",
+    "daemon에 중지 신호를 보낼 수 없습니다.",
+    "중지 중 daemon 소유자가 변경되었습니다.",
+    "시간 초과 전에 daemon lock이 해제되지 않았습니다.",
+    "이 플랫폼에서는 daemon 중지를 지원하지 않습니다.",
+];
+
+const CLI_ES: [&str; 15] = [
+    "--port requiere un entero entre 1 y 65535.",
+    "El ejecutable del servicio no está disponible.",
+    "No se pudo iniciar el servicio.",
+    "No se pudo limpiar el servicio en conflicto.",
+    "El estado del servicio no está disponible.",
+    "El servicio terminó antes de estar saludable.",
+    "El servicio no alcanzó un estado saludable.",
+    "El servicio ya pertenece a otro proceso.",
+    "Se reutiliza el servicio saludable existente.",
+    "El lock del daemon no está disponible.",
+    "No se puede verificar el propietario del lock del daemon.",
+    "No se pudo enviar la señal de detención al daemon.",
+    "El propietario del daemon cambió durante la detención.",
+    "El lock del daemon no se liberó antes del tiempo límite.",
+    "Esta plataforma no admite detener el daemon.",
+];
+
+const CLI_FR: [&str; 15] = [
+    "--port nécessite un entier compris entre 1 et 65535.",
+    "L’exécutable du service est indisponible.",
+    "Impossible de démarrer le service.",
+    "Impossible de nettoyer le service concurrent.",
+    "L’état du service est indisponible.",
+    "Le service s’est arrêté avant d’être sain.",
+    "Le service n’est pas devenu sain.",
+    "Le service est déjà détenu par un autre processus.",
+    "Réutilisation du service sain existant.",
+    "Le verrou du daemon est indisponible.",
+    "Impossible de vérifier le propriétaire du verrou du daemon.",
+    "Impossible d’envoyer le signal d’arrêt au daemon.",
+    "Le propriétaire du daemon a changé pendant l’arrêt.",
+    "Le verrou du daemon n’a pas été libéré à temps.",
+    "L’arrêt du daemon n’est pas pris en charge sur cette plateforme.",
+];
+
+const CLI_DE: [&str; 15] = [
+    "--port benötigt eine Ganzzahl von 1 bis 65535.",
+    "Die Dienstdatei ist nicht verfügbar.",
+    "Der Dienst konnte nicht gestartet werden.",
+    "Der konkurrierende Dienst konnte nicht bereinigt werden.",
+    "Der Dienststatus ist nicht verfügbar.",
+    "Der Dienst wurde beendet, bevor er bereit war.",
+    "Der Dienst wurde nicht bereit.",
+    "Der Dienst gehört bereits einem anderen Prozess.",
+    "Der vorhandene bereite Dienst wird wiederverwendet.",
+    "Die Daemon-Sperre ist nicht verfügbar.",
+    "Der Besitzer der Daemon-Sperre kann nicht überprüft werden.",
+    "Dem Daemon konnte kein Stoppsignal gesendet werden.",
+    "Der Daemon-Besitzer hat sich während des Stopps geändert.",
+    "Die Daemon-Sperre wurde nicht rechtzeitig freigegeben.",
+    "Das Stoppen des Daemons wird auf dieser Plattform nicht unterstützt.",
+];
+
+const CLI_PT: [&str; 15] = [
+    "--port requer um inteiro de 1 a 65535.",
+    "O executável do serviço não está disponível.",
+    "Não foi possível iniciar o serviço.",
+    "Não foi possível limpar o serviço concorrente.",
+    "O estado do serviço não está disponível.",
+    "O serviço saiu antes de ficar saudável.",
+    "O serviço não ficou saudável.",
+    "O serviço já pertence a outro processo.",
+    "Reutilizando o serviço saudável existente.",
+    "O lock do daemon não está disponível.",
+    "Não é possível verificar o proprietário do lock do daemon.",
+    "Não foi possível enviar o sinal de parada ao daemon.",
+    "O proprietário do daemon mudou durante a parada.",
+    "O lock do daemon não foi liberado antes do tempo limite.",
+    "Parar o daemon não é compatível com esta plataforma.",
+];
+
+const CLI_IT: [&str; 15] = [
+    "--port richiede un intero da 1 a 65535.",
+    "L’eseguibile del servizio non è disponibile.",
+    "Impossibile avviare il servizio.",
+    "Impossibile ripulire il servizio concorrente.",
+    "Lo stato del servizio non è disponibile.",
+    "Il servizio è terminato prima di diventare sano.",
+    "Il servizio non è diventato sano.",
+    "Il servizio è già di proprietà di un altro processo.",
+    "Riutilizzo del servizio sano esistente.",
+    "Il lock del daemon non è disponibile.",
+    "Impossibile verificare il proprietario del lock del daemon.",
+    "Impossibile inviare il segnale di arresto al daemon.",
+    "Il proprietario del daemon è cambiato durante l’arresto.",
+    "Il lock del daemon non è stato rilasciato prima del timeout.",
+    "L’arresto del daemon non è supportato su questa piattaforma.",
+];
+
+const CLI_RU: [&str; 15] = [
+    "--port требует целое число от 1 до 65535.",
+    "Исполняемый файл службы недоступен.",
+    "Не удалось запустить службу.",
+    "Не удалось очистить конкурирующую службу.",
+    "Состояние службы недоступно.",
+    "Служба завершилась до перехода в рабочее состояние.",
+    "Служба не перешла в рабочее состояние.",
+    "Служба уже принадлежит другому процессу.",
+    "Повторно используется существующая рабочая служба.",
+    "Блокировка daemon недоступна.",
+    "Не удалось проверить владельца блокировки daemon.",
+    "Не удалось отправить daemon сигнал остановки.",
+    "Владелец daemon изменился во время остановки.",
+    "Блокировка daemon не освобождена до истечения времени ожидания.",
+    "Остановка daemon не поддерживается на этой платформе.",
+];
 
 #[derive(Clone, Copy)]
 enum Unit {
@@ -1699,6 +1958,52 @@ mod tests {
             Language::detect_from_values(Some("ar_SA"), None, None),
             Language::English
         );
+    }
+
+    #[test]
+    fn launch_help_is_localized_for_every_supported_language() {
+        let japanese = Language::Japanese.launch_help();
+        let english = Language::English.launch_help();
+        assert_ne!(japanese, english);
+        for language in Language::ALL {
+            let help = language.launch_help();
+            assert!(help.contains("--ui"), "{}", language.code());
+            assert!(help.contains("--port"), "{}", language.code());
+            assert!(help.contains("--stop"), "{}", language.code());
+            assert!(help.contains("--help, --h, -h"), "{}", language.code());
+            for legacy in [
+                "--service",
+                "--ui-only",
+                "--all",
+                "--listen",
+                "--record-daemon",
+                "--once",
+            ] {
+                assert!(
+                    !help.contains(legacy),
+                    "legacy option {legacy} leaked into {}",
+                    language.code()
+                );
+            }
+            assert!(!help.trim().is_empty(), "{}", language.code());
+        }
+    }
+
+    #[test]
+    fn cli_lifecycle_messages_are_localized_for_every_supported_language() {
+        for key in CliTextKey::ALL {
+            let mut messages = Vec::new();
+            for language in Language::ALL {
+                let message = I18n::from_parts(language, Tz::UTC).cli_text(key);
+                assert!(!message.trim().is_empty(), "{} {:?}", language.code(), key);
+                messages.push(message);
+            }
+            assert!(
+                messages.windows(2).any(|pair| pair[0] != pair[1]),
+                "CLI message was not localized: {:?}",
+                key
+            );
+        }
     }
 
     #[test]

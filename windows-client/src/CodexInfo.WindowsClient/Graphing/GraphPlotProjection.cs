@@ -68,6 +68,7 @@ internal static class GraphPlotProjection
     private const double DollarLabelGutterRatio = 0.20;
     private const double TokenLabelGutterRatio = 0.27;
     private const double LabelGapRatio = 0.018;
+    private const long ModelContiguousSampleMaxGapSeconds = 60;
 
     public static GraphAxisProjection BuildAxes(
         GraphScene scene,
@@ -117,9 +118,8 @@ internal static class GraphPlotProjection
     }
 
     /// <summary>
-    /// Builds the remaining-quota path. The synthetic period-start anchor is
-    /// not an observation and therefore never becomes part of the path. The
-    /// boundary is still available to the idle-band projection.
+    /// Builds the remaining-quota path, retaining the synthetic reset anchor
+    /// so an unknown interval stays horizontal until the first observation.
     /// </summary>
     public static GraphLineProjection BuildRemainingLine(GraphScene scene)
     {
@@ -129,10 +129,9 @@ internal static class GraphPlotProjection
             return new GraphLineProjection([], []);
         }
 
-        var firstIndex = IsSyntheticFirstObservation(scene, 1) ? 1 : 0;
-        var x = new List<double>(scene.Timestamps.Count + 1) { scene.Timestamps[firstIndex] };
-        var y = new List<double>(scene.Remaining.Count + 1) { scene.Remaining[firstIndex] };
-        for (var index = firstIndex + 1; index < scene.Timestamps.Count; index++)
+        var x = new List<double>(scene.Timestamps.Count + 1) { scene.Timestamps[0] };
+        var y = new List<double>(scene.Remaining.Count + 1) { scene.Remaining[0] };
+        for (var index = 1; index < scene.Timestamps.Count; index++)
         {
             if (scene.IdleIntervals.Any(interval =>
                     interval.PreserveBoundary && interval.EndAt == (long)scene.Timestamps[index]))
@@ -176,16 +175,27 @@ internal static class GraphPlotProjection
 
             var startAt = scene.Timestamps[index - 1];
             var endAt = scene.Timestamps[index];
-            if (IsSyntheticFirstObservation(scene, index))
+            if (IsSyntheticFirstObservation(scene, values, index))
             {
                 // The interval between the synthetic reset anchor and the
-                // first real observation is unknown. Do not render either a
-                // fabricated horizontal hold or an instantaneous jump.
-                continue;
+                // first real observation is unknown. Keep the selected model
+                // flat at zero, then place its known cumulative increase at
+                // the actual observation timestamp.
+                AppendSegment(flatX, flatY, startAt, before, endAt, before);
+                AppendSegment(risingX, risingY, endAt, before, endAt, after);
             }
             else if (after == before)
             {
                 AppendSegment(flatX, flatY, startAt, before, endAt, after);
+            }
+            else if (endAt - startAt > ModelContiguousSampleMaxGapSeconds)
+            {
+                // The elapsed interval is not observed. Keep the cumulative
+                // value horizontal during that gap, then show the increase at
+                // the actual next observation instead of inventing a spend
+                // rate across idle time.
+                AppendSegment(flatX, flatY, startAt, before, endAt, before);
+                AppendSegment(risingX, risingY, endAt, before, endAt, after);
             }
             else
             {
@@ -198,7 +208,10 @@ internal static class GraphPlotProjection
             new GraphLineProjection(risingX, risingY));
     }
 
-    private static bool IsSyntheticFirstObservation(GraphScene scene, int index)
+    private static bool IsSyntheticFirstObservation(
+        GraphScene scene,
+        IReadOnlyList<double> values,
+        int index)
     {
         if (index <= 0 || index >= scene.Timestamps.Count)
         {
@@ -212,9 +225,8 @@ internal static class GraphPlotProjection
             scene.Sol[index - 1] <= 0 &&
             scene.Terra[index - 1] <= 0 &&
             scene.Luna[index - 1] <= 0 &&
-            (scene.Sol[index] > scene.Sol[index - 1] ||
-             scene.Terra[index] > scene.Terra[index - 1] ||
-             scene.Luna[index] > scene.Luna[index - 1]);
+            values[index - 1] <= 0 &&
+            values[index] > values[index - 1];
     }
 
     /// <summary>

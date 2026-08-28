@@ -20,8 +20,24 @@ on:
       - "scripts/data_protection_gate.sh"
       - "scripts/windows_client_contract_gate.sh"
       - "scripts/regression_guard.sh"
+      - "scripts/final_acceptance_gate.sh"
       - "docs/REGRESSION_PREVENTION_POLICY.md"
       - "docs/PRODUCT_REQUIREMENTS.md"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "build.rs"
+      - "run.sh"
+      - "src/**"
+      - "protocol/**"
+      - "tests/**"
+      - "ui/**"
+      - "assets/**"
+      - "LICENSE"
+      - "LICENSE.ja.md"
+      - "deny.toml"
+      - ".cargo/config.toml"
+      - "scripts/**"
+      - "docs/**"
       - ".github/workflows/windows-client.yml"
   pull_request:
     branches: ["main"]
@@ -39,8 +55,24 @@ on:
       - "scripts/data_protection_gate.sh"
       - "scripts/windows_client_contract_gate.sh"
       - "scripts/regression_guard.sh"
+      - "scripts/final_acceptance_gate.sh"
       - "docs/REGRESSION_PREVENTION_POLICY.md"
       - "docs/PRODUCT_REQUIREMENTS.md"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "build.rs"
+      - "run.sh"
+      - "src/**"
+      - "protocol/**"
+      - "tests/**"
+      - "ui/**"
+      - "assets/**"
+      - "LICENSE"
+      - "LICENSE.ja.md"
+      - "deny.toml"
+      - ".cargo/config.toml"
+      - "scripts/**"
+      - "docs/**"
       - ".github/workflows/windows-client.yml"
 
 permissions:
@@ -155,26 +187,28 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - name: Install required test tools
-        run: sudo apt-get update && sudo apt-get install --no-install-recommends --yes ripgrep sqlite3
+        run: sudo apt-get update && sudo apt-get install --no-install-recommends --yes ripgrep sqlite3 xvfb xauth x11-utils x11-apps libxkbcommon-x11-0
       - name: Enforce data protection policy
         run: bash scripts/data_protection_gate.sh
       - uses: actions/setup-dotnet@v4
         with:
           dotnet-version: "10.0.x"
-      - name: Restore locked dependencies
-        run: dotnet restore windows-client/CodexInfo.WindowsClient.sln --locked-mode
-      - name: Build desktop client
-        run: dotnet build windows-client/CodexInfo.WindowsClient.sln --no-restore --configuration Release
+      - name: Install Rust toolchain for native regression gate
+        uses: dtolnay/rust-toolchain@stable
+      - name: Enforce regression checks
+        run: xvfb-run --auto-servernum --server-args='-screen 0 1280x800x24' bash scripts/regression_guard.sh
       - name: Enforce Windows feature contract
         run: bash scripts/windows_client_contract_gate.sh
-      - name: Enforce regression checks
-        run: bash scripts/regression_guard.sh
 
   windows-build:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: actions/setup-dotnet@v4
         with:
           dotnet-version: "10.0.x"
@@ -183,7 +217,44 @@ jobs:
       - name: Build Windows client
         run: dotnet build windows-client/CodexInfo.WindowsClient.sln --no-restore --configuration Release
       - name: Test REST client and presentation contract
-        run: dotnet test windows-client/CodexInfo.WindowsClient.sln --no-restore --configuration Release
+        shell: pwsh
+        run: |
+          $resultsDirectory = Join-Path $env:RUNNER_TEMP 'codex-info-windows-test-results'
+          if (Test-Path -LiteralPath $resultsDirectory) {
+            Remove-Item -LiteralPath $resultsDirectory -Recurse -Force
+          }
+          New-Item -ItemType Directory -Path $resultsDirectory -Force | Out-Null
+          $testOutput = (& dotnet test windows-client/CodexInfo.WindowsClient.sln --no-restore --configuration Release --results-directory $resultsDirectory --logger 'trx;LogFilePrefix=windows-client' --logger 'console;verbosity=normal' 2>&1 | Out-String)
+          $exitCode = $LASTEXITCODE
+          $testOutput
+          if ($exitCode -ne 0) { throw "Windows tests failed with exit code $exitCode." }
+          $trxFiles = @(Get-ChildItem -LiteralPath $resultsDirectory -Filter '*.trx' -Recurse -File)
+          if ($trxFiles.Count -ne 2) { throw "Expected exactly two Windows TRX reports, found $($trxFiles.Count)." }
+          $totalTests = 0
+          $passedTests = 0
+          $failedTests = 0
+          $notExecutedTests = 0
+          foreach ($trxFile in $trxFiles) {
+            [xml]$trx = Get-Content -LiteralPath $trxFile.FullName -Raw
+            $counters = $trx.SelectSingleNode('/*[local-name()="TestRun"]/*[local-name()="ResultSummary"]/*[local-name()="Counters"]')
+            if ($null -eq $counters) { throw "TRX counters are missing: $($trxFile.FullName)" }
+            $total = [int]$counters.total
+            $executed = [int]$counters.executed
+            $passed = [int]$counters.passed
+            $failed = [int]$counters.failed
+            $notExecuted = [int]$counters.notExecuted
+            if ($total -le 0 -or $executed -ne $total -or $passed -ne $total -or $failed -ne 0 -or $notExecuted -ne 0) {
+              throw "Windows test counts are not release-safe: file=$($trxFile.Name) total=$total executed=$executed passed=$passed failed=$failed notExecuted=$notExecuted"
+            }
+            $totalTests += $total
+            $passedTests += $passed
+            $failedTests += $failed
+            $notExecutedTests += $notExecuted
+          }
+          if ($totalTests -le 0 -or $passedTests -ne $totalTests -or $failedTests -ne 0 -or $notExecutedTests -ne 0) {
+            throw "Windows aggregate test counts are not release-safe: total=$totalTests passed=$passedTests failed=$failedTests notExecuted=$notExecutedTests"
+          }
+          "Windows TRX tests executed: total=$totalTests passed=$passedTests"
       - name: Install locked Inno Setup compiler
         shell: pwsh
         run: |
@@ -257,8 +328,16 @@ jobs:
           if (-not (Test-Path $exe -PathType Leaf)) { throw 'Installed client executable is missing for UI E2E.' }
           $e2eOutput = Join-Path $env:RUNNER_TEMP 'codex-info-windows-e2e'
           try {
-            & ./windows-client/tools/Run-WindowsClientE2E.ps1 -ClientPath $exe -OutputDirectory $e2eOutput -Fixture
+            New-Item -ItemType Directory -Path $e2eOutput -Force | Out-Null
+            $moveSmokeLog = Join-Path $e2eOutput 'window-move-smoke.log'
+            & ./windows-client/tools/Run-WindowsClientE2E.ps1 -ClientPath $exe -OutputDirectory $e2eOutput -Fixture -SourceSha $env:GITHUB_SHA
             if (-not $?) { throw 'Windows UI Automation E2E failed.' }
+            "source-sha: $env:GITHUB_SHA" | Set-Content -LiteralPath $moveSmokeLog -Encoding utf8
+            $moveSmokeOutput = @(& ./scripts/windows_window_move_smoke.ps1 -ClientPath $exe -AllowPhysicalInput *>&1)
+            $moveSmokeOutput | Tee-Object -FilePath $moveSmokeLog -Append
+            if ($moveSmokeOutput.Count -eq 0 -or [string]$moveSmokeOutput[-1] -ne 'window-move-smoke: PASS') {
+              throw 'Physical window move smoke did not report its terminal PASS contract.'
+            }
           }
           finally {
             $uninstaller = Get-ChildItem -LiteralPath $install -Filter 'unins*.exe' -File -ErrorAction SilentlyContinue | Select-Object -First 1
@@ -282,19 +361,56 @@ jobs:
           path: artifacts/windows-installer/CodexInfo.WindowsClient.Setup.exe
           if-no-files-found: warn
 
+  acceptance:
+    if: needs.core-tests.result == 'success' && needs.windows-build.result == 'success'
+    needs: [core-tests, windows-build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Download Windows UI E2E evidence
+        uses: actions/download-artifact@v4
+        with:
+          name: windows-ui-e2e
+          path: artifacts/windows-ui-e2e
+      - name: Install final gate tools
+        run: sudo apt-get update && sudo apt-get install --no-install-recommends --yes ripgrep xvfb xauth x11-utils x11-apps libxkbcommon-x11-0
+      - name: Install Rust toolchain for final native gate
+        uses: dtolnay/rust-toolchain@stable
+      - name: Run final acceptance gate before merge
+        env:
+          EXPECTED_E2E_SOURCE_SHA: ${{ github.sha }}
+        run: xvfb-run --auto-servernum --server-args='-screen 0 1280x800x24' bash scripts/final_acceptance_gate.sh artifacts/windows-ui-e2e
+
   release:
     if: github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.version-policy.outputs.release == 'true'
-    needs: [version-policy, core-tests, windows-build]
+    needs: [version-policy, core-tests, windows-build, acceptance]
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - name: Download CI installer artifact
         uses: actions/download-artifact@v4
         with:
           name: windows-client-installer
           path: artifacts/windows-installer
+      - name: Download Windows UI E2E evidence
+        uses: actions/download-artifact@v4
+        with:
+          name: windows-ui-e2e
+          path: artifacts/windows-ui-e2e
+      - name: Install final gate tools
+        run: sudo apt-get update && sudo apt-get install --no-install-recommends --yes ripgrep xvfb xauth x11-utils x11-apps libxkbcommon-x11-0
+      - name: Install Rust toolchain for final native gate
+        uses: dtolnay/rust-toolchain@stable
+      - name: Run final acceptance gate
+        env:
+          EXPECTED_E2E_SOURCE_SHA: ${{ github.sha }}
+        run: xvfb-run --auto-servernum --server-args='-screen 0 1280x800x24' bash scripts/final_acceptance_gate.sh artifacts/windows-ui-e2e
       - name: Create deterministic update manifest
         shell: pwsh
         env:
