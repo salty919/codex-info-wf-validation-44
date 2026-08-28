@@ -61,12 +61,23 @@
 
 ## 6. 配布・顧客向け表明
 
-- Windows製品版は単一の`X.Y.Z`を正本とする。PRでは現行`main`より上がる変更だけをrelease候補として
-  検証し、PRからReleaseを書き換えない。`main`へのmergeで同版が上がり、全Windows gateがPASSした時だけ
-  `windows-vX.Y.Z` tag、Setup、update manifestを同じGitHub Releaseへ公開する。版が不変または後退なら
-  Releaseを作らない。HTTP 404だけを不存在と認め、tagは原子的に新規作成する。Setupとmanifestは
-  非公開Draft上でexact 2資産の名前・size・状態・commit SHAを検証し終えてから公開し、既存tag/Release、
-  通信障害、5xx、部分uploadへ上書きして継続しない。
+- Windows製品版とX版は単一のstable `X.Y.Z`を共有する。通常のPRはmajor/minorを変更せず、mergeごとに
+  自動採番処理がpatchを十進整数としてちょうど1増やす。patchからminorへ桁上がりさせず、`1.0.9`の次は
+  `1.0.10`とする。major/minorは利用者の明示指示を要する別変更でだけ更新し、自動採番処理は変更しない。
+  `Cargo.toml`、root packageの`Cargo.lock`、`windows-client/Directory.Build.props`が開始時点で同値でない場合、
+  または期待元versionとmainが一致しない場合は、3ファイルを一つも変更せず停止する。
+- PRの最新mainとの合成treeに対し、native、Windows、実Windows UIの品質確認を各1回だけ実行する。
+  同じtest/gateを別job、別workflow、acceptance、Releaseで再実行しない。単一のrequired acceptanceは
+  先行jobの成功、検証対象tree、source SHA、Windows証拠の対応を検査し、失敗・未完了・古い証拠では
+  mergeを許可しない。merge方式は、検証済みtreeとmain上のmerge結果を同一性検証できる方式に限定する。
+- PR品質確認を開始する前に、PR branch上のversion 3ファイルだけをexact next patchへ自動更新する。その
+  version commitを含む最新mainとの合成treeを品質確認し、mergeによって採番を確定する。採番commit自身では
+  高コスト品質jobを開始せず、新しいheadに対する次のworkflow runで一度だけ確認する。merge後は検証済みtree
+  との一致を確認し、再テストせずmanifest生成とRelease公開を行う。同時mergeと公開は直列化する。
+  PR品質証拠とtreeが一致しない、version以外の差分が混入する、tag/Releaseが別SHAを
+  指す、通信障害、5xx、部分uploadの場合は上書きせずfail-closedで停止する。
+- `windows-vX.Y.Z` tagは原子的に新規作成する。Setupとmanifestは非公開Draft上でexact 2資産の名前・size・
+  状態・commit SHAを検証し終えてから公開し、既存tag/Releaseへ上書きして継続しない。
 - release artifactはsource、lockfile、実payload、license/notice、署名、version、対象platformを一つのrelease identityで追跡する。
 - publisher名、certificate、対応OS build、RPO/RTO、accessibility適合、support窓口を根拠なしに推測しない。
 - authority inputがないclaimは「保証なし」「未対応」とし、認証済み、対応済み、測定済みと表示しない。

@@ -26,13 +26,15 @@
 
 6. `scripts/regression_guard.sh`は静的な文字列検査だけでPASSしてはならない。履歴・グラフの必須Rust回帰テスト（複数期間の境界、通常のmoving-reset、累積ドリフトする長時間moving-reset、使用量0の残量100% reset断片が前後の使用量期間を分割しないこと、観測されていない長時間を累積使用量の斜め線として描かないこと、モデル使用後の遅延した低残量観測を捨てないこと）を`--exact`で実際に実行し、対象テストが0件、未実行、失敗の場合は必ずFAILにする。さらにworking tree/index/current commitのdiff、format、全target check、全target test（実行件数>0）、release buildを同じゲートで検査する。`DISPLAY`が利用できる実行では`bash scripts/x11_graph_visual_gate.sh`を同じ実行で起動し、現行バイナリの940x640グラフ画像から残量線の連続性とLUNA/TERRA/SOLの色画素を機械判定する。履歴・グラフの変更は、この実行結果なしに完了判定してはならない。これはデグレード防止だけでなく、実行していない検証をPASS扱いする評価漏れの防止を目的とする。
 
-7. PRのmerge前およびRelease jobは`bash scripts/final_acceptance_gate.sh <Windows UI E2E evidence>`を通過しなければならない。同ゲートはRustのformat/check/test/release build、必須回帰テスト、Windows UI AutomationのPASSログ、status/detailsの同一世代受理マーカー、quota gauge証拠、過去期間グラフでLUNA/TERRA/SOLのモデル線と未使用期間の専用帯が既知の区間に実描画された証拠、E2Eが定義する19枚の名前付き画面キャプチャ（各PNG署名・非空）を検証する。さらに同じWindows実行で`windows_window_move_smoke.ps1 -AllowPhysicalInput`を実行し、source SHA付き`window-move-smoke: PASS`を必須とする。E2Eログの実行元SHAは対象SHAと一致し、各画像のSHA-256は同じ実行のcapture行と一致しなければならない。E2E出力は実行開始時に消去し、追記・前回証跡の再利用を許可しない。証拠ディレクトリ、ログ、対象マーカー、SHA、画面のいずれかが欠ける場合は`HOLD`とし、未確認をPASSへ変換しない。
+7. PRのmerge前にだけ`bash scripts/final_acceptance_gate.sh <Windows UI E2E evidence>`を1回通過させる。同ゲートは同一PR実行で既に完了したnative gate、Windows test、Windows UI Automationの結果を再実行せず、先行jobの成功とsource SHA/tree、status/detailsの同一世代受理マーカー、quota gauge証拠、過去期間グラフ、名前付き画面キャプチャ、物理window move証拠の対応と完全性を検証する。各画像のSHA-256は同じ実行のcapture行と一致しなければならない。証拠欠落、古いSHA/tree、SKIP、test 0件を`PASS`へ変換しない。Release jobはこのrequired acceptanceの検証済みtreeとmerge結果の同一性を確認し、品質test/gateを再実行しない。
 
-8. Windows workflowのpath filterはnative collector/API、Slint UI、Cargo manifest/lockfile、build/run script、全scripts/docsを含める。これらの変更でWindows/native回帰ゲートが起動しない状態を許可しない。契約ゲートはこのtrigger一覧とRust toolchain、native gateの必須コマンド自体も検査する。
+8. PR品質workflowは変更分類jobを常に起動し、native collector/API、Slint UI、Cargo manifest/lockfile、build/run script、Windows client、品質script、製品仕様の影響を有限に分類する。影響するownerのgateを各1回だけ実行し、関係しないownerの高コスト検査を起動しない。単一required acceptanceは分類結果と全必須ownerの成功を集約し、path filterでrequired check自体が消える状態を許可しない。
 
 9. CI checkoutは履歴比較を必要とする全jobで`fetch-depth: 0`を使用する。全targetテストは実行件数0を許可せず、Windowsテストはpassed>0かつskipped=0を満たさなければならない。件数を出せない、または一部targetが未実行の結果はPASSではなくFAIL/HOLDとする。
 
 10. X先行の変更凍結を必須とする。X版の正本要件（履歴期間、未使用帯、残量とモデル使用量の独立性、定期更新の前回表示保持、thread失敗時の全体破棄）を同一revisionで個別テストと実画面検査により確認するまで、Windows機能ゲート・PRのCI・workflow再実行を開始してはならない。X確認後にソース・仕様を1行でも変更した場合、確認結果は無効化し、X確認からやり直す。変更が確定した同一revisionでは、ローカル対象テスト、全体ゲート、CIを各1回までとし、失敗時は原因を修正してから次のrevisionで一度だけ再実行する。未確認のまま先に進めるためのworkflow再実行は禁止する。
+
+11. PR品質jobの前段は、base versionと同じPRだけにpatchを十進整数でちょうど1増やすcommitを追加し、その実行では高コスト品質jobを開始しない。次のheadでmajor/minor不変、exact patch+1、version変更対象が正本3ファイルだけであることを確認してから品質jobを各1回実行する。merge後は検証済みtreeとの同一性だけを確認し、同じnative、Windows、UI gateまたはbuildを再実行せず、受理済みinstallerからmanifestとReleaseを公開する。
 
 ## 回帰発生時
 

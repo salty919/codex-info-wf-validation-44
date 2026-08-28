@@ -268,13 +268,12 @@ require_text src/main.rs 'include_str!("../LICENSE")'
 require_text src/main.rs 'include_str!("../THIRD_PARTY_NOTICES.md")'
 require_text src/main.rs 'i18n.text(TextKey::LegalProtocol)'
 require_text src/main.rs 'i18n.text(TextKey::LegalThirdParty)'
-require_text .github/workflows/windows-client.yml 'needs: [version-policy, core-tests, windows-build, acceptance]'
+require_text .github/workflows/windows-client.yml 'uses: ./.github/workflows/rust.yml'
+require_text .github/workflows/windows-client.yml 'needs: [native-quality, windows-quality, ui-quality]'
 require_text .github/workflows/windows-client.yml 'Run final acceptance gate before merge'
 require_text .github/workflows/windows-client.yml 'windows_window_move_smoke.ps1 -ClientPath $exe -AllowPhysicalInput'
-require_text .github/workflows/windows-client.yml "--logger 'trx;LogFilePrefix=windows-client'"
-require_text .github/workflows/windows-client.yml 'Expected exactly two Windows TRX reports'
-require_text .github/workflows/windows-client.yml 'TRX counters are missing'
-require_text .github/workflows/windows-client.yml 'Windows test counts are not release-safe:'
+require_text .github/workflows/windows-client.yml 'WINDOWS_CONTRACT_EVIDENCE_DIR'
+require_text .github/workflows/windows-client.yml 'windows-tests: PASS'
 require_text .github/workflows/windows-client.yml 'bash scripts/final_acceptance_gate.sh artifacts/windows-ui-e2e'
 require_text .github/workflows/windows-client.yml '-SourceSha $env:GITHUB_SHA'
 require_text .github/workflows/windows-client.yml 'EXPECTED_E2E_SOURCE_SHA: ${{ github.sha }}'
@@ -286,22 +285,17 @@ require_text scripts/final_acceptance_gate.sh 'capture: name=$capture_name '
 require_text scripts/final_acceptance_gate.sh 'sha256sum "$capture_path"'
 require_text scripts/final_acceptance_gate.sh 'window-move-smoke: PASS'
 require_text .github/workflows/windows-client.yml 'cancel-in-progress: false'
-for native_trigger in 'Cargo.toml' 'Cargo.lock' 'build.rs' 'run.sh' 'src/**' 'protocol/**' 'tests/**' 'ui/**' 'assets/**' 'LICENSE' 'LICENSE.ja.md' 'deny.toml' '.cargo/config.toml' 'scripts/**' 'docs/**'; do
-    require_text .github/workflows/windows-client.yml "      - \"$native_trigger\""
-done
-require_text .github/workflows/windows-client.yml 'dtolnay/rust-toolchain@stable'
-require_text .github/workflows/windows-client.yml 'x11-apps'
-regression_step_line="$(rg -n 'name: Enforce regression checks' .github/workflows/windows-client.yml | head -n 1 | cut -d: -f1)"
-windows_contract_step_line="$(rg -n 'name: Enforce Windows feature contract' .github/workflows/windows-client.yml | head -n 1 | cut -d: -f1)"
-[[ -n "$regression_step_line" && -n "$windows_contract_step_line" &&
-    "$regression_step_line" -lt "$windows_contract_step_line" ]] ||
-    fail 'X/native regression checks must run before the Windows feature contract gate'
-final_gate_line="$(rg -n 'bash scripts/final_acceptance_gate.sh artifacts/windows-ui-e2e' .github/workflows/windows-client.yml | cut -d: -f1 | tail -n 1)"
-[[ -n "$final_gate_line" ]] || fail 'final acceptance gate invocation is missing'
-if ! sed -n "$((final_gate_line - 4)),${final_gate_line}p" .github/workflows/windows-client.yml |
-    rg -q --fixed-strings 'dtolnay/rust-toolchain@stable'; then
-    fail 'final acceptance gate must install the pinned Rust toolchain before running'
+require_text .github/workflows/windows-client.yml 'pull_request_target:'
+require_text .github/workflows/windows-client.yml 'types: [closed]'
+require_text .github/workflows/windows-client.yml 'python3 scripts/product_version.py bump --expected "$base_version"'
+require_text .github/workflows/windows-client.yml "if: github.event_name == 'pull_request_target' && github.event.pull_request.merged == true"
+if rg -q '^  push:' .github/workflows/windows-client.yml; then
+    fail 'main push must not rerun PR quality or release tests'
 fi
+require_text .github/workflows/rust.yml 'dtolnay/rust-toolchain@stable'
+require_text .github/workflows/rust.yml 'x11-apps'
+final_gate_line="$(rg -n 'bash scripts/final_acceptance_gate.sh artifacts/windows-ui-e2e' .github/workflows/windows-client.yml | cut -d: -f1 | head -n 1)"
+[[ -n "$final_gate_line" ]] || fail 'final acceptance gate invocation is missing'
 require_text scripts/regression_guard.sh 'cargo check --locked --all-targets'
 require_text scripts/regression_guard.sh 'cargo test --locked --all-targets'
 require_text scripts/regression_guard.sh 'cargo build --release --locked'
@@ -309,7 +303,6 @@ require_text scripts/regression_guard.sh '--exact --nocapture'
 require_text scripts/regression_guard.sh 'Rust all-target test set contains a zero-test target'
 require_text scripts/regression_guard.sh 'X11 graph visual gate unverified (DISPLAY unavailable)'
 require_text .github/workflows/rust.yml 'xvfb-run --auto-servernum'
-require_text .github/workflows/windows-client.yml 'xvfb-run --auto-servernum'
 for required_history_test in \
     historical_week_fixture_preserves_each_period_and_graph_samples \
     observed_moving_reset_sequence_keeps_the_spend_in_the_selected_graph \
@@ -554,8 +547,19 @@ require_text docs/PRODUCT_REQUIREMENTS.md '# Codex Info 製品要件'
 require_file windows-client/CodeCoverage.runsettings
 
 if command -v dotnet >/dev/null 2>&1; then
+    contract_evidence_dir="${WINDOWS_CONTRACT_EVIDENCE_DIR:-}"
+    if [[ -n "$contract_evidence_dir" ]]; then
+        [[ ! -e "$contract_evidence_dir" ]] ||
+            fail "Windows contract evidence directory already exists: $contract_evidence_dir"
+        mkdir -p "$contract_evidence_dir"
+    fi
     coverage_results="$(mktemp -d "${TMPDIR:-/tmp}/codex-info-windows-coverage.XXXXXX")"
-    trap 'rm -rf -- "$coverage_results"' EXIT
+    trap '
+        if [[ -n "${contract_evidence_dir:-}" ]]; then
+            cp -R "$coverage_results"/. "$contract_evidence_dir"/
+        fi
+        rm -rf -- "$coverage_results"
+    ' EXIT
     dotnet restore windows-client/CodexInfo.WindowsClient.sln --locked-mode
     dotnet_test_output="$(dotnet test windows-client/CodexInfo.WindowsClient.sln \
         --no-restore \
