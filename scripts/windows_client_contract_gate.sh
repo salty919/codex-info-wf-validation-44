@@ -273,6 +273,60 @@ require_text .github/workflows/windows-client.yml 'needs: [version-prepared, nat
 require_text .github/workflows/windows-client.yml 'Run final acceptance gate before merge'
 require_text .github/workflows/windows-client.yml 'windows_window_move_smoke.ps1 -ClientPath $exe -AllowPhysicalInput'
 require_text .github/workflows/windows-client.yml 'WINDOWS_CONTRACT_EVIDENCE_DIR'
+workflow_contract_scope="$(
+    awk '
+        $0 == "  windows-quality:" {
+            in_windows_quality = 1
+            next
+        }
+        in_windows_quality && $0 ~ /^  [[:alnum:]_-]+:/ {
+            exit
+        }
+        in_windows_quality &&
+            $0 == "      - name: Export Windows contract evidence directory" {
+            export_name_count++
+            export_name_line = NR
+        }
+        in_windows_quality && index($0, "WINDOWS_CONTRACT_EVIDENCE_DIR=") {
+            assignment_count++
+        }
+        in_windows_quality && $0 ~ /^        run: printf / &&
+            index($0, "WINDOWS_CONTRACT_EVIDENCE_DIR=$RUNNER_TEMP/codex-info-windows-contract") &&
+            index($0, ">> \"$GITHUB_ENV\"") {
+            export_command_count++
+            export_command_line = NR
+        }
+        in_windows_quality &&
+            $0 == "      - name: Enforce Windows feature contract and tests" {
+            enforce_line = NR
+        }
+        in_windows_quality && $0 == "      - name: Write Windows quality evidence" {
+            write_line = NR
+        }
+        in_windows_quality && $0 ~ /^[[:space:]]+WINDOWS_CONTRACT_EVIDENCE_DIR:/ {
+            yaml_env_count++
+        }
+        END {
+            printf "%d %d %d %d %d %d %d %d\n",
+                export_name_count + 0,
+                export_command_count + 0,
+                assignment_count + 0,
+                yaml_env_count + 0,
+                export_name_line + 0,
+                export_command_line + 0,
+                enforce_line + 0,
+                write_line + 0
+        }
+    ' .github/workflows/windows-client.yml
+)"
+read -r export_name_count export_command_count assignment_count yaml_env_count \
+    export_name_line export_command_line enforce_line write_line <<<"$workflow_contract_scope"
+[[ "$export_name_count" -eq 1 && "$export_command_count" -eq 1 &&
+    "$assignment_count" -eq 1 && "$yaml_env_count" -eq 0 ]] ||
+    fail "Windows contract evidence export must be singular and non-YAML: name=$export_name_count command=$export_command_count assignment=$assignment_count yaml=$yaml_env_count"
+[[ "$export_command_line" -eq $((export_name_line + 2)) &&
+    "$export_command_line" -lt "$enforce_line" && "$enforce_line" -lt "$write_line" ]] ||
+    fail "Windows contract evidence export must precede both consumer steps"
 require_text .github/workflows/windows-client.yml 'windows-tests: PASS'
 require_text .github/workflows/windows-client.yml 'bash scripts/final_acceptance_gate.sh artifacts/windows-ui-e2e'
 require_text .github/workflows/windows-client.yml '-SourceSha $env:GITHUB_SHA'

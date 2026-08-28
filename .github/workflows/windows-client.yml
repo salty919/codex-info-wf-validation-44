@@ -86,9 +86,10 @@ jobs:
       - uses: actions/setup-dotnet@v4
         with:
           dotnet-version: "10.0.x"
+      - name: Export Windows contract evidence directory
+        shell: bash
+        run: printf '%s\n' "WINDOWS_CONTRACT_EVIDENCE_DIR=$RUNNER_TEMP/codex-info-windows-contract" >> "$GITHUB_ENV"
       - name: Enforce Windows feature contract and tests
-        env:
-          WINDOWS_CONTRACT_EVIDENCE_DIR: ${{ runner.temp }}/codex-info-windows-contract
         run: bash scripts/windows_client_contract_gate.sh
       - name: Write Windows quality evidence
         run: |
