@@ -18,6 +18,11 @@ RESOLVER = ROOT / "scripts" / "release_quality_run_resolver.py"
 HEAD_SHA = "a" * 40
 MERGE_SHA = "b" * 40
 BASE_SHA = "d" * 40
+MERGED_AT = "2026-08-29T00:05:00Z"
+RUN_83_CREATED_AT = "2026-08-29T00:01:00Z"
+RUN_83_UPDATED_AT = "2026-08-29T00:02:00Z"
+RUN_84_CREATED_AT = "2026-08-29T00:03:00Z"
+RUN_84_UPDATED_AT = "2026-08-29T00:04:00Z"
 BASE_REPOSITORY = {"id": 202, "full_name": "salty919/codex_info_v2"}
 HEAD_REPOSITORY = copy.deepcopy(BASE_REPOSITORY)
 
@@ -29,6 +34,7 @@ def event_fixture() -> dict[str, Any]:
         "pull_request": {
             "number": 42,
             "merged": True,
+            "merged_at": MERGED_AT,
             "head": {
                 "sha": HEAD_SHA,
                 "ref": "feature/release",
@@ -50,43 +56,87 @@ def pull_request_fixture() -> dict[str, Any]:
     return result
 
 
-def runs_fixture(pull_requests: Any = None) -> dict[str, Any]:
+def workflow_run_fixture(
+    *,
+    run_id: int = 987654,
+    run_number: int = 84,
+    run_attempt: int = 1,
+    status: str = "completed",
+    conclusion: str | None = "success",
+    created_at: str = RUN_84_CREATED_AT,
+    updated_at: str = RUN_84_UPDATED_AT,
+    pull_requests: Any = None,
+) -> dict[str, Any]:
     if pull_requests is None:
         pull_requests = []
     return {
-        "workflow_runs": [
+        "id": run_id,
+        "run_number": run_number,
+        "run_attempt": run_attempt,
+        "path": ".github/workflows/windows-client.yml",
+        "event": "pull_request",
+        "status": status,
+        "conclusion": conclusion,
+        "created_at": created_at,
+        "updated_at": updated_at,
+        "head_sha": HEAD_SHA,
+        "head_commit": {"id": HEAD_SHA},
+        "head_branch": "feature/release",
+        "head_repository": copy.deepcopy(HEAD_REPOSITORY),
+        "repository": copy.deepcopy(BASE_REPOSITORY),
+        "ref": None,
+        "referenced_workflows": [
             {
-                "id": 987654,
-                "path": ".github/workflows/windows-client.yml",
-                "event": "pull_request",
-                "status": "completed",
-                "conclusion": "success",
-                "head_sha": HEAD_SHA,
-                "head_commit": {"id": HEAD_SHA},
-                "head_branch": "feature/release",
-                "head_repository": copy.deepcopy(HEAD_REPOSITORY),
-                "repository": copy.deepcopy(BASE_REPOSITORY),
-                "ref": None,
-                "referenced_workflows": [
-                    {
-                        "path": (
-                            BASE_REPOSITORY["full_name"]
-                            + "/.github/workflows/rust.yml@"
-                            + "c" * 40
-                        ),
-                        "ref": "refs/pull/42/merge",
-                        "sha": "c" * 40,
-                    }
-                ],
-                "pull_requests": pull_requests,
+                "path": (
+                    BASE_REPOSITORY["full_name"]
+                    + "/.github/workflows/rust.yml@"
+                    + "c" * 40
+                ),
+                "ref": "refs/pull/42/merge",
+                "sha": "c" * 40,
             }
-        ]
+        ],
+        "pull_requests": pull_requests,
     }
 
 
+def runs_response(
+    workflow_runs: list[Any], *, total_count: int | None = None
+) -> dict[str, Any]:
+    if total_count is None:
+        total_count = len(workflow_runs)
+    return {"total_count": total_count, "workflow_runs": workflow_runs}
+
+
+def runs_fixture(
+    pull_requests: Any = None,
+    *,
+    run_id: int = 987654,
+    run_number: int = 84,
+    run_attempt: int = 1,
+    status: str = "completed",
+    conclusion: str | None = "success",
+    created_at: str = RUN_84_CREATED_AT,
+    updated_at: str = RUN_84_UPDATED_AT,
+) -> dict[str, Any]:
+    return runs_response(
+        [
+            workflow_run_fixture(
+                run_id=run_id,
+                run_number=run_number,
+                run_attempt=run_attempt,
+                status=status,
+                conclusion=conclusion,
+                created_at=created_at,
+                updated_at=updated_at,
+                pull_requests=pull_requests,
+            )
+        ]
+    )
+
+
 def different_pull_request_run_fixture() -> dict[str, Any]:
-    run = copy.deepcopy(runs_fixture()["workflow_runs"][0])
-    run["id"] = 987655
+    run = workflow_run_fixture(run_id=987655, run_number=85)
     run["referenced_workflows"][0]["ref"] = "refs/pull/43/merge"
     return run
 
@@ -135,33 +185,86 @@ class ReleaseQualityRunResolverTests(unittest.TestCase):
         result = self.run_resolver(event, pull_request, runs)
         self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
 
-    def test_accepts_empty_and_nonempty_pull_requests(self) -> None:
+    def assert_accepted(
+        self,
+        event: Any,
+        pull_request: Any,
+        runs: Any,
+        expected_run_id: int,
+    ) -> None:
+        result = self.run_resolver(event, pull_request, runs)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, f"{expected_run_id}\n")
+
+    def test_accepts_single_success_and_ignores_pull_requests(self) -> None:
         for pull_requests in ([], [{"number": 999, "malformed": True}]):
             with self.subTest(pull_requests=pull_requests):
-                result = self.run_resolver(
-                    event_fixture(), pull_request_fixture(), runs_fixture(pull_requests)
+                self.assert_accepted(
+                    event_fixture(),
+                    pull_request_fixture(),
+                    runs_fixture(pull_requests),
+                    987654,
                 )
-                self.assertEqual(result.returncode, 0, result.stderr)
-                self.assertEqual(result.stdout, "987654\n")
 
     def test_ignores_top_level_run_ref(self) -> None:
         for top_level_ref in (None, "refs/heads/not-the-pull-request-ref"):
             with self.subTest(top_level_ref=top_level_ref):
                 runs = runs_fixture()
                 runs["workflow_runs"][0]["ref"] = top_level_ref
-                result = self.run_resolver(
-                    event_fixture(), pull_request_fixture(), runs
+                self.assert_accepted(
+                    event_fixture(), pull_request_fixture(), runs, 987654
                 )
-                self.assertEqual(result.returncode, 0, result.stderr)
 
-    def test_rejects_zero_or_two_runs(self) -> None:
-        self.assert_rejected(
-            event_fixture(), pull_request_fixture(), {"workflow_runs": []}
+    def test_accepts_latest_success_for_two_runs_in_input_order(self) -> None:
+        older = workflow_run_fixture(
+            run_id=987653,
+            run_number=83,
+            created_at=RUN_83_CREATED_AT,
+            updated_at=RUN_83_UPDATED_AT,
         )
-        two_runs = runs_fixture()
-        two_runs["workflow_runs"].append(copy.deepcopy(two_runs["workflow_runs"][0]))
-        two_runs["workflow_runs"][1]["id"] = 987655
-        self.assert_rejected(event_fixture(), pull_request_fixture(), two_runs)
+        latest = workflow_run_fixture(
+            run_id=987654,
+            run_number=84,
+            created_at=RUN_84_CREATED_AT,
+            updated_at=RUN_84_UPDATED_AT,
+        )
+        for name, ordered_runs in (
+            ("older before latest", [older, latest]),
+            ("latest before older", [latest, older]),
+        ):
+            with self.subTest(name=name):
+                self.assert_accepted(
+                    event_fixture(),
+                    pull_request_fixture(),
+                    runs_response(ordered_runs),
+                    987654,
+                )
+
+    def test_accepts_latest_success_across_paginated_responses(self) -> None:
+        older = workflow_run_fixture(
+            run_id=987653,
+            run_number=83,
+            created_at=RUN_83_CREATED_AT,
+            updated_at=RUN_83_UPDATED_AT,
+        )
+        latest = workflow_run_fixture(
+            run_id=987654,
+            run_number=84,
+            created_at=RUN_84_CREATED_AT,
+            updated_at=RUN_84_UPDATED_AT,
+        )
+        pages = [
+            runs_response([older], total_count=2),
+            runs_response([latest], total_count=2),
+        ]
+        self.assert_accepted(
+            event_fixture(), pull_request_fixture(), pages, 987654
+        )
+
+    def test_rejects_zero_exact_matches(self) -> None:
+        self.assert_rejected(
+            event_fixture(), pull_request_fixture(), runs_response([])
+        )
 
     def test_ignores_different_pull_request_success_in_either_order(self) -> None:
         exact = runs_fixture()["workflow_runs"][0]
@@ -174,7 +277,7 @@ class ReleaseQualityRunResolverTests(unittest.TestCase):
                 result = self.run_resolver(
                     event_fixture(),
                     pull_request_fixture(),
-                    {"workflow_runs": ordered_runs},
+                    runs_response(ordered_runs),
                 )
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual(result.stdout, "987654\n")
@@ -188,60 +291,152 @@ class ReleaseQualityRunResolverTests(unittest.TestCase):
                 result = self.run_resolver(
                     event_fixture(),
                     pull_request_fixture(),
-                    {"workflow_runs": ordered_runs},
+                    runs_response(ordered_runs),
                 )
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual(result.stdout, "987654\n")
+
+    def test_rejects_zero_exact_matches_with_only_unrelated_run(self) -> None:
+        unrelated = different_pull_request_run_fixture()
+        self.assert_rejected(
+            event_fixture(), pull_request_fixture(), runs_response([unrelated])
+        )
 
     def test_rejects_malformed_successful_run_with_exact_match(self) -> None:
         malformed = runs_fixture()["workflow_runs"][0]
         malformed["head_commit"].pop("id")
-        exact = runs_fixture()["workflow_runs"][0]
         self.assert_rejected(
             event_fixture(),
             pull_request_fixture(),
-            {"workflow_runs": [exact, malformed]},
+            runs_response([malformed]),
         )
 
-    def test_ignores_unsuccessful_runs_around_valid_success(self) -> None:
-        success = runs_fixture()["workflow_runs"][0]
-        unsuccessful = copy.deepcopy(success)
-        unsuccessful["id"] = 987653
-        unsuccessful["conclusion"] = "failure"
-        for name, ordered_runs in (
-            ("failed before success", [unsuccessful, success]),
-            ("failed after success", [success, unsuccessful]),
+    def test_rejects_latest_non_success_even_with_older_success(self) -> None:
+        older = workflow_run_fixture(
+            run_id=987653,
+            run_number=83,
+            created_at=RUN_83_CREATED_AT,
+            updated_at=RUN_83_UPDATED_AT,
+        )
+        for status, conclusion in (
+            ("completed", "failure"),
+            ("completed", "cancelled"),
+            ("queued", None),
+            ("in_progress", None),
         ):
-            with self.subTest(name=name):
-                result = self.run_resolver(
-                    event_fixture(),
-                    pull_request_fixture(),
-                    {"workflow_runs": ordered_runs},
-                )
-                self.assertEqual(result.returncode, 0, result.stderr)
-                self.assertEqual(result.stdout, "987654\n")
+            latest = workflow_run_fixture(
+                run_id=987654,
+                run_number=84,
+                status=status,
+                conclusion=conclusion,
+                created_at=RUN_84_CREATED_AT,
+                updated_at=RUN_84_UPDATED_AT,
+            )
+            for name, ordered_runs in (
+                ("older before latest", [older, latest]),
+                ("latest before older", [latest, older]),
+            ):
+                with self.subTest(status=status, name=name):
+                    self.assert_rejected(
+                        event_fixture(),
+                        pull_request_fixture(),
+                        runs_response(ordered_runs),
+                    )
 
-        cancelled = copy.deepcopy(success)
-        cancelled["id"] = 987652
-        cancelled["conclusion"] = "cancelled"
-        result = self.run_resolver(
+    def test_rejects_maximum_run_number_tie(self) -> None:
+        first = workflow_run_fixture(
+            run_id=987654, run_number=84, run_attempt=1
+        )
+        second = workflow_run_fixture(
+            run_id=987655, run_number=84, run_attempt=2
+        )
+        self.assert_rejected(
             event_fixture(),
             pull_request_fixture(),
-            {"workflow_runs": [cancelled, success]},
+            runs_response([first, second]),
         )
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(result.stdout, "987654\n")
 
-    def test_rejects_unsuccessful_only_runs(self) -> None:
-        unsuccessful = runs_fixture()["workflow_runs"][0]
-        unsuccessful["conclusion"] = "failure"
+    def test_rejects_postmerge_latest_success_with_older_success(self) -> None:
+        older = workflow_run_fixture(
+            run_id=987653,
+            run_number=83,
+            created_at="2026-08-28T23:58:00Z",
+            updated_at="2026-08-28T23:59:00Z",
+        )
+        latest = workflow_run_fixture(
+            run_id=987654,
+            run_number=84,
+            status="completed",
+            conclusion="success",
+            created_at="2026-08-29T00:06:00Z",
+            updated_at="2026-08-29T00:07:00Z",
+        )
         self.assert_rejected(
-            event_fixture(), pull_request_fixture(), {"workflow_runs": [unsuccessful]}
+            event_fixture(),
+            pull_request_fixture(),
+            runs_response([older, latest]),
+        )
+
+    def test_rejects_created_after_updated(self) -> None:
+        self.assert_rejected(
+            event_fixture(),
+            pull_request_fixture(),
+            runs_fixture(
+                created_at=RUN_84_UPDATED_AT,
+                updated_at=RUN_84_CREATED_AT,
+            ),
+        )
+
+    def test_accepts_run_at_pr_merge_boundary(self) -> None:
+        self.assert_accepted(
+            event_fixture(),
+            pull_request_fixture(),
+            runs_fixture(
+                created_at=MERGED_AT,
+                updated_at=MERGED_AT,
+            ),
+            987654,
+        )
+
+    def test_rejects_missing_or_malformed_run_timestamps(self) -> None:
+        cases: dict[str, Callable[[dict[str, Any]], None]] = {
+            "created_at missing": lambda run: run.pop("created_at"),
+            "updated_at missing": lambda run: run.pop("updated_at"),
+            "created_at malformed": lambda run: run.update(
+                created_at="not-a-timestamp"
+            ),
+            "updated_at malformed": lambda run: run.update(
+                updated_at="not-a-timestamp"
+            ),
+            "created_at null": lambda run: run.update(created_at=None),
+            "updated_at null": lambda run: run.update(updated_at=None),
+        }
+        for name, change in cases.items():
+            with self.subTest(name=name):
+                runs = runs_fixture()
+                change(runs["workflow_runs"][0])
+                self.assert_rejected(
+                    event_fixture(), pull_request_fixture(), runs
+                )
+
+    def test_rejects_total_count_mismatch(self) -> None:
+        self.assert_rejected(
+            event_fixture(),
+            pull_request_fixture(),
+            runs_response([workflow_run_fixture()], total_count=2),
+        )
+        self.assert_rejected(
+            event_fixture(),
+            pull_request_fixture(),
+            [
+                runs_response([workflow_run_fixture(run_id=987653)], total_count=2),
+                runs_response([workflow_run_fixture(run_id=987654)], total_count=3),
+            ],
         )
 
     def test_rejects_non_dict_workflow_run(self) -> None:
         self.assert_rejected(
-            event_fixture(), pull_request_fixture(), {"workflow_runs": [None]}
+            event_fixture(), pull_request_fixture(), runs_response([None])
         )
 
     def test_rejects_event_and_pull_request_identity_mismatches(self) -> None:
@@ -290,6 +485,31 @@ class ReleaseQualityRunResolverTests(unittest.TestCase):
                 mutate(
                     event_fixture(),
                     lambda value: value["pull_request"].update(merge_commit_sha=None),
+                ),
+                pull_request_fixture(),
+            ),
+            "event merged_at mismatch": (
+                mutate(
+                    event_fixture(),
+                    lambda value: value["pull_request"].update(
+                        merged_at="2026-08-29T00:00:01Z"
+                    ),
+                ),
+                pull_request_fixture(),
+            ),
+            "event merged_at missing": (
+                mutate(
+                    event_fixture(),
+                    lambda value: value["pull_request"].pop("merged_at"),
+                ),
+                pull_request_fixture(),
+            ),
+            "event merged_at malformed": (
+                mutate(
+                    event_fixture(),
+                    lambda value: value["pull_request"].update(
+                        merged_at="not-a-timestamp"
+                    ),
                 ),
                 pull_request_fixture(),
             ),
@@ -374,6 +594,29 @@ class ReleaseQualityRunResolverTests(unittest.TestCase):
                 mutate(
                     pull_request_fixture(),
                     lambda value: value.update(merge_commit_sha="c" * 40),
+                ),
+            ),
+            "PR merged_at mismatch": (
+                event_fixture(),
+                mutate(
+                    pull_request_fixture(),
+                    lambda value: value.update(
+                        merged_at="2026-08-29T00:00:01Z"
+                    ),
+                ),
+            ),
+            "PR merged_at missing": (
+                event_fixture(),
+                mutate(
+                    pull_request_fixture(),
+                    lambda value: value.pop("merged_at"),
+                ),
+            ),
+            "PR merged_at malformed": (
+                event_fixture(),
+                mutate(
+                    pull_request_fixture(),
+                    lambda value: value.update(merged_at="not-a-timestamp"),
                 ),
             ),
             "PR not merged": (
@@ -472,6 +715,27 @@ class ReleaseQualityRunResolverTests(unittest.TestCase):
                 runs = runs_fixture()
                 runs["workflow_runs"][0]["id"] = invalid_id
                 self.assert_rejected(event_fixture(), pull_request_fixture(), runs)
+
+    def test_rejects_invalid_or_missing_run_numbers_and_attempts(self) -> None:
+        cases: dict[str, Callable[[dict[str, Any]], None]] = {
+            "run_number zero": lambda run: run.update(run_number=0),
+            "run_number negative": lambda run: run.update(run_number=-1),
+            "run_number bool": lambda run: run.update(run_number=True),
+            "run_number string": lambda run: run.update(run_number="84"),
+            "run_number missing": lambda run: run.pop("run_number"),
+            "run_attempt zero": lambda run: run.update(run_attempt=0),
+            "run_attempt negative": lambda run: run.update(run_attempt=-1),
+            "run_attempt bool": lambda run: run.update(run_attempt=True),
+            "run_attempt string": lambda run: run.update(run_attempt="1"),
+            "run_attempt missing": lambda run: run.pop("run_attempt"),
+        }
+        for name, change in cases.items():
+            with self.subTest(name=name):
+                runs = runs_fixture()
+                change(runs["workflow_runs"][0])
+                self.assert_rejected(
+                    event_fixture(), pull_request_fixture(), runs
+                )
 
 
 if __name__ == "__main__":

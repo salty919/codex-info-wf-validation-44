@@ -402,7 +402,7 @@ jobs:
           gh api --method GET \
             "repos/$REPOSITORY/pulls/$PR_NUMBER" > "$pull_request_json"
           gh api --method GET --paginate --slurp \
-            "repos/$REPOSITORY/actions/workflows/windows-client.yml/runs?event=pull_request&status=completed&head_sha=$PR_HEAD_SHA&per_page=100" \
+            "repos/$REPOSITORY/actions/workflows/windows-client.yml/runs?event=pull_request&head_sha=$PR_HEAD_SHA&per_page=100" \
             > "$workflow_runs_json"
           resolved_run_id="$(
             python3 scripts/release_quality_run_resolver.py \
