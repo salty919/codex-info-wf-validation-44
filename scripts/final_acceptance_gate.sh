@@ -2,9 +2,10 @@
 set -euo pipefail
 
 # This is the single PR acceptance boundary.  It is intentionally
-# fail-closed, but evidence-only: native, Windows, and UI jobs own execution
-# and upload immutable result bundles; this script only joins and verifies
-# those bundles.  No environment variable can replace the evidence.
+# fail-closed, but evidence-only: the native release/CLI/recorder owners, the
+# merge-policy audit, and the UI job own execution and upload immutable result
+# bundles; this script only joins and verifies those bundles.  No environment
+# variable can replace the evidence.
 ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 

@@ -19,24 +19,26 @@
 ## 強制ゲート
 
 1. 変更前に`docs/PRODUCT_REQUIREMENTS.md`と対象仕様を読み、変更する観測結果と失敗時動作を決める。
-2. 変更後に固定.NET SDKのCore/Presentationテスト、契約ゲート、`git diff --check`、native回帰ゲートを実行する。
+2. 変更後は`bash scripts/pre_pr_gate.sh`をローカルの単一入口として1回実行する。同入口はnative回帰、data protection契約、固定.NET SDKのCore/Presentation testを含むWindows契約を各1回だけ所有し、同じtest/gateを入口の外で再実行しない。
 3. インストーラを再発行した場合は、artifactとworkspace publish copyのSHAが一致し、ホストのインストール先SHAも一致することを確認する。
 4. 独立サブエージェントが、実装者のPASS結論を見ずに上表を再評価する。1項目でもFAIL/INCONCLUSIVEなら`RELEASE HOLD`とする。
 5. `docs/INDEPENDENT_AUDIT_LATEST.md`を`status: PASS`へ変更できるのは独立評価担当だけとし、主担当が手動でPASSへ書き換えてはならない。
 
-6. `scripts/regression_guard.sh`は静的な文字列検査だけでPASSしてはならない。履歴・グラフの必須Rust回帰テスト（複数期間の境界、通常のmoving-reset、累積ドリフトする長時間moving-reset、使用量0の残量100% reset断片が前後の使用量期間を分割しないこと、観測されていない長時間を累積使用量の斜め線として描かないこと、モデル使用後の遅延した低残量観測を捨てないこと）を`--exact`で実際に実行し、対象テストが0件、未実行、失敗の場合は必ずFAILにする。さらにworking tree/index/current commitのdiff、format、全target check、全target test（実行件数>0）、release buildを同じゲートで検査する。`DISPLAY`が利用できる実行では`bash scripts/x11_graph_visual_gate.sh`を同じ実行で起動し、現行バイナリの940x640グラフ画像から残量線の連続性とLUNA/TERRA/SOLの色画素を機械判定する。履歴・グラフの変更は、この実行結果なしに完了判定してはならない。これはデグレード防止だけでなく、実行していない検証をPASS扱いする評価漏れの防止を目的とする。
+6. `scripts/regression_guard.sh`は静的な文字列検査だけでPASSしてはならない。`cargo test --locked --all-targets -- --nocapture`を1回だけ実行し、履歴・グラフ・thread・data protectionの必須Rust回帰テスト（複数期間の境界、通常のmoving-reset、累積ドリフトする長時間moving-reset、使用量0の残量100% reset断片が前後の使用量期間を分割しないこと、観測されていない長時間を累積使用量の斜め線として描かないこと、モデル使用後の遅延した低残量観測を捨てないことを含む）が同じ出力内で実行・成功したことを名前付きで確認する。必須testの個別`--exact`再実行、対象test 0件、未実行、失敗は必ずFAILにする。さらにworking tree/index/current commitのdiff、format、全target check、release buildを同じゲートで検査する。`DISPLAY`が利用できる実行では`bash scripts/x11_graph_visual_gate.sh`を同じ実行で起動し、現行バイナリの940x640グラフ画像から残量線の連続性とLUNA/TERRA/SOLの色画素を機械判定する。履歴・グラフの変更は、この実行結果なしに完了判定してはならない。これはデグレード防止だけでなく、実行していない検証をPASS扱いする評価漏れの防止を目的とする。
 
-7. PRのmerge前にだけ`bash scripts/final_acceptance_gate.sh <Windows UI E2E evidence>`を1回通過させる。同ゲートは同一PR実行で既に完了したnative gate、Windows test、Windows UI Automationの結果を再実行せず、先行jobの成功とsource SHA/tree、status/detailsの同一世代受理マーカー、quota gauge証拠、過去期間グラフ、名前付き画面キャプチャ、物理window move証拠の対応と完全性を検証する。各画像のSHA-256は同じ実行のcapture行と一致しなければならない。証拠欠落、古いSHA/tree、SKIP、test 0件を`PASS`へ変換しない。Release jobはこのrequired acceptanceの検証済みtreeとmerge結果の同一性を確認し、品質test/gateを再実行しない。
+7. PRのmerge前にだけ`bash scripts/final_acceptance_gate.sh <Windows UI E2E evidence>`を1回通過させる。同ゲートは同一PR実行で既に完了したnative release build/CLI/recorder、main実適用merge rule、Windows installer/UI Automationを再実行せず、先行jobの成功とsource SHA/tree、status/detailsの同一世代受理マーカー、quota gauge証拠、過去期間グラフ、名前付き画面キャプチャ、物理window move証拠の対応と完全性を検証する。各画像のSHA-256は同じ実行のcapture行と一致しなければならない。証拠欠落、古いSHA/tree、SKIP、test 0件を`PASS`へ変換しない。version準備または先行jobが失敗してもrequired acceptance自体を消さず、明示的に失敗させる。Release jobはこのrequired acceptanceの検証済みtreeとmerge結果の同一性を確認し、品質test/gateを再実行しない。
 
-8. PR品質workflowは変更分類jobを常に起動し、native collector/API、Slint UI、Cargo manifest/lockfile、build/run script、Windows client、品質script、製品仕様の影響を有限に分類する。影響するownerのgateを各1回だけ実行し、関係しないownerの高コスト検査を起動しない。単一required acceptanceは分類結果と全必須ownerの成功を集約し、path filterでrequired check自体が消える状態を許可しない。
+8. すべてのaccepted mergeが同じrelease candidateを生成するため、PR品質workflowはpath filterや変更分類でartifact producerを省略しない。version準備済みheadだけがnative release runtime、main実適用merge rule、実Windows installer/UIのownerを各1回実行する。高コストなRust全target testとWindows unit/contract testはローカル`pre_pr_gate.sh`だけが所有し、PR job、acceptance、Releaseへ複製しない。単一required acceptanceは常に生成し、version準備と全PR ownerの成功を集約する。
 
-9. CI checkoutは履歴比較を必要とする全jobで`fetch-depth: 0`を使用する。全targetテストは実行件数0を許可せず、Windowsテストはpassed>0かつskipped=0を満たさなければならない。件数を出せない、または一部targetが未実行の結果はPASSではなくFAIL/HOLDとする。
+9. 履歴比較を必要とするcheckoutは`fetch-depth: 0`を使用する。ローカルの全target testは実行件数0を許可せず、Windows testはpassed>0かつskipped=0を満たさなければならない。PRのCLI/recorder/実Windows UIは各named PASSと同一source/treeのartifactを必須とする。件数またはnamed resultを出せない、未実行、SKIPはPASSではなくFAIL/HOLDとする。
 
-10. X先行の変更凍結を必須とする。X版の正本要件（履歴期間、未使用帯、残量とモデル使用量の独立性、定期更新の前回表示保持、thread失敗時の全体破棄）を同一revisionで個別テストと実画面検査により確認するまで、Windows機能ゲート・PRのCI・workflow再実行を開始してはならない。X確認後にソース・仕様を1行でも変更した場合、確認結果は無効化し、X確認からやり直す。変更が確定した同一revisionでは、ローカル対象テスト、全体ゲート、CIを各1回までとし、失敗時は原因を修正してから次のrevisionで一度だけ再実行する。未確認のまま先に進めるためのworkflow再実行は禁止する。
+10. X先行の変更凍結を必須とする。X版の正本要件（履歴期間、未使用帯、残量とモデル使用量の独立性、定期更新の前回表示保持、thread失敗時の全体破棄）を同一revisionの`pre_pr_gate.sh`内にある全target testと実画面検査で確認するまで、PRのCI・workflow再実行を開始してはならない。X確認後にソース・仕様を1行でも変更した場合、確認結果は無効化し、単一ローカルゲートからやり直す。変更が確定した同一revisionでは、ローカル全体ゲートとCIを各1回までとし、失敗時は原因を修正してから次のrevisionで一度だけ再実行する。未確認のまま先に進めるためのworkflow再実行は禁止する。
 
 11. PR品質jobの前段は、base versionと同じPRだけにpatchを十進整数でちょうど1増やすcommitを追加し、その実行では高コスト品質jobを開始しない。次のheadでmajor/minor不変、exact patch+1、version変更対象が正本3ファイルだけであることを確認してから品質jobを各1回実行する。merge後は検証済みtreeとの同一性だけを確認し、同じnative、Windows、UI gateまたはbuildを再実行せず、受理済みinstallerからmanifestとReleaseを公開する。
 
-12. PR由来codeをwrite tokenのあるjobでcheckoutまたは実行しない。採番ownerはdefault branchのtrusted codeだけとし、PR headはAPIから取得する検証対象dataとして扱う。CodeQLのcritical/high finding、required acceptance未生成、version準備未完了のいずれかがあるheadはmerge不可とする。外部AI findingsを無効化してもCodeQLとalertを無効化・dismissしない。
+12. PR由来codeをwrite tokenのあるjobでcheckoutまたは実行しない。採番ownerはdefault branchのtrusted codeだけとし、PR headはAPIから取得する検証対象dataとして扱う。post-merge release jobがPR APIを読む権限は`pull-requests: read`に限定し、write権限を与えない。CodeQLのcritical/high finding、required acceptance失敗・未生成、version準備未完了のいずれかがあるheadはmerge不可とする。外部AI findingsを無効化してもCodeQLとalertを無効化・dismissしない。
+
+13. Codex code reviewは変更が確定したPR最新headへ`@codex review`を1回だけ投稿して起動する。新commit後は旧headのreviewを根拠にせず、non-outdatedかつ未解決のP0/P1がある間はready/releaseをHOLDする。Codex用の独自API key workflowやrequired statusを追加せず、CodeQL、required acceptance、必要な承認の代替にしない。
 
 ## 回帰発生時
 

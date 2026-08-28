@@ -15,6 +15,18 @@ require_text() {
     local file="$1" pattern="$2"
     rg -q --fixed-strings -- "$pattern" "$file" || fail "missing: $file: $pattern"
 }
+count_live_shell_invocations() {
+    local file="$1" command="$2"
+    awk -v command="$command" '
+        /^[[:space:]]*#/ { next }
+        {
+            line = $0
+            sub(/[[:space:]]*#.*/, "", line)
+            if (index(line, command)) count++
+        }
+        END { print count + 0 }
+    ' "$file"
+}
 require_function_text() {
     local file="$1" function_name="$2" pattern="$3" function_text
     function_text="$(
@@ -272,7 +284,11 @@ require_text .github/workflows/windows-client.yml 'uses: ./.github/workflows/rus
 require_text .github/workflows/windows-client.yml 'needs: [version-prepared, native-quality, windows-quality, ui-quality]'
 require_text .github/workflows/windows-client.yml 'Run final acceptance gate before merge'
 require_text .github/workflows/windows-client.yml 'windows_window_move_smoke.ps1 -ClientPath $exe -AllowPhysicalInput'
-require_text .github/workflows/windows-client.yml 'WINDOWS_CONTRACT_EVIDENCE_DIR'
+require_text .github/workflows/windows-client.yml "if: always() && github.event_name == 'pull_request'"
+require_text .github/workflows/windows-client.yml 'VERSION_RESULT: ${{ needs.version-prepared.result }}'
+require_text .github/workflows/windows-client.yml '[[ "$VERSION_RESULT" == success ]]'
+require_text .github/workflows/windows-client.yml '[[ "$VERSION_READY" == true ]]'
+require_text .github/workflows/windows-client.yml 'for result in "$NATIVE_RESULT" "$WINDOWS_RESULT" "$UI_RESULT"; do'
 ui_quality_scope="$(
     awk '
         $0 == "      - name: Write UI quality evidence" {
@@ -326,51 +342,76 @@ workflow_contract_scope="$(
             exit
         }
         in_windows_quality &&
-            $0 == "      - name: Export Windows contract evidence directory" {
-            export_name_count++
-            export_name_line = NR
-        }
-        in_windows_quality && index($0, "WINDOWS_CONTRACT_EVIDENCE_DIR=") {
-            assignment_count++
-        }
-        in_windows_quality && $0 ~ /^        run: printf / &&
-            index($0, "WINDOWS_CONTRACT_EVIDENCE_DIR=$RUNNER_TEMP/codex-info-windows-contract") &&
-            index($0, ">> \"$GITHUB_ENV\"") {
-            export_command_count++
-            export_command_line = NR
+            $0 == "      - uses: actions/checkout@v4" {
+            checkout_count++
+            checkout_line = NR
         }
         in_windows_quality &&
-            $0 == "      - name: Enforce Windows feature contract and tests" {
-            enforce_line = NR
+            $0 == "      - name: Audit live applied merge rules" {
+            audit_count++
+            audit_line = NR
         }
-        in_windows_quality && $0 == "      - name: Write Windows quality evidence" {
+        in_windows_quality &&
+            $0 == "      - name: Write Windows quality evidence" {
+            write_count++
             write_line = NR
         }
-        in_windows_quality && $0 ~ /^[[:space:]]+WINDOWS_CONTRACT_EVIDENCE_DIR:/ {
-            yaml_env_count++
+        in_windows_quality &&
+            $0 == "      - name: Upload Windows quality evidence" {
+            upload_count++
+            upload_line = NR
+        }
+        in_windows_quality && index($0, "apt-get") {
+            apt_count++
+        }
+        in_windows_quality && index($0, "actions/setup-dotnet@") {
+            dotnet_setup_count++
+        }
+        in_windows_quality && index($0, "scripts/windows_client_contract_gate.sh") {
+            contract_call_count++
+        }
+        in_windows_quality && index($0, "WINDOWS_CONTRACT_EVIDENCE_DIR") {
+            evidence_env_count++
         }
         END {
-            printf "%d %d %d %d %d %d %d %d\n",
-                export_name_count + 0,
-                export_command_count + 0,
-                assignment_count + 0,
-                yaml_env_count + 0,
-                export_name_line + 0,
-                export_command_line + 0,
-                enforce_line + 0,
-                write_line + 0
+            printf "%d %d %d %d %d %d %d %d %d %d %d %d\n",
+                checkout_count + 0,
+                audit_count + 0,
+                write_count + 0,
+                upload_count + 0,
+                checkout_line + 0,
+                audit_line + 0,
+                write_line + 0,
+                upload_line + 0,
+                apt_count + 0,
+                dotnet_setup_count + 0,
+                contract_call_count + 0,
+                evidence_env_count + 0
         }
     ' .github/workflows/windows-client.yml
 )"
-read -r export_name_count export_command_count assignment_count yaml_env_count \
-    export_name_line export_command_line enforce_line write_line <<<"$workflow_contract_scope"
-[[ "$export_name_count" -eq 1 && "$export_command_count" -eq 1 &&
-    "$assignment_count" -eq 1 && "$yaml_env_count" -eq 0 ]] ||
-    fail "Windows contract evidence export must be singular and non-YAML: name=$export_name_count command=$export_command_count assignment=$assignment_count yaml=$yaml_env_count"
-[[ "$export_command_line" -eq $((export_name_line + 2)) &&
-    "$export_command_line" -lt "$enforce_line" && "$enforce_line" -lt "$write_line" ]] ||
-    fail "Windows contract evidence export must precede both consumer steps"
-require_text .github/workflows/windows-client.yml 'windows-tests: PASS'
+read -r checkout_count audit_count write_count upload_count \
+    checkout_line audit_line write_line upload_line apt_count dotnet_setup_count \
+    contract_call_count evidence_env_count <<<"$workflow_contract_scope"
+[[ "$checkout_count" -eq 1 && "$audit_count" -eq 1 &&
+    "$write_count" -eq 1 && "$upload_count" -eq 1 ]] ||
+    fail "Windows PR quality job must have one checkout, live audit, provenance, and upload step"
+[[ "$checkout_line" -lt "$audit_line" && "$audit_line" -lt "$write_line" &&
+    "$write_line" -lt "$upload_line" ]] ||
+    fail "Windows live audit and provenance steps are out of order"
+[[ "$apt_count" -eq 0 && "$dotnet_setup_count" -eq 0 &&
+    "$contract_call_count" -eq 0 && "$evidence_env_count" -eq 0 ]] ||
+    fail "Windows PR quality job must not run local contract setup, tests, or evidence export"
+require_text .github/workflows/windows-client.yml 'source-sha: $source_sha'
+require_text .github/workflows/windows-client.yml 'tree-sha: $tree_sha'
+require_text .github/workflows/windows-client.yml 'quality: merge-policy'
+require_text .github/workflows/windows-client.yml 'live-applied-rules: PASS'
+require_text .github/workflows/windows-client.yml 'merge-policy: PASS'
+if rg -q --fixed-strings 'windows-contract: PASS' .github/workflows/windows-client.yml ||
+   rg -q --fixed-strings 'windows-tests: PASS' .github/workflows/windows-client.yml ||
+   rg -q --fixed-strings 'windows-quality: PASS' .github/workflows/windows-client.yml; then
+    fail 'Windows merge-policy evidence retains obsolete test or Windows-quality markers'
+fi
 require_text .github/workflows/windows-client.yml 'bash scripts/final_acceptance_gate.sh artifacts/windows-ui-e2e'
 require_text .github/workflows/windows-client.yml '-SourceSha $env:GITHUB_SHA'
 require_text .github/workflows/windows-client.yml 'EXPECTED_E2E_SOURCE_SHA: ${{ github.sha }}'
@@ -386,12 +427,21 @@ require_text scripts/final_acceptance_gate.sh 'grep -F --'
 require_file scripts/final_acceptance_gate_test.sh
 require_text scripts/final_acceptance_gate_test.sh 'final-acceptance-gate-test: PASS cases=$cases'
 require_text scripts/final_acceptance_gate_test.sh 'isolated acceptance PATH unexpectedly contains rg'
+require_text scripts/quality_artifact_gate.sh 'release-build: PASS'
+require_text scripts/quality_artifact_gate.sh 'cli-contract-e2e: PASS'
+require_text scripts/quality_artifact_gate.sh 'quality: merge-policy'
+require_text scripts/quality_artifact_gate.sh 'live-applied-rules: PASS'
+require_text scripts/quality_artifact_gate.sh 'merge-policy: PASS'
 require_text .github/workflows/windows-client.yml 'cancel-in-progress: false'
 require_text .github/workflows/windows-client.yml 'pull_request_target:'
 require_text .github/workflows/windows-client.yml 'types: [closed]'
 require_text .github/workflows/windows-client.yml 'version-prepared:'
 require_text .github/workflows/windows-client.yml 'contents: read'
 require_text .github/workflows/windows-client.yml "if: github.event_name == 'pull_request_target' && github.event.pull_request.merged == true"
+require_text .github/workflows/windows-client.yml 'python3 scripts/release_quality_run_resolver.py'
+if rg -q --fixed-strings '.pull_requests' .github/workflows/windows-client.yml; then
+    fail 'post-merge release must not trust the optional workflow-run pull_requests association'
+fi
 require_file .github/workflows/version-prepare.yml
 require_text .github/workflows/version-prepare.yml 'pull_request_target:'
 require_text .github/workflows/version-prepare.yml 'ref: refs/heads/main'
@@ -409,53 +459,84 @@ require_text .github/workflows/rust.yml 'dtolnay/rust-toolchain@stable'
 require_text .github/workflows/rust.yml 'x11-apps'
 require_text .github/workflows/rust.yml 'cd artifacts/native-quality'
 require_text .github/workflows/rust.yml 'sha256sum native-quality.txt > SHA256SUMS'
+require_text .github/workflows/rust.yml 'release-build: PASS'
+require_text .github/workflows/rust.yml 'cli-contract-e2e: PASS'
+require_text .github/workflows/rust.yml 'recorder-daemon: PASS'
+for obsolete_native_marker in 'regression-guard: PASS' 'data-protection: PASS'; do
+    if rg -q --fixed-strings -- "$obsolete_native_marker" .github/workflows/rust.yml; then
+        fail "native PR artifact retains obsolete marker: $obsolete_native_marker"
+    fi
+done
 if rg -q --fixed-strings -- 'sha256sum artifacts/native-quality/native-quality.txt' .github/workflows/rust.yml; then
     fail 'native quality manifest must use bundle-relative paths'
 fi
 final_gate_line="$(rg -n 'bash scripts/final_acceptance_gate.sh artifacts/windows-ui-e2e' .github/workflows/windows-client.yml | cut -d: -f1 | head -n 1)"
 [[ -n "$final_gate_line" ]] || fail 'final acceptance gate invocation is missing'
+require_file scripts/pre_pr_gate.sh
+pre_pr_regression_calls="$(count_live_shell_invocations scripts/pre_pr_gate.sh 'bash scripts/regression_guard.sh')"
+[[ "$pre_pr_regression_calls" -eq 1 ]] ||
+    fail "pre_pr_gate must own exactly one regression guard invocation: count=$pre_pr_regression_calls"
+pre_pr_contract_calls="$(count_live_shell_invocations scripts/pre_pr_gate.sh 'bash scripts/windows_client_contract_gate.sh')"
+[[ "$pre_pr_contract_calls" -eq 1 ]] ||
+    fail "pre_pr_gate must own exactly one Windows contract gate invocation: count=$pre_pr_contract_calls"
+pre_pr_data_calls="$(count_live_shell_invocations scripts/pre_pr_gate.sh 'bash scripts/data_protection_gate.sh')"
+[[ "$pre_pr_data_calls" -eq 1 ]] ||
+    fail "pre_pr_gate must own exactly one data protection gate invocation: count=$pre_pr_data_calls"
+for workflow in .github/workflows/windows-client.yml .github/workflows/rust.yml; do
+    if rg -q --fixed-strings 'scripts/regression_guard.sh' "$workflow" ||
+       rg -q --fixed-strings 'scripts/data_protection_gate.sh' "$workflow" ||
+       rg -q --fixed-strings 'scripts/windows_client_contract_gate.sh' "$workflow"; then
+        fail "local pre-PR gates must not be executable owners in PR workflow: $workflow"
+    fi
+done
+if awk '
+    /^[[:space:]]*#/ { next }
+    {
+        line = $0
+        sub(/[[:space:]]*#.*/, "", line)
+        if (line ~ /(^|[;&|[:space:]])cargo[[:space:]]+test([[:space:]]|$)/) found = 1
+    }
+    END { exit !found }
+' scripts/data_protection_gate.sh; then
+    fail 'data protection gate must not invoke cargo test'
+fi
+db_fixture_calls="$(count_live_shell_invocations scripts/data_protection_gate.sh 'bash scripts/db_protection_e2e.sh')"
+[[ "$db_fixture_calls" -eq 1 ]] ||
+    fail "data protection gate must invoke the SQLite fixture exactly once: count=$db_fixture_calls"
+if awk '
+    /^[[:space:]]*#/ { next }
+    {
+        line = $0
+        sub(/[[:space:]]*#.*/, "", line)
+        if (line ~ /(^|[;&|[:space:]])cargo[[:space:]]+test([[:space:]]|$)/) found = 1
+    }
+    END { exit !found }
+' scripts/db_protection_e2e.sh; then
+    fail 'DB protection fixture must not invoke cargo test'
+fi
+for required_db_test in \
+    db_protection_runtime_backup_migration_restore \
+    backup_generations_are_sqlite_consistent_and_bounded \
+    failed_backup_rotation_keeps_existing_generation_untouched \
+    verified_migration_switches_only_after_candidate_validation \
+    invalid_migration_candidate_leaves_source_untouched \
+    migration_that_drops_a_valid_row_is_rejected_before_switch \
+    opening_an_old_schema_is_rejected_without_migration \
+    corrupt_database_error_preserves_the_original_file; do
+    require_text scripts/regression_guard.sh "$required_db_test"
+done
 require_text scripts/regression_guard.sh 'cargo check --locked --all-targets'
 require_text scripts/regression_guard.sh 'cargo test --locked --all-targets'
 require_text scripts/regression_guard.sh 'cargo build --release --locked'
-require_text scripts/regression_guard.sh '--exact --nocapture'
+all_target_test_invocations="$(count_live_shell_invocations scripts/regression_guard.sh 'cargo test --locked --all-targets')"
+[[ "$all_target_test_invocations" -eq 1 ]] ||
+    fail "regression guard must execute one all-target test command and inspect its output: count=$all_target_test_invocations"
+if rg -q --fixed-strings -- '--exact --nocapture' scripts/regression_guard.sh; then
+    fail 'required Rust tests must inspect the one all-target test output instead of rerunning --exact tests'
+fi
 require_text scripts/regression_guard.sh 'Rust all-target test set contains a zero-test target'
 require_text scripts/regression_guard.sh 'X11 graph visual gate unverified (DISPLAY unavailable)'
 require_text .github/workflows/rust.yml 'xvfb-run --auto-servernum'
-for required_history_test in \
-    historical_week_fixture_preserves_each_period_and_graph_samples \
-    observed_moving_reset_sequence_keeps_the_spend_in_the_selected_graph \
-    long_rolling_reset_sequence_stays_in_one_period_after_a_real_boundary \
-    quota_only_reset_fragments_stay_with_the_adjacent_spend_period \
-    live_rolling_quota_chain_does_not_expose_an_empty_past_period \
-    affected_period_keeps_sol_spend_and_unobserved_quota_distinct \
-    shared_graph_fixture_is_the_x_history_oracle \
-    model_graph_does_not_invent_spend_during_an_unobserved_gap \
-    unused_intervals_mark_long_gap_before_observed_spend \
-    graph_controls_use_one_visual_boundary_and_show_short_histories \
-    remaining_graph_does_not_infer_quota_loss_from_model_spend \
-    affected_timestamp_does_not_mix_a_singleton_reset_period_into_history \
-    ambiguous_missing_quota_row_at_a_spend_timestamp_is_not_a_period \
-    singleton_reset_snapshot_overlapping_a_spend_period_stays_separate \
-    graph_collision_preview_matches_the_historical_singleton_oracle \
-    moving_reset_collision_at_30_and_60_seconds_fails_closed \
-    record_rejects_alias_quota_collision_before_canonical_merge \
-    same_timestamp_reset_drift_above_jitter_fails_closed \
-    startup_load_sanitizes_legacy_same_timestamp_quota_collision \
-    periodic_quota_refresh_retains_last_good_main_snapshot \
-    product_version_is_visible_once_on_native_main_surface; do
-    require_text scripts/regression_guard.sh "run_required_rust_test $required_history_test"
-done
-require_text scripts/regression_guard.sh 'run_required_rust_lib_test recoverable_rollout_parser_skips_only_malformed_token_count_records'
-require_text scripts/regression_guard.sh 'run_required_rust_test public_snapshot_is_whitelisted_and_tracks_auth_state'
-for required_thread_failure_test in \
-    thread_c_all_current_cycle_failure_classes_return_no_partial_snapshot \
-    thread_c_candidate_failure_rejects_the_complete_cycle \
-    thread_c_known_token_invalid_event_rejects_entire_rollout \
-    thread_c_no_thread_and_all_candidate_failure_are_distinct \
-    thread_c_private_accumulator_abort_never_yields_partial_snapshot \
-    thread_c_snapshot_rejects_partial_candidate_reads; do
-    require_text scripts/regression_guard.sh "run_required_rust_lib_test \"\$required_thread_failure_test\""
-done
 require_text .github/workflows/windows-client.yml 'Get-GitHubResourceStatus'
 require_text .github/workflows/windows-client.yml 'gh api --method POST "repos/$repository/git/refs"'
 require_text .github/workflows/windows-client.yml 'gh api --method POST "repos/$repository/releases"'
@@ -664,6 +745,8 @@ require_file scripts/workflow_quality_gate.py
 require_file scripts/ci_trust_fixture.py
 require_file scripts/release_candidate_gate.sh
 require_file scripts/release_candidate_gate_test.sh
+require_file scripts/release_quality_run_resolver.py
+require_file scripts/test_release_quality_run_resolver.py
 require_file scripts/release_state_gate.py
 require_file docs/REQUIREMENTS_LEDGER.md
 for required_ledger_id in X-START-01 X-START-02 X-START-03 X-GRAPH-01 X-THREAD-01 WIN-START-01 WIN-GRAPH-01 WIN-VERSION-01 PROC-LEDGER-01; do
@@ -681,6 +764,7 @@ require_file windows-client/CodeCoverage.runsettings
 # test suite, UI run, or acceptance job.
 PYTHONDONTWRITEBYTECODE=1 python3 scripts/workflow_quality_gate.py --self-test
 PYTHONDONTWRITEBYTECODE=1 python3 scripts/ci_trust_fixture.py --self-test
+PYTHONDONTWRITEBYTECODE=1 python3 scripts/test_release_quality_run_resolver.py
 bash scripts/final_acceptance_gate_test.sh
 bash scripts/release_candidate_gate_test.sh
 PYTHONDONTWRITEBYTECODE=1 python3 scripts/release_state_gate.py --self-test

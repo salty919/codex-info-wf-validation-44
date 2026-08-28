@@ -74,6 +74,7 @@ jobs:
       contents: read
 
   windows-quality:
+    name: Merge policy
     if: github.event_name == 'pull_request' && needs.version-prepared.outputs.ready == 'true'
     needs: [version-prepared]
     runs-on: ubuntu-latest
@@ -81,16 +82,14 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - name: Install Windows contract gate tools
-        run: sudo apt-get update && sudo apt-get install --no-install-recommends --yes ripgrep
-      - uses: actions/setup-dotnet@v4
-        with:
-          dotnet-version: "10.0.x"
-      - name: Export Windows contract evidence directory
-        shell: bash
-        run: printf '%s\n' "WINDOWS_CONTRACT_EVIDENCE_DIR=$RUNNER_TEMP/codex-info-windows-contract" >> "$GITHUB_ENV"
-      - name: Enforce Windows feature contract and tests
-        run: bash scripts/windows_client_contract_gate.sh
+      - name: Audit live applied merge rules
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          gh api --method GET -H "X-GitHub-Api-Version: 2026-03-10" "repos/$REPOSITORY/rules/branches/main" |
+            env -u GH_TOKEN python3 scripts/workflow_quality_gate.py --validate-live-applied-rules
       - name: Write Windows quality evidence
         run: |
           set -euo pipefail
@@ -103,16 +102,12 @@ jobs:
           }
           cat > artifacts/windows-quality/windows-quality.txt <<EOF
           schema: codex-info-quality-v1
-          quality: windows
+          quality: merge-policy
           source-sha: $source_sha
           tree-sha: $tree_sha
-          windows-contract: PASS
-          windows-tests: PASS
-          windows-quality: PASS
+          live-applied-rules: PASS
+          merge-policy: PASS
           EOF
-          if [[ -d "$WINDOWS_CONTRACT_EVIDENCE_DIR" ]]; then
-            cp -R "$WINDOWS_CONTRACT_EVIDENCE_DIR"/. artifacts/windows-quality/
-          fi
           (
             cd artifacts/windows-quality
             manifest="$(mktemp)"
@@ -140,7 +135,16 @@ jobs:
       - name: Install locked Inno Setup compiler
         shell: pwsh
         run: |
+          winget source update --name winget --disable-interactivity
+          $sourceUpdateExitCode = $LASTEXITCODE
+          if ($sourceUpdateExitCode -ne 0) {
+            throw ('WinGet source update failed with exit code 0x{0:X8}.' -f $sourceUpdateExitCode)
+          }
           winget install --id JRSoftware.InnoSetup.7 --version 7.1.0 -e -s winget --scope user --silent --accept-package-agreements --accept-source-agreements --disable-interactivity
+          $installExitCode = $LASTEXITCODE
+          if ($installExitCode -ne 0) {
+            throw ('WinGet Inno Setup install failed with exit code 0x{0:X8}.' -f $installExitCode)
+          }
           $compiler = Join-Path $env:LOCALAPPDATA 'Programs\Inno Setup 7\ISCC.exe'
           if (-not (Test-Path $compiler -PathType Leaf)) { throw 'Inno Setup 7.1.0 compiler was not installed.' }
           "INNO_SETUP_COMPILER=$compiler" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
@@ -287,8 +291,9 @@ jobs:
   acceptance:
     # Keep this job key stable so branch protection can require exactly one
     # aggregate verdict. The read-only required `version-prepared` job owns
-    # the old-head failure; only its exact-next new head reaches acceptance.
-    if: always() && github.event_name == 'pull_request' && needs.version-prepared.outputs.ready == 'true'
+    # version preparation; this job is still instantiated to report every
+    # skipped or failed quality owner through its first outcome check.
+    if: always() && github.event_name == 'pull_request'
     needs: [version-prepared, native-quality, windows-quality, ui-quality]
     runs-on: ubuntu-latest
     steps:
@@ -297,9 +302,11 @@ jobs:
           NATIVE_RESULT: ${{ needs.native-quality.result }}
           WINDOWS_RESULT: ${{ needs.windows-quality.result }}
           UI_RESULT: ${{ needs.ui-quality.result }}
+          VERSION_RESULT: ${{ needs.version-prepared.result }}
           VERSION_READY: ${{ needs.version-prepared.outputs.ready }}
         run: |
           set -euo pipefail
+          [[ "$VERSION_RESULT" == success ]] || { echo "version-prepared job did not succeed: $VERSION_RESULT" >&2; exit 1; }
           [[ "$VERSION_READY" == true ]] || { echo 'version preparation did not complete on this revision' >&2; exit 1; }
           for result in "$NATIVE_RESULT" "$WINDOWS_RESULT" "$UI_RESULT"; do
             [[ "$result" == success ]] || {
@@ -374,6 +381,7 @@ jobs:
     permissions:
       contents: write
       actions: read
+      pull-requests: read
     steps:
       - uses: actions/checkout@v4
         with:
@@ -389,16 +397,20 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          mapfile -t quality_runs < <(
-            gh api --paginate \
-              "repos/$REPOSITORY/actions/workflows/windows-client.yml/runs?event=pull_request&status=completed&head_sha=$PR_HEAD_SHA&per_page=100" \
-              --jq ".workflow_runs[] | select(.conclusion == \"success\" and any(.pull_requests[]; .number == ($PR_NUMBER | tonumber))) | .id"
-          )
-          if [[ "${#quality_runs[@]}" -ne 1 ]]; then
-            echo "expected exactly one successful PR quality run for PR $PR_NUMBER head $PR_HEAD_SHA; found ${#quality_runs[@]}" >&2
-            exit 1
-          fi
-          printf 'run-id=%s\n' "${quality_runs[0]}" >> "$GITHUB_OUTPUT"
+          pull_request_json="$RUNNER_TEMP/release-quality-pull-request.json"
+          workflow_runs_json="$RUNNER_TEMP/release-quality-workflow-runs.json"
+          gh api --method GET \
+            "repos/$REPOSITORY/pulls/$PR_NUMBER" > "$pull_request_json"
+          gh api --method GET --paginate --slurp \
+            "repos/$REPOSITORY/actions/workflows/windows-client.yml/runs?event=pull_request&status=completed&head_sha=$PR_HEAD_SHA&per_page=100" \
+            > "$workflow_runs_json"
+          resolved_run_id="$(
+            python3 scripts/release_quality_run_resolver.py \
+              --event "$GITHUB_EVENT_PATH" \
+              --pull-request "$pull_request_json" \
+              --workflow-runs "$workflow_runs_json"
+          )"
+          printf 'run-id=%s\n' "$resolved_run_id" >> "$GITHUB_OUTPUT"
       - name: Download accepted PR release candidate
         uses: actions/download-artifact@v4
         with:

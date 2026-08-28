@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Evidence-only join for the three PR quality owners.  This script deliberately
-# does not invoke cargo, dotnet, a UI runner, or any other test command.  The
-# producing jobs own those operations; this boundary only proves that their
-# immutable result bundles describe the same committed source tree.
+# Evidence-only join for the native release/CLI/recorder owners, the merge
+# policy audit, and the UI owner.  This script deliberately does not invoke
+# cargo, dotnet, a UI runner, or any other test command.  The producing jobs
+# own those operations; this boundary only proves that their immutable result
+# bundles describe the same committed source tree.
 
 hold() {
     echo "quality-artifact-gate: HOLD: $*" >&2
@@ -57,18 +58,30 @@ verify_bundle() {
 }
 
 verify_bundle "$native_dir" native-quality.txt 'native-quality: PASS'
-grep -Fxq 'regression-guard: PASS' "$native_dir/native-quality.txt" ||
-    hold 'native regression PASS marker is missing'
+grep -Fxq 'quality: native' "$native_dir/native-quality.txt" ||
+    hold 'native quality marker is missing'
+grep -Fxq 'release-build: PASS' "$native_dir/native-quality.txt" ||
+    hold 'native release-build PASS marker is missing'
+grep -Fxq 'cli-contract-e2e: PASS' "$native_dir/native-quality.txt" ||
+    hold 'native CLI contract E2E PASS marker is missing'
 grep -Fxq 'recorder-daemon: PASS' "$native_dir/native-quality.txt" ||
     hold 'recorder daemon PASS marker is missing'
-grep -Fxq 'data-protection: PASS' "$native_dir/native-quality.txt" ||
-    hold 'data protection PASS marker is missing'
+for obsolete_marker in 'regression-guard: PASS' 'data-protection: PASS'; do
+    if grep -Fxq "$obsolete_marker" "$native_dir/native-quality.txt"; then
+        hold "native artifact retains obsolete marker: $obsolete_marker"
+    fi
+done
 
-verify_bundle "$windows_dir" windows-quality.txt 'windows-quality: PASS'
-grep -Fxq 'windows-contract: PASS' "$windows_dir/windows-quality.txt" ||
-    hold 'Windows contract PASS marker is missing'
-grep -Fxq 'windows-tests: PASS' "$windows_dir/windows-quality.txt" ||
-    hold 'Windows test PASS marker is missing'
+verify_bundle "$windows_dir" windows-quality.txt 'merge-policy: PASS'
+grep -Fxq 'quality: merge-policy' "$windows_dir/windows-quality.txt" ||
+    hold 'merge-policy quality marker is missing'
+grep -Fxq 'live-applied-rules: PASS' "$windows_dir/windows-quality.txt" ||
+    hold 'live applied-rules PASS marker is missing'
+for obsolete_marker in 'quality: windows' 'windows-contract: PASS' 'windows-tests: PASS' 'windows-quality: PASS'; do
+    if grep -Fxq "$obsolete_marker" "$windows_dir/windows-quality.txt"; then
+        hold "merge-policy artifact retains obsolete marker: $obsolete_marker"
+    fi
+done
 
 verify_bundle "$ui_dir" ui-quality.txt 'ui-quality: PASS'
 grep -Fxq 'windows-ui-e2e: PASS' "$ui_dir/ui-quality.txt" ||

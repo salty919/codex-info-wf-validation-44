@@ -32,6 +32,7 @@ from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
 WORKFLOW = ROOT / ".github" / "workflows" / "version-prepare.yml"
+RELEASE_WORKFLOW = ROOT / ".github" / "workflows" / "windows-client.yml"
 EXPECTED_PATHS = (
     "Cargo.toml",
     "Cargo.lock",
@@ -112,6 +113,44 @@ def _replace_once(source: str, old: str, new: str, label: str) -> str:
     if count != 1:
         fail(f"mutation target {label!r} occurred {count} times, expected 1")
     return source.replace(old, new, 1)
+
+
+def _release_job_permissions(source: str) -> tuple[str, ...]:
+    """Extract the release job's small, explicit permission mapping."""
+
+    marker = "  release:\n"
+    marker_indexes = [index for index, line in enumerate(source.splitlines()) if line == marker.rstrip("\n")]
+    if len(marker_indexes) != 1:
+        fail("windows release job marker must occur exactly once")
+    lines = source.splitlines()
+    start = marker_indexes[0]
+    end = next(
+        (index for index in range(start + 1, len(lines)) if re.match(r"^  [A-Za-z0-9_.-]+:", lines[index])),
+        len(lines),
+    )
+    job = lines[start:end]
+    permission_indexes = [index for index, line in enumerate(job) if line == "    permissions:"]
+    if len(permission_indexes) != 1:
+        fail("windows release job must have one permissions mapping")
+    permission_start = permission_indexes[0]
+    permissions: list[str] = []
+    for line in job[permission_start + 1 :]:
+        if line and not line.startswith("      "):
+            break
+        if line.startswith("      "):
+            permissions.append(line.strip())
+    return tuple(permissions)
+
+
+def validate_release_permissions(source: str) -> None:
+    """Keep the release PR lookup at the least privilege required by GitHub."""
+
+    permissions = _release_job_permissions(source)
+    expected = ("contents: write", "actions: read", "pull-requests: read")
+    if permissions != expected:
+        fail(f"release job permissions must be exactly {expected}, found {permissions}")
+    if "pull-requests: write" in permissions or "issues: write" in permissions:
+        fail("release job must not grant PR or issue write access")
 
 
 _ALLOWED_SHELL_COMMANDS = frozenset(
@@ -477,6 +516,23 @@ def validate_static(source: str) -> None:
     if block.count('[[ "$HEAD_REPOSITORY" != "$REPOSITORY" ]]') != 1:
         fail("same-repository mutation guard must occur exactly once")
 
+    blob_start = block.find("create_blob() {\n")
+    blob_end = block.find("\ncargo_toml_blob=", blob_start)
+    if blob_start < 0 or blob_end < 0:
+        fail("blob creation function is missing")
+    blob_block = block[blob_start:blob_end]
+    _require(
+        blob_block,
+        'base64 --wrap=0 "$path" |\n'
+        '    jq -Rs \'{content:.,encoding:"base64"}\' |\n'
+        '    gh api \\\n',
+        "blob payload is JSON on stdin",
+    )
+    if blob_block.count("--input -") != 1:
+        fail("blob creation must read exactly one stdin request")
+    if re.search(r"(?<![A-Za-z0-9_])(?:-f|-F|--field|--raw-field)(?:[=\s])", blob_block):
+        fail("blob content must not be passed through a gh argv field")
+
 
 @dataclass(frozen=True)
 class Scenario:
@@ -682,6 +738,8 @@ def _write_fake_gh(directory: Path) -> Path:
                     index += 2
                     continue
                 if arg == "--input":
+                    if index + 1 >= len(args) or args[index + 1] != "-":
+                        die("--input must read stdin")
                     input_mode = True
                     index += 2
                     continue
@@ -767,8 +825,25 @@ def _write_fake_gh(directory: Path) -> Path:
                 index = len([item for item in transcript if item["method"] == "POST" and item["endpoint"].endswith("/git/blobs")]) - 1
                 if index >= len(config["blob_shas"]):
                     die("too many blob writes")
+                if fields:
+                    die("blob request must not pass fields through argv")
+                if not input_mode:
+                    die("blob request must use stdin JSON")
+                if (
+                    not isinstance(payload, dict)
+                    or set(payload) != {"content", "encoding"}
+                    or payload.get("encoding") != "base64"
+                    or not isinstance(payload.get("content"), str)
+                ):
+                    die("blob request must use exact base64 JSON payload")
+                content_b64 = payload["content"]
+                try:
+                    decoded = base64.b64decode(content_b64, validate=True)
+                except Exception:
+                    die("blob stdin content was not base64")
                 response = {"sha": config["blob_shas"][index]}
-                transcript[-1]["content_b64"] = fields["content"]
+                transcript[-1]["content_b64"] = content_b64
+                transcript[-1]["content_sha256"] = hashlib.sha256(decoded).hexdigest()
                 transcript[-1]["response_sha"] = response["sha"]
                 with open(transcript_path, "w", encoding="utf-8") as handle:
                     json.dump(transcript, handle, separators=(",", ":"))
@@ -1049,12 +1124,24 @@ def _assert_blob_payloads(
     if len(blob_entries) != len(EXPECTED_PATHS):
         fail(f"{result.scenario.name}: {label} expected three blob payloads")
     for path, blob_entry in zip(EXPECTED_PATHS, blob_entries):
+        payload = blob_entry.get("payload")
+        if (
+            not isinstance(payload, dict)
+            or set(payload) != {"content", "encoding"}
+            or payload.get("encoding") != "base64"
+            or not isinstance(payload.get("content"), str)
+        ):
+            fail(f"{result.scenario.name}: {label} blob transcript lacks exact stdin payload for {path}")
+        if payload["content"] != blob_entry.get("content_b64"):
+            fail(f"{result.scenario.name}: {label} blob transcript content mismatch for {path}")
         try:
-            actual_bytes = base64.b64decode(blob_entry["content_b64"], validate=True)
+            actual_bytes = base64.b64decode(payload["content"], validate=True)
         except (KeyError, ValueError):
             fail(f"{result.scenario.name}: {label} blob transcript lacks valid content for {path}")
         if actual_bytes != expected_files[path]:
             fail(f"{result.scenario.name}: {label} bytes differ for {path}")
+        if blob_entry.get("content_sha256") != hashlib.sha256(actual_bytes).hexdigest():
+            fail(f"{result.scenario.name}: {label} blob transcript digest mismatch for {path}")
 
 
 def check_runtime(block: str) -> int:
@@ -1163,7 +1250,7 @@ def check_runtime(block: str) -> int:
                 fail(f"normal: ref update was not strict: {patch!r}")
             if result.output_file:
                 fail(f"normal: unexpected output {result.output_file!r}")
-            if [entry.get("fields", {}).get("content_sha256") for entry in blob_entries] != result.blob_digests:
+            if [entry.get("content_sha256") for entry in blob_entries] != result.blob_digests:
                 fail("normal: blob transcript does not match prepared files")
         elif scenario.name == "final-force-false-conflict":
             _assert_failure(result)
@@ -1206,6 +1293,34 @@ def check_mutations(source: str) -> int:
         "          fi\n"
     )
     tree_line = '              {path:"windows-client/Directory.Build.props",mode:"100644",type:"blob",sha:$windows_props_sha}\n'
+    blob_stdin = (
+        '          create_blob() {\n'
+        '            local path="$1"\n'
+        '            base64 --wrap=0 "$path" |\n'
+        '              jq -Rs \'{content:.,encoding:"base64"}\' |\n'
+        '              gh api \\\n'
+        '                --method POST \\\n'
+        "                -H 'Accept: application/vnd.github+json' \\\n"
+        "                -H 'X-GitHub-Api-Version: 2022-11-28' \\\n"
+        '                "repos/$REPOSITORY/git/blobs" \\\n'
+        '                --input - --jq \'.sha\'\n'
+        '          }\n'
+    )
+    blob_argv = (
+        '          create_blob() {\n'
+        '            local path="$1"\n'
+        '            local encoded\n'
+        '            encoded="$(base64 --wrap=0 "$path")"\n'
+        '            gh api \\\n'
+        '              --method POST \\\n'
+        "              -H 'Accept: application/vnd.github+json' \\\n"
+        "              -H 'X-GitHub-Api-Version: 2022-11-28' \\\n"
+        '              "repos/$REPOSITORY/git/blobs" \\\n'
+        '              -f "content=$encoded" \\\n'
+        '              -f encoding=base64 \\\n'
+        "              --jq '.sha'\n"
+        '          }\n'
+    )
     mutations = [
         ("trusted-checkout-pr-head", "          ref: refs/heads/main\n", "          ref: ${{ github.event.pull_request.head.sha }}\n"),
         ("force-true", "            -F force=false \\\n", "            -F force=true \\\n"),
@@ -1243,6 +1358,7 @@ def check_mutations(source: str) -> int:
             work_assignment,
             work_assignment + '          printf probe > "$GITHUB_WORKSPACE/probe"\n',
         ),
+        ("blob-content-argv", blob_stdin, blob_argv),
     ]
     for name, old, new in mutations:
         mutated = _replace_once(source, old, new, name)
@@ -1254,6 +1370,36 @@ def check_mutations(source: str) -> int:
     return len(mutations)
 
 
+def check_release_permission_mutations(source: str) -> int:
+    """Exercise the finite release-job permission contract."""
+
+    mutations = (
+        (
+            "release-pull-requests-missing",
+            "      pull-requests: read\n",
+            "",
+        ),
+        (
+            "release-pull-requests-write",
+            "      pull-requests: read\n",
+            "      pull-requests: write\n",
+        ),
+        (
+            "release-permission-excess",
+            "      actions: read\n",
+            "      actions: read\n      packages: read\n",
+        ),
+    )
+    for name, old, new in mutations:
+        mutated = _replace_once(source, old, new, name)
+        try:
+            validate_release_permissions(mutated)
+        except FixtureError:
+            continue
+        fail(f"release permission mutation escaped static oracle: {name}")
+    return len(mutations)
+
+
 def self_test() -> tuple[int, int]:
     try:
         source = WORKFLOW.read_text(encoding="utf-8")
@@ -1261,6 +1407,9 @@ def self_test() -> tuple[int, int]:
         block = extract_run_block(source)
         runtime_cases = check_runtime(block)
         mutation_cases = check_mutations(source)
+        release_source = RELEASE_WORKFLOW.read_text(encoding="utf-8")
+        validate_release_permissions(release_source)
+        mutation_cases += check_release_permission_mutations(release_source)
         if runtime_cases <= 0 or mutation_cases <= 0:
             fail("case counts must be positive")
         return runtime_cases, mutation_cases

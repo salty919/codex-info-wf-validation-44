@@ -68,7 +68,7 @@ codex app-server --help
 
 ## データ保護と変更ゲート
 
-履歴DBの一意性、複数collector、app-server停止時の復旧、3世代バックアップ、schema mismatch、migration、prune、障害時の保持境界は[データ保護規約](docs/DATA_PROTECTION_POLICY.md)を正本とします。変更時は`bash scripts/data_protection_gate.sh`で実装と回帰テストを確認します。
+履歴DBの一意性、複数collector、app-server停止時の復旧、3世代バックアップ、schema mismatch、migration、prune、障害時の保持境界は[データ保護規約](docs/DATA_PROTECTION_POLICY.md)を正本とします。変更完了の単一入口は`bash scripts/pre_pr_gate.sh`であり、`regression_guard`がRust実装回帰を、`data_protection_gate`が破壊操作scanと独立SQLite fixtureを各1回担当します。
 
 ## Windowsからのイントラネット監視
 
