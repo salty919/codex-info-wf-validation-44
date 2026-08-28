@@ -203,9 +203,8 @@ DataGeneration、pair publicationを二重化しない。foreign/第二operation
 2. 既存DB行のread-only row count/hashを変更前後で比較する。通常の3か月prune以外の減少はFAILとする。
    DB保持は3暦月、1回の取得はその中の最長1暦月（最大44,640分点）であり、取得上限を保持期間の短縮へ読み替えない。
 3. malformed、empty、multiple writer、app-server停止、再起動、認証境界、migration/schema mismatchを検査する。
-4. `cargo fmt --check`、`cargo check --locked`、`cargo test --locked`、`cargo build --release --locked`を実行する。
-5. `scripts/data_protection_gate.sh`を実行する。
-6. 実環境確認が必要な変更では、新しいruntime traceを取り、前回の画像・ログを再利用しない。
+4. `bash scripts/pre_pr_gate.sh`を1回だけ実行する。`regression_guard`がRust実装回帰を、`data_protection_gate`が破壊操作scanと独立SQLite fixtureを各1回担当する。standaloneの`data_protection_gate.sh`だけを実装回帰の証拠にしない。
+5. 実環境確認が必要な変更では、新しいruntime traceを取り、前回の画像・ログを再利用しない。
 
 ### 禁止事項
 
