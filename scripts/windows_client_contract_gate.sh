@@ -269,7 +269,7 @@ require_text src/main.rs 'include_str!("../THIRD_PARTY_NOTICES.md")'
 require_text src/main.rs 'i18n.text(TextKey::LegalProtocol)'
 require_text src/main.rs 'i18n.text(TextKey::LegalThirdParty)'
 require_text .github/workflows/windows-client.yml 'uses: ./.github/workflows/rust.yml'
-require_text .github/workflows/windows-client.yml 'needs: [native-quality, windows-quality, ui-quality]'
+require_text .github/workflows/windows-client.yml 'needs: [version-prepared, native-quality, windows-quality, ui-quality]'
 require_text .github/workflows/windows-client.yml 'Run final acceptance gate before merge'
 require_text .github/workflows/windows-client.yml 'windows_window_move_smoke.ps1 -ClientPath $exe -AllowPhysicalInput'
 require_text .github/workflows/windows-client.yml 'WINDOWS_CONTRACT_EVIDENCE_DIR'
@@ -352,8 +352,14 @@ done
 require_text .github/workflows/windows-client.yml 'Get-GitHubResourceStatus'
 require_text .github/workflows/windows-client.yml 'gh api --method POST "repos/$repository/git/refs"'
 require_text .github/workflows/windows-client.yml 'gh api --method POST "repos/$repository/releases"'
-require_text .github/workflows/windows-client.yml '$draftReleaseEndpoint = "repos/$repository/releases/$($createdRelease.id)"'
+require_text .github/workflows/windows-client.yml 'python3 scripts/release_state_gate.py created --tag $tag'
+require_text .github/workflows/windows-client.yml '$createdReleaseId = [long]$createdRelease.id'
+require_text .github/workflows/windows-client.yml '$draftReleaseEndpoint = "repos/$repository/releases/$createdReleaseId"'
+require_text .github/workflows/windows-client.yml 'python3 scripts/release_state_gate.py draft `'
+require_text .github/workflows/windows-client.yml 'python3 scripts/release_state_gate.py tag --sha $env:EXPECTED_MERGE_SHA'
+require_text .github/workflows/windows-client.yml 'python3 scripts/release_state_gate.py published `'
 require_text .github/workflows/windows-client.yml 'gh release upload $tag $setup $manifest'
+require_text .github/workflows/windows-client.yml 'gh api --method PATCH "repos/$repository/releases/$createdReleaseId"'
 require_text .github/workflows/windows-client.yml '-F draft=false'
 require_file windows-client/src/CodexInfo.WindowsClient/Settings/ClientSettingsSession.cs
 require_text windows-client/src/CodexInfo.WindowsClient/Settings/ClientSettingsSession.cs 'SettingsCorrupt = false'
@@ -538,7 +544,8 @@ if rg -q --fixed-strings 'Start-Sleep' windows-client/tools/Measure-WindowsGraph
 fi
 require_text docs/WINDOWS_CLIENT_REQUIREMENTS.md 'WIN-PAR-13'
 require_text docs/WINDOWS_CLIENT_REQUIREMENTS.md 'WIN-INSTALL-01'
-require_text docs/REGRESSION_PREVENTION_POLICY.md 'windows_window_move_smoke.ps1 -AllowPhysicalInput'
+require_text docs/REGRESSION_PREVENTION_POLICY.md '物理window move証拠'
+require_text docs/REGRESSION_PREVENTION_POLICY.md 'CI受入時の`-AllowPhysicalInput`実行ログ'
 require_text .github/workflows/windows-client.yml '$moveSmokeOutput = @(& ./scripts/windows_window_move_smoke.ps1'
 require_text .github/workflows/windows-client.yml "[string]\$moveSmokeOutput[-1] -ne 'window-move-smoke: PASS'"
 if rg -q --fixed-strings 'if ($LASTEXITCODE -ne 0) { throw '\''Physical window move smoke failed.'\'' }' .github/workflows/windows-client.yml; then
@@ -546,6 +553,11 @@ if rg -q --fixed-strings 'if ($LASTEXITCODE -ne 0) { throw '\''Physical window m
 fi
 require_file scripts/x11_graph_visual_gate.sh
 require_file scripts/x11_startup_visual_gate.sh
+require_file scripts/workflow_quality_gate.py
+require_file scripts/ci_trust_fixture.py
+require_file scripts/release_candidate_gate.sh
+require_file scripts/release_candidate_gate_test.sh
+require_file scripts/release_state_gate.py
 require_file docs/REQUIREMENTS_LEDGER.md
 for required_ledger_id in X-START-01 X-START-02 X-START-03 X-GRAPH-01 X-THREAD-01 WIN-START-01 WIN-GRAPH-01 WIN-VERSION-01 PROC-LEDGER-01; do
     require_text docs/REQUIREMENTS_LEDGER.md "| $required_ledger_id |"
@@ -556,6 +568,14 @@ require_text scripts/x11_graph_visual_gate.sh 'dedicated idle-band pixels are mi
 require_text scripts/x11_graph_visual_gate.sh 'implausible vertical stroke'
 require_text docs/PRODUCT_REQUIREMENTS.md '# Codex Info 製品要件'
 require_file windows-client/CodeCoverage.runsettings
+
+# These finite fixtures are owned by this contract gate.  They exercise the
+# workflow/release trust boundaries without repeating a product build, unit
+# test suite, UI run, or acceptance job.
+PYTHONDONTWRITEBYTECODE=1 python3 scripts/workflow_quality_gate.py --self-test
+PYTHONDONTWRITEBYTECODE=1 python3 scripts/ci_trust_fixture.py --self-test
+bash scripts/release_candidate_gate_test.sh
+PYTHONDONTWRITEBYTECODE=1 python3 scripts/release_state_gate.py --self-test
 
 if command -v dotnet >/dev/null 2>&1; then
     contract_evidence_dir="${WINDOWS_CONTRACT_EVIDENCE_DIR:-}"

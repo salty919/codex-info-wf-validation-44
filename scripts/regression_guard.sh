@@ -36,7 +36,8 @@ require_text docs/PRODUCT_REQUIREMENTS.md '全直積、N倍、N二乗、N階乗�
 require_text docs/PRODUCT_REQUIREMENTS.md '製品バージョンはメイン画面に一度だけ表示し'
 require_text docs/REGRESSION_PREVENTION_POLICY.md 'REG-WIN-DRAG'
 require_text docs/REGRESSION_PREVENTION_POLICY.md 'X先行の変更凍結を必須とする'
-require_text docs/REGRESSION_PREVENTION_POLICY.md 'windows_window_move_smoke.ps1 -AllowPhysicalInput'
+require_text docs/REGRESSION_PREVENTION_POLICY.md '物理window move証拠'
+require_text docs/REGRESSION_PREVENTION_POLICY.md 'CI受入時の`-AllowPhysicalInput`実行ログ'
 for required_ledger_id in X-START-01 X-START-02 X-START-03 X-GRAPH-01 X-THREAD-01 WIN-START-01 WIN-GRAPH-01 WIN-VERSION-01 PROC-LEDGER-01; do
     require_text docs/REQUIREMENTS_LEDGER.md "| $required_ledger_id |"
 done

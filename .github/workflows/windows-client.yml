@@ -397,21 +397,7 @@ jobs:
       - name: Verify accepted source and artifact hashes
         env:
           EXPECTED_MERGE_SHA: ${{ github.event.pull_request.merge_commit_sha }}
-        run: |
-          set -euo pipefail
-          candidate=artifacts/release-candidate
-          provenance="$candidate/acceptance.txt"
-          [[ -f "$provenance" ]] || { echo 'accepted provenance is missing' >&2; exit 1; }
-          tree_sha="$(sed -n 's/^tree-sha: //p' "$provenance")"
-          [[ "$(git rev-parse HEAD)" == "$EXPECTED_MERGE_SHA" ]] || { echo 'checkout does not match merge commit' >&2; exit 1; }
-          [[ "$tree_sha" == "$(git rev-parse 'HEAD^{tree}')" ]] || { echo 'accepted tree SHA does not match merge tree' >&2; exit 1; }
-          grep -Fxq 'acceptance: PASS' "$provenance" || { echo 'accepted PASS marker is missing' >&2; exit 1; }
-          [[ -s "$candidate/CodexInfo.WindowsClient.Setup.exe" ]] || { echo 'accepted installer is missing' >&2; exit 1; }
-          [[ -s "$candidate/SHA256SUMS" ]] || { echo 'accepted artifact hash manifest is missing' >&2; exit 1; }
-          (
-            cd "$candidate"
-            sha256sum -c SHA256SUMS
-          )
+        run: bash scripts/release_candidate_gate.sh artifacts/release-candidate "$EXPECTED_MERGE_SHA"
       - name: Create deterministic update manifest
         id: release-version
         shell: pwsh
@@ -505,12 +491,13 @@ jobs:
             -F draft=true `
             -F prerelease=false
           if ($LASTEXITCODE -ne 0) { throw "Draft GitHub Release creation failed for $tag" }
-          $createdRelease = $createdReleaseJson | ConvertFrom-Json
-          if ($null -eq $createdRelease.id -or $createdRelease.tag_name -ne $tag -or
-              -not $createdRelease.draft -or $createdRelease.prerelease) {
+          $createdReleaseJson | python3 scripts/release_state_gate.py created --tag $tag
+          if ($LASTEXITCODE -ne 0) {
             throw "Created draft GitHub Release state is invalid for $tag"
           }
-          $draftReleaseEndpoint = "repos/$repository/releases/$($createdRelease.id)"
+          $createdRelease = $createdReleaseJson | ConvertFrom-Json
+          $createdReleaseId = [long]$createdRelease.id
+          $draftReleaseEndpoint = "repos/$repository/releases/$createdReleaseId"
 
           gh release upload $tag $setup $manifest --repo $repository
           if ($LASTEXITCODE -ne 0) { throw "Draft GitHub Release asset upload failed for $tag" }
@@ -520,25 +507,10 @@ jobs:
             -H 'X-GitHub-Api-Version: 2022-11-28' `
             $draftReleaseEndpoint
           if ($LASTEXITCODE -ne 0) { throw "Could not inspect the draft GitHub Release for $tag" }
-          $release = $releaseJson | ConvertFrom-Json
-          if ($release.tag_name -ne $tag -or -not $release.draft -or $release.prerelease) {
+          $releaseJson | python3 scripts/release_state_gate.py draft `
+            --tag $tag --setup $setup --manifest $manifest
+          if ($LASTEXITCODE -ne 0) {
             throw "Draft GitHub Release state is invalid for $tag"
-          }
-
-          $expectedAssets = @{
-            ([IO.Path]::GetFileName($setup)) = (Get-Item -LiteralPath $setup).Length
-            ([IO.Path]::GetFileName($manifest)) = (Get-Item -LiteralPath $manifest).Length
-          }
-          $assets = @($release.assets)
-          if ($assets.Count -ne $expectedAssets.Count) {
-            throw "Draft GitHub Release has an unexpected asset count for $tag"
-          }
-          foreach ($asset in $assets) {
-            if (-not $expectedAssets.ContainsKey([string]$asset.name) -or
-                [long]$asset.size -ne [long]$expectedAssets[[string]$asset.name] -or
-                [string]$asset.state -ne 'uploaded') {
-              throw "Draft GitHub Release asset verification failed for $tag"
-            }
           }
 
           $tagJson = & gh api `
@@ -546,12 +518,12 @@ jobs:
             -H 'X-GitHub-Api-Version: 2022-11-28' `
             $tagEndpoint
           if ($LASTEXITCODE -ne 0) { throw "Could not verify the created Git tag for $tag" }
-          $tagRef = $tagJson | ConvertFrom-Json
-          if ([string]$tagRef.object.type -ne 'commit' -or [string]$tagRef.object.sha -ne $env:EXPECTED_MERGE_SHA) {
+          $tagJson | python3 scripts/release_state_gate.py tag --sha $env:EXPECTED_MERGE_SHA
+          if ($LASTEXITCODE -ne 0) {
             throw "Created Git tag does not identify the gated commit for $tag"
           }
 
-          gh api --method PATCH "repos/$repository/releases/$($release.id)" `
+          gh api --method PATCH "repos/$repository/releases/$createdReleaseId" `
             -F draft=false *> $null
           if ($LASTEXITCODE -ne 0) { throw "Publishing the verified GitHub Release failed for $tag" }
 
@@ -560,9 +532,8 @@ jobs:
             -H 'X-GitHub-Api-Version: 2022-11-28' `
             $releaseEndpoint
           if ($LASTEXITCODE -ne 0) { throw "Could not verify the published GitHub Release for $tag" }
-          $published = $publishedJson | ConvertFrom-Json
-          if ($published.tag_name -ne $tag -or $published.draft -or $published.prerelease -or
-              [string]::IsNullOrWhiteSpace([string]$published.published_at) -or
-              @($published.assets).Count -ne $expectedAssets.Count) {
+          $publishedJson | python3 scripts/release_state_gate.py published `
+            --tag $tag --setup $setup --manifest $manifest
+          if ($LASTEXITCODE -ne 0) {
             throw "Published GitHub Release verification failed for $tag"
           }
