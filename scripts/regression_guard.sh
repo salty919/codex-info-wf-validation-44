@@ -44,6 +44,10 @@ require_file scripts/x11_graph_visual_gate.sh
 require_file scripts/x11_startup_visual_gate.sh
 require_file scripts/cli_contract_e2e.sh
 require_text scripts/cli_contract_e2e.sh "initial_commit='codex-info: recorder committed 1 samples'"
+require_text scripts/cli_contract_e2e.sh "fixture_now=\"\$(date -u +%s)\""
+require_text scripts/cli_contract_e2e.sh '"CODEX_INFO_DAEMON_INTERVAL_SECS=5"'
+require_text scripts/cli_contract_e2e.sh 'BEGIN EXCLUSIVE;'
+require_text scripts/cli_contract_e2e.sh "'forced transient recorder failure was not observed'"
 require_text scripts/cli_contract_e2e.sh "sqlite3 -batch -bail -cmd '.timeout 2000'"
 require_text scripts/x11_graph_visual_gate.sh 'graph child window title redundantly exposes product version'
 require_text scripts/windows_client_contract_gate.sh 'main version automation marker must appear exactly once'
