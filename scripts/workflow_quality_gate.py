@@ -4,17 +4,20 @@
 This is intentionally a small, line-oriented parser for the two workflow
 shapes used by this repository.  It is not a general YAML parser: unsupported
 or ambiguous structure is rejected.  The merge table below is synthetic test
-data only; it is not live GitHub evidence and must not be treated as a
-substitute for an API audit snapshot.
+data only; live merge-policy evidence is validated separately from GitHub's
+applied-rules endpoint.
 """
 
 from __future__ import annotations
 
 import argparse
+from copy import deepcopy
 from dataclasses import dataclass, replace
+import json
 from pathlib import Path
 import re
 import shutil
+import sys
 import tempfile
 from typing import Callable, Iterable, Mapping, Sequence
 
@@ -93,6 +96,15 @@ QUALITY_WRAPPER_ALLOWLIST = {
         }
     ),
 }
+LIVE_AUDIT_ENDPOINT = 'gh api --method GET -H "X-GitHub-Api-Version: 2026-03-10" "repos/$REPOSITORY/rules/branches/main"'
+LIVE_AUDIT_VALIDATOR = "env -u GH_TOKEN python3 scripts/workflow_quality_gate.py --validate-live-applied-rules"
+EXPECTED_LIVE_RULESET_ID = 21746295
+EXPECTED_LIVE_RULE_SOURCE_TYPE = "Repository"
+EXPECTED_LIVE_RULE_SOURCE = "salty919/codex_info_v2"
+EXPECTED_LIVE_RULE_KEYS = frozenset(
+    {"type", "parameters", "ruleset_source_type", "ruleset_source", "ruleset_id"}
+)
+EXPECTED_LIVE_STATUS_CONTEXTS = frozenset({"acceptance", "version-prepared"})
 
 
 class WorkflowError(ValueError):
@@ -484,6 +496,128 @@ def _quality_commands(workflow: Workflow, job_names: Iterable[str]) -> list[str]
     return violations
 
 
+def _live_audit_contract(workflow: Workflow) -> list[str]:
+    """Require one fail-closed applied-rules audit before local Windows work."""
+    errors: list[str] = []
+    job = workflow.jobs.get("windows-quality")
+    if job is None:
+        return ["missing windows-quality job for live policy audit"]
+    bodies = [
+        "\n".join(
+            line for line in block.body.splitlines() if not line.lstrip().startswith("#")
+        )
+        for block in job.run_blocks
+    ]
+    endpoint_hits = sum(body.count(LIVE_AUDIT_ENDPOINT) for body in bodies)
+    validator_hits = sum(body.count(LIVE_AUDIT_VALIDATOR) for body in bodies)
+    if endpoint_hits != 1:
+        errors.append(f"live policy endpoint cardinality is {endpoint_hits}")
+    if validator_hits != 1:
+        errors.append(f"live policy validator cardinality is {validator_hits}")
+    audit_bodies = [
+        body
+        for body in bodies
+        if LIVE_AUDIT_ENDPOINT in body or LIVE_AUDIT_VALIDATOR in body
+    ]
+    if len(audit_bodies) != 1:
+        return errors + ["live policy audit command scope is ambiguous"]
+    body = audit_bodies[0]
+    if "set -euo pipefail" not in body:
+        errors.append("live policy audit must enable pipefail")
+    endpoint_position = body.find(LIVE_AUDIT_ENDPOINT)
+    validator_position = body.find(LIVE_AUDIT_VALIDATOR)
+    if endpoint_position < 0 or validator_position < 0 or endpoint_position >= validator_position:
+        errors.append("live policy endpoint must pipe into its validator")
+    if re.search(r"\|\||\b(?:fallback|cache)\b", body, re.IGNORECASE):
+        errors.append("live policy audit must not use fallback or cache")
+
+    markers = [
+        index
+        for index, line in enumerate(workflow.lines)
+        if line == "      - name: Audit live applied merge rules"
+    ]
+    if len(markers) != 1:
+        errors.append("live policy audit step name cardinality is not one")
+    else:
+        start = markers[0]
+        end = next(
+            (
+                index
+                for index in range(start + 1, len(workflow.lines))
+                if workflow.lines[index].startswith("      - name:")
+            ),
+            len(workflow.lines),
+        )
+        step_text = "\n".join(workflow.lines[start:end])
+        if (
+            step_text.count("GH_TOKEN:") != 1
+            or step_text.count("GH_TOKEN: ${{ github.token }}") != 1
+        ):
+            errors.append("live policy audit token must be step-local")
+        if (
+            step_text.count("REPOSITORY:") != 1
+            or step_text.count("REPOSITORY: ${{ github.repository }}") != 1
+        ):
+            errors.append("live policy audit repository must come from repository context")
+        enforce_marker = "      - name: Enforce Windows feature contract and tests"
+        enforce_indices = [
+            index
+            for index, line in enumerate(workflow.lines)
+            if line == enforce_marker
+        ]
+        if len(enforce_indices) != 1 or markers[0] >= enforce_indices[0]:
+            errors.append("live policy audit must precede the Windows contract gate")
+        job_start = next(
+            (index for index, line in enumerate(workflow.lines) if line == "  windows-quality:"),
+            -1,
+        )
+        job_end = next(
+            (
+                index
+                for index in range(job_start + 1, len(workflow.lines))
+                if re.match(r"^  [A-Za-z0-9_.-]+:", workflow.lines[index])
+            ),
+            len(workflow.lines),
+        )
+        checkout_indices = [
+            index
+            for index in range(job_start + 1, job_end)
+            if workflow.lines[index] == "      - uses: actions/checkout@v4"
+        ]
+        install_indices = [
+            index
+            for index in range(job_start + 1, job_end)
+            if workflow.lines[index] == "      - name: Install Windows contract gate tools"
+        ]
+        if (
+            len(checkout_indices) != 1
+            or len(install_indices) != 1
+            or markers[0] <= checkout_indices[0]
+            or markers[0] >= install_indices[0]
+        ):
+            errors.append("live policy audit must run after checkout and before local setup")
+        for env_start in (
+            index
+            for index in range(job_start + 1, job_end)
+            if workflow.lines[index] == "    env:"
+        ):
+            env_end = next(
+                (
+                    index
+                    for index in range(env_start + 1, job_end)
+                    if workflow.lines[index].strip()
+                    and _indent(workflow.lines[index]) <= 4
+                ),
+                job_end,
+            )
+            if any(
+                workflow.lines[index].lstrip().startswith("GH_TOKEN:")
+                for index in range(env_start + 1, env_end)
+            ):
+                errors.append("live policy audit token must not be job-wide")
+    return errors
+
+
 def validate_workflows(windows_path: Path = WINDOWS_WORKFLOW, rust_path: Path = RUST_WORKFLOW) -> list[str]:
     errors: list[str] = []
     try:
@@ -547,6 +681,7 @@ def validate_workflows(windows_path: Path = WINDOWS_WORKFLOW, rust_path: Path = 
                 errors.append(f"owner {owner} is in job {blocks[0].job}")
         if "acceptance" in windows.jobs and "release" in windows.jobs:
             errors.extend(_quality_commands(windows, ("acceptance", "release")))
+        errors.extend(_live_audit_contract(windows))
 
         # A reusable workflow must advertise workflow_call; this avoids
         # accepting a source copy whose job text merely happens to match.
@@ -580,8 +715,6 @@ class MergeRun:
 
 @dataclass(frozen=True)
 class MergeState:
-    required_contexts: frozenset[str]
-    strict: bool
     current_base: str
     current_head: str
     current_tree: str
@@ -589,9 +722,7 @@ class MergeState:
     provenance_tree: str
     runs: tuple[MergeRun, ...]
     provenance_id: str = ""
-    branch_protection: Mapping[str, object] | None = None
-    ruleset: Mapping[str, object] | None = None
-    default_setup: Mapping[str, object] | None = None
+    live_applied_rules: object | None = None
 
 
 _SHA40 = re.compile(r"^[0-9a-fA-F]{40}$")
@@ -609,108 +740,117 @@ def _mapping(value: object) -> Mapping[str, object] | None:
     return value if isinstance(value, Mapping) else None
 
 
-def _exact_string_list(value: object, expected: set[str]) -> bool:
-    if type(value) is not list or any(type(item) is not str for item in value):
-        return False
-    return len(value) == len(expected) and len(set(value)) == len(value) and set(value) == expected
-
-
-def _valid_branch_protection(policy: object) -> bool:
-    """Validate the raw branch-protection response, not a normalized proxy."""
-    payload = _mapping(policy)
-    if payload is None:
-        return False
-    required = _mapping(payload.get("required_status_checks"))
-    if required is None or required.get("strict") is not True:
-        return False
-    expected = {"acceptance", "version-prepared"}
-    if not _exact_string_list(required.get("contexts"), expected):
-        return False
-    checks = required.get("checks")
-    if type(checks) is not list or len(checks) != len(expected):
-        return False
-    check_contexts: list[str] = []
-    for check in checks:
-        entry = _mapping(check)
-        if entry is None or type(entry.get("context")) is not str:
-            return False
-        if type(entry.get("app_id")) is not int or entry["app_id"] != 15368:
-            return False
-        check_contexts.append(entry["context"])
+def _valid_live_rule_metadata(rule: Mapping[str, object]) -> bool:
     return (
-        len(check_contexts) == len(set(check_contexts))
-        and set(check_contexts) == expected
+        set(rule) == EXPECTED_LIVE_RULE_KEYS
+        and type(rule.get("ruleset_id")) is int
+        and rule["ruleset_id"] == EXPECTED_LIVE_RULESET_ID
+        and rule.get("ruleset_source_type") == EXPECTED_LIVE_RULE_SOURCE_TYPE
+        and rule.get("ruleset_source") == EXPECTED_LIVE_RULE_SOURCE
     )
 
 
-def _valid_codeql_ruleset(policy: object) -> bool:
-    """Validate the raw GitHub ruleset response and its exact CodeQL rule."""
-    payload = _mapping(policy)
-    if payload is None:
-        return False
-    if payload.get("target") != "branch" or payload.get("enforcement") != "active":
-        return False
-    if type(payload.get("bypass_actors")) is not list or payload["bypass_actors"] != []:
-        return False
-
-    conditions = _mapping(payload.get("conditions"))
-    ref_name = _mapping(conditions.get("ref_name")) if conditions is not None else None
-    if ref_name is None:
-        return False
-    if not _exact_string_list(ref_name.get("include"), {"refs/heads/main"}):
-        return False
-    if not _exact_string_list(ref_name.get("exclude"), set()):
-        return False
-
-    rules = payload.get("rules")
-    if type(rules) is not list or len(rules) != 1:
-        return False
-    rule = _mapping(rules[0])
-    if rule is None or rule.get("type") != "code_scanning":
+def _valid_live_required_status_rule(rule: Mapping[str, object]) -> bool:
+    if not _valid_live_rule_metadata(rule) or rule.get("type") != "required_status_checks":
         return False
     parameters = _mapping(rule.get("parameters"))
-    tools = parameters.get("code_scanning_tools") if parameters is not None else None
+    if parameters is None or set(parameters) != {
+        "required_status_checks",
+        "strict_required_status_checks_policy",
+        "do_not_enforce_on_create",
+    }:
+        return False
+    if parameters.get("strict_required_status_checks_policy") is not True:
+        return False
+    if parameters.get("do_not_enforce_on_create") is not False:
+        return False
+    checks = parameters.get("required_status_checks")
+    if type(checks) is not list or len(checks) != len(EXPECTED_LIVE_STATUS_CONTEXTS):
+        return False
+    contexts: list[str] = []
+    for check in checks:
+        entry = _mapping(check)
+        if entry is None or set(entry) != {"context", "integration_id"}:
+            return False
+        if type(entry.get("context")) is not str:
+            return False
+        if type(entry.get("integration_id")) is not int or entry["integration_id"] != 15368:
+            return False
+        contexts.append(entry["context"])
+    return len(contexts) == len(set(contexts)) and set(contexts) == EXPECTED_LIVE_STATUS_CONTEXTS
+
+
+def _valid_live_codeql_rule(rule: Mapping[str, object]) -> bool:
+    if not _valid_live_rule_metadata(rule) or rule.get("type") != "code_scanning":
+        return False
+    parameters = _mapping(rule.get("parameters"))
+    if parameters is None or set(parameters) != {"code_scanning_tools"}:
+        return False
+    tools = parameters.get("code_scanning_tools")
     if type(tools) is not list or len(tools) != 1:
         return False
     codeql = _mapping(tools[0])
-    return codeql is not None and (
-        codeql.get("tool") == "CodeQL"
+    return (
+        codeql is not None
+        and set(codeql) == {"tool", "alerts_threshold", "security_alerts_threshold"}
+        and codeql.get("tool") == "CodeQL"
         and codeql.get("alerts_threshold") == "errors"
         and codeql.get("security_alerts_threshold") == "high_or_higher"
     )
 
 
-def _valid_default_setup(setup: object) -> bool:
-    """Validate default-setup state while leaving the language set dynamic."""
-    payload = _mapping(setup)
-    if payload is None or payload.get("state") != "configured":
+def _valid_live_applied_rules(payload: object) -> bool:
+    """Validate GitHub's raw GET /rules/branches/main response exactly."""
+    if type(payload) is not list or len(payload) != 2:
         return False
-    languages = payload.get("languages")
-    return (
-        type(languages) is list
-        and bool(languages)
-        and all(type(language) is str and language.strip() for language in languages)
-        and len(set(languages)) == len(languages)
+    rules: list[Mapping[str, object]] = []
+    for item in payload:
+        rule = _mapping(item)
+        if rule is None:
+            return False
+        rules.append(rule)
+    types = [rule.get("type") for rule in rules]
+    if any(type(rule_type) is not str for rule_type in types):
+        return False
+    if len(set(types)) != len(types) or set(types) != {"required_status_checks", "code_scanning"}:
+        return False
+    return all(
+        _valid_live_required_status_rule(rule)
+        if rule.get("type") == "required_status_checks"
+        else _valid_live_codeql_rule(rule)
+        for rule in rules
     )
+
+
+def validate_live_applied_rules_json(raw: str) -> bool:
+    """Parse and validate one raw applied-rules JSON document."""
+
+    def reject_duplicate_keys(pairs: list[tuple[str, object]]) -> dict[str, object]:
+        result: dict[str, object] = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError("duplicate JSON object key")
+            result[key] = value
+        return result
+
+    try:
+        payload = json.loads(raw, object_pairs_hook=reject_duplicate_keys)
+    except (json.JSONDecodeError, TypeError, UnicodeDecodeError, ValueError):
+        return False
+    return _valid_live_applied_rules(payload)
 
 
 def evaluate_merge_state(state: MergeState) -> bool:
     """Return ALLOW only for one exact, current-head synthetic run set.
 
-    The raw policy evidence is checked here so callers cannot bypass the
+    Live applied-rules evidence is checked here so callers cannot bypass the
     authority schema with a hand-built normalized dataclass.  Pending CodeQL
     analysis and current-head enforcement remain GitHub's official ruleset
     responsibilities; this oracle intentionally verifies policy declaration
     without duplicating that runtime behavior.
     """
-    required = {"acceptance", "version-prepared"}
-    if (
-        state.required_contexts != required
-        or state.strict is not True
-        or not _valid_branch_protection(state.branch_protection)
-        or not _valid_codeql_ruleset(state.ruleset)
-        or not _valid_default_setup(state.default_setup)
-    ):
+    required = set(EXPECTED_LIVE_STATUS_CONTEXTS)
+    if not _valid_live_applied_rules(state.live_applied_rules):
         return False
     if not all(
         _full_sha(value)
@@ -766,8 +906,6 @@ def _valid_merge_state() -> MergeState:
     head = "2222222222222222222222222222222222222222"
     tree = "3333333333333333333333333333333333333333"
     return MergeState(
-        required_contexts=frozenset({"acceptance", "version-prepared"}),
-        strict=True,
         current_base=base,
         current_head=head,
         current_tree=tree,
@@ -788,46 +926,42 @@ def _valid_merge_state() -> MergeState:
             ),
         ),
         provenance_id="provenance-101",
-        branch_protection={
-            "required_status_checks": {
-                "strict": True,
-                "contexts": ["acceptance", "version-prepared"],
-                "checks": [
-                    {"context": "acceptance", "app_id": 15368},
-                    {"context": "version-prepared", "app_id": 15368},
+        live_applied_rules=_valid_live_applied_rules_fixture(),
+    )
+
+
+def _valid_live_applied_rules_fixture() -> list[dict[str, object]]:
+    return [
+        {
+            "type": "required_status_checks",
+            "parameters": {
+                "required_status_checks": [
+                    {"context": "acceptance", "integration_id": 15368},
+                    {"context": "version-prepared", "integration_id": 15368},
+                ],
+                "strict_required_status_checks_policy": True,
+                "do_not_enforce_on_create": False,
+            },
+            "ruleset_source_type": EXPECTED_LIVE_RULE_SOURCE_TYPE,
+            "ruleset_source": EXPECTED_LIVE_RULE_SOURCE,
+            "ruleset_id": EXPECTED_LIVE_RULESET_ID,
+        },
+        {
+            "type": "code_scanning",
+            "parameters": {
+                "code_scanning_tools": [
+                    {
+                        "tool": "CodeQL",
+                        "alerts_threshold": "errors",
+                        "security_alerts_threshold": "high_or_higher",
+                    },
                 ],
             },
+            "ruleset_source_type": EXPECTED_LIVE_RULE_SOURCE_TYPE,
+            "ruleset_source": EXPECTED_LIVE_RULE_SOURCE,
+            "ruleset_id": EXPECTED_LIVE_RULESET_ID,
         },
-        ruleset={
-            "target": "branch",
-            "enforcement": "active",
-            "bypass_actors": [],
-            "conditions": {
-                "ref_name": {
-                    "include": ["refs/heads/main"],
-                    "exclude": [],
-                },
-            },
-            "rules": [
-                {
-                    "type": "code_scanning",
-                    "parameters": {
-                        "code_scanning_tools": [
-                            {
-                                "tool": "CodeQL",
-                                "alerts_threshold": "errors",
-                                "security_alerts_threshold": "high_or_higher",
-                            },
-                        ],
-                    },
-                },
-            ],
-        },
-        default_setup={
-            "state": "configured",
-            "languages": ["actions", "csharp", "python", "rust"],
-        },
-    )
+    ]
 
 
 def _copy_workflows(directory: Path) -> tuple[Path, Path]:
@@ -836,6 +970,98 @@ def _copy_workflows(directory: Path) -> tuple[Path, Path]:
     shutil.copyfile(WINDOWS_WORKFLOW, windows)
     shutil.copyfile(RUST_WORKFLOW, rust)
     return windows, rust
+
+
+def _run_live_applied_rules_cases() -> int:
+    valid = _valid_live_applied_rules_fixture()
+    cases: list[tuple[str, object, bool]] = [("valid", valid, True)]
+
+    def mutated(name: str, mutate: Callable[[list[dict[str, object]]], None]) -> None:
+        candidate = deepcopy(valid)
+        mutate(candidate)
+        cases.append((name, candidate, False))
+
+    mutated("extra-rule", lambda candidate: candidate.append(deepcopy(candidate[0])))
+    cases.append(("missing-rule", deepcopy(valid[:1]), False))
+    malformed_parameters = deepcopy(valid)
+    malformed_parameters[0]["parameters"] = None
+    cases.append(("malformed-parameters", malformed_parameters, False))
+    mutated(
+        "duplicate-status-context",
+        lambda candidate: candidate[0]["parameters"]["required_status_checks"][1].update(  # type: ignore[index]
+            {"context": "acceptance"}
+        ),
+    )
+    mutated(
+        "wrong-source-type",
+        lambda candidate: candidate[0].update({"ruleset_source_type": "Organization"}),
+    )
+    mutated(
+        "wrong-source",
+        lambda candidate: candidate[0].update({"ruleset_source": "other/repository"}),
+    )
+    mutated("wrong-ruleset-id", lambda candidate: candidate[0].update({"ruleset_id": 1}))
+    mutated(
+        "missing-ruleset-id",
+        lambda candidate: candidate[0].pop("ruleset_id"),
+    )
+    mutated(
+        "required-status-strict-false",
+        lambda candidate: candidate[0]["parameters"].update(  # type: ignore[index]
+            {"strict_required_status_checks_policy": False}
+        ),
+    )
+    mutated(
+        "required-status-create-enforced",
+        lambda candidate: candidate[0]["parameters"].update(  # type: ignore[index]
+            {"do_not_enforce_on_create": True}
+        ),
+    )
+    mutated(
+        "wrong-integration-id",
+        lambda candidate: candidate[0]["parameters"]["required_status_checks"][0].update(  # type: ignore[index]
+            {"integration_id": 1}
+        ),
+    )
+    mutated(
+        "codeql-alert-threshold",
+        lambda candidate: candidate[1]["parameters"]["code_scanning_tools"][0].update(  # type: ignore[index]
+            {"alerts_threshold": "none"}
+        ),
+    )
+    mutated(
+        "codeql-security-threshold",
+        lambda candidate: candidate[1]["parameters"]["code_scanning_tools"][0].update(  # type: ignore[index]
+            {"security_alerts_threshold": "medium_or_higher"}
+        ),
+    )
+    mutated(
+        "codeql-tool",
+        lambda candidate: candidate[1]["parameters"]["code_scanning_tools"][0].update(  # type: ignore[index]
+            {"tool": "Semgrep"}
+        ),
+    )
+    with_extra_metadata = deepcopy(valid)
+    with_extra_metadata[0]["bypass_actors"] = []
+    cases.append(("extra-top-level-metadata", with_extra_metadata, False))
+
+    for name, payload, expected in cases:
+        result = validate_live_applied_rules_json(json.dumps(payload))
+        if result is not expected:
+            raise AssertionError(f"live applied-rules fixture {name} expected {expected}, got {result}")
+    parse_failures = ("", "{", "null", "{}", "1", '"rules"')
+    for raw in parse_failures:
+        if validate_live_applied_rules_json(raw):
+            raise AssertionError(f"live applied-rules malformed JSON/type was accepted: {raw!r}")
+    valid_raw = json.dumps(valid)
+    duplicate_key_raw = valid_raw.replace(
+        '"type": "required_status_checks",',
+        '"type": "required_status_checks", "type": "required_status_checks",',
+        1,
+    )
+    if duplicate_key_raw == valid_raw or validate_live_applied_rules_json(duplicate_key_raw):
+        raise AssertionError("duplicate JSON object key was accepted")
+    return len(cases) + len(parse_failures) + 1
 
 
 def _replace_exact(text: str, needle: str, replacement: str) -> str:
@@ -911,6 +1137,75 @@ def _static_mutations() -> tuple[tuple[str, Callable[[Path, Path], None]], ...]:
     def forbidden_quality_wrapper(suffix: str) -> Callable[[Path, Path], None]:
         return forbidden_quality_tool(f"bash scripts/custom_quality_{suffix}.sh")
 
+    def live_audit_scope(text: str) -> tuple[int, int]:
+        marker = "      - name: Audit live applied merge rules"
+        if text.count(marker) != 1:
+            raise AssertionError("live audit step marker is not unique")
+        start = text.index(marker)
+        end = text.find("\n      - name:", start + len(marker))
+        if end < 0:
+            raise AssertionError("live audit step has no following step")
+        return start, end + 1
+
+    def replace_live_audit(text: str, needle: str, replacement: str) -> str:
+        start, end = live_audit_scope(text)
+        scope = text[start:end]
+        return text[:start] + _replace_exact(scope, needle, replacement) + text[end:]
+
+    def missing_live_audit(windows: Path, _rust: Path) -> None:
+        text = windows.read_text(encoding="utf-8")
+        start, end = live_audit_scope(text)
+        windows.write_text(text[:start] + text[end:], encoding="utf-8")
+
+    def wrong_live_endpoint(windows: Path, _rust: Path) -> None:
+        text = windows.read_text(encoding="utf-8")
+        windows.write_text(
+            replace_live_audit(
+                text,
+                LIVE_AUDIT_ENDPOINT,
+                'gh api --method GET -H "X-GitHub-Api-Version: 2025-01-01" "repos/$REPOSITORY/rules/branches/main"',
+            ),
+            encoding="utf-8",
+        )
+
+    def wrong_live_validator(windows: Path, _rust: Path) -> None:
+        text = windows.read_text(encoding="utf-8")
+        windows.write_text(
+            replace_live_audit(
+                text,
+                LIVE_AUDIT_VALIDATOR,
+                "python3 scripts/workflow_quality_gate.py --validate-live-applied-rules",
+            ),
+            encoding="utf-8",
+        )
+
+    def missing_live_pipefail(windows: Path, _rust: Path) -> None:
+        text = windows.read_text(encoding="utf-8")
+        windows.write_text(
+            replace_live_audit(text, "set -euo pipefail", "set -eu"),
+            encoding="utf-8",
+        )
+
+    def live_audit_after_setup(windows: Path, _rust: Path) -> None:
+        text = windows.read_text(encoding="utf-8")
+        start, end = live_audit_scope(text)
+        audit = text[start:end]
+        without_audit = text[:start] + text[end:]
+        insertion = without_audit.index("      - name: Export Windows contract evidence directory")
+        windows.write_text(
+            without_audit[:insertion] + audit + without_audit[insertion:],
+            encoding="utf-8",
+        )
+
+    def live_audit_job_token(windows: Path, _rust: Path) -> None:
+        text = windows.read_text(encoding="utf-8")
+        marker = "  windows-quality:\n"
+        insertion = text.index(marker) + len(marker)
+        windows.write_text(
+            text[:insertion] + "    env:\n      GH_TOKEN: ${{ github.token }}\n" + text[insertion:],
+            encoding="utf-8",
+        )
+
     def unknown_job(windows: Path, _rust: Path) -> None:
         text = windows.read_text(encoding="utf-8")
         windows.write_text(_replace_exact(text, "jobs:\n  version-prepared:", "jobs:\n  unexpected-job:\n    runs-on: ubuntu-latest\n  version-prepared:"), encoding="utf-8")
@@ -943,6 +1238,12 @@ def _static_mutations() -> tuple[tuple[str, Callable[[Path, Path], None]], ...]:
         ("quality-wrapper-gate", forbidden_quality_wrapper("gate")),
         ("quality-wrapper-test", forbidden_quality_wrapper("test")),
         ("quality-wrapper-e2e", forbidden_quality_wrapper("e2e")),
+        ("live-audit-missing", missing_live_audit),
+        ("live-audit-endpoint", wrong_live_endpoint),
+        ("live-audit-validator", wrong_live_validator),
+        ("live-audit-pipefail", missing_live_pipefail),
+        ("live-audit-order", live_audit_after_setup),
+        ("live-audit-job-token", live_audit_job_token),
     )
 
 
@@ -1061,342 +1362,10 @@ def _run_merge_cases() -> int:
     def jobs_update(state: MergeState, jobs: tuple[MergeJob, ...]) -> MergeState:
         return run_update(state, jobs=jobs)
 
-    def raw_update(
-        state: MergeState,
-        field: str,
-        path: tuple[str, ...],
-        value: object,
-    ) -> MergeState:
-        raw = getattr(state, field)
-        if not isinstance(raw, Mapping):
-            raise AssertionError(f"cannot mutate non-mapping policy {field}")
-        updated: dict[str, object] = dict(raw)
-        cursor = updated
-        for key in path[:-1]:
-            nested = cursor.get(key)
-            if not isinstance(nested, Mapping):
-                raise AssertionError(f"cannot mutate missing policy path {field}.{key}")
-            nested_copy = dict(nested)
-            cursor[key] = nested_copy
-            cursor = nested_copy
-        cursor[path[-1]] = value
-        return replace(state, **{field: updated})
-
-    def codeql_required(state: MergeState) -> MergeState:
-        with_codeql_contexts = raw_update(
-            state,
-            "branch_protection",
-            ("required_status_checks", "contexts"),
-            ["acceptance", "version-prepared", "CodeQL"],
-        )
-        return raw_update(
-            with_codeql_contexts,
-            "branch_protection",
-            ("required_status_checks", "checks"),
-            [
-                {"context": "acceptance", "app_id": 15368},
-                {"context": "version-prepared", "app_id": 15368},
-                {"context": "CodeQL", "app_id": 15368},
-            ],
-        )
-
-    def neutral_codeql_aggregate(state: MergeState) -> MergeState:
-        return codeql_required(
-            jobs_update(
-                state,
-                (
-                    *state.runs[0].jobs,
-                    MergeJob("CodeQL", job_id="job-codeql", conclusion="neutral"),
-                ),
-            )
-        )
-
     mutations: tuple[tuple[str, Callable[[MergeState], MergeState], bool], ...] = (
         ("valid", lambda state: state, True),
-        ("legacy-codeql-required", codeql_required, False),
-        ("neutral-codeql-aggregate", neutral_codeql_aggregate, False),
-        ("branch-protection-missing", lambda state: replace(state, branch_protection=None), False),
-        ("branch-protection-wrong-type", lambda state: replace(state, branch_protection=[]), False),
-        (
-            "required-status-checks-missing",
-            lambda state: replace(state, branch_protection={}),
-            False,
-        ),
-        (
-            "required-status-checks-null",
-            lambda state: raw_update(state, "branch_protection", ("required_status_checks",), None),
-            False,
-        ),
-        (
-            "strict-wrong-type",
-            lambda state: raw_update(state, "branch_protection", ("required_status_checks", "strict"), "true"),
-            False,
-        ),
-        (
-            "contexts-wrong-type",
-            lambda state: raw_update(state, "branch_protection", ("required_status_checks", "contexts"), "acceptance"),
-            False,
-        ),
-        (
-            "contexts-duplicate",
-            lambda state: raw_update(
-                state,
-                "branch_protection",
-                ("required_status_checks", "contexts"),
-                ["acceptance", "acceptance"],
-            ),
-            False,
-        ),
-        (
-            "checks-wrong-type",
-            lambda state: raw_update(state, "branch_protection", ("required_status_checks", "checks"), {}),
-            False,
-        ),
-        (
-            "checks-duplicate",
-            lambda state: raw_update(
-                state,
-                "branch_protection",
-                ("required_status_checks", "checks"),
-                [
-                    {"context": "acceptance", "app_id": 15368},
-                    {"context": "acceptance", "app_id": 15368},
-                ],
-            ),
-            False,
-        ),
-        (
-            "checks-wrong-app",
-            lambda state: raw_update(
-                state,
-                "branch_protection",
-                ("required_status_checks", "checks"),
-                [
-                    {"context": "acceptance", "app_id": 15368},
-                    {"context": "version-prepared", "app_id": 1},
-                ],
-            ),
-            False,
-        ),
-        ("ruleset-missing", lambda state: replace(state, ruleset=None), False),
-        ("ruleset-wrong-type", lambda state: replace(state, ruleset=[]), False),
-        (
-            "ruleset-disabled",
-            lambda state: raw_update(state, "ruleset", ("enforcement",), "disabled"),
-            False,
-        ),
-        (
-            "ruleset-wrong-target",
-            lambda state: raw_update(state, "ruleset", ("target",), "repository"),
-            False,
-        ),
-        (
-            "ruleset-main-ref-missing",
-            lambda state: raw_update(state, "ruleset", ("conditions", "ref_name", "include"), []),
-            False,
-        ),
-        (
-            "ruleset-main-ref-extra",
-            lambda state: raw_update(
-                state,
-                "ruleset",
-                ("conditions", "ref_name", "include"),
-                ["refs/heads/main", "refs/heads/release"],
-            ),
-            False,
-        ),
-        (
-            "ruleset-main-ref-wildcard",
-            lambda state: raw_update(state, "ruleset", ("conditions", "ref_name", "include"), ["*"]),
-            False,
-        ),
-        (
-            "ruleset-exclude-ref",
-            lambda state: raw_update(
-                state,
-                "ruleset",
-                ("conditions", "ref_name", "exclude"),
-                ["refs/heads/release"],
-            ),
-            False,
-        ),
-        (
-            "ruleset-conditions-null",
-            lambda state: raw_update(state, "ruleset", ("conditions",), None),
-            False,
-        ),
-        (
-            "ruleset-rules-extra",
-            lambda state: raw_update(
-                state,
-                "ruleset",
-                ("rules",),
-                [
-                    {
-                        "type": "code_scanning",
-                        "parameters": {
-                            "code_scanning_tools": [
-                                {
-                                    "tool": "CodeQL",
-                                    "alerts_threshold": "errors",
-                                    "security_alerts_threshold": "high_or_higher",
-                                },
-                            ],
-                        },
-                    },
-                    {
-                        "type": "code_scanning",
-                        "parameters": {
-                            "code_scanning_tools": [
-                                {
-                                    "tool": "CodeQL",
-                                    "alerts_threshold": "errors",
-                                    "security_alerts_threshold": "high_or_higher",
-                                },
-                            ],
-                        },
-                    },
-                ],
-            ),
-            False,
-        ),
-        (
-            "ruleset-wrong-rule-type",
-            lambda state: raw_update(
-                state,
-                "ruleset",
-                ("rules",),
-                [
-                    {
-                        "type": "branch_name_pattern",
-                        "parameters": {
-                            "code_scanning_tools": [
-                                {
-                                    "tool": "CodeQL",
-                                    "alerts_threshold": "errors",
-                                    "security_alerts_threshold": "high_or_higher",
-                                },
-                            ],
-                        },
-                    },
-                ],
-            ),
-            False,
-        ),
-        (
-            "ruleset-wrong-tool",
-            lambda state: raw_update(
-                state,
-                "ruleset",
-                ("rules",),
-                [
-                    {
-                        "type": "code_scanning",
-                        "parameters": {
-                            "code_scanning_tools": [
-                                {
-                                    "tool": "Semgrep",
-                                    "alerts_threshold": "errors",
-                                    "security_alerts_threshold": "high_or_higher",
-                                },
-                            ],
-                        },
-                    },
-                ],
-            ),
-            False,
-        ),
-        (
-            "ruleset-alert-threshold",
-            lambda state: raw_update(
-                state,
-                "ruleset",
-                ("rules",),
-                [
-                    {
-                        "type": "code_scanning",
-                        "parameters": {
-                            "code_scanning_tools": [
-                                {
-                                    "tool": "CodeQL",
-                                    "alerts_threshold": "none",
-                                    "security_alerts_threshold": "high_or_higher",
-                                },
-                            ],
-                        },
-                    },
-                ],
-            ),
-            False,
-        ),
-        (
-            "ruleset-security-threshold",
-            lambda state: raw_update(
-                state,
-                "ruleset",
-                ("rules",),
-                [
-                    {
-                        "type": "code_scanning",
-                        "parameters": {
-                            "code_scanning_tools": [
-                                {
-                                    "tool": "CodeQL",
-                                    "alerts_threshold": "errors",
-                                    "security_alerts_threshold": "medium_or_higher",
-                                },
-                            ],
-                        },
-                    },
-                ],
-            ),
-            False,
-        ),
-        (
-            "ruleset-bypass",
-            lambda state: raw_update(
-                state,
-                "ruleset",
-                ("bypass_actors",),
-                [{"actor_id": 123, "actor_type": "Integration", "bypass_mode": "always"}],
-            ),
-            False,
-        ),
-        (
-            "default-setup-missing",
-            lambda state: replace(state, default_setup=None),
-            False,
-        ),
-        (
-            "default-setup-wrong-type",
-            lambda state: replace(state, default_setup=[]),
-            False,
-        ),
-        (
-            "default-setup-state-wrong",
-            lambda state: raw_update(state, "default_setup", ("state",), "not-configured"),
-            False,
-        ),
-        (
-            "default-setup-languages-missing",
-            lambda state: replace(state, default_setup={"state": "configured"}),
-            False,
-        ),
-        (
-            "default-setup-languages-wrong-type",
-            lambda state: raw_update(state, "default_setup", ("languages",), "rust"),
-            False,
-        ),
-        (
-            "default-setup-languages-empty",
-            lambda state: raw_update(state, "default_setup", ("languages",), []),
-            False,
-        ),
-        (
-            "default-setup-languages-duplicate",
-            lambda state: raw_update(state, "default_setup", ("languages",), ["rust", "rust"]),
-            False,
-        ),
+        ("live-policy-missing", lambda state: replace(state, live_applied_rules=None), False),
+        ("live-policy-wrong-type", lambda state: replace(state, live_applied_rules={}), False),
         ("job-failure", lambda state: jobs_update(state, (replace(state.runs[0].jobs[0], conclusion="failure"), *state.runs[0].jobs[1:])), False),
         ("job-cancelled", lambda state: jobs_update(state, (replace(state.runs[0].jobs[0], conclusion="cancelled"), *state.runs[0].jobs[1:])), False),
         ("job-in-progress", lambda state: jobs_update(state, (replace(state.runs[0].jobs[0], status="in_progress"), *state.runs[0].jobs[1:])), False),
@@ -1411,8 +1380,6 @@ def _run_merge_cases() -> int:
         ("tree-mismatch", lambda state: run_update(state, tree_sha=old_tree), False),
         ("provenance-source-mismatch", lambda state: replace(state, provenance_source=old_head), False),
         ("provenance-tree-mismatch", lambda state: replace(state, provenance_tree=old_tree), False),
-        ("strict-false", lambda state: replace(state, strict=False), False),
-        ("context-set-mismatch", lambda state: replace(state, required_contexts=frozenset({"acceptance"})), False),
         ("run-zero", lambda state: replace(state, runs=()), False),
         ("run-two", lambda state: replace(state, runs=state.runs + (replace(state.runs[0], run_id="run-102"),)), False),
         ("stale-mixed-run", lambda state: replace(state, runs=(state.runs[0], replace(state.runs[0], run_id="run-old", head_sha=old_head, base_sha=old_base, tree_sha=old_tree))), False),
@@ -1428,7 +1395,7 @@ def _run_merge_cases() -> int:
         result = evaluate_merge_state(mutate(valid))
         if result is not expected:
             raise AssertionError(f"merge fixture {name} expected {expected}, got {result}")
-    return len(mutations)
+    return len(mutations) + _run_live_applied_rules_cases()
 
 
 def self_test() -> tuple[int, int]:
@@ -1437,10 +1404,27 @@ def self_test() -> tuple[int, int]:
 
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Check the Windows workflow quality oracle")
-    parser.add_argument("--self-test", action="store_true", help="run baseline, mutation, and merge fixtures")
+    modes = parser.add_mutually_exclusive_group()
+    modes.add_argument("--self-test", action="store_true", help="run baseline, mutation, and merge fixtures")
+    modes.add_argument(
+        "--validate-live-applied-rules",
+        action="store_true",
+        help="validate applied-rules JSON from stdin",
+    )
     args = parser.parse_args(argv)
+    if args.validate_live_applied_rules:
+        try:
+            raw = sys.stdin.read()
+        except (OSError, UnicodeDecodeError):
+            print("workflow-quality-gate: FAIL live-applied-rules input", file=sys.stderr)
+            return 1
+        if not validate_live_applied_rules_json(raw):
+            print("workflow-quality-gate: FAIL live-applied-rules", file=sys.stderr)
+            return 1
+        print("workflow-quality-gate: PASS live-applied-rules")
+        return 0
     if not args.self_test:
-        parser.error("--self-test is required")
+        parser.error("one validation mode is required")
     static_cases, merge_cases = self_test()
     if static_cases <= 0 or merge_cases <= 0:
         raise AssertionError("fixture case counts must be positive")

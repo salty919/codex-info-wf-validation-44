@@ -81,6 +81,14 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+      - name: Audit live applied merge rules
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          gh api --method GET -H "X-GitHub-Api-Version: 2026-03-10" "repos/$REPOSITORY/rules/branches/main" |
+            env -u GH_TOKEN python3 scripts/workflow_quality_gate.py --validate-live-applied-rules
       - name: Install Windows contract gate tools
         run: sudo apt-get update && sudo apt-get install --no-install-recommends --yes ripgrep
       - uses: actions/setup-dotnet@v4

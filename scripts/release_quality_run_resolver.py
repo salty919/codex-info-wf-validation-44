@@ -142,47 +142,52 @@ def _workflow_runs(value: Any) -> list[Any]:
     raise ResolutionError("invalid workflow-runs response")
 
 
-def _run_id(
+def _workflow_run_identity(
     run: Any,
-    expected: tuple[int, str, str, tuple[int, str], str, str, tuple[int, str], str],
-) -> int:
+) -> tuple[
+    str,
+    str,
+    str,
+    str,
+    str,
+    str,
+    str,
+    tuple[int, str],
+    tuple[int, str],
+    str,
+    str,
+    str,
+]:
     if not isinstance(run, dict):
         raise ResolutionError("invalid workflow run")
-    (
-        number,
-        head_sha,
-        head_ref,
-        head_repository,
-        _base_ref,
-        _base_sha,
-        base_repository,
-        _merge_sha,
-    ) = expected
-    if run.get("path") != ".github/workflows/windows-client.yml":
-        raise ResolutionError("workflow run path mismatch")
-    if run.get("event") != "pull_request":
-        raise ResolutionError("workflow run event mismatch")
-    if run.get("status") != "completed":
-        raise ResolutionError("workflow run status mismatch")
-    if run.get("conclusion") != "success":
-        raise ResolutionError("workflow run conclusion mismatch")
-    if run.get("head_sha") != head_sha:
-        raise ResolutionError("workflow run head SHA mismatch")
+    path = _string(_required(run, "path", "workflow_run"), "workflow_run.path")
+    event = _string(_required(run, "event", "workflow_run"), "workflow_run.event")
+    status = _string(
+        _required(run, "status", "workflow_run"), "workflow_run.status"
+    )
+    conclusion = _string(
+        _required(run, "conclusion", "workflow_run"), "workflow_run.conclusion"
+    )
+    head_sha = _sha(
+        _required(run, "head_sha", "workflow_run"), "workflow_run.head_sha"
+    )
     head_commit = run.get("head_commit")
-    if not isinstance(head_commit, dict) or head_commit.get("id") != head_sha:
-        raise ResolutionError("workflow run head commit mismatch")
-    if run.get("head_branch") != head_ref:
-        raise ResolutionError("workflow run head branch mismatch")
-    if (
-        _repository(run.get("head_repository"), "workflow_run.head_repository")
-        != head_repository
-    ):
-        raise ResolutionError("workflow run head repository mismatch")
-    if (
-        _repository(run.get("repository"), "workflow_run.repository")
-        != base_repository
-    ):
-        raise ResolutionError("workflow run repository mismatch")
+    if not isinstance(head_commit, dict):
+        raise ResolutionError("invalid workflow_run.head_commit")
+    head_commit_id = _sha(
+        _required(head_commit, "id", "workflow_run.head_commit"),
+        "workflow_run.head_commit.id",
+    )
+    head_branch = _string(
+        _required(run, "head_branch", "workflow_run"), "workflow_run.head_branch"
+    )
+    head_repository = _repository(
+        _required(run, "head_repository", "workflow_run"),
+        "workflow_run.head_repository",
+    )
+    base_repository = _repository(
+        _required(run, "repository", "workflow_run"), "workflow_run.repository"
+    )
     referenced_workflows = run.get("referenced_workflows", MISSING)
     if not isinstance(referenced_workflows, list) or len(referenced_workflows) != 1:
         raise ResolutionError("workflow run referenced workflow cardinality mismatch")
@@ -190,16 +195,88 @@ def _run_id(
     if not isinstance(referenced_workflow, dict):
         raise ResolutionError("invalid referenced workflow")
     referenced_sha = _sha(
-        referenced_workflow.get("sha"), "referenced_workflow.sha"
+        _required(referenced_workflow, "sha", "referenced_workflow"),
+        "referenced_workflow.sha",
     )
-    if referenced_workflow.get("ref") != f"refs/pull/{number}/merge":
-        raise ResolutionError("referenced workflow ref mismatch")
-    expected_path = (
-        f"{base_repository[1]}/.github/workflows/rust.yml@{referenced_sha}"
+    referenced_ref = _string(
+        _required(referenced_workflow, "ref", "referenced_workflow"),
+        "referenced_workflow.ref",
     )
-    if referenced_workflow.get("path") != expected_path:
-        raise ResolutionError("referenced workflow path mismatch")
-    return _positive_integer(run.get("id"), "workflow_run.id")
+    referenced_path = _string(
+        _required(referenced_workflow, "path", "referenced_workflow"),
+        "referenced_workflow.path",
+    )
+    return (
+        path,
+        event,
+        status,
+        conclusion,
+        head_sha,
+        head_commit_id,
+        head_branch,
+        head_repository,
+        base_repository,
+        referenced_sha,
+        referenced_ref,
+        referenced_path,
+    )
+
+
+def _workflow_run_matches(
+    identity: tuple[
+        str,
+        str,
+        str,
+        str,
+        str,
+        str,
+        str,
+        tuple[int, str],
+        tuple[int, str],
+        str,
+        str,
+        str,
+    ],
+    expected: tuple[int, str, str, tuple[int, str], str, str, tuple[int, str], str],
+) -> bool:
+    (
+        path,
+        event,
+        status,
+        conclusion,
+        head_sha,
+        head_commit_id,
+        head_branch,
+        head_repository,
+        base_repository,
+        referenced_sha,
+        referenced_ref,
+        referenced_path,
+    ) = identity
+    (
+        number,
+        expected_head_sha,
+        expected_head_ref,
+        expected_head_repository,
+        _base_ref,
+        _base_sha,
+        expected_base_repository,
+        _merge_sha,
+    ) = expected
+    return (
+        path == ".github/workflows/windows-client.yml"
+        and event == "pull_request"
+        and status == "completed"
+        and conclusion == "success"
+        and head_sha == expected_head_sha
+        and head_commit_id == expected_head_sha
+        and head_branch == expected_head_ref
+        and head_repository == expected_head_repository
+        and base_repository == expected_base_repository
+        and referenced_ref == f"refs/pull/{number}/merge"
+        and referenced_path
+        == f"{expected_base_repository[1]}/.github/workflows/rust.yml@{referenced_sha}"
+    )
 
 
 def resolve_quality_run(event: Any, pull_request: Any, workflow_runs: Any) -> int:
@@ -213,17 +290,17 @@ def resolve_quality_run(event: Any, pull_request: Any, workflow_runs: Any) -> in
     runs = _workflow_runs(workflow_runs)
     if any(not isinstance(run, dict) for run in runs):
         raise ResolutionError("invalid workflow run")
-    successful_runs = [
-        run
-        for run in runs
-        if run.get("status") == "completed" and run.get("conclusion") == "success"
-    ]
-    resolved = [_run_id(run, event_identity) for run in successful_runs]
-    if len(resolved) != 1:
+    matching_runs: list[Any] = []
+    for run in runs:
+        if run.get("status") == "completed" and run.get("conclusion") == "success":
+            identity = _workflow_run_identity(run)
+            if _workflow_run_matches(identity, event_identity):
+                matching_runs.append(run)
+    if len(matching_runs) != 1:
         raise ResolutionError(
-            f"expected exactly one successful workflow run, found {len(resolved)}"
+            f"expected exactly one matching successful workflow run, found {len(matching_runs)}"
         )
-    return resolved[0]
+    return _positive_integer(matching_runs[0].get("id"), "workflow_run.id")
 
 
 def _read_json(path: Path, label: str) -> Any:

@@ -84,6 +84,13 @@ def runs_fixture(pull_requests: Any = None) -> dict[str, Any]:
     }
 
 
+def different_pull_request_run_fixture() -> dict[str, Any]:
+    run = copy.deepcopy(runs_fixture()["workflow_runs"][0])
+    run["id"] = 987655
+    run["referenced_workflows"][0]["ref"] = "refs/pull/43/merge"
+    return run
+
+
 def mutate(base: Any, change: Callable[[dict[str, Any]], None]) -> Any:
     result = copy.deepcopy(base)
     change(result)
@@ -155,6 +162,46 @@ class ReleaseQualityRunResolverTests(unittest.TestCase):
         two_runs["workflow_runs"].append(copy.deepcopy(two_runs["workflow_runs"][0]))
         two_runs["workflow_runs"][1]["id"] = 987655
         self.assert_rejected(event_fixture(), pull_request_fixture(), two_runs)
+
+    def test_ignores_different_pull_request_success_in_either_order(self) -> None:
+        exact = runs_fixture()["workflow_runs"][0]
+        different = different_pull_request_run_fixture()
+        for name, ordered_runs in (
+            ("different before exact", [different, exact]),
+            ("exact before different", [exact, different]),
+        ):
+            with self.subTest(name=name):
+                result = self.run_resolver(
+                    event_fixture(),
+                    pull_request_fixture(),
+                    {"workflow_runs": ordered_runs},
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout, "987654\n")
+
+    def test_ignores_unrelated_success_with_invalid_id(self) -> None:
+        unrelated = different_pull_request_run_fixture()
+        unrelated["id"] = 0
+        exact = runs_fixture()["workflow_runs"][0]
+        for ordered_runs in ([unrelated, exact], [exact, unrelated]):
+            with self.subTest(ordered_runs=ordered_runs):
+                result = self.run_resolver(
+                    event_fixture(),
+                    pull_request_fixture(),
+                    {"workflow_runs": ordered_runs},
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout, "987654\n")
+
+    def test_rejects_malformed_successful_run_with_exact_match(self) -> None:
+        malformed = runs_fixture()["workflow_runs"][0]
+        malformed["head_commit"].pop("id")
+        exact = runs_fixture()["workflow_runs"][0]
+        self.assert_rejected(
+            event_fixture(),
+            pull_request_fixture(),
+            {"workflow_runs": [exact, malformed]},
+        )
 
     def test_ignores_unsuccessful_runs_around_valid_success(self) -> None:
         success = runs_fixture()["workflow_runs"][0]
