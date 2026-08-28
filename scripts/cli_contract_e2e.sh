@@ -130,9 +130,26 @@ curl --fail --silent --max-time 1 "http://127.0.0.1:$port/v1/health" >/dev/null 
 ss -ltnH "sport = :$port" | rg -q "127[.]0[.]0[.]1:$port" \
     || fail 'listener is not bound to 127.0.0.1'
 
+# Health proves lock/listener readiness, not completion of the recorder's
+# initial backfill.  Wait for this fixture's one deterministic commit before
+# reading SQLite or exercising the successful stop path; racing the writer
+# would test the documented fail-closed timeout path instead.
+initial_commit='codex-info: recorder committed 1 samples'
+for _ in $(seq 1 200); do
+    rg -q --fixed-strings "$initial_commit" "$tmp_root/service.log" && break
+    sleep 0.1
+done
+rg -q --fixed-strings "$initial_commit" "$tmp_root/service.log" \
+    || fail 'initial recorder backfill did not complete'
+
 database="$data_root/history/usage_history.sqlite3"
 [[ -f "$database" ]] || fail 'history database was not created'
-db_before="$(sqlite3 "$database" .dump | sha256sum | awk '{print $1}')"
+logical_database_sha256() {
+    sqlite3 -batch -bail -cmd '.timeout 2000' "$1" .dump \
+        | sha256sum \
+        | awk '{print $1}'
+}
+db_before="$(logical_database_sha256 "$database")"
 source_before="$(sha256sum "$session_file" | awk '{print $1}')"
 hint_before="$(sha256sum "$reset_hint" | awk '{print $1}')"
 
@@ -145,7 +162,7 @@ service_pid=""
 if curl --fail --silent --max-time 1 "http://127.0.0.1:$port/v1/health" >/dev/null 2>&1; then
     fail '--stop left the REST listener healthy'
 fi
-[[ "$(sqlite3 "$database" .dump | sha256sum | awk '{print $1}')" == "$db_before" ]] \
+[[ "$(logical_database_sha256 "$database")" == "$db_before" ]] \
     || fail '--stop changed logical database content'
 [[ "$(sha256sum "$session_file" | awk '{print $1}')" == "$source_before" ]] \
     || fail '--stop changed source JSONL'
