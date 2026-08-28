@@ -36,6 +36,8 @@
 
 11. PR品質jobの前段は、base versionと同じPRだけにpatchを十進整数でちょうど1増やすcommitを追加し、その実行では高コスト品質jobを開始しない。次のheadでmajor/minor不変、exact patch+1、version変更対象が正本3ファイルだけであることを確認してから品質jobを各1回実行する。merge後は検証済みtreeとの同一性だけを確認し、同じnative、Windows、UI gateまたはbuildを再実行せず、受理済みinstallerからmanifestとReleaseを公開する。
 
+12. PR由来codeをwrite tokenのあるjobでcheckoutまたは実行しない。採番ownerはdefault branchのtrusted codeだけとし、PR headはAPIから取得する検証対象dataとして扱う。CodeQLのcritical/high finding、required acceptance未生成、version準備未完了のいずれかがあるheadはmerge不可とする。外部AI findingsを無効化してもCodeQLとalertを無効化・dismissしない。
+
 ## 回帰発生時
 
 回帰を検出した時点で、前回のPASS証拠を現行成果物の証拠として再利用しない。影響する観測結果だけを再検証し、無関係な検査や文書hash更新を連鎖させない。過去DB・履歴を削除して見かけ上直すことは禁止する。

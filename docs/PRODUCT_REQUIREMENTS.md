@@ -76,6 +76,14 @@
   との一致を確認し、再テストせずmanifest生成とRelease公開を行う。同時mergeと公開は直列化する。
   PR品質証拠とtreeが一致しない、version以外の差分が混入する、tag/Releaseが別SHAを
   指す、通信障害、5xx、部分uploadの場合は上書きせずfail-closedで停止する。
+- PR由来のcheckout、script、workflow、artifactを、repository contents・checks・Releaseへのwrite権限を
+  持つjobで実行しない。自動採番はdefault branchのtrusted workflow/toolだけを実行し、PRのversion 3ファイルを
+  dataとして検証した後、same-repository headへexact 1 commitを原子的に追加する。head/baseの競合、fork、
+  不正version、対象外file mutationでは書き込まない。post-merge jobはdefault branchのmainだけをcheckoutし、
+  eventのmerge SHAと一致しない場合はRelease mutationを行わない。
+- CodeQLはmerge必須gateとし、critical/high findingをdismissやworkflow無効化で通過させない。外部AI findingsが
+  provider側の未対応modelで継続失敗する場合は、そのAI機能だけをrepository単位で無効化できるが、CodeQL、
+  code-scanning alerts、required acceptanceは維持する。
 - `windows-vX.Y.Z` tagは原子的に新規作成する。Setupとmanifestは非公開Draft上でexact 2資産の名前・size・
   状態・commit SHAを検証し終えてから公開し、既存tag/Releaseへ上書きして継続しない。
 - release artifactはsource、lockfile、実payload、license/notice、署名、version、対象platformを一つのrelease identityで追跡する。

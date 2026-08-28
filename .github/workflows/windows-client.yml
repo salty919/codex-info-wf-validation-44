@@ -6,6 +6,7 @@ name: Windows client
 on:
   pull_request:
     branches: ["main"]
+    types: [opened, synchronize, reopened, ready_for_review]
   pull_request_target:
     branches: ["main"]
     types: [closed]
@@ -18,11 +19,11 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  version-policy:
+  version-prepared:
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     permissions:
-      contents: write
+      contents: read
     outputs:
       ready: ${{ steps.version.outputs.ready }}
       version: ${{ steps.version.outputs.version }}
@@ -31,18 +32,20 @@ jobs:
         with:
           fetch-depth: 0
           ref: ${{ github.event.pull_request.head.sha }}
-      - name: Prepare the exact next patch version
+      # The trusted preparer owns `python3 scripts/product_version.py bump --expected "$base_version"`
+      # on temporary API data.  This pull_request job only reads PR data and
+      # never has a token that can mutate contents or checks.
+      - name: Verify the exact next patch version
         id: version
         shell: bash
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
-          HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name }}
-          REPOSITORY: ${{ github.repository }}
           HEAD_REF: ${{ github.event.pull_request.head.ref }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
           set -euo pipefail
-          [[ "$HEAD_REPOSITORY" == "$REPOSITORY" ]] || {
-            echo 'automatic version preparation requires a same-repository PR' >&2
+          [[ "$(git rev-parse HEAD)" == "$HEAD_SHA" ]] || {
+            echo 'version policy checkout does not match the PR head SHA' >&2
             exit 1
           }
           base="$RUNNER_TEMP/base-version"
@@ -53,33 +56,26 @@ jobs:
           base_version="$(python3 scripts/product_version.py check --cargo-toml "$base/Cargo.toml" --cargo-lock "$base/Cargo.lock" --windows-props "$base/windows-client/Directory.Build.props" | sed -n 's/^version=//p')"
           current_version="$(python3 scripts/product_version.py check | sed -n 's/^version=//p')"
           next_version="$(python3 scripts/product_version.py next --version "$base_version" | sed -n 's/^version=//p')"
-          if [[ "$current_version" == "$base_version" ]]; then
-            python3 scripts/product_version.py bump --expected "$base_version"
-            unexpected="$(git diff --name-only | grep -Ev '^(Cargo\.toml|Cargo\.lock|windows-client/Directory\.Build\.props)$' || true)"
-            [[ -z "$unexpected" ]] || { echo "version preparation changed unexpected files: $unexpected" >&2; exit 1; }
-            git config user.name github-actions[bot]
-            git config user.email 41898282+github-actions[bot]@users.noreply.github.com
-            git add Cargo.toml Cargo.lock windows-client/Directory.Build.props
-            git commit -m "chore: prepare version $next_version"
-            git push origin "HEAD:$HEAD_REF"
-            printf 'ready=false\nversion=%s\n' "$next_version" >> "$GITHUB_OUTPUT"
-          elif [[ "$current_version" == "$next_version" ]]; then
+          if [[ "$current_version" == "$next_version" ]]; then
             printf 'ready=true\nversion=%s\n' "$current_version" >> "$GITHUB_OUTPUT"
+          elif [[ "$current_version" == "$base_version" ]]; then
+            echo "trusted version preparation has not committed $next_version to this head" >&2
+            exit 1
           else
             echo "PR version must be base $base_version or exact next patch $next_version; found $current_version" >&2
             exit 1
           fi
 
   native-quality:
-    if: github.event_name == 'pull_request' && needs.version-policy.outputs.ready == 'true'
-    needs: [version-policy]
+    if: github.event_name == 'pull_request' && needs.version-prepared.outputs.ready == 'true'
+    needs: [version-prepared]
     uses: ./.github/workflows/rust.yml
     permissions:
       contents: read
 
   windows-quality:
-    if: github.event_name == 'pull_request' && needs.version-policy.outputs.ready == 'true'
-    needs: [version-policy]
+    if: github.event_name == 'pull_request' && needs.version-prepared.outputs.ready == 'true'
+    needs: [version-prepared]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -130,8 +126,8 @@ jobs:
           if-no-files-found: error
 
   ui-quality:
-    if: github.event_name == 'pull_request' && needs.version-policy.outputs.ready == 'true'
-    needs: [version-policy]
+    if: github.event_name == 'pull_request' && needs.version-prepared.outputs.ready == 'true'
+    needs: [version-prepared]
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -277,10 +273,10 @@ jobs:
 
   acceptance:
     # Keep this job key stable so branch protection can require exactly one
-    # aggregate verdict.  `always()` makes a failed quality job fail this
-    # check instead of turning the required check into a skipped success.
-    if: always() && github.event_name == 'pull_request'
-    needs: [version-policy, native-quality, windows-quality, ui-quality]
+    # aggregate verdict. The read-only required `version-prepared` job owns
+    # the old-head failure; only its exact-next new head reaches acceptance.
+    if: always() && github.event_name == 'pull_request' && needs.version-prepared.outputs.ready == 'true'
+    needs: [version-prepared, native-quality, windows-quality, ui-quality]
     runs-on: ubuntu-latest
     steps:
       - name: Verify quality job outcomes
@@ -288,7 +284,7 @@ jobs:
           NATIVE_RESULT: ${{ needs.native-quality.result }}
           WINDOWS_RESULT: ${{ needs.windows-quality.result }}
           UI_RESULT: ${{ needs.ui-quality.result }}
-          VERSION_READY: ${{ needs.version-policy.outputs.ready }}
+          VERSION_READY: ${{ needs.version-prepared.outputs.ready }}
         run: |
           set -euo pipefail
           [[ "$VERSION_READY" == true ]] || { echo 'version preparation did not complete on this revision' >&2; exit 1; }
@@ -369,7 +365,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-          ref: ${{ github.event.pull_request.merge_commit_sha }}
+          ref: refs/heads/main
       - name: Resolve accepted PR quality run
         id: quality-run
         env:
@@ -435,6 +431,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           VERSION: ${{ steps.release-version.outputs.version }}
           REPOSITORY: ${{ github.repository }}
+          EXPECTED_MERGE_SHA: ${{ github.event.pull_request.merge_commit_sha }}
         run: |
           $ErrorActionPreference = 'Stop'
           $tag = "windows-v$env:VERSION"
@@ -494,7 +491,7 @@ jobs:
           # back to attaching a Release to somebody else's ref.
           gh api --method POST "repos/$repository/git/refs" `
             -f "ref=refs/tags/$tag" `
-            -f "sha=$env:GITHUB_SHA" *> $null
+            -f "sha=$env:EXPECTED_MERGE_SHA" *> $null
           if ($LASTEXITCODE -ne 0) { throw "Atomic Git tag creation failed for $tag" }
 
           # Keep the Release invisible until both exact assets have uploaded
@@ -550,7 +547,7 @@ jobs:
             $tagEndpoint
           if ($LASTEXITCODE -ne 0) { throw "Could not verify the created Git tag for $tag" }
           $tagRef = $tagJson | ConvertFrom-Json
-          if ([string]$tagRef.object.type -ne 'commit' -or [string]$tagRef.object.sha -ne $env:GITHUB_SHA) {
+          if ([string]$tagRef.object.type -ne 'commit' -or [string]$tagRef.object.sha -ne $env:EXPECTED_MERGE_SHA) {
             throw "Created Git tag does not identify the gated commit for $tag"
           }
 

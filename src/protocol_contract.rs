@@ -3129,13 +3129,13 @@ mod tests {
                     assert_eq!(
                         result,
                         Ok(None),
-                        "compatible pair did not return no quota: {account_plan}/{quota_plan}"
+                        "compatible pair returned unexpected quota result"
                     );
                 } else {
                     assert_eq!(
                         result,
                         Err(ContractError::AccountQuotaPlanMismatch),
-                        "incompatible pair accepted: {account_plan}/{quota_plan}"
+                        "incompatible pair returned an unexpected result"
                     );
                 }
             }
@@ -4186,13 +4186,13 @@ mod tests {
                     assert_eq!(
                         result,
                         Ok(None),
-                        "compatible pair did not return no quota: {account_plan}/{quota_plan}"
+                        "compatible pair returned unexpected quota result"
                     );
                 } else {
                     assert_eq!(
                         result,
                         Err(ContractError::AccountQuotaPlanMismatch),
-                        "incompatible pair did not return mismatch: {account_plan}/{quota_plan}"
+                        "incompatible pair returned an unexpected result"
                     );
                 }
                 visited += 1;

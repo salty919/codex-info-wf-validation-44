@@ -287,8 +287,19 @@ require_text scripts/final_acceptance_gate.sh 'window-move-smoke: PASS'
 require_text .github/workflows/windows-client.yml 'cancel-in-progress: false'
 require_text .github/workflows/windows-client.yml 'pull_request_target:'
 require_text .github/workflows/windows-client.yml 'types: [closed]'
-require_text .github/workflows/windows-client.yml 'python3 scripts/product_version.py bump --expected "$base_version"'
+require_text .github/workflows/windows-client.yml 'version-prepared:'
+require_text .github/workflows/windows-client.yml 'contents: read'
 require_text .github/workflows/windows-client.yml "if: github.event_name == 'pull_request_target' && github.event.pull_request.merged == true"
+require_file .github/workflows/version-prepare.yml
+require_text .github/workflows/version-prepare.yml 'pull_request_target:'
+require_text .github/workflows/version-prepare.yml 'ref: refs/heads/main'
+require_text .github/workflows/version-prepare.yml 'persist-credentials: false'
+require_text .github/workflows/version-prepare.yml 'python3 scripts/product_version.py bump --expected "$base_version"'
+require_text .github/workflows/version-prepare.yml 'force=false'
+if rg -q --fixed-strings 'ref: ${{ github.event.pull_request.head.sha }}' .github/workflows/version-prepare.yml ||
+   rg -q --fixed-strings 'checks: write' .github/workflows/version-prepare.yml; then
+    fail 'trusted version preparer must not checkout PR code or own a duplicate check result'
+fi
 if rg -q '^  push:' .github/workflows/windows-client.yml; then
     fail 'main push must not rerun PR quality or release tests'
 fi
