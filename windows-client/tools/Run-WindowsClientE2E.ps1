@@ -111,8 +111,10 @@ Add-Type -AssemblyName UIAutomationClient
 Add-Type -AssemblyName UIAutomationTypes
 Add-Type -AssemblyName System.Drawing
 
-Add-Type -TypeDefinition @'
+Add-Type -ReferencedAssemblies System.Drawing -TypeDefinition @'
 using System;
+using System.Drawing;
+using System.Collections.Generic;
 using System.Runtime.InteropServices;
 using System.Text;
 
@@ -136,6 +138,160 @@ public static class CodexInfoWindowsE2EWin32 {
         public int Top;
         public int Right;
         public int Bottom;
+    }
+}
+
+public sealed class CodexInfoGraphPixelMeasurement {
+    public int PeriodStartX { get; set; }
+    public int PeriodEndX { get; set; }
+    public int PlotSpan { get; set; }
+    public int GutterWidth { get; set; }
+    public int[] GridCenters { get; set; }
+    public int[] SeriesTop { get; set; }
+    public int[] SeriesBottom { get; set; }
+    public int[] SeriesPixelCount { get; set; }
+    public int[] SeriesGutterPixelCount { get; set; }
+    public int[] SeriesRightmost { get; set; }
+}
+
+public static class CodexInfoGraphPixelScanner {
+    private static readonly Color GridColor = ColorTranslator.FromHtml("#263548");
+    private static readonly Color[] SeriesColors = new[] {
+        ColorTranslator.FromHtml("#56B2F5"),
+        ColorTranslator.FromHtml("#A88CF5"),
+        ColorTranslator.FromHtml("#5DC98A"),
+        ColorTranslator.FromHtml("#E6A23C"),
+    };
+
+    public static CodexInfoGraphPixelMeasurement Scan(
+        string path,
+        int plotLeft,
+        int plotTop,
+        int plotWidth,
+        int plotHeight) {
+        using (var bitmap = new Bitmap(path)) {
+            if (plotLeft < 0 || plotTop < 0 || plotWidth <= 0 || plotHeight <= 40 ||
+                plotLeft + plotWidth > bitmap.Width || plotTop + plotHeight > bitmap.Height) {
+                throw new InvalidOperationException("Graph plot bounds are outside the capture.");
+            }
+
+            int yStart = plotTop + 20;
+            int yEnd = plotTop + plotHeight - 20;
+            int sampledHeight = yEnd - yStart;
+            int requiredGridPixels = (int)Math.Ceiling(sampledHeight * 0.40);
+            var gridColumns = new bool[plotWidth];
+            for (int localX = 0; localX < plotWidth; localX++) {
+                int matches = 0;
+                for (int y = yStart; y < yEnd; y++) {
+                    if (Matches(bitmap.GetPixel(plotLeft + localX, y), GridColor, 8)) matches++;
+                }
+                gridColumns[localX] = matches >= requiredGridPixels;
+            }
+
+            var centers = new List<int>();
+            int runStart = -1;
+            for (int x = 0; x <= plotWidth; x++) {
+                bool isGrid = x < plotWidth && gridColumns[x];
+                if (isGrid && runStart < 0) runStart = x;
+                if (!isGrid && runStart >= 0) {
+                    centers.Add((runStart + x - 1) / 2);
+                    runStart = -1;
+                }
+            }
+            if (centers.Count < 4) {
+                throw new InvalidOperationException("Fewer than four visible vertical period-grid groups were detected.");
+            }
+
+            int bestStart = -1;
+            int visiblePeriodGridCount = 0;
+            double bestScore = double.PositiveInfinity;
+            foreach (int candidateCount in new[] { 5, 4 }) {
+                if (centers.Count < candidateCount) continue;
+                int candidateIntervals = candidateCount - 1;
+                for (int start = 0; start <= centers.Count - candidateCount; start++) {
+                    double average = (centers[start + candidateIntervals] - centers[start]) / (double)candidateIntervals;
+                    double score = 0;
+                    for (int index = 0; index < candidateIntervals; index++) {
+                        score = Math.Max(score, Math.Abs((centers[start + index + 1] - centers[start + index]) - average));
+                    }
+                    if (score < bestScore) {
+                        bestScore = score;
+                        bestStart = start;
+                        visiblePeriodGridCount = candidateCount;
+                    }
+                }
+            }
+            if (bestStart < 0 || bestScore > 3) {
+                throw new InvalidOperationException(
+                    "Equally spaced period-grid groups were not detected: " + string.Join(",", centers));
+            }
+
+            int periodStart = centers[bestStart];
+            int intervalCount = visiblePeriodGridCount - 1;
+            double periodStep = (centers[bestStart + intervalCount] - periodStart) / (double)intervalCount;
+            int periodEnd = visiblePeriodGridCount == 5
+                ? centers[bestStart + 4]
+                : (int)Math.Round(periodStart + 4 * periodStep);
+            if (periodEnd <= periodStart || periodEnd >= plotWidth) {
+                throw new InvalidOperationException("The inferred period-end grid is outside the plot.");
+            }
+            if (visiblePeriodGridCount == 4) {
+                int endpointEvidence = 0;
+                for (int y = yStart; y < yEnd; y++) {
+                    bool rowMatches = false;
+                    for (int localX = Math.Max(0, periodEnd - 3);
+                        localX <= Math.Min(plotWidth - 1, periodEnd + 3) && !rowMatches;
+                        localX++) {
+                        Color pixel = bitmap.GetPixel(plotLeft + localX, y);
+                        rowMatches = Matches(pixel, GridColor, 8);
+                        for (int series = 0; series < SeriesColors.Length && !rowMatches; series++) {
+                            rowMatches = Matches(pixel, SeriesColors[series], 24);
+                        }
+                    }
+                    if (rowMatches) endpointEvidence++;
+                }
+                if (endpointEvidence < requiredGridPixels) {
+                    throw new InvalidOperationException("The inferred period-end grid has no vertical grid/series evidence.");
+                }
+            }
+            var top = new[] { int.MaxValue, int.MaxValue, int.MaxValue, int.MaxValue };
+            var bottom = new[] { int.MinValue, int.MinValue, int.MinValue, int.MinValue };
+            var count = new int[4];
+            var gutterCount = new int[4];
+            var rightmost = new[] { int.MinValue, int.MinValue, int.MinValue, int.MinValue };
+            for (int localX = 0; localX < plotWidth; localX++) {
+                for (int localY = 0; localY < plotHeight; localY++) {
+                    Color pixel = bitmap.GetPixel(plotLeft + localX, plotTop + localY);
+                    for (int series = 0; series < SeriesColors.Length; series++) {
+                        if (!Matches(pixel, SeriesColors[series], 24)) continue;
+                        count[series]++;
+                        top[series] = Math.Min(top[series], localY);
+                        bottom[series] = Math.Max(bottom[series], localY);
+                        rightmost[series] = Math.Max(rightmost[series], localX);
+                        if (localX > periodEnd) gutterCount[series]++;
+                    }
+                }
+            }
+
+            return new CodexInfoGraphPixelMeasurement {
+                PeriodStartX = periodStart,
+                PeriodEndX = periodEnd,
+                PlotSpan = periodEnd - periodStart,
+                GutterWidth = plotWidth - 1 - periodEnd,
+                GridCenters = centers.ToArray(),
+                SeriesTop = top,
+                SeriesBottom = bottom,
+                SeriesPixelCount = count,
+                SeriesGutterPixelCount = gutterCount,
+                SeriesRightmost = rightmost,
+            };
+        }
+    }
+
+    private static bool Matches(Color actual, Color expected, int tolerance) {
+        return Math.Abs(actual.R - expected.R) <= tolerance &&
+            Math.Abs(actual.G - expected.G) <= tolerance &&
+            Math.Abs(actual.B - expected.B) <= tolerance;
     }
 }
 
@@ -956,6 +1112,151 @@ function Invoke-E2ECaptureSelfTest {
         }
     }
     Write-E2E 'capture-self-test: PASS target, occluding decoy, and invalid/failure cases'
+}
+
+function Set-E2EGraphLogicalSize {
+    param(
+        [Parameter(Mandatory = $true)][IntPtr]$Handle,
+        [Parameter(Mandatory = $true)][int]$LogicalWidth,
+        [Parameter(Mandatory = $true)][int]$LogicalHeight,
+        [Parameter(Mandatory = $true)][double]$Scale
+    )
+
+    $physicalWidth = [int][Math]::Floor(($LogicalWidth * $Scale) + 0.5)
+    $physicalHeight = [int][Math]::Floor(($LogicalHeight * $Scale) + 0.5)
+    $bounds = Get-E2EWindowBounds $Handle
+    $flags = [uint32]0x0016 # SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE
+    Assert-E2E ([CodexInfoWindowsE2EWin32]::SetWindowPos(
+        $Handle, [IntPtr]::Zero, $bounds.Left, $bounds.Top,
+        $physicalWidth, $physicalHeight, $flags)) `
+        "Graph resize to ${LogicalWidth}x${LogicalHeight} logical failed."
+    Wait-E2E -Description "Graph resize ${LogicalWidth}x${LogicalHeight} logical" -Probe {
+        $current = Get-E2EWindowBounds $Handle
+        return $current.Width -eq $physicalWidth -and $current.Height -eq $physicalHeight
+    } | Out-Null
+    Start-Sleep -Milliseconds 300
+}
+
+function Wait-E2EGraphLoadSettled {
+    param([Parameter(Mandatory = $true)][System.Windows.Automation.AutomationElement]$Root)
+
+    Start-Sleep -Milliseconds 300
+    Wait-E2E -Description 'Graph period/metric load settles' -Probe {
+        $progress = @(Get-E2EAllDescendants $Root | Where-Object {
+            $_.Current.ControlType -eq [System.Windows.Automation.ControlType]::ProgressBar -and
+            -not $_.Current.IsOffscreen
+        })
+        return $progress.Count -eq 0
+    } | Out-Null
+}
+
+function Get-E2EGraphMeasurement {
+    param(
+        [Parameter(Mandatory = $true)][psobject]$Capture,
+        [Parameter(Mandatory = $true)][System.Windows.Automation.AutomationElement]$Plot,
+        [Parameter(Mandatory = $true)][IntPtr]$WindowHandle,
+        [Parameter(Mandatory = $true)][string]$Description
+    )
+
+    $windowBounds = Get-E2EWindowBounds $WindowHandle
+    $plotRect = $Plot.Current.BoundingRectangle
+    $plotLeft = [int][Math]::Floor(($plotRect.Left - $windowBounds.Left) + 0.5)
+    $plotTop = [int][Math]::Floor(($plotRect.Top - $windowBounds.Top) + 0.5)
+    $plotWidth = [int][Math]::Floor($plotRect.Width + 0.5)
+    $plotHeight = [int][Math]::Floor($plotRect.Height + 0.5)
+    $measurement = [CodexInfoGraphPixelScanner]::Scan(
+        $Capture.Path, $plotLeft, $plotTop, $plotWidth, $plotHeight)
+    $seriesNames = @('Remaining', 'SOL', 'TERRA', 'LUNA')
+    for ($index = 0; $index -lt $seriesNames.Count; $index++) {
+        Assert-E2E ($measurement.SeriesPixelCount[$index] -gt 0) `
+            "$Description has no visible $($seriesNames[$index]) color pixels."
+        Assert-E2E ($measurement.SeriesGutterPixelCount[$index] -gt 0) `
+            "$Description has no $($seriesNames[$index]) leader/glyph pixels in the endpoint gutter."
+        Assert-E2E ($measurement.SeriesRightmost[$index] -le $plotWidth - 3) `
+            "$Description clips $($seriesNames[$index]) at the right plot edge."
+    }
+    Write-E2E ("graph-resize-measurement: state={0} plot={1}x{2} grids={3} start={4} end={5} span={6} gutter={7}" -f
+        $Description, $plotWidth, $plotHeight, ($measurement.GridCenters -join ','),
+        $measurement.PeriodStartX, $measurement.PeriodEndX,
+        $measurement.PlotSpan, $measurement.GutterWidth)
+    return [pscustomobject]@{
+        Pixels = $measurement
+        PlotBoundsWidth = $plotWidth
+        PlotBoundsHeight = $plotHeight
+    }
+}
+
+function Wait-E2EGraphPixelsReady {
+    param(
+        [Parameter(Mandatory = $true)][System.Windows.Automation.AutomationElement]$Root,
+        [Parameter(Mandatory = $true)][IntPtr]$WindowHandle,
+        [Parameter(Mandatory = $true)][string]$Description
+    )
+
+    return Wait-E2E -Description "$Description rendered graph pixels" -TimeoutSeconds 30 -Probe {
+        $candidatePlot = Find-E2EElementByAutomationId $Root 'Graph.Plot'
+        if ($null -eq $candidatePlot) { return $false }
+        $candidateCapture = Capture-E2EWindow $WindowHandle 'graph-ready-probe'
+        try {
+            return Get-E2EGraphMeasurement -Capture $candidateCapture -Plot $candidatePlot `
+                -WindowHandle $WindowHandle -Description $Description
+        }
+        catch {
+            return $false
+        }
+    }
+}
+
+function Invoke-E2EGraphPixelScannerSelfTest {
+    $validPath = Join-Path $script:e2eOutput 'graph-pixel-scanner-self-test-valid.png'
+    $invalidPath = Join-Path $script:e2eOutput 'graph-pixel-scanner-self-test-invalid.png'
+    $gridColor = [System.Drawing.ColorTranslator]::FromHtml('#263548')
+    $background = [System.Drawing.ColorTranslator]::FromHtml('#101925')
+    $seriesColors = @('#56B2F5', '#A88CF5', '#5DC98A', '#E6A23C') |
+        ForEach-Object { [System.Drawing.ColorTranslator]::FromHtml($_) }
+    foreach ($case in @(
+        @{ Path = $validPath; GridXs = @(10, 50, 90, 130, 170, 230) },
+        @{ Path = $invalidPath; GridXs = @(10, 50, 90, 130) }
+    )) {
+        $bitmap = New-Object System.Drawing.Bitmap(240, 140)
+        $graphics = [System.Drawing.Graphics]::FromImage($bitmap)
+        try {
+            $graphics.Clear($background)
+            $gridPen = New-Object System.Drawing.Pen($gridColor, 1)
+            try {
+                foreach ($x in $case.GridXs) { $graphics.DrawLine($gridPen, $x, 5, $x, 135) }
+            }
+            finally { $gridPen.Dispose() }
+            for ($index = 0; $index -lt $seriesColors.Count; $index++) {
+                $seriesPen = New-Object System.Drawing.Pen($seriesColors[$index], 2)
+                try { $graphics.DrawLine($seriesPen, 175, 30 + ($index * 20), 215, 30 + ($index * 20)) }
+                finally { $seriesPen.Dispose() }
+            }
+            $bitmap.Save($case.Path, [System.Drawing.Imaging.ImageFormat]::Png)
+        }
+        finally {
+            $graphics.Dispose()
+            $bitmap.Dispose()
+        }
+    }
+
+    try {
+        $valid = [CodexInfoGraphPixelScanner]::Scan($validPath, 0, 0, 240, 140)
+        Assert-E2E ($valid.PeriodStartX -eq 10 -and $valid.PeriodEndX -eq 170 -and
+            $valid.PlotSpan -eq 160 -and $valid.GutterWidth -eq 69) `
+            'Graph pixel scanner rejected the valid synthetic geometry.'
+        Assert-E2E (($valid.SeriesGutterPixelCount | Where-Object { $_ -le 0 }).Count -eq 0) `
+            'Graph pixel scanner missed synthetic endpoint colors.'
+        Write-E2E 'graph-pixel-scanner-self-test: PASS valid fixed-gutter geometry'
+        Assert-E2ECaptureExpectedFailure -Name 'graph-grid-negative' -Action {
+            [CodexInfoGraphPixelScanner]::Scan($invalidPath, 0, 0, 240, 140)
+        }
+    }
+    finally {
+        foreach ($path in @($validPath, $invalidPath)) {
+            if (Test-Path -LiteralPath $path -PathType Leaf) { Remove-Item -LiteralPath $path -Force }
+        }
+    }
 }
 
 function Assert-E2EImageChanged {
@@ -2242,6 +2543,7 @@ function Invoke-E2EFixtureContractTests {
     Assert-E2EExpectedContractFailure -Name 'history-sample-minute-bucket' -Health $health -Status $status -Details $minuteMisalignedDetails -ExpectedReason 'minute bucket'
     Invoke-E2EGraphIdleBandSelfTest
     Invoke-E2ECaptureSelfTest
+    Invoke-E2EGraphPixelScannerSelfTest
     Invoke-E2EGraphOracleSelfTest
     Write-E2E 'fixture-contract: PASS five negative cases rejected individually'
 }
@@ -2426,6 +2728,7 @@ try {
     $graph = Open-E2EChildWindow -MainRoot $mainRoot -ButtonName 'Graph' -ButtonAutomationId 'Main.OpenGraph' -Title 'Codex Info Graph' -Role 'Graph' -ProcessId $clientPid
     $graphRoot = $graph.Root
     Assert-E2ENoChildProductVersion $graphRoot 'Graph'
+    Wait-E2EGraphLoadSettled $graphRoot
     $plot = Wait-E2E -Description 'Graph plot' -Probe {
         $candidate = Find-E2EElementByAutomationId $graphRoot 'Graph.Plot'
         if ($null -eq $candidate) { return $false }
@@ -2433,7 +2736,16 @@ try {
         if ($candidate.Current.IsOffscreen -or $rect.Width -le 0 -or $rect.Height -le 0) { return $false }
         return $candidate
     }
+    $null = Wait-E2EGraphPixelsReady -Root $graphRoot -WindowHandle $graph.Handle -Description 'initial-current'
     Write-E2E ("graph: plot bounds={0}x{1}" -f $plot.Current.BoundingRectangle.Width, $plot.Current.BoundingRectangle.Height)
+    $initialGraphBounds = Get-E2EWindowBounds $graph.Handle
+    $graphScaleX = $initialGraphBounds.Width / 940.0
+    $graphScaleY = $initialGraphBounds.Height / 640.0
+    Assert-E2E ([Math]::Abs($graphScaleX - $graphScaleY) -le 0.02) `
+        "Graph initial window does not map 940x640 logical through one DPI scale: x=$graphScaleX y=$graphScaleY."
+    $graphScale = ($graphScaleX + $graphScaleY) / 2
+    Write-E2E ("graph: dpi-scale={0:N3} initial-physical={1}x{2}" -f
+        $graphScale, $initialGraphBounds.Width, $initialGraphBounds.Height)
     $periodSelector = Find-E2EElementByAutomationId $graphRoot 'Graph.PeriodSelector'
     $metricSelector = Find-E2EElementByAutomationId $graphRoot 'Graph.MetricSelector'
     Assert-E2E ($null -ne $periodSelector -and $null -ne $metricSelector) 'Graph selectors are missing.'
@@ -2460,6 +2772,8 @@ try {
     Assert-E2E (-not [string]::IsNullOrWhiteSpace($pastLabel)) 'Past period option is missing.'
     Select-E2EListItem $graphRoot $pastLabel
     Wait-E2ESelectorLabel $graphRoot 'Graph.PeriodSelector' $pastLabel
+    Wait-E2EGraphLoadSettled $graphRoot
+    $null = Wait-E2EGraphPixelsReady -Root $graphRoot -WindowHandle $graph.Handle -Description 'past-period'
     $graphPast = Capture-E2EWindow $graph.Handle '03-graph-past'
     Assert-E2EImageChanged $graphCurrent $graphPast 'Current-to-past period selection'
     if ($Fixture -or $script:e2ePreviewEnabled) {
@@ -2473,6 +2787,8 @@ try {
     Toggle-E2EElement $periodSelector
     Select-E2EListItem $graphRoot $currentLabel
     Wait-E2ESelectorLabel $graphRoot 'Graph.PeriodSelector' $currentLabel
+    Wait-E2EGraphLoadSettled $graphRoot
+    $null = Wait-E2EGraphPixelsReady -Root $graphRoot -WindowHandle $graph.Handle -Description 'current-period-restored'
     $graphCurrentAgain = Capture-E2EWindow $graph.Handle '04-graph-current-again'
     Assert-E2EImageChanged $graphPast $graphCurrentAgain 'Past-to-current period selection'
 
@@ -2496,6 +2812,8 @@ try {
     Assert-E2E (-not [string]::IsNullOrWhiteSpace($otherMetric)) 'Second metric option is missing.'
     Select-E2EListItem $graphRoot $otherMetric
     Wait-E2ESelectorLabel $graphRoot 'Graph.MetricSelector' $otherMetric
+    Wait-E2EGraphLoadSettled $graphRoot
+    $null = Wait-E2EGraphPixelsReady -Root $graphRoot -WindowHandle $graph.Handle -Description 'other-metric'
     Wait-E2E -Description "axis for metric '$otherMetric'" -Probe {
         $texts = Get-E2ETextValues $graphRoot
         if ($texts -contains $otherMetric -or ($texts -join ' ') -like "*$otherMetric*") { return $true }
@@ -2508,10 +2826,102 @@ try {
     Toggle-E2EElement $metricSelector
     Select-E2EListItem $graphRoot $initialMetric
     Wait-E2ESelectorLabel $graphRoot 'Graph.MetricSelector' $initialMetric
+    Wait-E2EGraphLoadSettled $graphRoot
+    $null = Wait-E2EGraphPixelsReady -Root $graphRoot -WindowHandle $graph.Handle -Description 'initial-metric-restored'
     $graphInitialMetricAgain = Capture-E2EWindow $graph.Handle '06-graph-initial-metric'
     Assert-E2EImageChanged $graphOtherMetric $graphInitialMetricAgain "Metric selection '$initialMetric'"
 
-    Write-E2E 'case-4: each series toggle OFF then ON exactly once'
+    Write-E2E 'case-4: fixed endpoint gutter across finite horizontal resize states'
+    $allMetricMeasurements = @{}
+    $resizeMetricLabels = @($initialMetric, $otherMetric)
+    for ($metricIndex = 0; $metricIndex -lt $resizeMetricLabels.Count; $metricIndex++) {
+        $metricLabel = $resizeMetricLabels[$metricIndex]
+        # Localized labels can both sanitize to the same ASCII filename.
+        # Prefix the stable selector order so evidence from one metric never
+        # overwrites the other metric's captures.
+        $metricKey = "metric-$metricIndex-" + ($metricLabel -replace '[^A-Za-z0-9_.-]', '_')
+        $currentMetricLabel = Get-E2ESelectorLabel (Find-E2EElementByAutomationId $graphRoot 'Graph.MetricSelector')
+        if ($currentMetricLabel -ne $metricLabel -and -not $currentMetricLabel.Contains($metricLabel)) {
+            Toggle-E2EElement (Find-E2EElementByAutomationId $graphRoot 'Graph.MetricSelector')
+            Select-E2EListItem $graphRoot $metricLabel
+            Wait-E2ESelectorLabel $graphRoot 'Graph.MetricSelector' $metricLabel
+            Wait-E2EGraphLoadSettled $graphRoot
+            $null = Wait-E2EGraphPixelsReady -Root $graphRoot -WindowHandle $graph.Handle -Description "metric-$metricKey"
+        }
+
+        $measurements = @{}
+        foreach ($resizeState in @(
+            @{ Name = '700x640'; Width = 700; Height = 640 },
+            @{ Name = '940x640'; Width = 940; Height = 640 },
+            @{ Name = '1360x640'; Width = 1360; Height = 640 },
+            @{ Name = 'restore-940x640'; Width = 940; Height = 640 },
+            @{ Name = '700x480'; Width = 700; Height = 480 }
+        )) {
+            Set-E2EGraphLogicalSize -Handle $graph.Handle `
+                -LogicalWidth $resizeState.Width -LogicalHeight $resizeState.Height -Scale $graphScale
+            $graphRoot = Get-E2EUiaRoot $graph.Handle
+            $plot = Wait-E2E -Description "Graph plot at $($resizeState.Name)" -Probe {
+                $candidate = Find-E2EElementByAutomationId $graphRoot 'Graph.Plot'
+                if ($null -eq $candidate -or $candidate.Current.IsOffscreen) { return $false }
+                if ($candidate.Current.BoundingRectangle.Width -le 0 -or $candidate.Current.BoundingRectangle.Height -le 0) { return $false }
+                return $candidate
+            }
+            $description = "$metricKey-$($resizeState.Name)"
+            $capture = Capture-E2EWindow $graph.Handle ("resize-{0}" -f $description)
+            $measurements[$resizeState.Name] = Get-E2EGraphMeasurement `
+                -Capture $capture -Plot $plot -WindowHandle $graph.Handle -Description $description
+        }
+
+        $target = $measurements['940x640']
+        foreach ($stateName in @('700x640', '940x640', '1360x640', '700x480')) {
+            $actual = $measurements[$stateName]
+            Assert-E2E ([Math]::Abs($actual.Pixels.GutterWidth - $target.Pixels.GutterWidth) -le 2) `
+                "$metricLabel endpoint gutter changed at ${stateName}: target=$($target.Pixels.GutterWidth) actual=$($actual.Pixels.GutterWidth)."
+        }
+        Assert-E2E ($measurements['700x640'].Pixels.PlotSpan -lt $target.Pixels.PlotSpan -and
+            $target.Pixels.PlotSpan -lt $measurements['1360x640'].Pixels.PlotSpan) `
+            "$metricLabel plot span did not grow monotonically with same-height window width."
+        foreach ($pair in @(
+            @($measurements['700x640'], $target),
+            @($target, $measurements['1360x640'])
+        )) {
+            $spanIncrease = $pair[1].Pixels.PlotSpan - $pair[0].Pixels.PlotSpan
+            $uiaWidthIncrease = $pair[1].PlotBoundsWidth - $pair[0].PlotBoundsWidth
+            Assert-E2E ([Math]::Abs($spanIncrease - $uiaWidthIncrease) -le 3) `
+                "$metricLabel plot span increase $spanIncrease does not match Graph.Plot width increase $uiaWidthIncrease."
+        }
+        foreach ($sameHeightState in @('700x640', '1360x640')) {
+            for ($seriesIndex = 0; $seriesIndex -lt 4; $seriesIndex++) {
+                Assert-E2E ([Math]::Abs(
+                    $measurements[$sameHeightState].Pixels.SeriesTop[$seriesIndex] -
+                    $target.Pixels.SeriesTop[$seriesIndex]) -le 2) `
+                    "$metricLabel series $seriesIndex top changed at $sameHeightState."
+                Assert-E2E ([Math]::Abs(
+                    $measurements[$sameHeightState].Pixels.SeriesBottom[$seriesIndex] -
+                    $target.Pixels.SeriesBottom[$seriesIndex]) -le 2) `
+                    "$metricLabel series $seriesIndex bottom changed at $sameHeightState."
+            }
+        }
+        $restored = $measurements['restore-940x640']
+        Assert-E2E ([Math]::Abs($restored.Pixels.GutterWidth - $target.Pixels.GutterWidth) -le 2 -and
+            [Math]::Abs($restored.Pixels.PlotSpan - $target.Pixels.PlotSpan) -le 2) `
+            "$metricLabel did not restore its 940x640 gutter/plot span after 1360x640."
+        Write-E2E ("graph-resize: PASS metric={0} gutter={1}px states=700x640,940x640,1360x640,700x480 restore=PASS" -f
+            $metricLabel, $target.Pixels.GutterWidth)
+        $allMetricMeasurements[$metricLabel] = $measurements
+    }
+
+    Set-E2EGraphLogicalSize -Handle $graph.Handle -LogicalWidth 940 -LogicalHeight 640 -Scale $graphScale
+    $graphRoot = Get-E2EUiaRoot $graph.Handle
+    $currentMetricLabel = Get-E2ESelectorLabel (Find-E2EElementByAutomationId $graphRoot 'Graph.MetricSelector')
+    if ($currentMetricLabel -ne $initialMetric -and -not $currentMetricLabel.Contains($initialMetric)) {
+        Toggle-E2EElement (Find-E2EElementByAutomationId $graphRoot 'Graph.MetricSelector')
+        Select-E2EListItem $graphRoot $initialMetric
+        Wait-E2ESelectorLabel $graphRoot 'Graph.MetricSelector' $initialMetric
+        Wait-E2EGraphLoadSettled $graphRoot
+    }
+
+    Write-E2E 'case-5: each series toggle OFF then ON exactly once'
     $toggleCases = @(
         @{ Id = 'Graph.Toggle.Remaining'; Name = 'Remaining' },
         @{ Id = 'Graph.Toggle.LUNA'; Name = 'LUNA' },

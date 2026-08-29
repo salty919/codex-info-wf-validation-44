@@ -14,7 +14,7 @@ Linux / WSL のネイティブ UI は Slint の宣言的コンポーネントで
 
 Windows版は次の依存方向を固定する。`Core`はREST契約の取得・検証、`Settings`は永続化と現行設定generation、`ViewModels`は状態遷移と表示意味論、`Graphing`は軸・tick・endpoint等の純粋計算を所有する。`Infrastructure`、`*.axaml`、`*.axaml.cs`、`Controls`はOS process、入力、描画を上位ロジックへ接着するadapterに限定し、設定保存、setup完了判定、graph座標・ラベル配置の独自計算を持たない。単体テストは前者を、binding・DPI・window lifecycle・実process・実描画は同一Windows成果物のE2Eを合格根拠とする。
 
-Windowsグラフの表示正本はX版の意味論と`Graphing`の純粋projectionである。0値と最大値は描画域の1%/99%へ置き、右端には系列線とは別のendpoint label gutterを確保する。モデル系列は停滞1px・増加3pxへ分離し、初回観測前を斜線で推測しない。最小plot幅で1px未満になるidle帯は描かず、ScottPlotの高密度`SignalXY`列集約は使用しない。adapterはprojection済み`Scatter`、限定grid、leader、labelを適用するだけとする。
+Windowsグラフの表示正本はX版の意味論と`Graphing`の純粋projectionである。0値と最大値は描画域の1%/99%へ置き、右端には系列線とは別のendpoint label gutterを確保する。gutterの物理幅は初期940×640 logical表示時の値をドル／トークンごとに保持し、横リサイズで増減する幅はplotへ割り当てる。モデル系列は停滞1px・増加3pxへ分離し、初回観測前を斜線で推測しない。最小plot幅で1px未満になるidle帯は描かず、ScottPlotの高密度`SignalXY`列集約は使用しない。adapterはprojection済み`Scatter`、限定grid、leader、labelを適用するだけとする。
 
 余白・色・文字サイズを変更する場合は`theme.slint`の値を変更する。部品の配置を変更する場合は`app.slint`のレイアウト構造を変更し、Rustに座標値を追加しない。
 
