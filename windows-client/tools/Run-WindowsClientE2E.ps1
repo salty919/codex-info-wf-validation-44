@@ -111,7 +111,13 @@ Add-Type -AssemblyName UIAutomationClient
 Add-Type -AssemblyName UIAutomationTypes
 Add-Type -AssemblyName System.Drawing
 
-Add-Type -ReferencedAssemblies System.Drawing -TypeDefinition @'
+$drawingReferences = @(
+    [System.Drawing.Bitmap].Assembly.Location
+    [System.Drawing.Color].Assembly.Location
+) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -Unique
+Assert-E2E ($drawingReferences.Count -gt 0) 'System.Drawing runtime assemblies could not be resolved.'
+
+Add-Type -ReferencedAssemblies $drawingReferences -TypeDefinition @'
 using System;
 using System.Drawing;
 using System.Collections.Generic;
