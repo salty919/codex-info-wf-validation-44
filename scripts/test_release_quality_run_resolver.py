@@ -60,6 +60,23 @@ def acceptance_check() -> dict[str, Any]:
     }
 
 
+def native_acceptance_check(check_id: int, run_id: int) -> dict[str, Any]:
+    """Model the same-name job checks observed on failed PR #46."""
+
+    return {
+        "id": check_id,
+        "name": "acceptance",
+        "head_sha": HEAD_SHA,
+        "status": "completed",
+        "conclusion": "skipped",
+        "external_id": f"00000000-0000-0000-0000-{check_id:012d}",
+        "details_url": (
+            f"https://github.com/{REPOSITORY}/actions/runs/{run_id}/job/{check_id}"
+        ),
+        "app": {"id": resolver.GITHUB_ACTIONS_APP_ID},
+    }
+
+
 def check_runs(*runs: dict[str, Any]) -> dict[str, Any]:
     selected = list(runs) if runs else [acceptance_check()]
     return {"total_count": len(selected), "check_runs": selected}
@@ -105,6 +122,41 @@ class ReleaseQualityRunResolverTests(unittest.TestCase):
         self.assertEqual(
             resolver.resolve_quality_run_id(event(), pull_request(), pages), RUN_ID
         )
+
+    def test_ignores_native_same_name_job_checks_from_premerge_and_closed_runs(
+        self,
+    ) -> None:
+        observed_premerge = native_acceptance_check(99103608680, 33253681960)
+        observed_closed = native_acceptance_check(99103726774, 33253725121)
+        checks = check_runs(observed_closed, observed_premerge, acceptance_check())
+
+        self.assertEqual(
+            resolver.resolve_quality_run_id(event(), pull_request(), checks), RUN_ID
+        )
+        self.assertEqual(
+            resolver.verify_quality_run(event(), pull_request(), checks, workflow_run()),
+            RUN_ID,
+        )
+
+    def test_native_same_name_job_checks_are_not_release_authority(self) -> None:
+        checks = check_runs(
+            native_acceptance_check(99103726774, 33253725121),
+            native_acceptance_check(99103608680, 33253681960),
+        )
+        with self.assertRaisesRegex(
+            resolver.ResolutionError, "final-head acceptance check, found 0"
+        ):
+            resolver.resolve_quality_run_id(event(), pull_request(), checks)
+
+    def test_rejects_malformed_reserved_external_identity(self) -> None:
+        malformed = native_acceptance_check(123, 456)
+        malformed["external_id"] = "codex-quality-v1:malformed"
+        with self.assertRaisesRegex(
+            resolver.ResolutionError, "external_id is malformed"
+        ):
+            resolver.resolve_quality_run_id(
+                event(), pull_request(), check_runs(malformed, acceptance_check())
+            )
 
     def test_rejects_duplicate_or_missing_actions_acceptance(self) -> None:
         for runs in (
