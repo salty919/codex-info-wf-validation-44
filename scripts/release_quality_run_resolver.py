@@ -1,11 +1,5 @@
 #!/usr/bin/env python3
-"""Resolve the latest unique accepted workflow-dispatch quality run.
-
-The release workflow obtains the three JSON documents from GitHub and calls
-this module as the sole identity resolver.  In particular, pull_requests on a
-workflow run is deliberately not consulted: GitHub can omit it after a pull
-request is merged.
-"""
+"""Resolve and verify the trusted workflow run bound to final-head acceptance."""
 
 from __future__ import annotations
 
@@ -17,18 +11,17 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-
+GITHUB_ACTIONS_APP_ID = 15368
 SHA_PATTERN = re.compile(r"^[0-9a-f]{40}$")
 REPOSITORY_PATTERN = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
-RFC3339_PATTERN = re.compile(
-    r"^(?P<date>\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})"
-    r"(?P<fraction>\.\d+)?(?P<timezone>Z|[+-]\d{2}:\d{2})$"
+EXTERNAL_ID_PATTERN = re.compile(
+    r"^codex-quality-v1:pr=(?P<pr>[1-9][0-9]*):"
+    r"head=(?P<head>[0-9a-f]{40}):run=(?P<run>[1-9][0-9]*)$"
 )
-MISSING = object()
 
 
 class ResolutionError(ValueError):
-    """Raised when release-run evidence is missing or inconsistent."""
+    """Raised when accepted-run evidence is missing or inconsistent."""
 
 
 def _required(value: Any, key: str, path: str) -> Any:
@@ -37,8 +30,8 @@ def _required(value: Any, key: str, path: str) -> Any:
     return value[key]
 
 
-def _string(value: Any, path: str) -> str:
-    if not isinstance(value, str) or not value:
+def _positive_integer(value: Any, path: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
         raise ResolutionError(f"invalid {path}")
     return value
 
@@ -49,407 +42,220 @@ def _sha(value: Any, path: str) -> str:
     return value
 
 
-def _positive_integer(value: Any, path: str) -> int:
-    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+def _repository(value: Any, path: str) -> str:
+    if not isinstance(value, str) or REPOSITORY_PATTERN.fullmatch(value) is None:
         raise ResolutionError(f"invalid {path}")
     return value
 
 
-def _nonnegative_integer(value: Any, path: str) -> int:
-    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
-        raise ResolutionError(f"invalid {path}")
-    return value
-
-
-def _rfc3339(value: Any, path: str) -> datetime:
-    if not isinstance(value, str):
-        raise ResolutionError(f"invalid {path}")
-    match = RFC3339_PATTERN.fullmatch(value)
-    if match is None or match.group("timezone") == "-00:00":
+def _timestamp(value: Any, path: str) -> datetime:
+    if not isinstance(value, str) or not value:
         raise ResolutionError(f"invalid {path}")
     normalized = value[:-1] + "+00:00" if value.endswith("Z") else value
     try:
-        parsed = datetime.fromisoformat(normalized)
-    except ValueError as exc:
-        raise ResolutionError(f"invalid {path}") from exc
-    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        result = datetime.fromisoformat(normalized)
+    except ValueError as error:
+        raise ResolutionError(f"invalid {path}") from error
+    if result.tzinfo is None or result.utcoffset() is None:
         raise ResolutionError(f"invalid {path}")
-    return parsed
+    return result
 
 
-def _repository(value: Any, path: str) -> tuple[int, str]:
-    if not isinstance(value, dict):
-        raise ResolutionError(f"invalid {path}")
-    repository_id = _positive_integer(_required(value, "id", path), f"{path}.id")
-    full_name = _string(_required(value, "full_name", path), f"{path}.full_name")
-    if REPOSITORY_PATTERN.fullmatch(full_name) is None:
-        raise ResolutionError(f"invalid {path}.full_name")
-    return repository_id, full_name
-
-
-def _pull_request_identity(
-    value: Any, path: str
-) -> tuple[
-    int,
-    str,
-    str,
-    tuple[int, str],
-    str,
-    str,
-    tuple[int, str],
-    str,
-    datetime,
-]:
-    if not isinstance(value, dict):
-        raise ResolutionError(f"invalid {path}")
+def _pull_request_identity(value: Any, path: str) -> tuple[Any, ...]:
     number = _positive_integer(_required(value, "number", path), f"{path}.number")
     head = _required(value, "head", path)
     base = _required(value, "base", path)
-    if not isinstance(head, dict) or not isinstance(base, dict):
-        raise ResolutionError(f"invalid {path}.head/base")
-    head_sha = _sha(_required(head, "sha", f"{path}.head"), f"{path}.head.sha")
-    head_ref = _string(_required(head, "ref", f"{path}.head"), f"{path}.head.ref")
-    head_repository = _repository(
-        _required(head, "repo", f"{path}.head"), f"{path}.head.repo"
-    )
-    base_ref = _string(_required(base, "ref", f"{path}.base"), f"{path}.base.ref")
-    base_sha = _sha(_required(base, "sha", f"{path}.base"), f"{path}.base.sha")
-    base_repository = _repository(
-        _required(base, "repo", f"{path}.base"), f"{path}.base.repo"
-    )
-    merge_sha = _sha(
-        _required(value, "merge_commit_sha", path), f"{path}.merge_commit_sha"
-    )
-    merged_at = _rfc3339(_required(value, "merged_at", path), f"{path}.merged_at")
+    head_repo = _required(head, "repo", f"{path}.head")
+    base_repo = _required(base, "repo", f"{path}.base")
     return (
         number,
-        head_sha,
-        head_ref,
-        head_repository,
-        base_ref,
-        base_sha,
-        base_repository,
-        merge_sha,
-        merged_at,
+        _sha(_required(head, "sha", f"{path}.head"), f"{path}.head.sha"),
+        _required(head, "ref", f"{path}.head"),
+        _repository(
+            _required(head_repo, "full_name", f"{path}.head.repo"),
+            f"{path}.head.repo.full_name",
+        ),
+        _sha(_required(base, "sha", f"{path}.base"), f"{path}.base.sha"),
+        _required(base, "ref", f"{path}.base"),
+        _repository(
+            _required(base_repo, "full_name", f"{path}.base.repo"),
+            f"{path}.base.repo.full_name",
+        ),
+        _sha(_required(value, "merge_commit_sha", path), f"{path}.merge_commit_sha"),
+        _timestamp(_required(value, "merged_at", path), f"{path}.merged_at"),
     )
 
 
-def _event_identity(
-    event: Any,
-) -> tuple[
-    int,
-    str,
-    str,
-    tuple[int, str],
-    str,
-    str,
-    tuple[int, str],
-    str,
-    datetime,
-]:
-    if not isinstance(event, dict):
-        raise ResolutionError("invalid event")
+def validate_merged_identity(event: Any, pull_request: Any) -> tuple[Any, ...]:
     if _required(event, "action", "event") != "closed":
         raise ResolutionError("event action is not closed")
     event_pr = _required(event, "pull_request", "event")
     if _required(event_pr, "merged", "event.pull_request") is not True:
         raise ResolutionError("event pull request is not merged")
-    identity = _pull_request_identity(event_pr, "event.pull_request")
-    event_repository = _repository(
-        _required(event, "repository", "event"), "event.repository"
-    )
-    if event_repository != identity[6]:
-        raise ResolutionError("event repository does not match pull-request base")
-    return identity
-
-
-def _api_pull_request_identity(
-    pull_request: Any,
-) -> tuple[
-    int,
-    str,
-    str,
-    tuple[int, str],
-    str,
-    str,
-    tuple[int, str],
-    str,
-    datetime,
-]:
-    if not isinstance(pull_request, dict):
-        raise ResolutionError("invalid pull-request response")
-    if pull_request.get("merged") is not True:
+    if _required(pull_request, "merged", "pull_request") is not True:
         raise ResolutionError("pull-request response is not merged")
-    return _pull_request_identity(pull_request, "pull_request")
+    event_identity = _pull_request_identity(event_pr, "event.pull_request")
+    api_identity = _pull_request_identity(pull_request, "pull_request")
+    if event_identity != api_identity:
+        raise ResolutionError("pull-request identity does not match event")
+    event_repository = _required(event, "repository", "event")
+    repository = _repository(
+        _required(event_repository, "full_name", "event.repository"),
+        "event.repository.full_name",
+    )
+    if (
+        repository != event_identity[6]
+        or event_identity[2] != "feat/next"
+        or event_identity[3] != repository
+        or event_identity[5] != "main"
+    ):
+        raise ResolutionError("merged identity is outside feat/next to main")
+    return event_identity
 
 
-def _workflow_runs(value: Any) -> list[Any]:
-    if isinstance(value, dict):
-        pages = [value]
-    elif isinstance(value, list):
-        pages = value
-    else:
-        raise ResolutionError("invalid workflow-runs response")
+def _flatten_check_runs(value: Any) -> list[Any]:
+    pages = value if isinstance(value, list) else [value]
     if not pages:
-        raise ResolutionError("invalid workflow-runs response")
-
-    runs: list[Any] = []
+        raise ResolutionError("check-runs response is empty")
+    result: list[Any] = []
     total_count: int | None = None
     for index, page in enumerate(pages):
-        page_path = "workflow-runs" if len(pages) == 1 else f"workflow-runs page {index}"
-        if not isinstance(page, dict):
-            raise ResolutionError(f"invalid {page_path}")
-        page_runs = _required(page, "workflow_runs", page_path)
-        if not isinstance(page_runs, list):
-            raise ResolutionError(f"invalid {page_path}.workflow_runs")
-        page_total_count = _nonnegative_integer(
-            _required(page, "total_count", page_path), f"{page_path}.total_count"
-        )
+        path = f"check-runs[{index}]"
+        runs = _required(page, "check_runs", path)
+        if not isinstance(runs, list):
+            raise ResolutionError(f"invalid {path}.check_runs")
+        count = _required(page, "total_count", path)
+        if isinstance(count, bool) or not isinstance(count, int) or count < 0:
+            raise ResolutionError(f"invalid {path}.total_count")
         if total_count is None:
-            total_count = page_total_count
-        elif page_total_count != total_count:
-            raise ResolutionError("workflow-runs total_count mismatch across pages")
-        runs.extend(page_runs)
-
-    assert total_count is not None
-    if total_count != len(runs):
-        raise ResolutionError(
-            "workflow-runs total_count does not match flattened run count"
-        )
-    return runs
+            total_count = count
+        elif total_count != count:
+            raise ResolutionError("check-run total_count differs across pages")
+        result.extend(runs)
+    if total_count != len(result):
+        raise ResolutionError("check-run response is incomplete")
+    return result
 
 
-def _workflow_run_identity(
-    run: Any,
-) -> tuple[
-    str,
-    str,
-    str,
-    str,
-    str,
-    tuple[int, str],
-    tuple[int, str],
-    tuple[tuple[str, str, str], ...],
-]:
-    if not isinstance(run, dict):
-        raise ResolutionError("invalid workflow run")
-    path = _string(_required(run, "path", "workflow_run"), "workflow_run.path")
-    event = _string(_required(run, "event", "workflow_run"), "workflow_run.event")
-    head_sha = _sha(
-        _required(run, "head_sha", "workflow_run"), "workflow_run.head_sha"
-    )
-    head_commit = run.get("head_commit")
-    if not isinstance(head_commit, dict):
-        raise ResolutionError("invalid workflow_run.head_commit")
-    head_commit_id = _sha(
-        _required(head_commit, "id", "workflow_run.head_commit"),
-        "workflow_run.head_commit.id",
-    )
-    head_branch = _string(
-        _required(run, "head_branch", "workflow_run"), "workflow_run.head_branch"
-    )
-    head_repository = _repository(
-        _required(run, "head_repository", "workflow_run"),
-        "workflow_run.head_repository",
-    )
-    base_repository = _repository(
-        _required(run, "repository", "workflow_run"), "workflow_run.repository"
-    )
-    referenced_workflows = run.get("referenced_workflows", MISSING)
-    if not isinstance(referenced_workflows, list) or len(referenced_workflows) != 2:
-        raise ResolutionError("workflow run referenced workflow cardinality mismatch")
-    references: list[tuple[str, str, str]] = []
-    for index, referenced_workflow in enumerate(referenced_workflows):
-        label = f"referenced_workflows[{index}]"
-        if not isinstance(referenced_workflow, dict):
-            raise ResolutionError(f"invalid {label}")
-        references.append(
-            (
-                _sha(
-                    _required(referenced_workflow, "sha", label),
-                    f"{label}.sha",
-                ),
-                _string(
-                    _required(referenced_workflow, "ref", label),
-                    f"{label}.ref",
-                ),
-                _string(
-                    _required(referenced_workflow, "path", label),
-                    f"{label}.path",
-                ),
-            )
-        )
-    references.sort(key=lambda reference: reference[2])
-    return (
-        path,
-        event,
-        head_sha,
-        head_commit_id,
-        head_branch,
-        head_repository,
-        base_repository,
-        tuple(references),
-    )
+def resolve_quality_run_id(event: Any, pull_request: Any, check_runs: Any) -> int:
+    """Return the unique run ID named by successful H1 acceptance."""
 
-
-def _workflow_run_matches(
-    identity: tuple[
-        str,
-        str,
-        str,
-        str,
-        str,
-        tuple[int, str],
-        tuple[int, str],
-        tuple[tuple[str, str, str], ...],
-    ],
-    expected: tuple[
-        int,
-        str,
-        str,
-        tuple[int, str],
-        str,
-        str,
-        tuple[int, str],
-        str,
-        datetime,
-    ],
-) -> bool:
-    (
-        path,
-        event,
-        head_sha,
-        head_commit_id,
-        head_branch,
-        head_repository,
-        base_repository,
-        references,
-    ) = identity
-    (
-        _number,
-        expected_head_sha,
-        expected_head_ref,
-        expected_head_repository,
-        _base_ref,
-        _base_sha,
-        expected_base_repository,
-        _merge_sha,
-        _merged_at,
-    ) = expected
-    expected_ref = f"refs/heads/{expected_head_ref}"
-    referenced_shas = {sha for sha, _ref, _path in references}
-    if referenced_shas != {expected_head_sha}:
-        return False
-    expected_references = {
-        (
-            expected_head_sha,
-            expected_ref,
-            f"{expected_base_repository[1]}/.github/workflows/{workflow}@{expected_head_sha}",
-        )
-        for workflow in ("codeql.yml", "rust.yml")
-    }
-    return (
-        path == ".github/workflows/windows-client.yml"
-        and event == "workflow_dispatch"
-        and head_sha == expected_head_sha
-        and head_commit_id == expected_head_sha
-        and head_branch == expected_head_ref
-        and head_repository == expected_head_repository
-        and base_repository == expected_base_repository
-        and set(references) == expected_references
-    )
-
-
-def _workflow_run_metadata(
-    run: Any,
-) -> tuple[int, int, int, datetime, datetime]:
-    if not isinstance(run, dict):
-        raise ResolutionError("invalid workflow run")
-    run_id = _positive_integer(_required(run, "id", "workflow_run"), "workflow_run.id")
-    run_number = _positive_integer(
-        _required(run, "run_number", "workflow_run"), "workflow_run.run_number"
-    )
-    run_attempt = _positive_integer(
-        _required(run, "run_attempt", "workflow_run"), "workflow_run.run_attempt"
-    )
-    created_at = _rfc3339(
-        _required(run, "created_at", "workflow_run"), "workflow_run.created_at"
-    )
-    updated_at = _rfc3339(
-        _required(run, "updated_at", "workflow_run"), "workflow_run.updated_at"
-    )
-    return run_id, run_number, run_attempt, created_at, updated_at
-
-
-def resolve_quality_run(event: Any, pull_request: Any, workflow_runs: Any) -> int:
-    """Return the latest exact pre-merge successful run ID."""
-
-    event_identity = _event_identity(event)
-    api_identity = _api_pull_request_identity(pull_request)
-    if api_identity != event_identity:
-        raise ResolutionError("pull-request identity does not match event")
-
-    runs = _workflow_runs(workflow_runs)
-    if any(not isinstance(run, dict) for run in runs):
-        raise ResolutionError("invalid workflow run")
-    matching_runs: list[tuple[Any, tuple[int, int, int, datetime, datetime]]] = []
-    for run in runs:
+    identity = validate_merged_identity(event, pull_request)
+    pr_number, head_sha = identity[0], identity[1]
+    exact: list[Any] = []
+    for run in _flatten_check_runs(check_runs):
         if not isinstance(run, dict):
-            raise ResolutionError("invalid workflow run")
-        identity = _workflow_run_identity(run)
-        if not _workflow_run_matches(identity, event_identity):
-            continue
-        metadata = _workflow_run_metadata(run)
-        _, _, _, created_at, updated_at = metadata
-        merged_at = event_identity[-1]
-        if not (created_at <= updated_at <= merged_at):
-            raise ResolutionError(
-                "exact workflow run timestamps are not ordered before pull-request merge"
-            )
-        matching_runs.append((run, metadata))
-
-    if not matching_runs:
-        raise ResolutionError("expected at least one exact workflow run, found 0")
-
-    max_run_number = max(metadata[1] for _, metadata in matching_runs)
-    latest_runs = [
-        item for item in matching_runs if item[1][1] == max_run_number
-    ]
-    if len(latest_runs) != 1:
+            raise ResolutionError("invalid check run")
+        app = _required(run, "app", "check_run")
+        if (
+            run.get("name") == "acceptance"
+            and run.get("head_sha") == head_sha
+            and _required(app, "id", "check_run.app") == GITHUB_ACTIONS_APP_ID
+        ):
+            exact.append(run)
+    if len(exact) != 1:
         raise ResolutionError(
-            "expected exactly one exact workflow run at maximum run_number, "
-            f"found {len(latest_runs)}"
+            f"expected exactly one GitHub Actions acceptance check, found {len(exact)}"
         )
+    accepted = exact[0]
+    if accepted.get("status") != "completed" or accepted.get("conclusion") != "success":
+        raise ResolutionError("final-head acceptance check is not successful")
+    external_id = accepted.get("external_id")
+    match = (
+        EXTERNAL_ID_PATTERN.fullmatch(external_id)
+        if isinstance(external_id, str)
+        else None
+    )
+    if match is None:
+        raise ResolutionError("final-head acceptance external_id is malformed")
+    if (int(match.group("pr")), match.group("head")) != (pr_number, head_sha):
+        raise ResolutionError("final-head acceptance belongs to another candidate")
+    run_id = int(match.group("run"))
+    expected_url = f"https://github.com/{identity[6]}/actions/runs/{run_id}"
+    if accepted.get("details_url") != expected_url:
+        raise ResolutionError(
+            "final-head acceptance details URL does not match its run"
+        )
+    return run_id
 
-    latest_run, metadata = latest_runs[0]
-    if latest_run.get("status") != "completed":
-        raise ResolutionError("latest exact workflow run is not completed")
-    if latest_run.get("conclusion") != "success":
-        raise ResolutionError("latest exact workflow run is not successful")
-    return metadata[0]
+
+def verify_quality_run(
+    event: Any, pull_request: Any, check_runs: Any, workflow_run: Any
+) -> int:
+    """Verify that the selected run is the successful trusted main authority."""
+
+    identity = validate_merged_identity(event, pull_request)
+    run_id = resolve_quality_run_id(event, pull_request, check_runs)
+    repository = identity[6]
+    workflow_repository = _required(workflow_run, "repository", "workflow_run")
+    if (
+        _positive_integer(
+            _required(workflow_run, "id", "workflow_run"), "workflow_run.id"
+        )
+        != run_id
+    ):
+        raise ResolutionError("workflow run ID does not match acceptance")
+    if (
+        workflow_run.get("path") != ".github/workflows/version-prepare.yml"
+        or workflow_run.get("event") != "pull_request_target"
+        or workflow_run.get("head_branch") != "main"
+        or workflow_run.get("head_sha") != identity[4]
+        or _required(workflow_repository, "full_name", "workflow_run.repository")
+        != repository
+        or workflow_run.get("status") != "completed"
+        or workflow_run.get("conclusion") != "success"
+        or workflow_run.get("html_url")
+        != f"https://github.com/{repository}/actions/runs/{run_id}"
+    ):
+        raise ResolutionError(
+            "workflow run is not the successful trusted main authority"
+        )
+    _positive_integer(
+        _required(workflow_run, "run_attempt", "workflow_run"),
+        "workflow_run.run_attempt",
+    )
+    created_at = _timestamp(
+        _required(workflow_run, "created_at", "workflow_run"),
+        "workflow_run.created_at",
+    )
+    updated_at = _timestamp(
+        _required(workflow_run, "updated_at", "workflow_run"),
+        "workflow_run.updated_at",
+    )
+    if not created_at <= updated_at <= identity[8]:
+        raise ResolutionError("workflow run timestamps are not ordered before merge")
+    return run_id
 
 
 def _read_json(path: Path, label: str) -> Any:
     try:
         return json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
-        raise ResolutionError(f"invalid {label} JSON") from exc
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise ResolutionError(f"invalid {label} JSON") from error
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--event", type=Path, required=True)
     parser.add_argument("--pull-request", type=Path, required=True)
-    parser.add_argument("--workflow-runs", type=Path, required=True)
+    parser.add_argument("--check-runs", type=Path, required=True)
+    parser.add_argument("--workflow-run", type=Path)
     args = parser.parse_args(argv)
     try:
-        resolved = resolve_quality_run(
-            _read_json(args.event, "event"),
-            _read_json(args.pull_request, "pull-request"),
-            _read_json(args.workflow_runs, "workflow-runs"),
-        )
-    except ResolutionError as exc:
-        print(f"release quality run resolution failed: {exc}", file=sys.stderr)
+        event = _read_json(args.event, "event")
+        pull_request = _read_json(args.pull_request, "pull-request")
+        check_runs = _read_json(args.check_runs, "check-runs")
+        if args.workflow_run is None:
+            resolved = resolve_quality_run_id(event, pull_request, check_runs)
+        else:
+            resolved = verify_quality_run(
+                event,
+                pull_request,
+                check_runs,
+                _read_json(args.workflow_run, "workflow-run"),
+            )
+    except ResolutionError as error:
+        print(f"release quality run resolution failed: {error}", file=sys.stderr)
         return 1
     print(resolved)
     return 0
