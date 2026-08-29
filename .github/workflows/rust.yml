@@ -9,6 +9,11 @@ name: Native quality (reusable)
 
 on:
   workflow_call:
+    inputs:
+      source_sha:
+        description: Immutable source commit selected by the trusted caller
+        required: true
+        type: string
 
 permissions:
   contents: read
@@ -24,6 +29,8 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          ref: ${{ inputs.source_sha }}
+          persist-credentials: false
       - name: Install required native quality tools
         run: sudo apt-get update && sudo apt-get install --no-install-recommends --yes ripgrep sqlite3 xvfb xauth x11-utils x11-apps libxkbcommon-x11-0
       - uses: dtolnay/rust-toolchain@stable
@@ -34,13 +41,15 @@ jobs:
       - name: Run recorder daemon live acceptance
         run: xvfb-run --auto-servernum --server-args='-screen 0 1280x800x24' bash scripts/record_daemon_e2e.sh
       - name: Write native quality evidence
+        env:
+          SOURCE_SHA: ${{ inputs.source_sha }}
         run: |
           set -euo pipefail
           mkdir -p artifacts/native-quality
           source_sha="$(git rev-parse HEAD)"
           tree_sha="$(git rev-parse 'HEAD^{tree}')"
-          [[ "$source_sha" == "$GITHUB_SHA" ]] || {
-            echo "native quality checkout SHA does not match the workflow SHA" >&2
+          [[ "$source_sha" == "$SOURCE_SHA" ]] || {
+            echo "native quality checkout SHA does not match the immutable source SHA" >&2
             exit 1
           }
           cat > artifacts/native-quality/native-quality.txt <<EOF
