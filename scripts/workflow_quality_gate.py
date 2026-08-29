@@ -29,6 +29,7 @@ RUST_WORKFLOW = ROOT / ".github" / "workflows" / "rust.yml"
 WINDOWS_JOBS = (
     "version-prepared",
     "native-quality",
+    "codeql-analysis",
     "windows-quality",
     "ui-quality",
     "acceptance",
@@ -37,11 +38,13 @@ WINDOWS_JOBS = (
 EXPECTED_NEEDS = {
     "version-prepared": [],
     "native-quality": ["version-prepared"],
+    "codeql-analysis": ["version-prepared"],
     "windows-quality": ["version-prepared"],
     "ui-quality": ["version-prepared"],
     "acceptance": [
         "version-prepared",
         "native-quality",
+        "codeql-analysis",
         "windows-quality",
         "ui-quality",
     ],
@@ -787,7 +790,7 @@ def _version_scope_contract(workflow: Workflow) -> list[str]:
         errors.append("version-prepared permissions are not exact")
     if workflow.jobs["version-prepared"].properties.get("if") != "github.event_name == 'pull_request'":
         errors.append("version-prepared is not pull_request-only")
-    for owner in ("native-quality", "windows-quality", "ui-quality"):
+    for owner in ("native-quality", "codeql-analysis", "windows-quality", "ui-quality"):
         if workflow.jobs.get(owner, Job("", {}, (), ())).properties.get("if") != PRODUCT_JOB_IF:
             errors.append(f"{owner} is not exact product-only")
     return errors
@@ -816,7 +819,7 @@ def _acceptance_scope_contract(workflow: Workflow) -> list[str]:
         'case "$PRODUCT_CHANGED" in': 1,
         '[[ "$VERSION_READY" == true ]]': 1,
         '[[ -z "$VERSION_READY" ]]': 1,
-        'for result in "$NATIVE_RESULT" "$WINDOWS_RESULT" "$UI_RESULT"; do': 2,
+        'for result in "$NATIVE_RESULT" "$CODEQL_RESULT" "$WINDOWS_RESULT" "$UI_RESULT"; do': 2,
         '[[ "$result" == success ]]': 1,
         '[[ "$result" == skipped ]]': 1,
     }
@@ -878,12 +881,27 @@ def validate_workflows(windows_path: Path = WINDOWS_WORKFLOW, rust_path: Path = 
             unknown = [need for need in job.needs if need not in windows.jobs]
             if unknown:
                 errors.append(f"unknown needs for {job_name}: {unknown}")
-        if "native-quality" in windows.jobs:
-            if windows.jobs["native-quality"].properties.get("uses") != "./.github/workflows/rust.yml":
-                errors.append("native-quality is not the rust reusable job")
+        reusable_jobs = {
+            "native-quality": "./.github/workflows/rust.yml",
+            "codeql-analysis": "./.github/workflows/codeql.yml",
+        }
+        for name, expected_uses in reusable_jobs.items():
+            if name in windows.jobs and windows.jobs[name].properties.get("uses") != expected_uses:
+                errors.append(f"{name} reusable source changed")
         for name in WINDOWS_JOBS:
-            if name != "native-quality" and name in windows.jobs and "uses" in windows.jobs[name].properties:
+            if name not in reusable_jobs and name in windows.jobs and "uses" in windows.jobs[name].properties:
                 errors.append(f"unexpected reusable uses in {name}")
+        codeql_call = (
+            "  codeql-analysis:\n"
+            f"    if: {PRODUCT_JOB_IF}\n"
+            "    needs: [version-prepared]\n"
+            "    uses: ./.github/workflows/codeql.yml\n"
+            "    permissions:\n"
+            "      contents: read\n"
+            "      security-events: write\n"
+        )
+        if windows.text.count(codeql_call) != 1:
+            errors.append("codeql-analysis call or permissions are not exact")
 
         # The top-level trigger shape is checked independently of job strings.
         pull_request_lines = _event_child_lines(windows, "pull_request")
@@ -914,7 +932,7 @@ def validate_workflows(windows_path: Path = WINDOWS_WORKFLOW, rust_path: Path = 
             for required in (
                 '[[ "$VERSION_RESULT" == success ]]',
                 '[[ "$VERSION_READY" == true ]]',
-                'for result in "$NATIVE_RESULT" "$WINDOWS_RESULT" "$UI_RESULT"',
+                'for result in "$NATIVE_RESULT" "$CODEQL_RESULT" "$WINDOWS_RESULT" "$UI_RESULT"',
                 '[[ "$result" == success ]]',
             ):
                 if required not in first_acceptance_run:
@@ -936,6 +954,7 @@ def validate_workflows(windows_path: Path = WINDOWS_WORKFLOW, rust_path: Path = 
                 "VERSION_RESULT:",
                 "VERSION_READY:",
                 "NATIVE_RESULT:",
+                "CODEQL_RESULT:",
                 "WINDOWS_RESULT:",
                 "UI_RESULT:",
             ):
@@ -1385,8 +1404,8 @@ def _static_mutations() -> tuple[tuple[str, Callable[[Path, Path], None]], ...]:
         windows.write_text(
             _replace_exact(
                 text,
+                "needs: [version-prepared, native-quality, codeql-analysis, windows-quality, ui-quality]",
                 "needs: [version-prepared, native-quality, windows-quality, ui-quality]",
-                "needs: [version-prepared, native-quality, windows-quality]",
             ),
             encoding="utf-8",
         )
@@ -1459,11 +1478,11 @@ def _static_mutations() -> tuple[tuple[str, Callable[[Path, Path], None]], ...]:
     def missing_owner_outcome_guard(windows: Path, _rust: Path) -> None:
         text = windows.read_text(encoding="utf-8")
         needle = (
-            '              for result in "$NATIVE_RESULT" "$WINDOWS_RESULT" "$UI_RESULT"; do\n'
+            '              for result in "$NATIVE_RESULT" "$CODEQL_RESULT" "$WINDOWS_RESULT" "$UI_RESULT"; do\n'
             '                [[ "$result" == success ]] || {\n'
         )
         replacement = (
-            '              for result in "$NATIVE_RESULT" "$WINDOWS_RESULT"; do\n'
+            '              for result in "$NATIVE_RESULT" "$WINDOWS_RESULT" "$UI_RESULT"; do\n'
             '                [[ "$result" == success ]] || {\n'
         )
         windows.write_text(_replace_exact(text, needle, replacement), encoding="utf-8")
@@ -1477,6 +1496,38 @@ def _static_mutations() -> tuple[tuple[str, Callable[[Path, Path], None]], ...]:
             "needs.version-prepared.outputs.ready == 'true'\n"
         )
         windows.write_text(_replace_exact(text, needle, replacement), encoding="utf-8")
+
+    def missing_codeql_product_guard(windows: Path, _rust: Path) -> None:
+        text = windows.read_text(encoding="utf-8")
+        needle = f"  codeql-analysis:\n    if: {PRODUCT_JOB_IF}\n"
+        replacement = (
+            "  codeql-analysis:\n"
+            "    if: github.event_name == 'pull_request' && "
+            "needs.version-prepared.outputs.ready == 'true'\n"
+        )
+        windows.write_text(_replace_exact(text, needle, replacement), encoding="utf-8")
+
+    def wrong_codeql_reusable_source(windows: Path, _rust: Path) -> None:
+        text = windows.read_text(encoding="utf-8")
+        windows.write_text(
+            _replace_exact(
+                text,
+                "    uses: ./.github/workflows/codeql.yml\n",
+                "    uses: ./.github/workflows/rust.yml\n",
+            ),
+            encoding="utf-8",
+        )
+
+    def missing_codeql_acceptance_env(windows: Path, _rust: Path) -> None:
+        text = windows.read_text(encoding="utf-8")
+        windows.write_text(
+            _replace_exact(
+                text,
+                "          CODEQL_RESULT: ${{ needs.codeql-analysis.result }}\n",
+                "",
+            ),
+            encoding="utf-8",
+        )
 
     def version_scope_on_wrong_event(windows: Path, _rust: Path) -> None:
         text = windows.read_text(encoding="utf-8")
@@ -1652,6 +1703,9 @@ def _static_mutations() -> tuple[tuple[str, Callable[[Path, Path], None]], ...]:
         ("acceptance-version-outcome-missing", missing_version_outcome_guard),
         ("acceptance-owner-outcome-missing", missing_owner_outcome_guard),
         ("product-job-guard-missing", missing_product_job_guard),
+        ("codeql-product-guard-missing", missing_codeql_product_guard),
+        ("codeql-reusable-source-wrong", wrong_codeql_reusable_source),
+        ("codeql-acceptance-env-missing", missing_codeql_acceptance_env),
         ("version-scope-wrong-event", version_scope_on_wrong_event),
         ("non-product-owner-outcome-wrong", wrong_non_product_owner_outcome),
         ("acceptance-product-guard-missing", missing_acceptance_product_guard),
