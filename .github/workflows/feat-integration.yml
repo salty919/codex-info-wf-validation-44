@@ -123,6 +123,7 @@ jobs:
     needs: [register-selection]
     permissions:
       contents: read
+      pull-requests: read
       security-events: write
     uses: ./.github/workflows/selective-quality.yml
     with:
