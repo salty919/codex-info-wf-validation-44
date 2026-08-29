@@ -229,9 +229,7 @@ def _workflow_run_identity(
     str,
     tuple[int, str],
     tuple[int, str],
-    str,
-    str,
-    str,
+    tuple[tuple[str, str, str], ...],
 ]:
     if not isinstance(run, dict):
         raise ResolutionError("invalid workflow run")
@@ -258,23 +256,30 @@ def _workflow_run_identity(
         _required(run, "repository", "workflow_run"), "workflow_run.repository"
     )
     referenced_workflows = run.get("referenced_workflows", MISSING)
-    if not isinstance(referenced_workflows, list) or len(referenced_workflows) != 1:
+    if not isinstance(referenced_workflows, list) or len(referenced_workflows) != 2:
         raise ResolutionError("workflow run referenced workflow cardinality mismatch")
-    referenced_workflow = referenced_workflows[0]
-    if not isinstance(referenced_workflow, dict):
-        raise ResolutionError("invalid referenced workflow")
-    referenced_sha = _sha(
-        _required(referenced_workflow, "sha", "referenced_workflow"),
-        "referenced_workflow.sha",
-    )
-    referenced_ref = _string(
-        _required(referenced_workflow, "ref", "referenced_workflow"),
-        "referenced_workflow.ref",
-    )
-    referenced_path = _string(
-        _required(referenced_workflow, "path", "referenced_workflow"),
-        "referenced_workflow.path",
-    )
+    references: list[tuple[str, str, str]] = []
+    for index, referenced_workflow in enumerate(referenced_workflows):
+        label = f"referenced_workflows[{index}]"
+        if not isinstance(referenced_workflow, dict):
+            raise ResolutionError(f"invalid {label}")
+        references.append(
+            (
+                _sha(
+                    _required(referenced_workflow, "sha", label),
+                    f"{label}.sha",
+                ),
+                _string(
+                    _required(referenced_workflow, "ref", label),
+                    f"{label}.ref",
+                ),
+                _string(
+                    _required(referenced_workflow, "path", label),
+                    f"{label}.path",
+                ),
+            )
+        )
+    references.sort(key=lambda reference: reference[2])
     return (
         path,
         event,
@@ -283,9 +288,7 @@ def _workflow_run_identity(
         head_branch,
         head_repository,
         base_repository,
-        referenced_sha,
-        referenced_ref,
-        referenced_path,
+        tuple(references),
     )
 
 
@@ -298,9 +301,7 @@ def _workflow_run_matches(
         str,
         tuple[int, str],
         tuple[int, str],
-        str,
-        str,
-        str,
+        tuple[tuple[str, str, str], ...],
     ],
     expected: tuple[
         int,
@@ -322,9 +323,7 @@ def _workflow_run_matches(
         head_branch,
         head_repository,
         base_repository,
-        referenced_sha,
-        referenced_ref,
-        referenced_path,
+        references,
     ) = identity
     (
         number,
@@ -337,6 +336,19 @@ def _workflow_run_matches(
         _merge_sha,
         _merged_at,
     ) = expected
+    expected_ref = f"refs/pull/{number}/merge"
+    referenced_shas = {sha for sha, _ref, _path in references}
+    if len(referenced_shas) != 1:
+        return False
+    referenced_sha = next(iter(referenced_shas))
+    expected_references = {
+        (
+            referenced_sha,
+            expected_ref,
+            f"{expected_base_repository[1]}/.github/workflows/{workflow}@{referenced_sha}",
+        )
+        for workflow in ("codeql.yml", "rust.yml")
+    }
     return (
         path == ".github/workflows/windows-client.yml"
         and event == "pull_request"
@@ -345,9 +357,7 @@ def _workflow_run_matches(
         and head_branch == expected_head_ref
         and head_repository == expected_head_repository
         and base_repository == expected_base_repository
-        and referenced_ref == f"refs/pull/{number}/merge"
-        and referenced_path
-        == f"{expected_base_repository[1]}/.github/workflows/rust.yml@{referenced_sha}"
+        and set(references) == expected_references
     )
 
 

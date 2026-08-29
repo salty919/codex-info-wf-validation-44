@@ -9,7 +9,6 @@ import shutil
 import tempfile
 from typing import Callable
 
-import ci_change_scope
 import workflow_quality_gate
 
 
@@ -18,7 +17,7 @@ CODEQL_WORKFLOW = ROOT / ".github" / "workflows" / "codeql.yml"
 WINDOWS_WORKFLOW = ROOT / ".github" / "workflows" / "windows-client.yml"
 RUST_WORKFLOW = ROOT / ".github" / "workflows" / "rust.yml"
 
-PRODUCT_JOB_IF = workflow_quality_gate.PRODUCT_JOB_IF
+BINARY_IMPACT_JOB_IF = workflow_quality_gate.BINARY_IMPACT_JOB_IF
 EXPECTED_LANGUAGES = ("actions", "csharp", "python", "rust")
 
 
@@ -35,29 +34,6 @@ def _nonblank(lines: tuple[str, ...] | list[str]) -> tuple[str, ...]:
     return tuple(line for line in lines if line.strip())
 
 
-def _expected_ignored_paths() -> frozenset[str]:
-    exact = set(ci_change_scope.NON_PRODUCT_EXACT_PATHS)
-    prefixes = {f"{prefix}**" for prefix in ci_change_scope.NON_PRODUCT_PREFIXES}
-    return frozenset(exact | prefixes)
-
-
-def _push_ignored_paths(lines: tuple[str, ...]) -> frozenset[str] | None:
-    markers = [index for index, line in enumerate(lines) if line == "    paths-ignore:"]
-    if len(markers) != 1:
-        return None
-    values: list[str] = []
-    for line in lines[markers[0] + 1 :]:
-        if line and len(line) - len(line.lstrip(" ")) <= 4:
-            break
-        match = re.fullmatch(r'      - "([^"\n]+)"', line)
-        if match is None:
-            return None
-        values.append(match.group(1))
-    if not values or len(values) != len(set(values)):
-        return None
-    return frozenset(values)
-
-
 def validate(
     codeql_path: Path = CODEQL_WORKFLOW,
     windows_path: Path = WINDOWS_WORKFLOW,
@@ -67,19 +43,12 @@ def validate(
         codeql = workflow_quality_gate.parse_workflow(codeql_path)
         sections = workflow_quality_gate._top_level_ranges(codeql.lines)
         triggers = workflow_quality_gate._section_children(codeql, "on")
-        if set(triggers) != {"workflow_call", "push", "schedule", "workflow_dispatch"}:
+        if set(triggers) != {"workflow_call", "schedule", "workflow_dispatch"}:
             errors.append(f"CodeQL triggers changed: {sorted(triggers)}")
         for empty_trigger in ("workflow_call", "workflow_dispatch"):
             child = triggers.get(empty_trigger)
             if child is None or child[2] or _nonblank(list(codeql.lines[child[0] + 1 : child[1]])):
                 errors.append(f"CodeQL {empty_trigger} trigger is not an empty mapping")
-
-        push_lines = workflow_quality_gate._event_child_lines(codeql, "push")
-        if push_lines.count('    branches: ["main"]') != 1:
-            errors.append("CodeQL push is not main-only")
-        ignored = _push_ignored_paths(push_lines)
-        if ignored != _expected_ignored_paths():
-            errors.append("CodeQL push paths-ignore differs from the trusted classifier")
 
         schedule_lines = workflow_quality_gate._event_child_lines(codeql, "schedule")
         if _nonblank(list(schedule_lines)) != ('    - cron: "23 4 * * 1"',):
@@ -169,8 +138,8 @@ def validate(
         if codeql_call is None:
             errors.append("Windows workflow is missing codeql-analysis")
         else:
-            if codeql_call.properties.get("if") != PRODUCT_JOB_IF:
-                errors.append("Windows CodeQL call is not exact product-only")
+            if codeql_call.properties.get("if") != BINARY_IMPACT_JOB_IF:
+                errors.append("Windows CodeQL call is not exact binary-impact-only")
             if codeql_call.needs != ("version-prepared",):
                 errors.append("Windows CodeQL call does not depend only on trusted scope")
             if codeql_call.properties.get("uses") != "./.github/workflows/codeql.yml":
@@ -279,11 +248,11 @@ def _mutations() -> tuple[tuple[str, Mutation], ...]:
             _mutate_file("codeql", "  security-events: write\n", ""),
         ),
         (
-            "product-path-ignored",
+            "post-merge-push-trigger",
             _mutate_file(
                 "codeql",
-                '      - "docs/**"\n',
-                '      - "docs/**"\n      - "Cargo.toml"\n',
+                "on:\n",
+                'on:\n  push:\n    branches: ["main"]\n',
             ),
         ),
         (
@@ -311,7 +280,7 @@ def _mutations() -> tuple[tuple[str, Mutation], ...]:
             ),
         ),
         (
-            "product-outcome-missing",
+            "binary-impact-outcome-missing",
             _mutate_file(
                 "windows",
                 owner_loop + '                [[ "$result" == success ]] || {\n',
@@ -320,7 +289,7 @@ def _mutations() -> tuple[tuple[str, Mutation], ...]:
             ),
         ),
         (
-            "non-product-outcome-missing",
+            "no-binary-impact-outcome-missing",
             _mutate_file(
                 "windows",
                 owner_loop + '                [[ "$result" == skipped ]] || {\n',

@@ -5,13 +5,6 @@ name: CodeQL analysis (advanced)
 
 on:
   workflow_call:
-  push:
-    branches: ["main"]
-    paths-ignore:
-      - "AGENTS.md"
-      - "README.md"
-      - "docs/**"
-      - ".github/ISSUE_TEMPLATE/**"
   schedule:
     - cron: "23 4 * * 1"
   workflow_dispatch:

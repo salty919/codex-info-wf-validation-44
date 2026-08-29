@@ -433,11 +433,11 @@ def _validate_read_only_scope_block(block: str) -> None:
         '--expected-base-sha "$BASE_SHA"',
         '--expected-head-sha "$HEAD_SHA"',
         'case "$scope" in',
-        'product) product=true ;;',
-        'non-product) product=false ;;',
+        'binary-impact) binary_impact=true ;;',
+        'no-binary-impact) binary_impact=false ;;',
         "*) echo 'change-scope classifier returned an invalid result' >&2; exit 1 ;;",
         'esac',
-        "printf 'product=%s\\n' \"$product\" >> \"$GITHUB_OUTPUT\"",
+        "printf 'binary_impact=%s\\n' \"$binary_impact\" >> \"$GITHUB_OUTPUT\"",
     )
     for marker in expected_markers:
         if block.count(marker) != 1:
@@ -498,11 +498,11 @@ def _validate_read_only_scope_block(block: str) -> None:
         "--expected-base-sha ",
         "--expected-head-sha ",
         'case "$scope" in',
-        "product) product=true ;;",
-        "non-product) product=false ;;",
+        "binary-impact) binary_impact=true ;;",
+        "no-binary-impact) binary_impact=false ;;",
         "*) echo '",
         "esac",
-        "printf 'product=%s\\n' ",
+        "printf 'binary_impact=%s\\n' ",
     )
     for line in block.splitlines():
         stripped = line.strip()
@@ -552,8 +552,8 @@ def _validate_scope_contract(source: str) -> None:
         if scope.count(needle) != 1:
             fail(f"scope contract changed: {label}")
     _validate_read_only_scope_block(block)
-    if source.count("        if: steps.scope.outputs.product == 'true'\n") != 1:
-        fail("version mutation step must be guarded by the product scope output")
+    if source.count("        if: steps.scope.outputs.binary_impact == 'true'\n") != 1:
+        fail("version mutation step must be guarded by binary impact")
 
 
 def validate_release_scope(source: str) -> None:
@@ -1533,14 +1533,14 @@ def check_mutations(source: str) -> int:
             '          scope="$(python3 scripts/product_version.py \\\n',
         ),
         (
-            "scope-product-guard-deleted",
-            "        if: steps.scope.outputs.product == 'true'\n",
+            "scope-binary-impact-guard-deleted",
+            "        if: steps.scope.outputs.binary_impact == 'true'\n",
             "",
         ),
         (
-            "scope-non-product-became-product",
-            "            non-product) product=false ;;\n",
-            "            non-product) product=true ;;\n",
+            "scope-no-binary-impact-became-binary-impact",
+            "            no-binary-impact) binary_impact=false ;;\n",
+            "            no-binary-impact) binary_impact=true ;;\n",
         ),
         (
             "scope-failure-ignored",
@@ -1657,9 +1657,9 @@ def check_release_scope_mutations(source: str) -> int:
             '          scope="$(python3 scripts/product_version.py \\\n',
         ),
         (
-            "release-scope-non-product-became-product",
-            "            non-product) product=false ;;\n",
-            "            non-product) product=true ;;\n",
+            "release-scope-no-binary-impact-became-binary-impact",
+            "            no-binary-impact) binary_impact=false ;;\n",
+            "            no-binary-impact) binary_impact=true ;;\n",
         ),
         (
             "release-scope-failure-ignored",

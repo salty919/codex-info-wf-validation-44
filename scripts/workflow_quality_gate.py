@@ -25,6 +25,7 @@ from typing import Callable, Iterable, Mapping, Sequence
 ROOT = Path(__file__).resolve().parents[1]
 WINDOWS_WORKFLOW = ROOT / ".github" / "workflows" / "windows-client.yml"
 RUST_WORKFLOW = ROOT / ".github" / "workflows" / "rust.yml"
+WINDOWS_CONTRACT_GATE = ROOT / "scripts" / "windows_client_contract_gate.sh"
 
 WINDOWS_JOBS = (
     "version-prepared",
@@ -113,13 +114,13 @@ EXPECTED_LIVE_RULE_KEYS = frozenset(
     {"type", "parameters", "ruleset_source_type", "ruleset_source", "ruleset_id"}
 )
 EXPECTED_LIVE_STATUS_CONTEXTS = frozenset({"acceptance", "version-prepared"})
-PRODUCT_JOB_IF = (
+BINARY_IMPACT_JOB_IF = (
     "github.event_name == 'pull_request' && "
-    "needs.version-prepared.outputs.product == 'true' && "
+    "needs.version-prepared.outputs.binary_impact == 'true' && "
     "needs.version-prepared.outputs.ready == 'true'"
 )
-PRODUCT_STEP_IF = "needs.version-prepared.outputs.product == 'true'"
-RELEASE_PRODUCT_STEP_IF = "steps.scope.outputs.product == 'true'"
+BINARY_IMPACT_STEP_IF = "needs.version-prepared.outputs.binary_impact == 'true'"
+RELEASE_BINARY_IMPACT_STEP_IF = "steps.scope.outputs.binary_impact == 'true'"
 RELEASE_JOB_IF = (
     "github.event_name == 'pull_request_target' && "
     "github.event.pull_request.merged == true"
@@ -765,7 +766,10 @@ def _version_scope_contract(workflow: Workflow) -> list[str]:
         'python3 "$classifier"',
         '"repos/$REPOSITORY/pulls/$PR_NUMBER/files?per_page=100"',
         "--paginate --slurp",
-        "printf 'product=true\\n' >> \"$GITHUB_OUTPUT\"",
+        'case "$scope" in',
+        "binary-impact) binary_impact=true ;;",
+        "no-binary-impact) binary_impact=false ;;",
+        "printf 'binary_impact=%s\\n' \"$binary_impact\" >> \"$GITHUB_OUTPUT\"",
     ):
         if scope_text.count(marker) != 1:
             errors.append(f"trusted-base scope marker cardinality changed: {marker}")
@@ -773,13 +777,15 @@ def _version_scope_contract(workflow: Workflow) -> list[str]:
         errors.append("pull_request scope executes the PR classifier")
     if scope.properties.get("id") != "scope":
         errors.append("version-prepared scope step id changed")
-    if version.properties.get("if") != "steps.scope.outputs.product == 'true'":
-        errors.append("version check is not product-only")
+    if version.properties.get("if") != "steps.scope.outputs.binary_impact == 'true'":
+        errors.append("version check is not binary-impact-only")
     if 'id: version' not in version_text:
         errors.append("version step id changed")
     workflow_text = workflow.text
-    if workflow_text.count("      product: ${{ steps.scope.outputs.product }}") != 1:
-        errors.append("version-prepared product output changed")
+    if workflow_text.count(
+        "      binary_impact: ${{ steps.scope.outputs.binary_impact }}"
+    ) != 1:
+        errors.append("version-prepared binary-impact output changed")
     permissions = (
         "    permissions:\n"
         "      contents: read\n"
@@ -791,8 +797,8 @@ def _version_scope_contract(workflow: Workflow) -> list[str]:
     if workflow.jobs["version-prepared"].properties.get("if") != "github.event_name == 'pull_request'":
         errors.append("version-prepared is not pull_request-only")
     for owner in ("native-quality", "codeql-analysis", "windows-quality", "ui-quality"):
-        if workflow.jobs.get(owner, Job("", {}, (), ())).properties.get("if") != PRODUCT_JOB_IF:
-            errors.append(f"{owner} is not exact product-only")
+        if workflow.jobs.get(owner, Job("", {}, (), ())).properties.get("if") != BINARY_IMPACT_JOB_IF:
+            errors.append(f"{owner} is not exact binary-impact-only")
     return errors
 
 
@@ -812,11 +818,11 @@ def _acceptance_scope_contract(workflow: Workflow) -> list[str]:
     )
     if tuple(step.label for step in steps) != expected_labels:
         return ["acceptance step set or order changed"]
-    if "PRODUCT_CHANGED: ${{ needs.version-prepared.outputs.product }}" not in "\n".join(steps[0].lines):
-        errors.append("acceptance product scope environment is missing")
+    if "BINARY_IMPACT: ${{ needs.version-prepared.outputs.binary_impact }}" not in "\n".join(steps[0].lines):
+        errors.append("acceptance binary-impact environment is missing")
     outcome = workflow.jobs["acceptance"].run_blocks[0].body
     exact_counts = {
-        'case "$PRODUCT_CHANGED" in': 1,
+        'case "$BINARY_IMPACT" in': 1,
         '[[ "$VERSION_READY" == true ]]': 1,
         '[[ -z "$VERSION_READY" ]]': 1,
         'for result in "$NATIVE_RESULT" "$CODEQL_RESULT" "$WINDOWS_RESULT" "$UI_RESULT"; do': 2,
@@ -827,8 +833,8 @@ def _acceptance_scope_contract(workflow: Workflow) -> list[str]:
         if outcome.count(marker) != expected:
             errors.append(f"acceptance scope marker count changed: {marker}")
     for step in steps[1:]:
-        if step.properties.get("if") != PRODUCT_STEP_IF:
-            errors.append(f"acceptance product step is not guarded: {step.label}")
+        if step.properties.get("if") != BINARY_IMPACT_STEP_IF:
+            errors.append(f"acceptance binary-impact step is not guarded: {step.label}")
     return errors
 
 
@@ -860,8 +866,8 @@ def _release_scope_contract(workflow: Workflow) -> list[str]:
     if steps[1].properties.get("id") != "scope":
         errors.append("release scope step id changed")
     for step in steps[2:]:
-        if step.properties.get("if") != RELEASE_PRODUCT_STEP_IF:
-            errors.append(f"release mutation step is not product-only: {step.label}")
+        if step.properties.get("if") != RELEASE_BINARY_IMPACT_STEP_IF:
+            errors.append(f"release mutation step is not binary-impact-only: {step.label}")
     return errors
 
 
@@ -893,7 +899,7 @@ def validate_workflows(windows_path: Path = WINDOWS_WORKFLOW, rust_path: Path = 
                 errors.append(f"unexpected reusable uses in {name}")
         codeql_call = (
             "  codeql-analysis:\n"
-            f"    if: {PRODUCT_JOB_IF}\n"
+            f"    if: {BINARY_IMPACT_JOB_IF}\n"
             "    needs: [version-prepared]\n"
             "    uses: ./.github/workflows/codeql.yml\n"
             "    permissions:\n"
@@ -1009,7 +1015,7 @@ class MergeRun:
     base_sha: str
     tree_sha: str
     jobs: tuple[MergeJob, ...]
-    product: bool = True
+    binary_impact: bool = True
     artifact_ids: tuple[str, ...] = ()
     provenance_markers: tuple[str, ...] = ()
 
@@ -1171,10 +1177,10 @@ def evaluate_merge_state(state: MergeState) -> bool:
         or run.head_sha != state.current_head
         or run.base_sha != state.current_base
         or run.tree_sha != state.current_tree
-        or type(run.product) is not bool
+        or type(run.binary_impact) is not bool
     ):
         return False
-    if run.product:
+    if run.binary_impact:
         if (
             not _full_sha(state.provenance_source)
             or not _full_sha(state.provenance_tree)
@@ -1239,7 +1245,7 @@ def _valid_merge_state() -> MergeState:
     )
 
 
-def _valid_non_product_merge_state() -> MergeState:
+def _valid_no_binary_impact_merge_state() -> MergeState:
     state = _valid_merge_state()
     return replace(
         state,
@@ -1249,7 +1255,7 @@ def _valid_non_product_merge_state() -> MergeState:
         runs=(
             replace(
                 state.runs[0],
-                product=False,
+                binary_impact=False,
                 artifact_ids=(),
                 provenance_markers=(),
             ),
@@ -1487,9 +1493,9 @@ def _static_mutations() -> tuple[tuple[str, Callable[[Path, Path], None]], ...]:
         )
         windows.write_text(_replace_exact(text, needle, replacement), encoding="utf-8")
 
-    def missing_product_job_guard(windows: Path, _rust: Path) -> None:
+    def missing_binary_impact_job_guard(windows: Path, _rust: Path) -> None:
         text = windows.read_text(encoding="utf-8")
-        needle = f"  native-quality:\n    if: {PRODUCT_JOB_IF}\n"
+        needle = f"  native-quality:\n    if: {BINARY_IMPACT_JOB_IF}\n"
         replacement = (
             "  native-quality:\n"
             "    if: github.event_name == 'pull_request' && "
@@ -1497,9 +1503,9 @@ def _static_mutations() -> tuple[tuple[str, Callable[[Path, Path], None]], ...]:
         )
         windows.write_text(_replace_exact(text, needle, replacement), encoding="utf-8")
 
-    def missing_codeql_product_guard(windows: Path, _rust: Path) -> None:
+    def missing_codeql_binary_impact_guard(windows: Path, _rust: Path) -> None:
         text = windows.read_text(encoding="utf-8")
-        needle = f"  codeql-analysis:\n    if: {PRODUCT_JOB_IF}\n"
+        needle = f"  codeql-analysis:\n    if: {BINARY_IMPACT_JOB_IF}\n"
         replacement = (
             "  codeql-analysis:\n"
             "    if: github.event_name == 'pull_request' && "
@@ -1535,7 +1541,7 @@ def _static_mutations() -> tuple[tuple[str, Callable[[Path, Path], None]], ...]:
         replacement = "  version-prepared:\n    if: always()\n"
         windows.write_text(_replace_exact(text, needle, replacement), encoding="utf-8")
 
-    def wrong_non_product_owner_outcome(windows: Path, _rust: Path) -> None:
+    def wrong_no_binary_impact_owner_outcome(windows: Path, _rust: Path) -> None:
         text = windows.read_text(encoding="utf-8")
         windows.write_text(
             _replace_exact(
@@ -1546,22 +1552,22 @@ def _static_mutations() -> tuple[tuple[str, Callable[[Path, Path], None]], ...]:
             encoding="utf-8",
         )
 
-    def missing_acceptance_product_guard(windows: Path, _rust: Path) -> None:
+    def missing_acceptance_binary_impact_guard(windows: Path, _rust: Path) -> None:
         text = windows.read_text(encoding="utf-8")
         needle = (
             "      - name: Download native quality evidence\n"
-            "        if: needs.version-prepared.outputs.product == 'true'\n"
+            "        if: needs.version-prepared.outputs.binary_impact == 'true'\n"
         )
         windows.write_text(
             _replace_exact(text, needle, "      - name: Download native quality evidence\n"),
             encoding="utf-8",
         )
 
-    def missing_release_product_guard(windows: Path, _rust: Path) -> None:
+    def missing_release_binary_impact_guard(windows: Path, _rust: Path) -> None:
         text = windows.read_text(encoding="utf-8")
         needle = (
             "      - name: Resolve accepted PR quality run\n"
-            "        if: steps.scope.outputs.product == 'true'\n"
+            "        if: steps.scope.outputs.binary_impact == 'true'\n"
         )
         windows.write_text(
             _replace_exact(text, needle, "      - name: Resolve accepted PR quality run\n"),
@@ -1579,10 +1585,14 @@ def _static_mutations() -> tuple[tuple[str, Callable[[Path, Path], None]], ...]:
             encoding="utf-8",
         )
 
-    def missing_product_output(windows: Path, _rust: Path) -> None:
+    def missing_binary_impact_output(windows: Path, _rust: Path) -> None:
         text = windows.read_text(encoding="utf-8")
         windows.write_text(
-            _replace_exact(text, "      product: ${{ steps.scope.outputs.product }}\n", ""),
+            _replace_exact(
+                text,
+                "      binary_impact: ${{ steps.scope.outputs.binary_impact }}\n",
+                "",
+            ),
             encoding="utf-8",
         )
 
@@ -1702,16 +1712,16 @@ def _static_mutations() -> tuple[tuple[str, Callable[[Path, Path], None]], ...]:
         ("release-merged-guard-missing", release_on_any_close),
         ("acceptance-version-outcome-missing", missing_version_outcome_guard),
         ("acceptance-owner-outcome-missing", missing_owner_outcome_guard),
-        ("product-job-guard-missing", missing_product_job_guard),
-        ("codeql-product-guard-missing", missing_codeql_product_guard),
+        ("binary-impact-job-guard-missing", missing_binary_impact_job_guard),
+        ("codeql-binary-impact-guard-missing", missing_codeql_binary_impact_guard),
         ("codeql-reusable-source-wrong", wrong_codeql_reusable_source),
         ("codeql-acceptance-env-missing", missing_codeql_acceptance_env),
         ("version-scope-wrong-event", version_scope_on_wrong_event),
-        ("non-product-owner-outcome-wrong", wrong_non_product_owner_outcome),
-        ("acceptance-product-guard-missing", missing_acceptance_product_guard),
-        ("release-product-guard-missing", missing_release_product_guard),
+        ("no-binary-impact-owner-outcome-wrong", wrong_no_binary_impact_owner_outcome),
+        ("acceptance-binary-impact-guard-missing", missing_acceptance_binary_impact_guard),
+        ("release-binary-impact-guard-missing", missing_release_binary_impact_guard),
         ("pull-request-classifier-executed", execute_pull_request_classifier),
-        ("product-output-missing", missing_product_output),
+        ("binary-impact-output-missing", missing_binary_impact_output),
         ("pull-request-path-filter", add_path_filter),
         ("quality-command-in-acceptance", forbidden_quality_command),
         ("unknown-job", unknown_job),
@@ -1819,6 +1829,23 @@ def _run_static_cases() -> int:
     baseline_errors = validate_workflows()
     if baseline_errors:
         raise AssertionError("production workflow baseline failed: " + "; ".join(baseline_errors))
+    windows_contract = WINDOWS_CONTRACT_GATE.read_text(encoding="utf-8")
+    ci_owner_markers = (
+        "scripts/ci_change_scope.py",
+        "scripts/test_ci_change_scope.py",
+        "scripts/test_codeql_workflow.py",
+        "scripts/workflow_quality_gate.py",
+        "scripts/ci_trust_fixture.py",
+        "scripts/release_quality_run_resolver.py",
+        "scripts/test_release_quality_run_resolver.py",
+        ".github/workflows/version-prepare.yml",
+    )
+    for marker in ci_owner_markers:
+        if marker in windows_contract:
+            raise AssertionError(
+                f"Windows product gate duplicates CI-only contract owner: {marker}"
+            )
+        cases += 1
     cases += _run_quality_wrapper_cases()
     cases += _run_powershell_position_cases()
     for name, mutate in _static_mutations():
@@ -1843,7 +1870,7 @@ def _run_static_cases() -> int:
 
 def _run_merge_cases() -> int:
     valid = _valid_merge_state()
-    valid_non_product = _valid_non_product_merge_state()
+    valid_no_binary_impact = _valid_no_binary_impact_merge_state()
     old_base = "4444444444444444444444444444444444444444"
     old_head = "5555555555555555555555555555555555555555"
     old_tree = "6666666666666666666666666666666666666666"
@@ -1888,44 +1915,44 @@ def _run_merge_cases() -> int:
         if result is not expected:
             raise AssertionError(f"merge fixture {name} expected {expected}, got {result}")
 
-    non_product_cases: tuple[tuple[str, MergeState, bool], ...] = (
-        ("valid-non-product", valid_non_product, True),
+    no_binary_impact_cases: tuple[tuple[str, MergeState, bool], ...] = (
+        ("valid-no-binary-impact", valid_no_binary_impact, True),
         (
-            "non-product-artifact",
-            run_update(valid_non_product, artifact_ids=("unexpected-artifact",)),
+            "no-binary-impact-artifact",
+            run_update(valid_no_binary_impact, artifact_ids=("unexpected-artifact",)),
             False,
         ),
         (
-            "non-product-provenance-marker",
-            run_update(valid_non_product, provenance_markers=("unexpected",)),
+            "no-binary-impact-provenance-marker",
+            run_update(valid_no_binary_impact, provenance_markers=("unexpected",)),
             False,
         ),
         (
-            "non-product-provenance-id",
-            replace(valid_non_product, provenance_id="unexpected"),
+            "no-binary-impact-provenance-id",
+            replace(valid_no_binary_impact, provenance_id="unexpected"),
             False,
         ),
         (
-            "non-product-artifact-wrong-empty-type",
-            run_update(valid_non_product, artifact_ids=[]),
+            "no-binary-impact-artifact-wrong-empty-type",
+            run_update(valid_no_binary_impact, artifact_ids=[]),
             False,
         ),
         (
-            "non-product-provenance-wrong-empty-type",
-            replace(valid_non_product, provenance_source=0),
+            "no-binary-impact-provenance-wrong-empty-type",
+            replace(valid_no_binary_impact, provenance_source=0),
             False,
         ),
         (
-            "malformed-product-flag",
-            run_update(valid_non_product, product="false"),
+            "malformed-binary-impact-flag",
+            run_update(valid_no_binary_impact, binary_impact="false"),
             False,
         ),
     )
-    for name, state, expected in non_product_cases:
+    for name, state, expected in no_binary_impact_cases:
         result = evaluate_merge_state(state)
         if result is not expected:
             raise AssertionError(f"merge fixture {name} expected {expected}, got {result}")
-    return len(mutations) + len(non_product_cases) + _run_live_applied_rules_cases()
+    return len(mutations) + len(no_binary_impact_cases) + _run_live_applied_rules_cases()
 
 
 def self_test() -> tuple[int, int]:
