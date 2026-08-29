@@ -45,7 +45,7 @@ def validate(codeql: str, windows: str, selective: str) -> list[str]:
     exact(selective, "    if: inputs.codeql_languages_json != '[]'\n")
     exact(selective, "    uses: ./.github/workflows/codeql.yml\n")
     exact(selective, "      languages_json: ${{ inputs.codeql_languages_json }}\n")
-    exact(selective, "      security-events: write\n")
+    exact(selective, "      security-events: write\n", 2)
     exact(selective, "      - codeql-quality\n")
     return errors
 
