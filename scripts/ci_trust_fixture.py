@@ -354,8 +354,8 @@ def _validate_external_effect_boundary(block: str) -> None:
             fail(f"temporary path assignment is not unique and fixed: {assignment}")
     if block.count('local output="$4"') != 1:
         fail("Contents API output must remain the fourth bounded function argument")
-    if block.count('> "$output"') != 1 or block.count('>> "$GITHUB_OUTPUT"') != 1:
-        fail("file writes must use the single decoded output and GitHub output paths")
+    if block.count('> "$output"') != 1 or block.count('>> "$GITHUB_OUTPUT"') != 2:
+        fail("file writes must use the decoded output and two bounded GitHub outputs")
 
     expected_copy_commands = (
         'cp "$head/Cargo.toml" "$next/Cargo.toml"',
@@ -595,12 +595,103 @@ def validate_release_scope(source: str) -> None:
     _validate_read_only_scope_block(_extract_named_run_block(source, scope_marker))
 
 
+def _validate_dispatch_contract(source: str) -> None:
+    """Keep the trusted quality dispatch exact, idempotent, and fail closed."""
+
+    job_marker = "  dispatch-quality:\n"
+    step_marker = "      - name: Dispatch the exact quality head once"
+    if source.count(job_marker) != 1 or source.count(step_marker) != 1:
+        fail("quality dispatch job or step marker is not unique")
+    dispatch = source[source.index(job_marker) :]
+    expected_header = (
+        "  dispatch-quality:\n"
+        "    needs: [prepare]\n"
+        "    runs-on: ubuntu-latest\n"
+        "    permissions:\n"
+        "      actions: write\n"
+        "      contents: read\n"
+        "      pull-requests: read\n"
+    )
+    if dispatch.count(expected_header) != 1:
+        fail("dispatch job dependency or permissions changed")
+    block = _extract_named_run_block(source, step_marker)
+    required = (
+        '"$HEAD_REPOSITORY" == "$REPOSITORY" &&',
+        '"$HEAD_REF" == feat/next ]] || {',
+        '"repos/$REPOSITORY/pulls/$PR_NUMBER")"',
+        '"$(jq -r \'.state\' <<<"$pull_request")" == open &&',
+        '"$(jq -r \'.base.ref\' <<<"$pull_request")" == main &&',
+        '"$(jq -r \'.head.sha\' <<<"$pull_request")" == "$HEAD_SHA" ]] || {',
+        '"repos/$REPOSITORY/git/ref/heads/$HEAD_REF" --jq \'.object.sha\')"',
+        '[[ "$observed_head" == "$HEAD_SHA" ]] || {',
+        "runs?event=workflow_dispatch&head_sha=$HEAD_SHA&branch=$HEAD_REF&per_page=100",
+        '.event == "workflow_dispatch" and',
+        'case "$matching_runs" in',
+        'count_quality_runs() {',
+        'matching_runs="$(count_quality_runs)"',
+        "{ref:$ref,inputs:{pr_number:$pr_number,base_repository:$base_repository,head_repository:$head_repository,base_sha:$base_sha,head_sha:$head_sha,head_ref:$head_ref}}",
+        '"repos/$REPOSITORY/actions/workflows/windows-client.yml/dispatches"',
+        "--input - --silent <<<\"$payload\"",
+        "for attempt in 1 2 3 4 5 6; do",
+        'confirmed_runs="$(count_quality_runs)"',
+        '[[ "$confirmed_runs" == 1 ]] || {',
+        'echo "multiple quality workflow runs already exist for $HEAD_SHA" >&2',
+    )
+    for marker in required:
+        if block.count(marker) != 1:
+            fail(f"quality dispatch marker must occur exactly once: {marker}")
+    for arm in ("0)", "1)", "*)"):
+        if len(re.findall(rf"(?m)^  {re.escape(arm)}$", block)) != 1:
+            fail(f"quality dispatch case arm changed: {arm}")
+    if "event=pull_request" in block:
+        fail("quality dispatch still queries the approval-prone pull_request path")
+    if block.count("--method POST") != 1:
+        fail("quality workflow dispatch POST cardinality changed")
+    if block.count("--method GET") != 2:
+        fail("quality dispatch PR/run API read cardinality changed")
+    if block.count("gh api") != 4:
+        fail("quality dispatch GitHub API call cardinality changed")
+    if re.search(r"(?m)^\s+(?:contents|pull-requests|checks|issues):\s+write\s*$", dispatch):
+        fail("dispatch job gained repository, PR, check, or issue write permission")
+
+
+def _validate_result_contract(source: str) -> None:
+    """Require both scope classes to select one exact quality head."""
+
+    marker = "      - name: Select the exact quality head"
+    block = _extract_named_run_block(source, marker)
+    result_section = _between(source, marker, "  dispatch-quality:\n")
+    expected = (
+        "      binary_impact: ${{ steps.scope.outputs.binary_impact }}\n"
+        "      final_head_sha: ${{ steps.result.outputs.final_head_sha }}\n"
+    )
+    if source.count(expected) != 1:
+        fail("prepare outputs do not expose scope and exact final head")
+    for needle in (
+        'BINARY_IMPACT: ${{ steps.scope.outputs.binary_impact }}',
+        'EVENT_HEAD_SHA: ${{ github.event.pull_request.head.sha }}',
+        'PREPARED_HEAD_SHA: ${{ steps.prepare.outputs.final_head_sha }}',
+    ):
+        if result_section.count(needle) != 1:
+            fail(f"final-head input binding changed: {needle}")
+    for needle in (
+        'true) final_head_sha="$PREPARED_HEAD_SHA" ;;',
+        'false) final_head_sha="$EVENT_HEAD_SHA" ;;',
+        '[[ "$final_head_sha" =~ ^[0-9a-fA-F]{40}$ ]] || {',
+        "printf 'final_head_sha=%s\\n' \"$final_head_sha\" >> \"$GITHUB_OUTPUT\"",
+    ):
+        if block.count(needle) != 1:
+            fail(f"final-head selection marker changed: {needle}")
+
+
 def validate_static(source: str) -> None:
     """Validate the finite trust boundary without parsing untrusted YAML."""
 
     block = extract_run_block(source)
     _validate_external_effect_boundary(block)
     _validate_scope_contract(source)
+    _validate_result_contract(source)
+    _validate_dispatch_contract(source)
     trigger = _between(source, "on:\n", "permissions:\n")
     _require(trigger, "  pull_request_target:\n", "pull_request_target trigger")
     _require(trigger, '    branches: ["main"]\n', "main branch trigger")
@@ -706,6 +797,9 @@ def validate_static(source: str) -> None:
         fail("head-tree lookup, commit create, and proof endpoints must be present")
 
     _require(block, '[[ "$BASE_REPOSITORY" == "$REPOSITORY" ]]', "base repository guard")
+    _require(block, '[[ "$HEAD_REF" == feat/next ]]', "feat/next write-boundary guard")
+    if block.count('[[ "$HEAD_REF" == feat/next ]]') != 1:
+        fail("feat/next write-boundary guard must occur exactly once")
     _require(block, '[[ "$HEAD_REPOSITORY" != "$REPOSITORY" ]]', "same-repository mutation guard")
     if block.count('[[ "$HEAD_REPOSITORY" != "$REPOSITORY" ]]') != 1:
         fail("same-repository mutation guard must occur exactly once")
@@ -736,7 +830,7 @@ class Scenario:
     repository: str = REPOSITORY
     base_sha: str = BASE_SHA
     head_sha: str = HEAD_SHA
-    head_ref: str = "feature/version"
+    head_ref: str = "feat/next"
     base_version: str = "1.0.8"
     head_version: str = "1.0.8"
     observed_head: str = HEAD_SHA
@@ -745,6 +839,19 @@ class Scenario:
     expect_success: bool = False
     expect_already_next: bool = False
     expect_independent_baseline_rejection: bool = False
+
+
+@dataclass(frozen=True)
+class DispatchScenario:
+    name: str
+    pr_number: str = "42"
+    pr_state: str = "open"
+    api_head_sha: str = COMMIT_SHA
+    observed_head: str = COMMIT_SHA
+    existing_events: tuple[str, ...] = ()
+    dispatch_failure: bool = False
+    expect_success: bool = False
+    expected_dispatches: int = 0
 
 
 @dataclass(frozen=True)
@@ -1298,10 +1405,7 @@ def _assert_contents_provenance(result: RunResult) -> None:
         and re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", scenario.head_repository)
         and re.fullmatch(r"[0-9a-fA-F]{40}", scenario.base_sha)
         and re.fullmatch(r"[0-9a-fA-F]{40}", scenario.head_sha)
-        and not scenario.head_ref.startswith("/")
-        and ".." not in scenario.head_ref
-        and "?" not in scenario.head_ref
-        and "#" not in scenario.head_ref
+        and scenario.head_ref == "feat/next"
     )
     if full_fetch_expected and observed != base_expected + head_expected:
         fail(f"{scenario.name}: expected exact base/head Contents API fetches, found {observed!r}")
@@ -1338,6 +1442,270 @@ def _assert_blob_payloads(
             fail(f"{result.scenario.name}: {label} blob transcript digest mismatch for {path}")
 
 
+def _write_dispatch_fake_gh(fake_bin: Path) -> Path:
+    fake = fake_bin / "gh"
+    fake.write_text(
+        textwrap.dedent(
+            r'''
+            #!/usr/bin/env python3
+            import json
+            import os
+            import sys
+
+            config = json.load(open(os.environ["CI_DISPATCH_FAKE_CONFIG"], encoding="utf-8"))
+            transcript_path = config["transcript"]
+            args = sys.argv[1:]
+            if not args or args[0] != "api":
+                raise SystemExit("unexpected fake gh command")
+            method = "GET"
+            endpoint = None
+            input_mode = False
+            index = 1
+            while index < len(args):
+                argument = args[index]
+                if argument == "--method":
+                    method = args[index + 1]
+                    index += 2
+                elif argument in {"-H", "--jq"}:
+                    index += 2
+                elif argument == "--input":
+                    input_mode = args[index + 1] == "-"
+                    index += 2
+                elif argument in {"--paginate", "--slurp", "--silent"}:
+                    index += 1
+                elif argument.startswith("-"):
+                    raise SystemExit(f"unexpected fake gh option: {argument}")
+                else:
+                    if endpoint is not None:
+                        raise SystemExit("multiple fake gh endpoints")
+                    endpoint = argument
+                    index += 1
+            payload = json.load(sys.stdin) if input_mode else None
+            transcript = json.load(open(transcript_path, encoding="utf-8"))
+            transcript.append({"method": method, "endpoint": endpoint, "payload": payload})
+            with open(transcript_path, "w", encoding="utf-8") as handle:
+                json.dump(transcript, handle, separators=(",", ":"))
+
+            repository = config["repository"]
+            pr_number = config["pr_number"]
+            head_ref = config["head_ref"]
+            head_sha = config["head_sha"]
+            if method == "GET" and endpoint == f"repos/{repository}/pulls/{pr_number}":
+                print(json.dumps({
+                    "state": config["pr_state"],
+                    "base": {"repo": {"full_name": repository}, "ref": "main", "sha": config["base_sha"]},
+                    "head": {"repo": {"full_name": repository}, "ref": head_ref, "sha": config["api_head_sha"]},
+                }, separators=(",", ":")))
+                raise SystemExit(0)
+            if method == "GET" and endpoint == f"repos/{repository}/git/ref/heads/{head_ref}":
+                print(config["observed_head"])
+                raise SystemExit(0)
+            if method == "GET" and endpoint.startswith(
+                f"repos/{repository}/actions/workflows/windows-client.yml/runs?"
+            ):
+                dispatched = any(
+                    entry.get("method") == "POST"
+                    and entry.get("endpoint") == f"repos/{repository}/actions/workflows/windows-client.yml/dispatches"
+                    for entry in transcript
+                ) and not config["dispatch_failure"]
+                events = list(config["existing_events"])
+                if dispatched:
+                    events.append("workflow_dispatch")
+                runs = [
+                    {
+                        "path": ".github/workflows/windows-client.yml",
+                        "event": event,
+                        "head_sha": head_sha,
+                        "head_branch": head_ref,
+                        "head_repository": {"full_name": repository},
+                        "repository": {"full_name": repository},
+                    }
+                    for event in events
+                ]
+                print(json.dumps([{"total_count": len(runs), "workflow_runs": runs}], separators=(",", ":")))
+                raise SystemExit(0)
+            if method == "POST" and endpoint == f"repos/{repository}/actions/workflows/windows-client.yml/dispatches":
+                expected = {
+                    "ref": head_ref,
+                    "inputs": {
+                        "pr_number": pr_number,
+                        "base_repository": repository,
+                        "head_repository": repository,
+                        "base_sha": config["base_sha"],
+                        "head_sha": head_sha,
+                        "head_ref": head_ref,
+                    },
+                }
+                if payload != expected:
+                    raise SystemExit("dispatch payload mismatch")
+                if config["dispatch_failure"]:
+                    raise SystemExit("dispatch rejected")
+                raise SystemExit(0)
+            raise SystemExit(f"unexpected fake GitHub API request: {method} {endpoint}")
+            '''
+        ).lstrip("\n"),
+        encoding="utf-8",
+    )
+    fake.chmod(fake.stat().st_mode | stat.S_IXUSR)
+    return fake
+
+
+def _run_dispatch_case(block: str, scenario: DispatchScenario) -> tuple[int, list[Any], bytes, bytes]:
+    with tempfile.TemporaryDirectory(prefix="ci-dispatch-fixture-") as temporary:
+        temporary_path = Path(temporary)
+        fake_bin = temporary_path / "bin"
+        fake_bin.mkdir()
+        _write_dispatch_fake_gh(fake_bin)
+        transcript_path = temporary_path / "transcript.json"
+        transcript_path.write_text("[]", encoding="utf-8")
+        config_path = temporary_path / "config.json"
+        config_path.write_text(
+            json.dumps(
+                {
+                    "transcript": str(transcript_path),
+                    "repository": REPOSITORY,
+                    "pr_number": scenario.pr_number,
+                    "base_sha": BASE_SHA,
+                    "head_ref": "feat/next",
+                    "head_sha": COMMIT_SHA,
+                    "pr_state": scenario.pr_state,
+                    "api_head_sha": scenario.api_head_sha,
+                    "observed_head": scenario.observed_head,
+                    "existing_events": list(scenario.existing_events),
+                    "dispatch_failure": scenario.dispatch_failure,
+                }
+            ),
+            encoding="utf-8",
+        )
+        block_path = temporary_path / "run.sh"
+        block_path.write_text(block, encoding="utf-8")
+        environment = os.environ.copy()
+        environment.update(
+            {
+                "PATH": str(fake_bin) + os.pathsep + environment.get("PATH", ""),
+                "CI_DISPATCH_FAKE_CONFIG": str(config_path),
+                "GH_TOKEN": SECRET,
+                "REPOSITORY": REPOSITORY,
+                "PR_NUMBER": scenario.pr_number,
+                "BASE_REPOSITORY": REPOSITORY,
+                "HEAD_REPOSITORY": REPOSITORY,
+                "BASE_SHA": BASE_SHA,
+                "EVENT_HEAD_SHA": HEAD_SHA,
+                "HEAD_SHA": COMMIT_SHA,
+                "HEAD_REF": "feat/next",
+            }
+        )
+        before = _repo_snapshot()
+        result = subprocess.run(
+            ["bash", str(block_path)],
+            cwd=ROOT,
+            env=environment,
+            capture_output=True,
+            check=False,
+            timeout=30,
+        )
+        if _repo_snapshot() != before:
+            fail(f"{scenario.name}: dispatch block mutated repository state")
+        return (
+            result.returncode,
+            json.loads(transcript_path.read_text(encoding="utf-8")),
+            result.stdout,
+            result.stderr,
+        )
+
+
+def check_dispatch_runtime(source: str) -> int:
+    block = _extract_named_run_block(
+        source, "      - name: Dispatch the exact quality head once"
+    )
+    cases = (
+        DispatchScenario(
+            "initial-dispatch", expect_success=True, expected_dispatches=1
+        ),
+        DispatchScenario(
+            "synchronize-retry-reuses-run",
+            existing_events=("workflow_dispatch",),
+            expect_success=True,
+        ),
+        DispatchScenario(
+            "legacy-action-required-run-is-not-authority",
+            existing_events=("pull_request",),
+            expect_success=True,
+            expected_dispatches=1,
+        ),
+        DispatchScenario(
+            "duplicate-dispatches-fail-closed",
+            existing_events=("workflow_dispatch", "workflow_dispatch"),
+        ),
+        DispatchScenario("head-ref-race", observed_head="9" * 40),
+        DispatchScenario("pull-request-head-race", api_head_sha="8" * 40),
+        DispatchScenario("closed-pull-request", pr_state="closed"),
+        DispatchScenario("malformed-pr-number", pr_number="0"),
+        DispatchScenario(
+            "dispatch-api-failure", dispatch_failure=True, expected_dispatches=1
+        ),
+    )
+    for scenario in cases:
+        returncode, transcript, stdout, stderr = _run_dispatch_case(block, scenario)
+        for artifact in (stdout, stderr, json.dumps(transcript).encode("utf-8")):
+            if SECRET.encode("utf-8") in artifact:
+                fail(f"{scenario.name}: dispatch leaked GH_TOKEN")
+        dispatches = [entry for entry in transcript if entry.get("method") == "POST"]
+        if len(dispatches) != scenario.expected_dispatches:
+            fail(
+                f"{scenario.name}: dispatch count {len(dispatches)} != "
+                f"{scenario.expected_dispatches}"
+            )
+        if (returncode == 0) != scenario.expect_success:
+            fail(
+                f"{scenario.name}: unexpected return code {returncode}: "
+                f"{stderr.decode(errors='replace')}"
+            )
+    return len(cases)
+
+
+def check_result_runtime(source: str) -> int:
+    block = _extract_named_run_block(
+        source, "      - name: Select the exact quality head"
+    )
+    cases = (
+        ("binary-prepared-head", "true", HEAD_SHA, COMMIT_SHA, 0, COMMIT_SHA),
+        ("no-binary-event-head", "false", HEAD_SHA, "", 0, HEAD_SHA),
+        ("missing-prepared-head", "true", HEAD_SHA, "", 1, ""),
+        ("malformed-scope", "unknown", HEAD_SHA, COMMIT_SHA, 1, ""),
+    )
+    for name, scope, event_head, prepared_head, expected_failure, expected_head in cases:
+        with tempfile.TemporaryDirectory(prefix="ci-result-fixture-") as temporary:
+            root = Path(temporary)
+            output = root / "github-output"
+            script = root / "run.sh"
+            script.write_text(block, encoding="utf-8")
+            environment = os.environ.copy()
+            environment.update(
+                {
+                    "BINARY_IMPACT": scope,
+                    "EVENT_HEAD_SHA": event_head,
+                    "PREPARED_HEAD_SHA": prepared_head,
+                    "GITHUB_OUTPUT": str(output),
+                }
+            )
+            result = subprocess.run(
+                ["bash", str(script)],
+                cwd=ROOT,
+                env=environment,
+                capture_output=True,
+                check=False,
+                timeout=30,
+            )
+            if (result.returncode != 0) != bool(expected_failure):
+                fail(f"{name}: unexpected final-head return code {result.returncode}")
+            actual = output.read_text(encoding="utf-8") if output.exists() else ""
+            expected = f"final_head_sha={expected_head}\n" if expected_head else ""
+            if actual != expected:
+                fail(f"{name}: final-head output {actual!r} != {expected!r}")
+    return len(cases)
+
+
 def check_runtime(block: str) -> int:
     cases = [
         Scenario("normal", expect_success=True),
@@ -1352,6 +1720,7 @@ def check_runtime(block: str) -> int:
         Scenario("fork-head-repository", head_repository="contributor/repository"),
         Scenario("malformed-base-sha", base_sha="a" * 39),
         Scenario("malformed-repository", repository="owner/bad repo"),
+        Scenario("unexpected-safe-head-ref", head_ref="feature/version"),
         Scenario("malformed-head-ref", head_ref="/unsafe"),
         Scenario("head-race", observed_head="d" * 40),
         Scenario("final-force-false-conflict", conflict=True),
@@ -1393,7 +1762,10 @@ def check_runtime(block: str) -> int:
                 continue
             if scenario.expect_already_next:
                 _assert_no_writes(result)
-                if result.output_file != "check_conclusion=success\nversion=1.0.9\n":
+                if result.output_file != (
+                    "check_conclusion=success\nversion=1.0.9\n"
+                    f"final_head_sha={HEAD_SHA}\n"
+                ):
                     fail(f"{scenario.name}: unexpected output {result.output_file!r}")
                 continue
             writes = _writes(result)
@@ -1438,11 +1810,14 @@ def check_runtime(block: str) -> int:
             }:
                 fail(f"normal: commit payload differs: {commit!r}")
             patch = ref_writes[0]
-            if patch["endpoint"] != "repos/owner/repository/git/refs/heads/feature/version":
+            if patch["endpoint"] != "repos/owner/repository/git/refs/heads/feat/next":
                 fail(f"normal: wrong ref endpoint: {patch!r}")
             if patch.get("fields") != {"sha": COMMIT_SHA, "force": "false"}:
                 fail(f"normal: ref update was not strict: {patch!r}")
-            if result.output_file:
+            if result.output_file != (
+                "check_conclusion=success\nversion=1.0.9\n"
+                f"final_head_sha={COMMIT_SHA}\n"
+            ):
                 fail(f"normal: unexpected output {result.output_file!r}")
             if [entry.get("content_sha256") for entry in blob_entries] != result.blob_digests:
                 fail("normal: blob transcript does not match prepared files")
@@ -1482,7 +1857,8 @@ def check_mutations(source: str) -> int:
     )
     early_exit = (
         '          if [[ "$head_version" == "$next_version" ]]; then\n'
-        "            printf 'check_conclusion=success\\nversion=%s\\n' \"$head_version\" >> \"$GITHUB_OUTPUT\"\n"
+        "            printf 'check_conclusion=success\\nversion=%s\\nfinal_head_sha=%s\\n' \\\n"
+        '              "$head_version" "$HEAD_SHA" >> "$GITHUB_OUTPUT"\n'
         "            exit 0\n"
         "          fi\n"
     )
@@ -1519,8 +1895,8 @@ def check_mutations(source: str) -> int:
         ("trusted-checkout-pr-head", "          ref: refs/heads/main\n", "          ref: ${{ github.event.pull_request.head.sha }}\n"),
         (
             "scope-permission-missing",
-            "      pull-requests: read\n",
-            "",
+            "    permissions:\n      contents: write\n      pull-requests: read\n    outputs:\n",
+            "    permissions:\n      contents: write\n    outputs:\n",
         ),
         (
             "scope-read-became-write",
@@ -1549,6 +1925,14 @@ def check_mutations(source: str) -> int:
         ),
         ("force-true", "            -F force=false \\\n", "            -F force=true \\\n"),
         ("fork-guard-deleted", fork_guard, ""),
+        (
+            "feat-next-write-boundary-guard-deleted",
+            '          [[ "$HEAD_REF" == feat/next ]] || {\n'
+            "            echo 'automatic version preparation is restricted to feat/next' >&2\n"
+            "            exit 1\n"
+            "          }\n",
+            "",
+        ),
         ("head-race-guard-deleted", race_guard, ""),
         (
             "fourth-tree-path",
@@ -1583,6 +1967,16 @@ def check_mutations(source: str) -> int:
             work_assignment + '          printf probe > "$GITHUB_WORKSPACE/probe"\n',
         ),
         ("blob-content-argv", blob_stdin, blob_argv),
+        (
+            "no-binary-head-selection-missing",
+            '            false) final_head_sha="$EVENT_HEAD_SHA" ;;\n',
+            '            false) final_head_sha="$PREPARED_HEAD_SHA" ;;\n',
+        ),
+        (
+            "dispatch-binary-only",
+            "  dispatch-quality:\n    needs: [prepare]\n",
+            "  dispatch-quality:\n    if: needs.prepare.outputs.binary_impact == 'true'\n    needs: [prepare]\n",
+        ),
     ]
     for name, old, new in mutations:
         mutated = _replace_once(source, old, new, name)
@@ -1592,6 +1986,73 @@ def check_mutations(source: str) -> int:
             continue
         fail(f"mutation escaped static oracle: {name}")
     return len(mutations)
+
+
+def check_dispatch_mutations(source: str) -> int:
+    """Exercise the finite exact-once dispatch and trust-boundary contract."""
+
+    cases = (
+        (
+            "dispatch-actions-write-missing",
+            "      actions: write\n",
+            "      actions: read\n",
+        ),
+        (
+            "dispatch-gained-contents-write",
+            "      contents: read\n",
+            "      contents: write\n",
+        ),
+        (
+            "dispatch-head-branch-guard-missing",
+            '              "$HEAD_REF" == feat/next ]] || {\n',
+            '              "$HEAD_REF" != /* ]] || {\n',
+        ),
+        (
+            "dispatch-pr-head-binding-missing",
+            '              "$(jq -r \'.head.sha\' <<<"$pull_request")" == "$HEAD_SHA" ]] || {\n',
+            '              "$(jq -r \'.head.sha\' <<<"$pull_request")" =~ ^[0-9a-fA-F]{40}$ ]] || {\n',
+        ),
+        (
+            "dispatch-ref-race-guard-missing",
+            '          [[ "$observed_head" == "$HEAD_SHA" ]] || {\n',
+            '          [[ "$observed_head" =~ ^[0-9a-fA-F]{40}$ ]] || {\n',
+        ),
+        (
+            "dispatch-legacy-pull-request-query",
+            "runs?event=workflow_dispatch&head_sha=$HEAD_SHA&branch=$HEAD_REF&per_page=100",
+            "runs?event=pull_request&head_sha=$HEAD_SHA&branch=$HEAD_REF&per_page=100",
+        ),
+        (
+            "dispatch-idempotence-missing",
+            "            1)\n",
+            "            0|1)\n",
+        ),
+        (
+            "dispatch-duplicate-failure-missing",
+            '              echo "multiple quality workflow runs already exist for $HEAD_SHA" >&2\n',
+            '              echo "multiple quality workflow runs already exist for $HEAD_SHA"\n',
+        ),
+        (
+            "dispatch-input-missing",
+            ",head_ref:$head_ref}}')\"\n",
+            "}}')\"\n",
+        ),
+        (
+            "dispatch-confirmation-missing",
+            "              for attempt in 1 2 3 4 5 6; do\n",
+            "              for attempt in 1; do\n",
+        ),
+    )
+    for name, old, new in cases:
+        dispatch_start = source.index("  dispatch-quality:\n")
+        dispatch = source[dispatch_start:]
+        mutated = source[:dispatch_start] + _replace_once(dispatch, old, new, name)
+        try:
+            validate_static(mutated)
+        except FixtureError:
+            continue
+        fail(f"dispatch mutation escaped static oracle: {name}")
+    return len(cases)
 
 
 def check_release_permission_mutations(source: str) -> int:
@@ -1700,7 +2161,10 @@ def self_test() -> tuple[int, int]:
         validate_static(source)
         block = extract_run_block(source)
         runtime_cases = check_runtime(block)
+        runtime_cases += check_result_runtime(source)
+        runtime_cases += check_dispatch_runtime(source)
         mutation_cases = check_mutations(source)
+        mutation_cases += check_dispatch_mutations(source)
         release_source = RELEASE_WORKFLOW.read_text(encoding="utf-8")
         validate_release_permissions(release_source)
         validate_release_scope(release_source)

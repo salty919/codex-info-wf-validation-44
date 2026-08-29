@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Resolve the latest unique accepted pull-request quality workflow run.
+"""Resolve the latest unique accepted workflow-dispatch quality run.
 
 The release workflow obtains the three JSON documents from GitHub and calls
 this module as the sole identity resolver.  In particular, pull_requests on a
@@ -326,7 +326,7 @@ def _workflow_run_matches(
         references,
     ) = identity
     (
-        number,
+        _number,
         expected_head_sha,
         expected_head_ref,
         expected_head_repository,
@@ -336,22 +336,21 @@ def _workflow_run_matches(
         _merge_sha,
         _merged_at,
     ) = expected
-    expected_ref = f"refs/pull/{number}/merge"
+    expected_ref = f"refs/heads/{expected_head_ref}"
     referenced_shas = {sha for sha, _ref, _path in references}
-    if len(referenced_shas) != 1:
+    if referenced_shas != {expected_head_sha}:
         return False
-    referenced_sha = next(iter(referenced_shas))
     expected_references = {
         (
-            referenced_sha,
+            expected_head_sha,
             expected_ref,
-            f"{expected_base_repository[1]}/.github/workflows/{workflow}@{referenced_sha}",
+            f"{expected_base_repository[1]}/.github/workflows/{workflow}@{expected_head_sha}",
         )
         for workflow in ("codeql.yml", "rust.yml")
     }
     return (
         path == ".github/workflows/windows-client.yml"
-        and event == "pull_request"
+        and event == "workflow_dispatch"
         and head_sha == expected_head_sha
         and head_commit_id == expected_head_sha
         and head_branch == expected_head_ref

@@ -22,6 +22,9 @@ jobs:
     permissions:
       contents: write
       pull-requests: read
+    outputs:
+      binary_impact: ${{ steps.scope.outputs.binary_impact }}
+      final_head_sha: ${{ steps.result.outputs.final_head_sha }}
     steps:
       - name: Checkout trusted default branch
         uses: actions/checkout@v4
@@ -104,8 +107,8 @@ jobs:
             echo 'PR head repository is not a safe GitHub owner/name value' >&2
             exit 1
           }
-          [[ "$HEAD_REF" != /* && "$HEAD_REF" != *'..'* && "$HEAD_REF" != *'?'* && "$HEAD_REF" != *'#'* ]] || {
-            echo 'PR head ref is not a safe branch ref for the Git Data API' >&2
+          [[ "$HEAD_REF" == feat/next ]] || {
+            echo 'automatic version preparation is restricted to feat/next' >&2
             exit 1
           }
 
@@ -168,7 +171,8 @@ jobs:
           }
 
           if [[ "$head_version" == "$next_version" ]]; then
-            printf 'check_conclusion=success\nversion=%s\n' "$head_version" >> "$GITHUB_OUTPUT"
+            printf 'check_conclusion=success\nversion=%s\nfinal_head_sha=%s\n' \
+              "$head_version" "$HEAD_SHA" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
@@ -299,3 +303,140 @@ jobs:
             -f "sha=$commit_sha" \
             -F force=false \
             --jq '.object.sha' | grep -Fx "$commit_sha"
+          printf 'check_conclusion=success\nversion=%s\nfinal_head_sha=%s\n' \
+            "$next_version" "$commit_sha" >> "$GITHUB_OUTPUT"
+
+      - name: Select the exact quality head
+        id: result
+        shell: bash
+        env:
+          BINARY_IMPACT: ${{ steps.scope.outputs.binary_impact }}
+          EVENT_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PREPARED_HEAD_SHA: ${{ steps.prepare.outputs.final_head_sha }}
+        run: |
+          set -euo pipefail
+          case "$BINARY_IMPACT" in
+            true) final_head_sha="$PREPARED_HEAD_SHA" ;;
+            false) final_head_sha="$EVENT_HEAD_SHA" ;;
+            *) echo 'change scope output is missing or malformed' >&2; exit 1 ;;
+          esac
+          [[ "$final_head_sha" =~ ^[0-9a-fA-F]{40}$ ]] || {
+            echo 'final quality head is missing or malformed' >&2
+            exit 1
+          }
+          printf 'final_head_sha=%s\n' "$final_head_sha" >> "$GITHUB_OUTPUT"
+
+  dispatch-quality:
+    needs: [prepare]
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+      contents: read
+      pull-requests: read
+    steps:
+      - name: Dispatch the exact quality head once
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          BASE_REPOSITORY: ${{ github.event.pull_request.base.repo.full_name }}
+          HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          EVENT_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          HEAD_SHA: ${{ needs.prepare.outputs.final_head_sha }}
+          HEAD_REF: ${{ github.event.pull_request.head.ref }}
+        run: |
+          set -euo pipefail
+          [[ "$REPOSITORY" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ &&
+              "$BASE_REPOSITORY" == "$REPOSITORY" &&
+              "$HEAD_REPOSITORY" == "$REPOSITORY" &&
+              "$PR_NUMBER" =~ ^[1-9][0-9]*$ &&
+              "$BASE_SHA" =~ ^[0-9a-fA-F]{40}$ &&
+              "$EVENT_HEAD_SHA" =~ ^[0-9a-fA-F]{40}$ &&
+              "$HEAD_SHA" =~ ^[0-9a-fA-F]{40}$ &&
+              "$HEAD_REF" == feat/next ]] || {
+            echo 'quality dispatch identity is outside the trusted feat/next to main boundary' >&2
+            exit 1
+          }
+
+          pull_request="$(gh api --method GET \
+            -H 'Accept: application/vnd.github+json' \
+            -H 'X-GitHub-Api-Version: 2022-11-28' \
+            "repos/$REPOSITORY/pulls/$PR_NUMBER")"
+          [[ "$(jq -r '.state' <<<"$pull_request")" == open &&
+              "$(jq -r '.base.repo.full_name' <<<"$pull_request")" == "$REPOSITORY" &&
+              "$(jq -r '.base.ref' <<<"$pull_request")" == main &&
+              "$(jq -r '.base.sha' <<<"$pull_request")" == "$BASE_SHA" &&
+              "$(jq -r '.head.repo.full_name' <<<"$pull_request")" == "$REPOSITORY" &&
+              "$(jq -r '.head.ref' <<<"$pull_request")" == "$HEAD_REF" &&
+              "$(jq -r '.head.sha' <<<"$pull_request")" == "$HEAD_SHA" ]] || {
+            echo 'pull request moved or no longer matches the dispatch identity' >&2
+            exit 1
+          }
+
+          observed_head="$(gh api \
+            -H 'Accept: application/vnd.github+json' \
+            -H 'X-GitHub-Api-Version: 2022-11-28' \
+            "repos/$REPOSITORY/git/ref/heads/$HEAD_REF" --jq '.object.sha')"
+          [[ "$observed_head" == "$HEAD_SHA" ]] || {
+            echo "head ref moved before quality dispatch: expected $HEAD_SHA, found $observed_head" >&2
+            exit 1
+          }
+
+          count_quality_runs() {
+            local runs
+            runs="$(gh api --method GET --paginate --slurp \
+              -H 'Accept: application/vnd.github+json' \
+              -H 'X-GitHub-Api-Version: 2022-11-28' \
+              "repos/$REPOSITORY/actions/workflows/windows-client.yml/runs?event=workflow_dispatch&head_sha=$HEAD_SHA&branch=$HEAD_REF&per_page=100")"
+            jq --arg repository "$REPOSITORY" --arg head_ref "$HEAD_REF" --arg head_sha "$HEAD_SHA" \
+              '[.[].workflow_runs[] | select(
+                .path == ".github/workflows/windows-client.yml" and
+                .event == "workflow_dispatch" and
+                .head_sha == $head_sha and
+                .head_branch == $head_ref and
+                .head_repository.full_name == $repository and
+                .repository.full_name == $repository
+              )] | length' <<<"$runs"
+          }
+          matching_runs="$(count_quality_runs)"
+          case "$matching_runs" in
+            0)
+              payload="$(jq -n \
+                --arg ref "$HEAD_REF" \
+                --arg pr_number "$PR_NUMBER" \
+                --arg base_repository "$BASE_REPOSITORY" \
+                --arg head_repository "$HEAD_REPOSITORY" \
+                --arg base_sha "$BASE_SHA" \
+                --arg head_sha "$HEAD_SHA" \
+                --arg head_ref "$HEAD_REF" \
+                '{ref:$ref,inputs:{pr_number:$pr_number,base_repository:$base_repository,head_repository:$head_repository,base_sha:$base_sha,head_sha:$head_sha,head_ref:$head_ref}}')"
+              gh api --method POST \
+                -H 'Accept: application/vnd.github+json' \
+                -H 'X-GitHub-Api-Version: 2022-11-28' \
+                "repos/$REPOSITORY/actions/workflows/windows-client.yml/dispatches" \
+                --input - --silent <<<"$payload"
+              confirmed_runs=0
+              for attempt in 1 2 3 4 5 6; do
+                sleep 2
+                confirmed_runs="$(count_quality_runs)"
+                case "$confirmed_runs" in
+                  0) continue ;;
+                  1) break ;;
+                  *) echo "quality dispatch became ambiguous for $HEAD_SHA" >&2; exit 1 ;;
+                esac
+              done
+              [[ "$confirmed_runs" == 1 ]] || {
+                echo "quality dispatch was accepted but no exact run became visible for $HEAD_SHA after $attempt attempts" >&2
+                exit 1
+              }
+              ;;
+            1)
+              echo "quality workflow already dispatched for $HEAD_SHA"
+              ;;
+            *)
+              echo "multiple quality workflow runs already exist for $HEAD_SHA" >&2
+              exit 1
+              ;;
+          esac
