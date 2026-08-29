@@ -10,6 +10,9 @@ WORKFLOW = ROOT / ".github" / "workflows" / "version-prepare.yml"
 QUALITY_WORKFLOW = ROOT / ".github" / "workflows" / "windows-client.yml"
 RELEASE_WORKFLOW = ROOT / ".github" / "workflows" / "release.yml"
 REPORTER = ROOT / "scripts" / "final_head_check_reporter.py"
+FEAT_WORKFLOW = ROOT / ".github" / "workflows" / "feat-integration.yml"
+SELECTIVE_WORKFLOW = ROOT / ".github" / "workflows" / "selective-quality.yml"
+FEAT_REPORTER = ROOT / "scripts" / "feat_integration_check_reporter.py"
 
 
 def section(source: str, start: str, end: str | None) -> str:
@@ -114,15 +117,106 @@ def validate(
     return errors
 
 
+def validate_feat(feat: str, selective: str, reporter: str) -> list[str]:
+    errors: list[str] = []
+
+    def exact(source: str, marker: str, expected: int = 1) -> None:
+        actual = source.count(marker)
+        if actual != expected:
+            errors.append(f"feat count {marker!r}: expected {expected}, found {actual}")
+
+    register = section(feat, "  register-selection:\n", "  selective-quality:\n")
+    quality = section(feat, "  selective-quality:\n", "  finalize-selection:\n")
+    finalize = section(feat, "  finalize-selection:\n", None)
+    permissions_index = feat.find("\npermissions:")
+    trigger = feat[:permissions_index] if permissions_index >= 0 else feat
+
+    exact(trigger, "  pull_request_target:\n")
+    exact(trigger, '    branches: ["feat/next"]\n')
+    exact(trigger, "  pull_request:\n", 0)
+    exact(trigger, "  workflow_dispatch:\n", 0)
+    exact(feat, "permissions: {}\n")
+    exact(feat, "  cancel-in-progress: false\n")
+    exact(feat, "contents: write\n", 0)
+    exact(feat, "pull-requests: write\n", 0)
+
+    exact(register, "      checks: write\n")
+    exact(register, "      contents: read\n")
+    exact(register, "      pull-requests: read\n")
+    exact(register, "          ref: refs/heads/main\n")
+    exact(register, "          persist-credentials: false\n")
+    exact(register, '"repos/$REPOSITORY/pulls/$PR_NUMBER" > "$scope_root/before.json"\n')
+    exact(register, '"repos/$REPOSITORY/pulls/$PR_NUMBER" > "$scope_root/after.json"\n')
+    exact(register, "--paginate --slurp")
+    exact(register, "--expected-base-ref feat/next")
+    exact(register, '--expected-head-ref "$EVENT_HEAD_REF"')
+    exact(register, '"$EVENT_HEAD_REPOSITORY" == "$REPOSITORY"')
+    exact(register, "scripts/feat_integration_check_reporter.py register")
+
+    exact(quality, "uses: ./.github/workflows/selective-quality.yml")
+    exact(quality, "      contents: read\n")
+    exact(quality, "      security-events: write\n")
+    exact(quality, "      checks: write\n", 0)
+    exact(quality, "      contents: write\n", 0)
+
+    exact(finalize, "      checks: write\n")
+    exact(finalize, "      contents: read\n")
+    exact(finalize, "      pull-requests: read\n")
+    exact(finalize, "          ref: refs/heads/main\n")
+    exact(finalize, "scripts/feat_integration_check_reporter.py finalize")
+    exact(finalize, "      contents: write\n", 0)
+
+    exact(selective, "  workflow_call:\n")
+    exact(selective, "  pull_request_target:\n", 0)
+    exact(selective, "contents: write\n", 0)
+    exact(selective, "checks: write\n", 0)
+    exact(selective, "secrets:", 0)
+    exact(selective, "          ref: refs/heads/main\n")
+    exact(selective, "          ref: ${{ inputs.source_sha }}\n", 2)
+    for owner, job in (
+        ("DOCS", "docs-quality"),
+        ("GOVERNANCE", "governance-quality"),
+        ("LINUX_BACKEND", "linux-backend-quality"),
+        ("LINUX_UI", "linux-ui-quality"),
+        ("WINDOWS", "windows-quality"),
+    ):
+        exact(selective, f"  {job}:\n")
+        exact(selective, f"    if: contains(fromJSON(inputs.selection_json).owners, '{owner}')\n")
+    exact(selective, "    uses: ./.github/workflows/rust.yml\n")
+    exact(selective, "    uses: ./.github/workflows/linux-ui-quality.yml\n")
+    exact(selective, "    uses: ./.github/workflows/windows-client.yml\n")
+    exact(selective, "      selective_mode: true\n")
+    exact(selective, "    if: inputs.codeql_languages_json != '[]'\n")
+    exact(selective, "      languages_json: ${{ inputs.codeql_languages_json }}\n")
+    exact(selective, "  selected-quality:\n")
+    exact(selective, "python3 scripts/selected_quality_gate.py")
+
+    exact(reporter, 'CHECK_NAME = "feat-acceptance"')
+    exact(reporter, "APP_ID = 15368")
+    exact(reporter, "codex-feat-v1:pr=", 1)
+    exact(reporter, 'pr["base"]["ref"] == "feat/next"')
+    exact(reporter, "foreign, malformed, or duplicate-name feat check exists")
+    exact(reporter, "live pull request identity moved or is malformed")
+    return errors
+
+
 def main() -> int:
     workflow = WORKFLOW.read_text(encoding="utf-8")
     quality_workflow = QUALITY_WORKFLOW.read_text(encoding="utf-8")
     release_workflow = RELEASE_WORKFLOW.read_text(encoding="utf-8")
     reporter = REPORTER.read_text(encoding="utf-8")
+    feat = FEAT_WORKFLOW.read_text(encoding="utf-8")
+    selective = SELECTIVE_WORKFLOW.read_text(encoding="utf-8")
+    feat_reporter = FEAT_REPORTER.read_text(encoding="utf-8")
     baseline = validate(workflow, quality_workflow, release_workflow, reporter)
     if baseline:
         raise AssertionError(
             "production CI trust contract failed: " + "; ".join(baseline)
+        )
+    feat_baseline = validate_feat(feat, selective, feat_reporter)
+    if feat_baseline:
+        raise AssertionError(
+            "production feat CI trust contract failed: " + "; ".join(feat_baseline)
         )
     mutations = (
         ("workflow", "permissions: {}\n", "permissions:\n  contents: write\n"),
@@ -197,6 +291,30 @@ def main() -> int:
             candidate_reporter,
         ):
             raise AssertionError(f"CI trust mutation was accepted: {needle!r}")
+        cases += 1
+    feat_mutations = (
+        ("feat", "permissions: {}\n", "permissions:\n  contents: write\n"),
+        ("feat", "          ref: refs/heads/main\n", "          ref: feat/next\n"),
+        ("feat", '"$EVENT_HEAD_REPOSITORY" == "$REPOSITORY"', "true"),
+        ("feat", "--paginate --slurp", "--paginate"),
+        ("feat", "scripts/feat_integration_check_reporter.py register", "true"),
+        ("selective", "permissions:\n  contents: read\n", "permissions:\n  contents: write\n"),
+        ("selective", "          ref: refs/heads/main\n", "          ref: ${{ inputs.source_sha }}\n"),
+        ("selective", "    if: contains(fromJSON(inputs.selection_json).owners, 'WINDOWS')\n", "    if: always()\n"),
+        ("reporter", "APP_ID = 15368", "APP_ID = 1"),
+    )
+    for target, needle, replacement in feat_mutations:
+        candidate_feat = feat
+        candidate_selective = selective
+        candidate_reporter = feat_reporter
+        if target == "feat":
+            candidate_feat = candidate_feat.replace(needle, replacement, 1)
+        elif target == "selective":
+            candidate_selective = candidate_selective.replace(needle, replacement, 1)
+        else:
+            candidate_reporter = candidate_reporter.replace(needle, replacement, 1)
+        if not validate_feat(candidate_feat, candidate_selective, candidate_reporter):
+            raise AssertionError(f"feat CI trust mutation was accepted: {needle!r}")
         cases += 1
     print(f"ci-trust-fixture: PASS cases={cases}")
     return 0

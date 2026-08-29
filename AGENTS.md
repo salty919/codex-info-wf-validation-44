@@ -79,7 +79,7 @@ cleanup条件と削除予定:
 - CodexはPRのURL、base/headの完全SHA、変更file、検証結果、未確認事項、`main`へ統合した場合の影響を提示し、ユーザーが変更と動作を確認できる状態でmerge前に停止する。Codex自身の実装・検証・review結果を、ユーザーによる統合判断の代替にしてはならない。
 - pushまたはPR作成が許可されていない作業を「統合済み」または「完了」と報告してはならない。実装済み、local検証済み、未統合を区別して報告する。
 - pushまたはPR作成直前に`origin/feat/next`の完全SHAを再確認する。宣言baseから進んでいる場合は、旧SHA、新SHA、競合し得るowned pathsを報告して停止し、rebase、merge、reset、cherry-pick、stash、force pushを行わず再許可を待つ。
-- repositoryのworkflow契約が別途変更されない限り、required acceptance、version準備、CodeQL、Release前gateは`feat/next -> main` PRが所有する。`codex/<task> -> feat/next`では宣言済みlocal gateとreviewを行い、versionまたはRelease mutationを行わない。`feat/next`向けCIを追加する場合はRelease経路から分離した別設計・別許可とし、`main`向けtriggerを単純に広げてはならない。
+- `codex/<task> -> feat/next`はtrusted `feat-integration.yml`が完全なPR差分を有限ownerへ分類し、関係するremote qualityだけを実行して、最新headの`feat-acceptance`を成功させるまで統合しない。この経路ではversion、candidate、Release、tag、branch refをmutationしない。`feat/next -> main`は同じ分類正本を使用するが、required `acceptance`・`version-prepared`、version準備、選択build、Release前gateを別のmain経路で所有し、ユーザーだけがReleaseへ進む判断を行う。feat向けtriggerをmain向けtriggerの単純な拡張にしてはならない。
 
 ### race、cleanup、復旧、報告
 

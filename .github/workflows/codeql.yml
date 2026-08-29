@@ -14,6 +14,11 @@ on:
         description: Source branch used for CodeQL result attribution
         required: true
         type: string
+      languages_json:
+        description: Exact non-empty JSON language array selected by the trusted caller
+        required: false
+        default: '["actions","csharp","python","rust"]'
+        type: string
   schedule:
     - cron: "23 4 * * 1"
 
@@ -28,15 +33,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - language: actions
-            build-mode: none
-          - language: csharp
-            build-mode: none
-          - language: python
-            build-mode: none
-          - language: rust
-            build-mode: none
+        language: ${{ fromJSON(inputs.languages_json || '["actions","csharp","python","rust"]') }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -45,7 +42,7 @@ jobs:
       - uses: github/codeql-action/init@v4
         with:
           languages: ${{ matrix.language }}
-          build-mode: ${{ matrix.build-mode }}
+          build-mode: none
       - uses: github/codeql-action/analyze@v4
         with:
           category: "/language:${{ matrix.language }}"
