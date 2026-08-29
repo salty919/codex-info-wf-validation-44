@@ -34,6 +34,16 @@ on:
         description: Exact pull request head branch
         required: true
         type: string
+      selective_mode:
+        description: Run only the Windows owner for the shared selective gate
+        required: false
+        default: false
+        type: boolean
+      selection_json:
+        description: Trusted owner selection used in selective mode
+        required: false
+        default: '{}'
+        type: string
     outputs:
       binary_impact:
         value: ${{ jobs.version-prepared.outputs.binary_impact }}
@@ -57,7 +67,7 @@ concurrency:
 
 jobs:
   version-prepared:
-    if: inputs.premerge == true
+    if: inputs.premerge == true && inputs.selective_mode == false
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -167,7 +177,7 @@ jobs:
           fi
 
   native-quality:
-    if: inputs.premerge == true && needs.version-prepared.outputs.binary_impact == 'true' && needs.version-prepared.outputs.ready == 'true'
+    if: inputs.selective_mode == false && inputs.premerge == true && needs.version-prepared.outputs.binary_impact == 'true' && needs.version-prepared.outputs.ready == 'true'
     needs: [version-prepared]
     uses: ./.github/workflows/rust.yml
     with:
@@ -176,7 +186,7 @@ jobs:
       contents: read
 
   codeql-analysis:
-    if: inputs.premerge == true && needs.version-prepared.outputs.binary_impact == 'true' && needs.version-prepared.outputs.ready == 'true'
+    if: inputs.selective_mode == false && inputs.premerge == true && needs.version-prepared.outputs.binary_impact == 'true' && needs.version-prepared.outputs.ready == 'true'
     needs: [version-prepared]
     uses: ./.github/workflows/codeql.yml
     with:
@@ -188,7 +198,7 @@ jobs:
 
   windows-quality:
     name: Merge policy
-    if: inputs.premerge == true && needs.version-prepared.outputs.binary_impact == 'true' && needs.version-prepared.outputs.ready == 'true'
+    if: inputs.selective_mode == false && inputs.premerge == true && needs.version-prepared.outputs.binary_impact == 'true' && needs.version-prepared.outputs.ready == 'true'
     needs: [version-prepared]
     runs-on: ubuntu-latest
     steps:
@@ -239,7 +249,7 @@ jobs:
           if-no-files-found: error
 
   ui-quality:
-    if: inputs.premerge == true && needs.version-prepared.outputs.binary_impact == 'true' && needs.version-prepared.outputs.ready == 'true'
+    if: always() && inputs.premerge == true && ((inputs.selective_mode == false && needs.version-prepared.outputs.binary_impact == 'true' && needs.version-prepared.outputs.ready == 'true') || (inputs.selective_mode == true && contains(fromJSON(inputs.selection_json).owners, 'WINDOWS')))
     needs: [version-prepared]
     runs-on: windows-latest
     steps:
@@ -414,7 +424,7 @@ jobs:
   acceptance:
     # This job produces evidence only. The trusted caller publishes the two
     # exact required check-runs on the immutable PR head.
-    if: always() && inputs.premerge == true
+    if: always() && inputs.premerge == true && inputs.selective_mode == false
     needs: [version-prepared, native-quality, codeql-analysis, windows-quality, ui-quality]
     runs-on: ubuntu-latest
     outputs:

@@ -21,7 +21,7 @@ EXPECTED_RULESET_ID = 21746295
 EXPECTED_RULE_SOURCE = "salty919/codex_info_v2"
 EXPECTED_CONTEXTS = frozenset({"acceptance", "version-prepared"})
 BINARY_IMPACT_JOB_IF = (
-    "inputs.premerge == true && "
+    "inputs.selective_mode == false && inputs.premerge == true && "
     "needs.version-prepared.outputs.binary_impact == 'true' && "
     "needs.version-prepared.outputs.ready == 'true'"
 )
@@ -106,11 +106,29 @@ def validate_sources(
         "base_sha",
         "head_sha",
         "head_ref",
+        "selective_mode",
+        "selection_json",
     ):
         _count(windows_trigger, f"      {input_name}:\n", 1, errors)
-    _count(windows, f"    if: {BINARY_IMPACT_JOB_IF}\n", 4, errors)
-    _count(windows, "    if: inputs.premerge == true\n", 1, errors)
-    _count(windows, "    if: always() && inputs.premerge == true\n", 1, errors)
+    _count(windows, f"    if: {BINARY_IMPACT_JOB_IF}\n", 3, errors)
+    _count(
+        windows,
+        "    if: inputs.premerge == true && inputs.selective_mode == false\n",
+        1,
+        errors,
+    )
+    _count(
+        windows,
+        "    if: always() && inputs.premerge == true && inputs.selective_mode == false\n",
+        1,
+        errors,
+    )
+    _count(
+        windows,
+        "    if: always() && inputs.premerge == true && ((inputs.selective_mode == false && needs.version-prepared.outputs.binary_impact == 'true' && needs.version-prepared.outputs.ready == 'true') || (inputs.selective_mode == true && contains(fromJSON(inputs.selection_json).owners, 'WINDOWS')))\n",
+        1,
+        errors,
+    )
     _count(windows, "          ref: ${{ inputs.head_sha }}\n", 4, errors)
     _count(windows, "      source_sha: ${{ inputs.head_sha }}\n", 2, errors)
     _count(windows, "      head_ref: ${{ inputs.head_ref }}\n", 1, errors)

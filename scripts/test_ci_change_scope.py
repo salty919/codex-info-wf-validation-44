@@ -1,186 +1,222 @@
 #!/usr/bin/env python3
-"""Finite fixtures for the main-PR binary-impact classifier."""
+"""Finite tests for the fail-closed selective CI classifier."""
 
 from __future__ import annotations
 
-from contextlib import redirect_stdout
-import io
-import json
-from pathlib import Path
-import tempfile
+import subprocess
 import unittest
 
-import ci_change_scope
+from ci_change_scope import ScopeError, classify_payloads, owners_for_path, selection_for_paths
 
 
-REPOSITORY = "owner/repository"
-HEAD_REPOSITORY = "owner/fork"
-BASE_SHA = "a" * 40
-HEAD_SHA = "b" * 40
-NUMBER = 24
+REPOSITORY = "example/project"
+HEAD_REPOSITORY = "example/project"
+BASE_SHA = "1" * 40
+HEAD_SHA = "2" * 40
 
 
-def pull_request(changed_files: int) -> dict[str, object]:
+def pull_request(*, base_ref: str = "main", changed_files: int = 1) -> dict:
     return {
-        "number": NUMBER,
+        "number": 51,
+        "state": "open",
         "changed_files": changed_files,
-        "base": {"ref": "main", "sha": BASE_SHA, "repo": {"full_name": REPOSITORY}},
-        "head": {"ref": "feature", "sha": HEAD_SHA, "repo": {"full_name": HEAD_REPOSITORY}},
+        "base": {"ref": base_ref, "sha": BASE_SHA, "repo": {"full_name": REPOSITORY}},
+        "head": {"ref": "codex/change", "sha": HEAD_SHA, "repo": {"full_name": HEAD_REPOSITORY}},
     }
 
 
-def changed_file(filename: str, status: str = "modified", **extra: object) -> dict[str, object]:
-    return {"filename": filename, "status": status, **extra}
-
-
-def classify(files: list[list[dict[str, object]]], changed_files: int | None = None) -> str:
-    count = sum(len(page) for page in files) if changed_files is None else changed_files
-    return ci_change_scope.classify_payloads(
-        pull_request(count),
-        files,
+def classify(files: list[dict], *, base_ref: str = "main", pages: list[list[dict]] | None = None):
+    return classify_payloads(
+        pull_request(base_ref=base_ref, changed_files=len(files)),
+        pages if pages is not None else [files],
         expected_repository=REPOSITORY,
         expected_head_repository=HEAD_REPOSITORY,
-        expected_number=NUMBER,
+        expected_head_ref="codex/change",
+        expected_number=51,
+        expected_base_ref=base_ref,
         expected_base_sha=BASE_SHA,
         expected_head_sha=HEAD_SHA,
+        expected_state="open",
     )
 
 
-class ChangeScopeTests(unittest.TestCase):
-    def test_repository_only_paths_have_no_binary_impact(self) -> None:
-        files = [[
-            changed_file("AGENTS.md"),
-            changed_file("README.md"),
-            changed_file("docs/operations/runbook.md"),
-            changed_file(".github/ISSUE_TEMPLATE/work-item.md"),
-            changed_file(".github/workflows/windows-client.yml"),
-            changed_file("scripts/workflow_quality_gate.py"),
-            changed_file("tests/contract.rs"),
-        ]]
-        self.assertEqual(classify(files), "no-binary-impact")
-
-    def test_multiple_pages_are_complete(self) -> None:
-        files = [[changed_file("docs/a.md")], [changed_file("docs/b.md")]]
-        self.assertEqual(classify(files), "no-binary-impact")
-
-    def test_binary_input_path_has_binary_impact(self) -> None:
-        for path in (
-            "src/main.rs",
-            "ui/app.slint",
-            "protocol/v2/GetAccountResponse.json",
-            "assets/NotoSansJP.ttf",
-            "LICENSES/MIT.txt",
-            "Cargo.toml",
-            "windows-client/src/CodexInfo.WindowsClient/MainWindow.axaml",
-            "windows-client/installer/CodexInfo.WindowsClient.iss",
-            "windows-client/tools/Build-WindowsInstaller.ps1",
-        ):
+class OwnerTableTests(unittest.TestCase):
+    def test_single_owner_paths(self) -> None:
+        cases = {
+            "docs/PRODUCT_REQUIREMENTS.md": ("DOCS",),
+            ".github/workflows/feat-integration.yml": ("GOVERNANCE",),
+            "src/server.rs": ("LINUX_BACKEND",),
+            "ui/app.slint": ("LINUX_UI",),
+            "windows-client/src/App.cs": ("WINDOWS",),
+        }
+        for path, expected in cases.items():
             with self.subTest(path=path):
-                self.assertEqual(classify([[changed_file(path)]]), "binary-impact")
+                self.assertEqual(tuple(sorted(owners_for_path(path))), expected)
 
-    def test_mixed_paths_have_binary_impact(self) -> None:
-        files = [[changed_file("docs/a.md"), changed_file("Cargo.toml")]]
-        self.assertEqual(classify(files), "binary-impact")
-
-    def test_other_repository_path_has_no_binary_impact(self) -> None:
+    def test_shared_paths(self) -> None:
         self.assertEqual(
-            classify([[changed_file("README.en.md")]]), "no-binary-impact"
+            owners_for_path("Cargo.lock"), frozenset({"LINUX_BACKEND", "LINUX_UI"})
+        )
+        self.assertEqual(
+            owners_for_path("protocol/status.schema.json"),
+            frozenset({"LINUX_BACKEND", "WINDOWS"}),
+        )
+        self.assertEqual(
+            owners_for_path("LICENSES/dependency.txt"),
+            frozenset({"LINUX_BACKEND", "LINUX_UI", "WINDOWS"}),
         )
 
-    def test_pr_30_before_automatic_version_commit_has_no_binary_impact(self) -> None:
-        files = [[
-            changed_file(".github/workflows/codeql.yml", "added"),
-            changed_file(".github/workflows/windows-client.yml"),
-            changed_file("docs/PRODUCT_REQUIREMENTS.md"),
-            changed_file("docs/REQUIREMENTS_LEDGER.md"),
-            changed_file("scripts/test_codeql_workflow.py", "added"),
-            changed_file("scripts/windows_client_contract_gate.sh"),
-            changed_file("scripts/workflow_quality_gate.py"),
-        ]]
-        self.assertEqual(classify(files), "no-binary-impact")
+    def test_every_tracked_head_path_has_an_owner(self) -> None:
+        paths = subprocess.run(
+            ["git", "-c", "core.quotepath=false", "ls-files", "-z"],
+            check=True,
+            capture_output=True,
+        ).stdout.decode("utf-8").rstrip("\0").split("\0")
+        self.assertGreater(len(paths), 0)
+        for path in paths:
+            with self.subTest(path=path):
+                self.assertTrue(owners_for_path(path))
 
-    def test_repository_only_rename_has_no_binary_impact(self) -> None:
-        file_info = changed_file(
-            "docs/new.md", "renamed", previous_filename="docs/old.md"
+    def test_unknown_and_non_normalized_paths_fail_closed(self) -> None:
+        for path in ("future/unknown.bin", "../Cargo.toml", "/Cargo.toml", "a//b"):
+            with self.subTest(path=path), self.assertRaises(ScopeError):
+                owners_for_path(path)
+
+
+class SelectionTests(unittest.TestCase):
+    def test_docs_has_no_binary_or_codeql(self) -> None:
+        result = selection_for_paths(["README.md"])
+        self.assertEqual(result.owners, ("DOCS",))
+        self.assertEqual(result.codeql_languages, ())
+        self.assertFalse(result.binary_impact)
+
+    def test_governance_selects_actions_and_python(self) -> None:
+        result = selection_for_paths([".github/workflows/codeql.yml"])
+        self.assertEqual(result.owners, ("GOVERNANCE",))
+        self.assertEqual(result.codeql_languages, ("actions", "python"))
+        self.assertFalse(result.binary_impact)
+
+    def test_mixed_selection_is_a_deduplicated_finite_union(self) -> None:
+        result = selection_for_paths(
+            ["README.md", "src/server.rs", "ui/app.slint", "windows-client/src/App.cs"]
         )
-        self.assertEqual(classify([[file_info]]), "no-binary-impact")
-
-    def test_binary_input_rename_source_has_binary_impact(self) -> None:
-        file_info = changed_file(
-            "docs/main.md", "renamed", previous_filename="src/main.rs"
+        self.assertEqual(
+            result.owners, ("DOCS", "LINUX_BACKEND", "LINUX_UI", "WINDOWS")
         )
-        self.assertEqual(classify([[file_info]]), "binary-impact")
+        self.assertEqual(result.codeql_languages, ("csharp", "rust"))
+        self.assertTrue(result.binary_impact)
 
-    def test_binary_input_rename_destination_has_binary_impact(self) -> None:
-        file_info = changed_file(
-            "src/main.rs", "renamed", previous_filename="docs/main.md"
+
+class PayloadTests(unittest.TestCase):
+    def test_closed_event_remains_classifiable_for_postmerge_release(self) -> None:
+        pr = pull_request()
+        pr["state"] = "closed"
+        result = classify_payloads(
+            pr,
+            [[{"filename": "README.md", "status": "modified"}]],
+            expected_repository=REPOSITORY,
+            expected_head_repository=HEAD_REPOSITORY,
+            expected_number=51,
+            expected_base_sha=BASE_SHA,
+            expected_head_sha=HEAD_SHA,
         )
-        self.assertEqual(classify([[file_info]]), "binary-impact")
+        self.assertEqual(result.owners, ("DOCS",))
 
-    def test_missing_rename_source_fails(self) -> None:
-        with self.assertRaises(ci_change_scope.ScopeError):
-            classify([[changed_file("docs/new.md", "renamed")]])
-
-    def test_incomplete_pagination_fails(self) -> None:
-        with self.assertRaises(ci_change_scope.ScopeError):
-            classify([[changed_file("docs/a.md")]], changed_files=2)
-
-    def test_duplicate_file_record_fails(self) -> None:
-        files = [[changed_file("docs/a.md")], [changed_file("docs/a.md")]]
-        with self.assertRaises(ci_change_scope.ScopeError):
-            classify(files)
-
-    def test_empty_change_set_fails(self) -> None:
-        with self.assertRaises(ci_change_scope.ScopeError):
-            classify([], changed_files=0)
-
-    def test_identity_mismatch_fails(self) -> None:
-        candidate = pull_request(1)
-        candidate["number"] = NUMBER + 1
-        with self.assertRaises(ci_change_scope.ScopeError):
-            ci_change_scope.classify_payloads(
-                candidate,
-                [[changed_file("docs/a.md")]],
+    def test_main_and_feat_next_are_the_only_base_refs(self) -> None:
+        for ref in ("main", "feat/next"):
+            with self.subTest(ref=ref):
+                self.assertEqual(
+                    classify([{"filename": "README.md", "status": "modified"}], base_ref=ref).owners,
+                    ("DOCS",),
+                )
+        with self.assertRaises(ScopeError):
+            classify_payloads(
+                pull_request(base_ref="develop"),
+                [[{"filename": "README.md", "status": "modified"}]],
                 expected_repository=REPOSITORY,
                 expected_head_repository=HEAD_REPOSITORY,
-                expected_number=NUMBER,
+                expected_number=51,
+                expected_base_ref="develop",
                 expected_base_sha=BASE_SHA,
                 expected_head_sha=HEAD_SHA,
+                expected_state="open",
             )
 
-    def test_malformed_or_duplicate_json_fails(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="ci-change-scope-") as temporary:
-            malformed = Path(temporary) / "malformed.json"
-            duplicate = Path(temporary) / "duplicate.json"
-            malformed.write_text("{", encoding="utf-8")
-            duplicate.write_text('{"number":24,"number":25}', encoding="utf-8")
-            with self.assertRaises(ci_change_scope.ScopeError):
-                ci_change_scope.load_json(malformed)
-            with self.assertRaises(ci_change_scope.ScopeError):
-                ci_change_scope.load_json(duplicate)
-
-    def test_cli_output_is_exact(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="ci-change-scope-cli-") as temporary:
-            root = Path(temporary)
-            pull_path = root / "pull.json"
-            files_path = root / "files.json"
-            pull_path.write_text(json.dumps(pull_request(1)), encoding="utf-8")
-            files_path.write_text(
-                json.dumps([[changed_file("docs/a.md")]]), encoding="utf-8"
+    def test_rename_and_copy_union_old_and_new_owners(self) -> None:
+        for status in ("renamed", "copied"):
+            result = classify(
+                [{"filename": "docs/moved.md", "previous_filename": "src/old.rs", "status": status}]
             )
-            argv = [
-                "--pull-request", str(pull_path),
-                "--files", str(files_path),
-                "--expected-repository", REPOSITORY,
-                "--expected-head-repository", HEAD_REPOSITORY,
-                "--expected-number", str(NUMBER),
-                "--expected-base-sha", BASE_SHA,
-                "--expected-head-sha", HEAD_SHA,
-            ]
-            output = io.StringIO()
-            with redirect_stdout(output):
-                self.assertEqual(ci_change_scope.main(argv), 0)
-            self.assertEqual(output.getvalue(), "no-binary-impact\n")
+            self.assertEqual(result.owners, ("DOCS", "LINUX_BACKEND"))
+
+    def test_deleted_base_only_path_is_classified(self) -> None:
+        result = classify([{"filename": "windows-client/src/Old.cs", "status": "removed"}])
+        self.assertEqual(result.owners, ("WINDOWS",))
+
+    def test_complete_pagination_is_accepted(self) -> None:
+        files = [
+            {"filename": "README.md", "status": "modified"},
+            {"filename": "src/server.rs", "status": "modified"},
+        ]
+        result = classify(files, pages=[[files[0]], [files[1]]])
+        self.assertEqual(result.owners, ("DOCS", "LINUX_BACKEND"))
+
+    def test_incomplete_duplicate_and_unknown_payloads_fail(self) -> None:
+        cases = (
+            (pull_request(changed_files=2), [[{"filename": "README.md", "status": "modified"}]]),
+            (
+                pull_request(changed_files=2),
+                [[
+                    {"filename": "README.md", "status": "modified"},
+                    {"filename": "README.md", "status": "modified"},
+                ]],
+            ),
+            (pull_request(), [[{"filename": "future/new.file", "status": "modified"}]]),
+            (
+                pull_request(),
+                [[{"filename": "README.md", "previous_filename": "DESIGN.md", "status": "modified"}]],
+            ),
+        )
+        for pr, pages in cases:
+            with self.subTest(pages=pages), self.assertRaises(ScopeError):
+                classify_payloads(
+                    pr,
+                    pages,
+                    expected_repository=REPOSITORY,
+                    expected_head_repository=HEAD_REPOSITORY,
+                    expected_number=51,
+                    expected_base_sha=BASE_SHA,
+                    expected_head_sha=HEAD_SHA,
+                    expected_state="open",
+                )
+
+    def test_identity_and_head_move_fail_closed(self) -> None:
+        mutations = (
+            ("state", "closed"),
+            ("number", 52),
+            ("head.sha", "3" * 40),
+            ("head.ref", "codex/moved"),
+            ("base.sha", "4" * 40),
+        )
+        for key, value in mutations:
+            pr = pull_request()
+            target = pr
+            parts = key.split(".")
+            for part in parts[:-1]:
+                target = target[part]
+            target[parts[-1]] = value
+            with self.subTest(key=key), self.assertRaises(ScopeError):
+                classify_payloads(
+                    pr,
+                    [[{"filename": "README.md", "status": "modified"}]],
+                    expected_repository=REPOSITORY,
+                    expected_head_repository=HEAD_REPOSITORY,
+                    expected_head_ref="codex/change",
+                    expected_number=51,
+                    expected_base_sha=BASE_SHA,
+                    expected_head_sha=HEAD_SHA,
+                    expected_state="open",
+                )
 
 
 if __name__ == "__main__":
