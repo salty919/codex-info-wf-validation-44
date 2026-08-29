@@ -406,8 +406,14 @@ if rg -q --fixed-strings 'windows-contract: PASS' .github/workflows/windows-clie
     fail 'Windows merge-policy evidence retains obsolete test or Windows-quality markers'
 fi
 require_text .github/workflows/windows-client.yml 'bash scripts/final_acceptance_gate.sh artifacts/windows-ui-e2e'
-require_text .github/workflows/windows-client.yml '-SourceSha $env:GITHUB_SHA'
-require_text .github/workflows/windows-client.yml 'EXPECTED_E2E_SOURCE_SHA: ${{ github.sha }}'
+require_text .github/workflows/windows-client.yml '-SourceSha $env:SOURCE_SHA'
+require_text .github/workflows/windows-client.yml 'ref: ${{ inputs.head_sha }}'
+require_text .github/workflows/windows-client.yml 'commits/$PR_HEAD_SHA/check-runs?check_name=acceptance'
+require_file scripts/final_head_check_reporter.py
+require_file scripts/test_final_head_check_reporter.py
+require_file scripts/release_quality_run_resolver.py
+require_file scripts/test_release_quality_run_resolver.py
+require_text .github/workflows/windows-client.yml 'EXPECTED_E2E_SOURCE_SHA: ${{ inputs.head_sha }}'
 require_file scripts/final_acceptance_gate.sh
 require_text scripts/final_acceptance_gate.sh 'expected E2E source SHA is required'
 require_text scripts/final_acceptance_gate.sh 'source tree is dirty; release evidence must match a clean committed revision'
@@ -723,6 +729,11 @@ require_text docs/PRODUCT_REQUIREMENTS.md '# Codex Info 製品要件'
 require_file windows-client/CodeCoverage.runsettings
 
 bash scripts/final_acceptance_gate_test.sh
+python3 scripts/test_final_head_check_reporter.py
+python3 scripts/test_release_quality_run_resolver.py
+python3 scripts/ci_trust_fixture.py
+python3 scripts/workflow_quality_gate.py --self-test
+python3 scripts/test_codeql_workflow.py
 
 if command -v dotnet >/dev/null 2>&1; then
     contract_evidence_dir="${WINDOWS_CONTRACT_EVIDENCE_DIR:-}"

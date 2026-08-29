@@ -22,6 +22,10 @@ jobs:
     permissions:
       contents: write
       pull-requests: read
+    outputs:
+      binary_impact: ${{ steps.scope.outputs.binary_impact }}
+      final_head_sha: ${{ steps.result.outputs.final_head_sha }}
+      version: ${{ steps.prepare.outputs.version }}
     steps:
       - name: Checkout trusted default branch
         uses: actions/checkout@v4
@@ -104,8 +108,8 @@ jobs:
             echo 'PR head repository is not a safe GitHub owner/name value' >&2
             exit 1
           }
-          [[ "$HEAD_REF" != /* && "$HEAD_REF" != *'..'* && "$HEAD_REF" != *'?'* && "$HEAD_REF" != *'#'* ]] || {
-            echo 'PR head ref is not a safe branch ref for the Git Data API' >&2
+          [[ "$HEAD_REF" == feat/next ]] || {
+            echo 'automatic version preparation is restricted to feat/next' >&2
             exit 1
           }
 
@@ -168,7 +172,8 @@ jobs:
           }
 
           if [[ "$head_version" == "$next_version" ]]; then
-            printf 'check_conclusion=success\nversion=%s\n' "$head_version" >> "$GITHUB_OUTPUT"
+            printf 'check_conclusion=success\nversion=%s\nfinal_head_sha=%s\n' \
+              "$head_version" "$HEAD_SHA" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
@@ -299,3 +304,157 @@ jobs:
             -f "sha=$commit_sha" \
             -F force=false \
             --jq '.object.sha' | grep -Fx "$commit_sha"
+          printf 'check_conclusion=success\nversion=%s\nfinal_head_sha=%s\n' \
+            "$next_version" "$commit_sha" >> "$GITHUB_OUTPUT"
+
+      - name: Select the exact quality head
+        id: result
+        shell: bash
+        env:
+          BINARY_IMPACT: ${{ steps.scope.outputs.binary_impact }}
+          EVENT_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PREPARED_HEAD_SHA: ${{ steps.prepare.outputs.final_head_sha }}
+        run: |
+          set -euo pipefail
+          case "$BINARY_IMPACT" in
+            true) final_head_sha="$PREPARED_HEAD_SHA" ;;
+            false) final_head_sha="$EVENT_HEAD_SHA" ;;
+            *) echo 'change scope output is missing or malformed' >&2; exit 1 ;;
+          esac
+          [[ "$final_head_sha" =~ ^[0-9a-fA-F]{40}$ ]] || {
+            echo 'final quality head is missing or malformed' >&2
+            exit 1
+          }
+          printf 'final_head_sha=%s\n' "$final_head_sha" >> "$GITHUB_OUTPUT"
+
+  register-final-head-checks:
+    needs: [prepare]
+    runs-on: ubuntu-latest
+    permissions:
+      checks: write
+      contents: read
+      pull-requests: read
+    outputs:
+      quality_required: ${{ steps.register.outputs.quality_required }}
+    steps:
+      - name: Checkout trusted default branch
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository }}
+          ref: refs/heads/main
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Register required checks on the immutable final head
+        id: register
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BASE_REPOSITORY: ${{ github.event.pull_request.base.repo.full_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_REF: ${{ github.event.pull_request.head.ref }}
+          HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name }}
+          HEAD_SHA: ${{ needs.prepare.outputs.final_head_sha }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPOSITORY: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          python3 scripts/final_head_check_reporter.py register \
+            --repository "$REPOSITORY" \
+            --pr-number "$PR_NUMBER" \
+            --base-repository "$BASE_REPOSITORY" \
+            --head-repository "$HEAD_REPOSITORY" \
+            --base-sha "$BASE_SHA" \
+            --head-sha "$HEAD_SHA" \
+            --head-ref "$HEAD_REF" \
+            --run-id "$RUN_ID" \
+            --run-url "$RUN_URL" \
+            --github-output "$GITHUB_OUTPUT"
+
+  quality:
+    needs: [prepare, register-final-head-checks]
+    if: needs.register-final-head-checks.outputs.quality_required == 'true'
+    permissions:
+      contents: read
+      pull-requests: read
+      security-events: write
+    uses: ./.github/workflows/windows-client.yml
+    with:
+      premerge: true
+      pr_number: ${{ github.event.pull_request.number }}
+      base_repository: ${{ github.event.pull_request.base.repo.full_name }}
+      head_repository: ${{ github.event.pull_request.head.repo.full_name }}
+      base_sha: ${{ github.event.pull_request.base.sha }}
+      head_sha: ${{ needs.prepare.outputs.final_head_sha }}
+      head_ref: ${{ github.event.pull_request.head.ref }}
+
+  finalize-final-head-checks:
+    needs: [prepare, register-final-head-checks, quality]
+    if: always() && needs.register-final-head-checks.outputs.quality_required == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      checks: write
+      contents: read
+      pull-requests: read
+    steps:
+      - name: Checkout trusted default branch
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository }}
+          ref: refs/heads/main
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Download final acceptance verdict
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: acceptance-verdict
+          path: ${{ runner.temp }}/acceptance-verdict
+      - name: Download binary release candidate
+        if: needs.prepare.outputs.binary_impact == 'true'
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: release-candidate
+          path: ${{ runner.temp }}/release-candidate
+      - name: Finalize required acceptance on the immutable head
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BASE_REPOSITORY: ${{ github.event.pull_request.base.repo.full_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          BINARY_IMPACT: ${{ needs.prepare.outputs.binary_impact }}
+          CANDIDATE_ARTIFACT_DIGEST: ${{ needs.quality.outputs.candidate_artifact_digest }}
+          CANDIDATE_ARTIFACT_ID: ${{ needs.quality.outputs.candidate_artifact_id }}
+          HEAD_REF: ${{ github.event.pull_request.head.ref }}
+          HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name }}
+          HEAD_SHA: ${{ needs.prepare.outputs.final_head_sha }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          QUALITY_RESULT: ${{ needs.quality.result }}
+          REPOSITORY: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          VERDICT_ARTIFACT_DIGEST: ${{ needs.quality.outputs.verdict_artifact_digest }}
+          VERDICT_ARTIFACT_ID: ${{ needs.quality.outputs.verdict_artifact_id }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          set -euo pipefail
+          python3 scripts/final_head_check_reporter.py finalize \
+            --repository "$REPOSITORY" \
+            --pr-number "$PR_NUMBER" \
+            --base-repository "$BASE_REPOSITORY" \
+            --head-repository "$HEAD_REPOSITORY" \
+            --base-sha "$BASE_SHA" \
+            --head-sha "$HEAD_SHA" \
+            --head-ref "$HEAD_REF" \
+            --run-id "$RUN_ID" \
+            --run-url "$RUN_URL" \
+            --quality-result "$QUALITY_RESULT" \
+            --binary-impact "$BINARY_IMPACT" \
+            --version "$VERSION" \
+            --verdict-directory '${{ runner.temp }}/acceptance-verdict' \
+            --candidate-directory '${{ runner.temp }}/release-candidate' \
+            --verdict-artifact-id "$VERDICT_ARTIFACT_ID" \
+            --verdict-artifact-digest "$VERDICT_ARTIFACT_DIGEST" \
+            --candidate-artifact-id "$CANDIDATE_ARTIFACT_ID" \
+            --candidate-artifact-digest "$CANDIDATE_ARTIFACT_DIGEST"
