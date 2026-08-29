@@ -98,8 +98,9 @@
   same-repository headへexact 1 commitを原子的に追加する。head/baseの競合、fork、不正version、対象外file mutationでは
   書き込まない。post-merge jobはdefault branchのmainだけをcheckoutし、分類不成立またはeventのmerge SHAと不一致の場合は
   Release mutationを行わない。
-- CodeQLはmerge必須gateとし、critical/high findingをdismissやworkflow無効化で通過させない。外部AI findingsが
-  provider側の未対応modelで継続失敗する場合は、そのAI機能だけをrepository単位で無効化できるが、CodeQL、
+- 製品変更PRではCodeQLをmerge必須gateとし、critical/high findingをdismissやworkflow無効化で通過させない。
+  非製品のみPRではCodeQL AnalyzeとAutobuildを実行せず、active code-scanning rulesetの設定は維持する。外部AI findingsが
+  provider側の未対応modelで継続失敗する場合は、そのAI機能だけをrepository単位で無効化できるが、製品変更PRのCodeQL、
   code-scanning alerts、required acceptanceは維持する。
 - Codex code reviewはPRの変更が確定した最新headに対して`@codex review`を1回だけ起動する補助レビューとする。
   古いheadの結果や未解決かつnon-outdatedのP0/P1をready判定へ流用せず、独自API key workflowを追加しない。
