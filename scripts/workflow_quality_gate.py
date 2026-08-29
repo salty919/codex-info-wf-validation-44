@@ -115,7 +115,7 @@ EXPECTED_LIVE_RULE_KEYS = frozenset(
 )
 EXPECTED_LIVE_STATUS_CONTEXTS = frozenset({"acceptance", "version-prepared"})
 BINARY_IMPACT_JOB_IF = (
-    "github.event_name == 'pull_request' && "
+    "github.event_name == 'workflow_dispatch' && "
     "needs.version-prepared.outputs.binary_impact == 'true' && "
     "needs.version-prepared.outputs.ready == 'true'"
 )
@@ -764,6 +764,18 @@ def _version_scope_contract(workflow: Workflow) -> list[str]:
         'git cat-file -e "$BASE_SHA^{commit}"',
         'git show "$BASE_SHA:scripts/ci_change_scope.py" > "$classifier"',
         'python3 "$classifier"',
+        '"$HEAD_REPOSITORY" == "$REPOSITORY" &&',
+        '"$HEAD_REF" == feat/next &&',
+        '"$GITHUB_SHA" == "$HEAD_SHA" &&',
+        '"$GITHUB_REF" == "refs/heads/$HEAD_REF" ]] || {',
+        '[[ "$(jq -r \'.number | tostring\' "$scope_root/pull-request.json")" == "$PR_NUMBER" &&',
+        '"$(jq -r \'.state\' "$scope_root/pull-request.json")" == open &&',
+        '"$(jq -r \'.base.repo.full_name\' "$scope_root/pull-request.json")" == "$BASE_REPOSITORY" &&',
+        '"$(jq -r \'.base.ref\' "$scope_root/pull-request.json")" == main &&',
+        '"$(jq -r \'.base.sha\' "$scope_root/pull-request.json")" == "$BASE_SHA" &&',
+        '"$(jq -r \'.head.repo.full_name\' "$scope_root/pull-request.json")" == "$HEAD_REPOSITORY" &&',
+        '"$(jq -r \'.head.ref\' "$scope_root/pull-request.json")" == "$HEAD_REF" &&',
+        '"$(jq -r \'.head.sha\' "$scope_root/pull-request.json")" == "$HEAD_SHA" ]] || {',
         '"repos/$REPOSITORY/pulls/$PR_NUMBER/files?per_page=100"',
         "--paginate --slurp",
         'case "$scope" in',
@@ -774,7 +786,7 @@ def _version_scope_contract(workflow: Workflow) -> list[str]:
         if scope_text.count(marker) != 1:
             errors.append(f"trusted-base scope marker cardinality changed: {marker}")
     if "python3 scripts/ci_change_scope.py" in scope_text:
-        errors.append("pull_request scope executes the PR classifier")
+        errors.append("workflow_dispatch scope executes the PR classifier")
     if scope.properties.get("id") != "scope":
         errors.append("version-prepared scope step id changed")
     if version.properties.get("if") != "steps.scope.outputs.binary_impact == 'true'":
@@ -794,8 +806,8 @@ def _version_scope_contract(workflow: Workflow) -> list[str]:
     )
     if workflow_text.count(permissions) != 1:
         errors.append("version-prepared permissions are not exact")
-    if workflow.jobs["version-prepared"].properties.get("if") != "github.event_name == 'pull_request'":
-        errors.append("version-prepared is not pull_request-only")
+    if workflow.jobs["version-prepared"].properties.get("if") != "github.event_name == 'workflow_dispatch'":
+        errors.append("version-prepared is not workflow_dispatch-only")
     for owner in ("native-quality", "codeql-analysis", "windows-quality", "ui-quality"):
         if workflow.jobs.get(owner, Job("", {}, (), ())).properties.get("if") != BINARY_IMPACT_JOB_IF:
             errors.append(f"{owner} is not exact binary-impact-only")
@@ -835,6 +847,13 @@ def _acceptance_scope_contract(workflow: Workflow) -> list[str]:
     for step in steps[1:]:
         if step.properties.get("if") != BINARY_IMPACT_STEP_IF:
             errors.append(f"acceptance binary-impact step is not guarded: {step.label}")
+    assemble_text = "\n".join(steps[7].lines)
+    if assemble_text.count("          PR_NUMBER: ${{ inputs.pr_number }}") != 1:
+        errors.append("accepted candidate PR number input binding changed")
+    if workflow.jobs["acceptance"].run_blocks[-1].body.count(
+        "pr-number: $PR_NUMBER"
+    ) != 1:
+        errors.append("accepted candidate PR number provenance changed")
     return errors
 
 
@@ -865,6 +884,17 @@ def _release_scope_contract(workflow: Workflow) -> list[str]:
             errors.append(f"release scope marker cardinality changed: {marker}")
     if steps[1].properties.get("id") != "scope":
         errors.append("release scope step id changed")
+    resolver_text = "\n".join(steps[2].lines)
+    if resolver_text.count("event=workflow_dispatch&head_sha=$PR_HEAD_SHA") != 1:
+        errors.append("release resolver does not select workflow_dispatch by exact head")
+    verify_text = "\n".join(steps[4].lines)
+    for marker in (
+        "EXPECTED_PR_NUMBER: ${{ github.event.pull_request.number }}",
+        'grep -Fxc "pr-number: $EXPECTED_PR_NUMBER"',
+        'bash scripts/release_candidate_gate.sh artifacts/release-candidate "$EXPECTED_MERGE_SHA"',
+    ):
+        if verify_text.count(marker) != 1:
+            errors.append(f"release candidate PR binding changed: {marker}")
     for step in steps[2:]:
         if step.properties.get("if") != RELEASE_BINARY_IMPACT_STEP_IF:
             errors.append(f"release mutation step is not binary-impact-only: {step.label}")
@@ -909,10 +939,28 @@ def validate_workflows(windows_path: Path = WINDOWS_WORKFLOW, rust_path: Path = 
         if windows.text.count(codeql_call) != 1:
             errors.append("codeql-analysis call or permissions are not exact")
 
-        # The top-level trigger shape is checked independently of job strings.
-        pull_request_lines = _event_child_lines(windows, "pull_request")
-        if any(re.match(r"^\s{4}paths(?:-ignore)?:", line) for line in pull_request_lines):
-            errors.append("pull_request path filter is present")
+        # The quality run is created only by the trusted preparer. A direct
+        # pull_request trigger would recreate the pre-version failure and the
+        # GITHUB_TOKEN action_required run that caused Issue #24.
+        trigger_children = _section_children(windows, "on")
+        if set(trigger_children) != {"workflow_dispatch", "pull_request_target"}:
+            errors.append(f"Windows workflow triggers changed: {sorted(trigger_children)}")
+        dispatch_lines = _event_child_lines(windows, "workflow_dispatch")
+        dispatch_text = "\n".join(dispatch_lines)
+        for input_name in (
+            "pr_number",
+            "base_repository",
+            "head_repository",
+            "base_sha",
+            "head_sha",
+            "head_ref",
+        ):
+            if dispatch_text.count(f"    {input_name}:") != 1:
+                errors.append(f"workflow_dispatch input changed: {input_name}")
+        if dispatch_text.count("      required: true") != 6 or dispatch_text.count(
+            "      type: string"
+        ) != 6:
+            errors.append("workflow_dispatch inputs are not six required strings")
         target_lines = _event_child_lines(windows, "pull_request_target")
         type_lines = [line for line in target_lines if re.match(r"^\s{4}types:", line)]
         if len(type_lines) != 1 or _key_value(type_lines[0], 4)[2] != "[closed]":
@@ -928,8 +976,8 @@ def validate_workflows(windows_path: Path = WINDOWS_WORKFLOW, rust_path: Path = 
                 errors.append("cancel-in-progress is not false")
 
         acceptance_if = windows.jobs.get("acceptance", Job("", {}, (), ())).properties.get("if", "")
-        if acceptance_if != "always() && github.event_name == 'pull_request'":
-            errors.append("acceptance must always instantiate on pull_request")
+        if acceptance_if != "always() && github.event_name == 'workflow_dispatch'":
+            errors.append("acceptance must always instantiate on workflow_dispatch")
         acceptance = windows.jobs.get("acceptance")
         if acceptance is None or not acceptance.run_blocks:
             errors.append("acceptance outcome check is missing")
@@ -1463,7 +1511,7 @@ def _static_mutations() -> tuple[tuple[str, Callable[[Path, Path], None]], ...]:
 
     def no_acceptance_always(windows: Path, _rust: Path) -> None:
         text = windows.read_text(encoding="utf-8")
-        windows.write_text(_replace_exact(text, "if: always() && github.event_name == 'pull_request'", "if: github.event_name == 'pull_request'"), encoding="utf-8")
+        windows.write_text(_replace_exact(text, "if: always() && github.event_name == 'workflow_dispatch'", "if: github.event_name == 'workflow_dispatch'"), encoding="utf-8")
 
     def release_on_any_close(windows: Path, _rust: Path) -> None:
         text = windows.read_text(encoding="utf-8")
@@ -1498,7 +1546,7 @@ def _static_mutations() -> tuple[tuple[str, Callable[[Path, Path], None]], ...]:
         needle = f"  native-quality:\n    if: {BINARY_IMPACT_JOB_IF}\n"
         replacement = (
             "  native-quality:\n"
-            "    if: github.event_name == 'pull_request' && "
+            "    if: github.event_name == 'workflow_dispatch' && "
             "needs.version-prepared.outputs.ready == 'true'\n"
         )
         windows.write_text(_replace_exact(text, needle, replacement), encoding="utf-8")
@@ -1508,7 +1556,7 @@ def _static_mutations() -> tuple[tuple[str, Callable[[Path, Path], None]], ...]:
         needle = f"  codeql-analysis:\n    if: {BINARY_IMPACT_JOB_IF}\n"
         replacement = (
             "  codeql-analysis:\n"
-            "    if: github.event_name == 'pull_request' && "
+            "    if: github.event_name == 'workflow_dispatch' && "
             "needs.version-prepared.outputs.ready == 'true'\n"
         )
         windows.write_text(_replace_exact(text, needle, replacement), encoding="utf-8")
@@ -1537,7 +1585,7 @@ def _static_mutations() -> tuple[tuple[str, Callable[[Path, Path], None]], ...]:
 
     def version_scope_on_wrong_event(windows: Path, _rust: Path) -> None:
         text = windows.read_text(encoding="utf-8")
-        needle = "  version-prepared:\n    if: github.event_name == 'pull_request'\n"
+        needle = "  version-prepared:\n    if: github.event_name == 'workflow_dispatch'\n"
         replacement = "  version-prepared:\n    if: always()\n"
         windows.write_text(_replace_exact(text, needle, replacement), encoding="utf-8")
 
@@ -1596,9 +1644,89 @@ def _static_mutations() -> tuple[tuple[str, Callable[[Path, Path], None]], ...]:
             encoding="utf-8",
         )
 
-    def add_path_filter(windows: Path, _rust: Path) -> None:
+    def add_direct_pull_request_trigger(windows: Path, _rust: Path) -> None:
         text = windows.read_text(encoding="utf-8")
-        windows.write_text(_replace_exact(text, "  pull_request:\n    branches:", "  pull_request:\n    paths: ['**']\n    branches:"), encoding="utf-8")
+        windows.write_text(
+            _replace_exact(
+                text,
+                "on:\n  workflow_dispatch:\n",
+                'on:\n  pull_request:\n    branches: ["main"]\n  workflow_dispatch:\n',
+            ),
+            encoding="utf-8",
+        )
+
+    def workflow_dispatch_input_optional(windows: Path, _rust: Path) -> None:
+        text = windows.read_text(encoding="utf-8")
+        marker = "      pr_number:\n"
+        start = text.index(marker)
+        end = text.index("      base_repository:\n", start)
+        field = text[start:end]
+        windows.write_text(
+            text[:start]
+            + _replace_exact(field, "        required: true\n", "        required: false\n")
+            + text[end:],
+            encoding="utf-8",
+        )
+
+    def workflow_dispatch_sha_guard_missing(windows: Path, _rust: Path) -> None:
+        text = windows.read_text(encoding="utf-8")
+        windows.write_text(
+            _replace_exact(
+                text,
+                '              "$GITHUB_SHA" == "$HEAD_SHA" &&\n',
+                "",
+            ),
+            encoding="utf-8",
+        )
+
+    def workflow_dispatch_ref_guard_missing(windows: Path, _rust: Path) -> None:
+        text = windows.read_text(encoding="utf-8")
+        windows.write_text(
+            _replace_exact(
+                text,
+                '              "$GITHUB_REF" == "refs/heads/$HEAD_REF" ]] || {\n',
+                '              "$GITHUB_REF" != refs/tags/* ]] || {\n',
+            ),
+            encoding="utf-8",
+        )
+
+    def workflow_dispatch_api_identity_missing(
+        marker: str,
+    ) -> Callable[[Path, Path], None]:
+        def mutate(windows: Path, _rust: Path) -> None:
+            text = windows.read_text(encoding="utf-8")
+            windows.write_text(_replace_exact(text, marker, ""), encoding="utf-8")
+
+        return mutate
+
+    def release_resolver_legacy_event(windows: Path, _rust: Path) -> None:
+        text = windows.read_text(encoding="utf-8")
+        windows.write_text(
+            _replace_exact(
+                text,
+                "event=workflow_dispatch&head_sha=$PR_HEAD_SHA",
+                "event=pull_request&head_sha=$PR_HEAD_SHA",
+            ),
+            encoding="utf-8",
+        )
+
+    def accepted_candidate_pr_number_missing(windows: Path, _rust: Path) -> None:
+        text = windows.read_text(encoding="utf-8")
+        windows.write_text(
+            _replace_exact(text, "          pr-number: $PR_NUMBER\n", ""),
+            encoding="utf-8",
+        )
+
+    def release_candidate_pr_binding_missing(windows: Path, _rust: Path) -> None:
+        text = windows.read_text(encoding="utf-8")
+        windows.write_text(
+            _replace_exact(
+                text,
+                '          [[ "$(grep -Fxc "pr-number: $EXPECTED_PR_NUMBER" artifacts/release-candidate/acceptance.txt || true)" == 1 ]] || {\n',
+                '          [[ -f artifacts/release-candidate/acceptance.txt ]] || {\n',
+            ),
+            encoding="utf-8",
+        )
 
     def forbidden_quality_command(windows: Path, _rust: Path) -> None:
         text = windows.read_text(encoding="utf-8")
@@ -1722,7 +1850,61 @@ def _static_mutations() -> tuple[tuple[str, Callable[[Path, Path], None]], ...]:
         ("release-binary-impact-guard-missing", missing_release_binary_impact_guard),
         ("pull-request-classifier-executed", execute_pull_request_classifier),
         ("binary-impact-output-missing", missing_binary_impact_output),
-        ("pull-request-path-filter", add_path_filter),
+        ("direct-pull-request-trigger", add_direct_pull_request_trigger),
+        ("workflow-dispatch-input-optional", workflow_dispatch_input_optional),
+        ("workflow-dispatch-sha-guard-missing", workflow_dispatch_sha_guard_missing),
+        ("workflow-dispatch-ref-guard-missing", workflow_dispatch_ref_guard_missing),
+        (
+            "workflow-dispatch-api-number-missing",
+            workflow_dispatch_api_identity_missing(
+                '          [[ "$(jq -r \'.number | tostring\' "$scope_root/pull-request.json")" == "$PR_NUMBER" &&\n'
+            ),
+        ),
+        (
+            "workflow-dispatch-api-state-missing",
+            workflow_dispatch_api_identity_missing(
+                '              "$(jq -r \'.state\' "$scope_root/pull-request.json")" == open &&\n'
+            ),
+        ),
+        (
+            "workflow-dispatch-api-base-repository-missing",
+            workflow_dispatch_api_identity_missing(
+                '              "$(jq -r \'.base.repo.full_name\' "$scope_root/pull-request.json")" == "$BASE_REPOSITORY" &&\n'
+            ),
+        ),
+        (
+            "workflow-dispatch-api-base-ref-missing",
+            workflow_dispatch_api_identity_missing(
+                '              "$(jq -r \'.base.ref\' "$scope_root/pull-request.json")" == main &&\n'
+            ),
+        ),
+        (
+            "workflow-dispatch-api-base-sha-missing",
+            workflow_dispatch_api_identity_missing(
+                '              "$(jq -r \'.base.sha\' "$scope_root/pull-request.json")" == "$BASE_SHA" &&\n'
+            ),
+        ),
+        (
+            "workflow-dispatch-api-head-repository-missing",
+            workflow_dispatch_api_identity_missing(
+                '              "$(jq -r \'.head.repo.full_name\' "$scope_root/pull-request.json")" == "$HEAD_REPOSITORY" &&\n'
+            ),
+        ),
+        (
+            "workflow-dispatch-api-head-ref-missing",
+            workflow_dispatch_api_identity_missing(
+                '              "$(jq -r \'.head.ref\' "$scope_root/pull-request.json")" == "$HEAD_REF" &&\n'
+            ),
+        ),
+        (
+            "workflow-dispatch-api-head-sha-missing",
+            workflow_dispatch_api_identity_missing(
+                '              "$(jq -r \'.head.sha\' "$scope_root/pull-request.json")" == "$HEAD_SHA" ]] || {\n'
+            ),
+        ),
+        ("release-resolver-legacy-event", release_resolver_legacy_event),
+        ("accepted-candidate-pr-number-missing", accepted_candidate_pr_number_missing),
+        ("release-candidate-pr-binding-missing", release_candidate_pr_binding_missing),
         ("quality-command-in-acceptance", forbidden_quality_command),
         ("unknown-job", unknown_job),
         ("unknown-needs", unknown_need),

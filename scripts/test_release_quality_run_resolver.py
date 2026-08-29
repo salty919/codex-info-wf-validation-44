@@ -74,7 +74,7 @@ def workflow_run_fixture(
         "run_number": run_number,
         "run_attempt": run_attempt,
         "path": ".github/workflows/windows-client.yml",
-        "event": "pull_request",
+        "event": "workflow_dispatch",
         "status": status,
         "conclusion": conclusion,
         "created_at": created_at,
@@ -90,19 +90,19 @@ def workflow_run_fixture(
                 "path": (
                     BASE_REPOSITORY["full_name"]
                     + "/.github/workflows/rust.yml@"
-                    + "c" * 40
+                    + HEAD_SHA
                 ),
-                "ref": "refs/pull/42/merge",
-                "sha": "c" * 40,
+                "ref": "refs/heads/feature/release",
+                "sha": HEAD_SHA,
             },
             {
                 "path": (
                     BASE_REPOSITORY["full_name"]
                     + "/.github/workflows/codeql.yml@"
-                    + "c" * 40
+                    + HEAD_SHA
                 ),
-                "ref": "refs/pull/42/merge",
-                "sha": "c" * 40,
+                "ref": "refs/heads/feature/release",
+                "sha": HEAD_SHA,
             },
         ],
         "pull_requests": pull_requests,
@@ -146,7 +146,9 @@ def runs_fixture(
 
 def different_pull_request_run_fixture() -> dict[str, Any]:
     run = workflow_run_fixture(run_id=987655, run_number=85)
-    run["referenced_workflows"][0]["ref"] = "refs/pull/43/merge"
+    run["head_branch"] = "other/release"
+    for reference in run["referenced_workflows"]:
+        reference["ref"] = "refs/heads/other/release"
     return run
 
 
@@ -678,20 +680,20 @@ class ReleaseQualityRunResolverTests(unittest.TestCase):
             "referenced workflows three": lambda run: run["referenced_workflows"].append(
                 copy.deepcopy(run["referenced_workflows"][0])
             ),
-            "referenced workflow PR": lambda run: run[
+            "referenced workflow branch": lambda run: run[
                 "referenced_workflows"
-            ][0].update(ref="refs/pull/43/merge"),
+            ][0].update(ref="refs/heads/other/release"),
             "referenced workflow repository": lambda run: run[
                 "referenced_workflows"
             ][0].update(
-                path="other/repository/.github/workflows/rust.yml@" + "c" * 40
+                path="other/repository/.github/workflows/rust.yml@" + HEAD_SHA
             ),
             "referenced workflow path": lambda run: run[
                 "referenced_workflows"
             ][0].update(
                 path=BASE_REPOSITORY["full_name"]
                 + "/.github/workflows/other.yml@"
-                + "c" * 40
+                + HEAD_SHA
             ),
             "referenced workflow suffix": lambda run: run[
                 "referenced_workflows"
@@ -706,15 +708,15 @@ class ReleaseQualityRunResolverTests(unittest.TestCase):
             "referenced workflow SHA case": lambda run: run[
                 "referenced_workflows"
             ][0].update(sha="C" * 40),
-            "CodeQL referenced workflow PR": lambda run: run[
+            "CodeQL referenced workflow branch": lambda run: run[
                 "referenced_workflows"
-            ][1].update(ref="refs/pull/43/merge"),
+            ][1].update(ref="refs/heads/other/release"),
             "CodeQL referenced workflow path": lambda run: run[
                 "referenced_workflows"
             ][1].update(
                 path=BASE_REPOSITORY["full_name"]
                 + "/.github/workflows/other.yml@"
-                + "c" * 40
+                + HEAD_SHA
             ),
             "CodeQL referenced workflow SHA mismatch": lambda run: run[
                 "referenced_workflows"
