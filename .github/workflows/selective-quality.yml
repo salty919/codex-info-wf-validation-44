@@ -1,0 +1,162 @@
+# Copyright (C) 2026 salty919
+# SPDX-License-Identifier: GPL-3.0-only
+
+name: Selective quality (reusable)
+
+on:
+  workflow_call:
+    inputs:
+      source_sha:
+        required: true
+        type: string
+      base_sha:
+        required: true
+        type: string
+      head_ref:
+        required: true
+        type: string
+      pr_number:
+        required: true
+        type: string
+      selection_json:
+        required: true
+        type: string
+      codeql_languages_json:
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  docs-quality:
+    name: docs-quality
+    if: contains(fromJSON(inputs.selection_json).owners, 'DOCS')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ inputs.source_sha }}
+          persist-credentials: false
+      - name: Validate documentation revision
+        env:
+          BASE_SHA: ${{ inputs.base_sha }}
+          SOURCE_SHA: ${{ inputs.source_sha }}
+        run: |
+          set -euo pipefail
+          [[ "$(git rev-parse HEAD)" == "$SOURCE_SHA" ]]
+          git cat-file -e "$BASE_SHA^{commit}"
+          git diff --check "$BASE_SHA" "$SOURCE_SHA"
+          bash scripts/requirements_ledger_gate.sh
+
+  governance-quality:
+    name: governance-quality
+    if: contains(fromJSON(inputs.selection_json).owners, 'GOVERNANCE')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ inputs.source_sha }}
+          persist-credentials: false
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25.x'
+          cache: false
+      - name: Install pinned workflow syntax validator
+        run: go install github.com/rhysd/actionlint/cmd/actionlint@v1.7.12
+      - name: Run finite governance contracts
+        env:
+          BASE_SHA: ${{ inputs.base_sha }}
+          SOURCE_SHA: ${{ inputs.source_sha }}
+        run: |
+          set -euo pipefail
+          [[ "$(git rev-parse HEAD)" == "$SOURCE_SHA" ]]
+          git diff --check "$BASE_SHA" "$SOURCE_SHA"
+          actionlint .github/workflows/*.yml
+          python3 scripts/test_ci_change_scope.py
+          python3 scripts/test_selected_quality_gate.py
+          python3 scripts/test_feat_integration_check_reporter.py
+          python3 scripts/test_final_head_check_reporter.py
+          python3 scripts/test_codeql_workflow.py
+          python3 scripts/ci_trust_fixture.py
+          python3 scripts/workflow_quality_gate.py --self-test
+          bash scripts/requirements_ledger_gate.sh
+
+  linux-backend-quality:
+    name: linux-backend-quality
+    if: contains(fromJSON(inputs.selection_json).owners, 'LINUX_BACKEND')
+    uses: ./.github/workflows/rust.yml
+    with:
+      source_sha: ${{ inputs.source_sha }}
+    permissions:
+      contents: read
+
+  linux-ui-quality:
+    name: linux-ui-quality
+    if: contains(fromJSON(inputs.selection_json).owners, 'LINUX_UI')
+    uses: ./.github/workflows/linux-ui-quality.yml
+    with:
+      source_sha: ${{ inputs.source_sha }}
+    permissions:
+      contents: read
+
+  windows-quality:
+    name: windows-quality
+    if: contains(fromJSON(inputs.selection_json).owners, 'WINDOWS')
+    uses: ./.github/workflows/windows-client.yml
+    with:
+      premerge: true
+      pr_number: ${{ inputs.pr_number }}
+      base_repository: ${{ github.repository }}
+      head_repository: ${{ github.repository }}
+      base_sha: ${{ inputs.base_sha }}
+      head_sha: ${{ inputs.source_sha }}
+      head_ref: ${{ inputs.head_ref }}
+      selective_mode: true
+      selection_json: ${{ inputs.selection_json }}
+    permissions:
+      contents: read
+
+  codeql-quality:
+    name: codeql-quality
+    if: inputs.codeql_languages_json != '[]'
+    uses: ./.github/workflows/codeql.yml
+    with:
+      source_sha: ${{ inputs.source_sha }}
+      head_ref: ${{ inputs.head_ref }}
+      languages_json: ${{ inputs.codeql_languages_json }}
+    permissions:
+      contents: read
+      security-events: write
+
+  selected-quality:
+    name: selected-quality
+    if: always()
+    needs:
+      - docs-quality
+      - governance-quality
+      - linux-backend-quality
+      - linux-ui-quality
+      - windows-quality
+      - codeql-quality
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout trusted selection authority
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository }}
+          ref: refs/heads/main
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Require exact selected and skipped job states
+        env:
+          SELECTION: ${{ inputs.selection_json }}
+          RESULTS: ${{ toJSON(needs) }}
+        run: |
+          set -euo pipefail
+          results="$(jq -c 'with_entries(.value = .value.result)' <<<"$RESULTS")"
+          python3 scripts/selected_quality_gate.py --selection "$SELECTION" --results "$results"

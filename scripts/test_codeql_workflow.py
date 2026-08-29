@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Finite mutation contract for immutable-source CodeQL attribution."""
+"""Finite mutation contract for selective immutable-source CodeQL attribution."""
 
 from __future__ import annotations
 
@@ -8,10 +8,10 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 CODEQL = ROOT / ".github" / "workflows" / "codeql.yml"
 WINDOWS = ROOT / ".github" / "workflows" / "windows-client.yml"
-EXPECTED_LANGUAGES = ("actions", "csharp", "python", "rust")
+SELECTIVE = ROOT / ".github" / "workflows" / "selective-quality.yml"
 
 
-def validate(codeql: str, windows: str) -> list[str]:
+def validate(codeql: str, windows: str, selective: str) -> list[str]:
     errors: list[str] = []
 
     def exact(source: str, marker: str, count: int = 1) -> None:
@@ -25,64 +25,58 @@ def validate(codeql: str, windows: str) -> list[str]:
         exact(codeql, forbidden, 0)
     exact(codeql, "      source_sha:\n")
     exact(codeql, "      head_ref:\n")
-    exact(codeql, "          ref: ${{ inputs.source_sha || github.sha }}\n")
+    exact(codeql, "      languages_json:\n")
+    exact(codeql, "        default: '[\"actions\",\"csharp\",\"python\",\"rust\"]'\n")
     exact(
         codeql,
-        "          ref: ${{ inputs.source_sha && format('refs/heads/{0}', inputs.head_ref) || github.ref }}\n",
+        "        language: ${{ fromJSON(inputs.languages_json || '[\"actions\",\"csharp\",\"python\",\"rust\"]') }}\n",
     )
+    exact(codeql, "          ref: ${{ inputs.source_sha || github.sha }}\n")
     exact(codeql, "          sha: ${{ inputs.source_sha || github.sha }}\n")
+    exact(codeql, "          build-mode: none\n")
     exact(codeql, "  security-events: write\n")
     exact(codeql, "github/codeql-action/init@v4")
     exact(codeql, "github/codeql-action/analyze@v4")
     exact(codeql, "github/codeql-action/autobuild@", 0)
-    for language in EXPECTED_LANGUAGES:
-        exact(codeql, f"          - language: {language}\n")
-    exact(codeql, "            build-mode: none\n", len(EXPECTED_LANGUAGES))
+
     exact(windows, "    uses: ./.github/workflows/codeql.yml\n")
-    exact(windows, "      source_sha: ${{ inputs.head_sha }}\n", 2)
     exact(windows, "      head_ref: ${{ inputs.head_ref }}\n")
-    exact(
-        windows,
-        "needs: [version-prepared, native-quality, codeql-analysis, windows-quality, ui-quality]",
-    )
-    exact(windows, "          CODEQL_RESULT: ${{ needs.codeql-analysis.result }}\n")
+    exact(selective, "  codeql-quality:\n")
+    exact(selective, "    if: inputs.codeql_languages_json != '[]'\n")
+    exact(selective, "    uses: ./.github/workflows/codeql.yml\n")
+    exact(selective, "      languages_json: ${{ inputs.codeql_languages_json }}\n")
+    exact(selective, "      security-events: write\n")
+    exact(selective, "      - codeql-quality\n")
     return errors
 
 
 def main() -> int:
-    codeql = CODEQL.read_text(encoding="utf-8")
-    windows = WINDOWS.read_text(encoding="utf-8")
-    baseline = validate(codeql, windows)
+    sources = [
+        CODEQL.read_text(encoding="utf-8"),
+        WINDOWS.read_text(encoding="utf-8"),
+        SELECTIVE.read_text(encoding="utf-8"),
+    ]
+    baseline = validate(*sources)
     if baseline:
-        raise AssertionError(
-            "production CodeQL contract failed: " + "; ".join(baseline)
-        )
+        raise AssertionError("production CodeQL contract failed: " + "; ".join(baseline))
     mutations = (
-        ("codeql", "  workflow_call:\n", ""),
-        ("codeql", "          - language: rust\n", ""),
-        (
-            "codeql",
-            "            build-mode: none\n",
-            "            build-mode: autobuild\n",
-        ),
-        ("codeql", "          sha: ${{ inputs.source_sha || github.sha }}\n", ""),
-        ("codeql", "  security-events: write\n", ""),
-        ("windows", "      head_ref: ${{ inputs.head_ref }}\n", ""),
-        (
-            "windows",
-            "needs: [version-prepared, native-quality, codeql-analysis, windows-quality, ui-quality]",
-            "needs: [version-prepared, native-quality, windows-quality, ui-quality]",
-        ),
+        (0, "  workflow_call:\n", ""),
+        (0, "      languages_json:\n", "      languages:\n"),
+        (0, "          build-mode: none\n", "          build-mode: autobuild\n"),
+        (0, "          sha: ${{ inputs.source_sha || github.sha }}\n", ""),
+        (0, "  security-events: write\n", ""),
+        (1, "      head_ref: ${{ inputs.head_ref }}\n", ""),
+        (2, "    if: inputs.codeql_languages_json != '[]'\n", ""),
+        (2, "      languages_json: ${{ inputs.codeql_languages_json }}\n", ""),
+        (2, "      - codeql-quality\n", ""),
     )
     cases = 1
-    for target, needle, replacement in mutations:
-        candidate_codeql = codeql
-        candidate_windows = windows
-        if target == "codeql":
-            candidate_codeql = candidate_codeql.replace(needle, replacement, 1)
-        else:
-            candidate_windows = candidate_windows.replace(needle, replacement, 1)
-        if not validate(candidate_codeql, candidate_windows):
+    for index, needle, replacement in mutations:
+        candidate = sources.copy()
+        if candidate[index].count(needle) < 1:
+            raise AssertionError(f"missing mutation target: {needle!r}")
+        candidate[index] = candidate[index].replace(needle, replacement, 1)
+        if not validate(*candidate):
             raise AssertionError(f"CodeQL workflow mutation was accepted: {needle!r}")
         cases += 1
     print(f"codeql-workflow-test: PASS cases={cases}")
