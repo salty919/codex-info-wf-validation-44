@@ -4,6 +4,8 @@
 - 製品要件の正本は`docs/PRODUCT_REQUIREMENTS.md`とし、wire、データ、UIの詳細は同文書が参照する仕様へ置く。
 - 監査版ごとのEvidence、文書SHA一覧、サブエージェント作業台帳をrepositoryへ追加しない。再現可能なtestと必要最小限の仕様を残す。
 - 要件漏れを理由にN倍、N二乗、N階乗、全直積へ展開しない。同じ観測結果は既存要件へ統合し、因果関係のある有限caseだけを追加する。
+- ユーザーが述べていない要件、状態、分岐、品質目標を追加しない。実装上の入力errorや例外を製品要件の選択肢へ昇格させず、追加する各条項をユーザーの明示要求へ直接対応付けられない場合は削除する。
+- 実施申請に事実誤認、要求の取違い、scope誤りが判明した場合、その申請への許可だけを失効させ、要求自体は継続する。誤りと訂正差分を示して申請をやり直し、ユーザーが申請内容の誤りを発見することを安全境界にしない。
 - 文書ごとのSHAを完了ブロッカーにしない。製品artifactを一意に識別するhashは記録できるが、内容評価の代用にしない。
 - 外部authority値を推測しない。publisher、certificate、対応OS、保証値が未指定なら、公開・対応表明・mutationを行わないfail-closed動作を要件化する。
 - lockfileと既存package managerを守る。検索は`rg`を優先する。
@@ -17,7 +19,7 @@
 - localの静的検査、mock、契約test、build、実装者自身のreviewは、それぞれが直接観測した範囲だけの証拠とする。GitHub上のworkflow挙動、remote mutation、Release、実OS、実画面、外部service等をlocalで直接確認できない場合、その制約と未確認項目を明記し、local証拠で代用してはならない。
 - 要求または受入条件に`FAIL`、`INCONCLUSIVE`、未実行、未取得の証拠、未解決finding、未完了の依存作業が1件でもある間、Codexは作業全体を「完了」「要求達成」「全項目PASS」と報告せず、Issueを`status:review`へ進めず、closure reportを完成扱いしない。独立評価も証拠の欠落をPASSへ変更してはならない。
 - 報告では`実装済み`、`local検証済み`、`remote/実環境で検証済み`、`未確認（INCONCLUSIVE）`、`失敗（FAIL）`、`未統合`を区別する。一部だけが完了した場合は、その完了範囲と未完了範囲を同じ報告内で明示する。
-- 実環境確認にmerge、Release、外部mutation、追加権限またはユーザー操作が必要で許可されていない場合、Codexは許可済み範囲の終了時点で停止し、必要な確認操作、未確認の受入条件、完了判定を保留する理由を報告する。許可のない実環境操作を、完了証拠を得る目的で実行してはならない。
+- 実環境確認にPRのmergeまたは`main`の変更が必要な場合、Codexは停止して必要な確認操作と未確認項目を報告し、ユーザー本人の操作を待つ。Release、その他の外部mutation、追加権限またはユーザー操作が必要で許可されていない場合も、許可済み範囲の終了時点で停止する。未確認の受入条件を、許可のない実環境操作で完了証拠へ変えてはならない。
 
 ## 共有repositoryのbranch・worktreeガバナンス
 
@@ -25,8 +27,8 @@
 
 - `origin`は共有GitHub repositoryを指し、remote headは`origin`上の`refs/heads/*`を指す。Codexは他利用者が所有するbranch、worktree、変更、PRを推測で変更または削除してはならない。
 - `/home/salty/code/codex_info_v2`をユーザー通常worktreeとする。`feat/next`はユーザーが確認・統合するbranchであり、Codexにとってread-onlyとする。
-- `main`は本番・Releaseの正本とし、Codexは直接pushしてはならない。`feat/next`から`main`へのPR、承認、merge、close、Release判断はユーザーが管理する。
-- Codexが書込み可能なbranchは、宣言済みの完全な`origin/feat/next` SHAから作る一時branch`codex/<task>`だけとする。PRの方向は`codex/<task> -> feat/next -> main`に固定し、Codexは`main`向けPRを作らない。
+- `main`は本番・Releaseの正本とする。Codexは`main`を変更する判断、`main`向けPRの作成・更新・操作、`main`への直接pushを行わない。`feat/next`から`main`へのPR、承認、merge、close、Release判断はユーザー本人だけが行う。
+- Codexが書込み可能なbranchは、宣言済みの完全な`origin/feat/next` SHAから作る一時branch`codex/<task>`だけとする。Codexが作成・更新できるPRは`codex/<task> -> feat/next`だけとし、`feat/next -> main`はCodexの操作範囲外とする。
 - `active task`は、ユーザーが宣言内容を明示許可してからcleanupが完了するまでを指す。`at rest`はactive taskが0件の状態を指し、Codexが作成したlocal/remoteの`codex/*` branchと追加worktreeが残ってはならない。未知のbranchは他利用者所有として保持し、Codexは削除せず報告する。
 
 ### worktreeを使う理由と安全境界
@@ -71,7 +73,8 @@ cleanup条件と削除予定:
 - サブエージェントは宣言済み一時worktreeとowned pathsだけを扱う。サブエージェントによるbranch/worktreeの作成・削除、ref/config/remote操作、commit、push、PR操作を禁止し、管理は主担当だけが行う。
 - Codexは宣言した最小のformatter、check、testを実行し、0件のtestをPASSにしてはならない。既往障害、security、cross-cutting governance等で独立判断が必要な場合だけfresh evaluatorを使う。
 - commitはユーザーが明示許可した場合に限り、owned filesだけをstageして行う。pushとPR作成も宣言に含まれ明示許可された場合だけ行い、Codexが作るPRのbaseは`feat/next`に限定する。
-- CodexはPRを勝手にapprove、ready化、merge、close、auto-merge設定してはならず、workflowをapprove、rerunしてはならない。これらは、ユーザーがexact targetと操作を別途明示許可した場合だけ実施できる。
+- Codexは、ユーザーから依頼または許可を受けた場合も、いかなるPRもmergeせず、auto-mergeを設定または解除しない。この禁止に例外はなく、merge操作はユーザー本人だけが行う。Codexは`codex/<task> -> feat/next`のPR作成・更新と作業証拠のcommentを行える。PRのapprove、ready化、closeおよびworkflowのapproveまたはrerunは、exact targetと操作についてユーザーの明示許可がある場合だけ実施できる。
+- CodexはPRのURL、base/headの完全SHA、変更file、検証結果、未確認事項、`main`へ統合した場合の影響を提示し、ユーザーが変更と動作を確認できる状態でmerge前に停止する。Codex自身の実装・検証・review結果を、ユーザーによる統合判断の代替にしてはならない。
 - pushまたはPR作成が許可されていない作業を「統合済み」または「完了」と報告してはならない。実装済み、local検証済み、未統合を区別して報告する。
 - pushまたはPR作成直前に`origin/feat/next`の完全SHAを再確認する。宣言baseから進んでいる場合は、旧SHA、新SHA、競合し得るowned pathsを報告して停止し、rebase、merge、reset、cherry-pick、stash、force pushを行わず再許可を待つ。
 - repositoryのworkflow契約が別途変更されない限り、required acceptance、version準備、CodeQL、Release前gateは`feat/next -> main` PRが所有する。`codex/<task> -> feat/next`では宣言済みlocal gateとreviewを行い、versionまたはRelease mutationを行わない。`feat/next`向けCIを追加する場合はRelease経路から分離した別設計・別許可とし、`main`向けtriggerを単純に広げてはならない。

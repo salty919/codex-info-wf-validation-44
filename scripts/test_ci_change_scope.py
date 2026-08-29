@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Finite independent fixtures for the main-PR change-scope classifier."""
+"""Finite fixtures for the main-PR binary-impact classifier."""
 
 from __future__ import annotations
 
@@ -47,50 +47,75 @@ def classify(files: list[list[dict[str, object]]], changed_files: int | None = N
 
 
 class ChangeScopeTests(unittest.TestCase):
-    def test_exact_and_nested_allowlist_is_non_product(self) -> None:
+    def test_repository_only_paths_have_no_binary_impact(self) -> None:
         files = [[
             changed_file("AGENTS.md"),
             changed_file("README.md"),
             changed_file("docs/operations/runbook.md"),
             changed_file(".github/ISSUE_TEMPLATE/work-item.md"),
+            changed_file(".github/workflows/windows-client.yml"),
+            changed_file("scripts/workflow_quality_gate.py"),
+            changed_file("tests/contract.rs"),
         ]]
-        self.assertEqual(classify(files), "non-product")
+        self.assertEqual(classify(files), "no-binary-impact")
 
     def test_multiple_pages_are_complete(self) -> None:
         files = [[changed_file("docs/a.md")], [changed_file("docs/b.md")]]
-        self.assertEqual(classify(files), "non-product")
+        self.assertEqual(classify(files), "no-binary-impact")
 
-    def test_product_path_is_product(self) -> None:
-        self.assertEqual(classify([[changed_file("src/main.rs")]]), "product")
+    def test_binary_input_path_has_binary_impact(self) -> None:
+        for path in (
+            "src/main.rs",
+            "ui/app.slint",
+            "protocol/v2/GetAccountResponse.json",
+            "assets/NotoSansJP.ttf",
+            "LICENSES/MIT.txt",
+            "Cargo.toml",
+            "windows-client/src/CodexInfo.WindowsClient/MainWindow.axaml",
+            "windows-client/installer/CodexInfo.WindowsClient.iss",
+            "windows-client/tools/Build-WindowsInstaller.ps1",
+        ):
+            with self.subTest(path=path):
+                self.assertEqual(classify([[changed_file(path)]]), "binary-impact")
 
-    def test_mixed_paths_are_product(self) -> None:
+    def test_mixed_paths_have_binary_impact(self) -> None:
         files = [[changed_file("docs/a.md"), changed_file("Cargo.toml")]]
-        self.assertEqual(classify(files), "product")
+        self.assertEqual(classify(files), "binary-impact")
 
-    def test_unknown_root_path_is_product(self) -> None:
-        self.assertEqual(classify([[changed_file("README.en.md")]]), "product")
+    def test_other_repository_path_has_no_binary_impact(self) -> None:
+        self.assertEqual(
+            classify([[changed_file("README.en.md")]]), "no-binary-impact"
+        )
 
-    def test_workflow_change_is_product(self) -> None:
-        path = ".github/workflows/windows-client.yml"
-        self.assertEqual(classify([[changed_file(path)]]), "product")
+    def test_pr_30_before_automatic_version_commit_has_no_binary_impact(self) -> None:
+        files = [[
+            changed_file(".github/workflows/codeql.yml", "added"),
+            changed_file(".github/workflows/windows-client.yml"),
+            changed_file("docs/PRODUCT_REQUIREMENTS.md"),
+            changed_file("docs/REQUIREMENTS_LEDGER.md"),
+            changed_file("scripts/test_codeql_workflow.py", "added"),
+            changed_file("scripts/windows_client_contract_gate.sh"),
+            changed_file("scripts/workflow_quality_gate.py"),
+        ]]
+        self.assertEqual(classify(files), "no-binary-impact")
 
-    def test_allowlisted_rename_is_non_product(self) -> None:
+    def test_repository_only_rename_has_no_binary_impact(self) -> None:
         file_info = changed_file(
             "docs/new.md", "renamed", previous_filename="docs/old.md"
         )
-        self.assertEqual(classify([[file_info]]), "non-product")
+        self.assertEqual(classify([[file_info]]), "no-binary-impact")
 
-    def test_product_rename_source_is_product(self) -> None:
+    def test_binary_input_rename_source_has_binary_impact(self) -> None:
         file_info = changed_file(
             "docs/main.md", "renamed", previous_filename="src/main.rs"
         )
-        self.assertEqual(classify([[file_info]]), "product")
+        self.assertEqual(classify([[file_info]]), "binary-impact")
 
-    def test_product_rename_destination_is_product(self) -> None:
+    def test_binary_input_rename_destination_has_binary_impact(self) -> None:
         file_info = changed_file(
             "src/main.rs", "renamed", previous_filename="docs/main.md"
         )
-        self.assertEqual(classify([[file_info]]), "product")
+        self.assertEqual(classify([[file_info]]), "binary-impact")
 
     def test_missing_rename_source_fails(self) -> None:
         with self.assertRaises(ci_change_scope.ScopeError):
@@ -155,7 +180,7 @@ class ChangeScopeTests(unittest.TestCase):
             output = io.StringIO()
             with redirect_stdout(output):
                 self.assertEqual(ci_change_scope.main(argv), 0)
-            self.assertEqual(output.getvalue(), "non-product\n")
+            self.assertEqual(output.getvalue(), "no-binary-impact\n")
 
 
 if __name__ == "__main__":

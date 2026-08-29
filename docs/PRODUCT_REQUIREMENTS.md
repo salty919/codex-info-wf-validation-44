@@ -61,36 +61,36 @@
 
 ## 6. 配布・顧客向け表明
 
-- Windows製品版とX版は単一のstable `X.Y.Z`を共有する。製品変更を含むPRはmajor/minorを変更せず、mergeごとに
+- Windows製品版とX版は単一のstable `X.Y.Z`を共有する。バイナリ影響ありのPRはmajor/minorを変更せず、mergeごとに
   自動採番処理がpatchを十進整数としてちょうど1増やす。patchからminorへ桁上がりさせず、`1.0.9`の次は
   `1.0.10`とする。major/minorは利用者の明示指示を要する別変更でだけ更新し、自動採番処理は変更しない。
   `Cargo.toml`、root packageの`Cargo.lock`、`windows-client/Directory.Build.props`が開始時点で同値でない場合、
   または期待元versionとmainが一致しない場合は、3ファイルを一つも変更せず停止する。
-- `main`向けPRの変更pathが`AGENTS.md`、`README.md`、`docs/**`、`.github/ISSUE_TEMPLATE/**`だけで構成される場合を
-  「非製品のみ」とする。rename/copyは変更前後のpathを両方判定する。これ以外を1件でも含むmixed PR、未知path、
-  workflow・CI script・製品sourceの変更は製品変更として完全な採番・品質・配布経路を通す。PR/API identity不一致、
-  changed-files件数と全page取得結果の不一致、重複・空・malformed data、分類器未対応時は非製品扱いへfallbackせず、
-  mutation前に失敗する。ただしtrusted baseに分類器がまだ存在しない導入時の1境界だけは製品変更として完全経路を通す。
-- 製品変更PRの作成前は単一のローカル入口からnative deterministic test、data protection契約、Windows unit/contract testを
+- `main`向けPRは、配布するRust/Windows binaryまたはinstaller/payloadが消費するsource、依存関係・lockfile、組込みasset、
+  製品build・packaging入力を1件でも変更する場合を「バイナリ影響あり」、それ以外を「バイナリ影響なし」とする。
+  workflow・CI検査・test・文書・repository ruleだけの変更はバイナリ影響なしとする。分類はこの二つだけとし、rename/copyは
+  変更前後pathを両方判定する。PR/file APIのidentity、changed-files件数、全page、重複・schema検証に失敗した処理は
+  分類結果を返さず、versionまたはRelease mutationを開始しない。
+- バイナリ影響ありPRの作成前は単一のローカル入口からnative deterministic test、data protection契約、Windows unit/contract testを
   各1回だけ実行する。必須Rust testは1回の全target実行結果から名前と成功を確認し、個別に再実行しない。
   PRではrelease artifactに必要なnative buildとCLI/recorder実行、mainの実適用merge rule、実Windows installer/UIを
-  各1回だけ確認し、ローカルと同じtest/gateを別job、別workflow、acceptance、Releaseで再実行しない。非製品のみPRは
+  各1回だけ確認し、ローカルと同じtest/gateを別job、別workflow、acceptance、Releaseで再実行しない。バイナリ影響なしPRは
   これらの製品build/test/artifact producerをすべてskipし、分類とrequired check集約だけを短時間で実行する。
-  単一のrequired acceptanceは常に生成する。製品変更ではversion準備、先行jobの成功、検証対象tree、source SHA、
-  各artifact証拠の対応を検査し、非製品のみではversion未変更、全artifact producerが`skipped`、artifact 0件を検査する。
+  単一のrequired acceptanceは常に生成する。バイナリ影響ありではversion準備、先行jobの成功、検証対象tree、source SHA、
+  各artifact証拠の対応を検査し、バイナリ影響なしではversion未変更、全artifact producerが`skipped`、artifact 0件を検査する。
   分類欠落、期待外のjob結果、失敗・未完了・古い証拠では明示的に失敗してmergeを許可しない。
-- 製品変更PRだけ、品質確認を開始する前にPR branch上のversion 3ファイルをexact next patchへ自動更新する。その
+- バイナリ影響ありPRだけ、品質確認を開始する前にPR branch上のversion 3ファイルをexact next patchへ自動更新する。その
   version commitを含む最新mainとの合成treeを品質確認し、mergeによって採番を確定する。採番commit自身では
-  高コスト品質jobを開始せず、新しいheadに対する次のworkflow runで一度だけ確認する。非製品のみPRはversion 3ファイルを
+  高コスト品質jobを開始せず、新しいheadに対する次のworkflow runで一度だけ確認する。バイナリ影響なしPRはversion 3ファイルを
   変更せず、`version-prepared` required jobを分類だけで成功完了させる。
-- 製品変更のmerge後だけ、eventとPR APIの全identity（PR番号、head/base repository・ref・SHA、merge SHA）および
+- バイナリ影響ありのmerge後だけ、eventとPR APIの全identity（PR番号、head/base repository・ref・SHA、merge SHA）および
   `merged_at`の一致を確認する。ready_for_review等で同じheadの正当な品質runが複数存在し得ることを前提に、quality run APIを
   statusで絞らず全status・全page取得し、同一identityのexact候補がすべて`created_at <= updated_at <= merged_at`を
   満たすことを検証する。そのうち`run_number`が最大で一意のcandidateだけを選び、`completed`/`success`のときだけ
   受理する。最新candidateの失敗・未完了、tie、候補zero、malformed、post-merge run、pagination不完全・異常は
   artifact取得前にfail-closedとし、older successへfallbackしない。`pull_requests`はauthorityにせず、検証済みtreeとの
   一致を確認し、quality test/buildを再実行せずmanifest生成とRelease公開を行う。同時mergeと公開は直列化する。
-  非製品のみのmerge後jobは分類だけで成功完了し、quality run解決、artifact download、binary build、manifest、tag、
+  バイナリ影響なしのmerge後jobは分類だけで成功完了し、quality run解決、artifact download、binary build、manifest、tag、
   GitHub Releaseを一切生成しない。
 - PR由来のcheckout、script、workflow、artifactを、repository contents・checks・Releaseへのwrite権限を持つjobで実行しない。
   変更分類はPR/file APIの完全なidentityとpaginationをdefault branchまたはPRのtrusted baseにある分類器で判定する。
@@ -98,9 +98,9 @@
   same-repository headへexact 1 commitを原子的に追加する。head/baseの競合、fork、不正version、対象外file mutationでは
   書き込まない。post-merge jobはdefault branchのmainだけをcheckoutし、分類不成立またはeventのmerge SHAと不一致の場合は
   Release mutationを行わない。
-- 製品変更PRではCodeQLをmerge必須gateとし、critical/high findingをdismissやworkflow無効化で通過させない。
-  非製品のみPRではCodeQL AnalyzeとAutobuildを実行せず、active code-scanning rulesetの設定は維持する。外部AI findingsが
-  provider側の未対応modelで継続失敗する場合は、そのAI機能だけをrepository単位で無効化できるが、製品変更PRのCodeQL、
+- バイナリ影響ありPRではCodeQLをmerge必須gateとし、critical/high findingをdismissやworkflow無効化で通過させない。
+  バイナリ影響なしPRとmerge後pushではCodeQL AnalyzeとAutobuildを実行せず、active code-scanning rulesetの設定は維持する。外部AI findingsが
+  provider側の未対応modelで継続失敗する場合は、そのAI機能だけをrepository単位で無効化できるが、バイナリ影響ありPRのCodeQL、
   code-scanning alerts、required acceptanceは維持する。
 - Codex code reviewはPRの変更が確定した最新headに対して`@codex review`を1回だけ起動する補助レビューとする。
   古いheadの結果や未解決かつnon-outdatedのP0/P1をready判定へ流用せず、独自API key workflowを追加しない。

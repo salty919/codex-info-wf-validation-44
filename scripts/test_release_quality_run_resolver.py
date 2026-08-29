@@ -94,7 +94,16 @@ def workflow_run_fixture(
                 ),
                 "ref": "refs/pull/42/merge",
                 "sha": "c" * 40,
-            }
+            },
+            {
+                "path": (
+                    BASE_REPOSITORY["full_name"]
+                    + "/.github/workflows/codeql.yml@"
+                    + "c" * 40
+                ),
+                "ref": "refs/pull/42/merge",
+                "sha": "c" * 40,
+            },
         ],
         "pull_requests": pull_requests,
     }
@@ -657,11 +666,17 @@ class ReleaseQualityRunResolverTests(unittest.TestCase):
             "referenced workflows zero": lambda run: run.update(
                 referenced_workflows=[]
             ),
-            "referenced workflows two": lambda run: run.update(
+            "referenced workflows one": lambda run: run.update(
+                referenced_workflows=[run["referenced_workflows"][0]]
+            ),
+            "referenced workflows duplicate": lambda run: run.update(
                 referenced_workflows=[
                     run["referenced_workflows"][0],
                     copy.deepcopy(run["referenced_workflows"][0]),
                 ]
+            ),
+            "referenced workflows three": lambda run: run["referenced_workflows"].append(
+                copy.deepcopy(run["referenced_workflows"][0])
             ),
             "referenced workflow PR": lambda run: run[
                 "referenced_workflows"
@@ -691,6 +706,24 @@ class ReleaseQualityRunResolverTests(unittest.TestCase):
             "referenced workflow SHA case": lambda run: run[
                 "referenced_workflows"
             ][0].update(sha="C" * 40),
+            "CodeQL referenced workflow PR": lambda run: run[
+                "referenced_workflows"
+            ][1].update(ref="refs/pull/43/merge"),
+            "CodeQL referenced workflow path": lambda run: run[
+                "referenced_workflows"
+            ][1].update(
+                path=BASE_REPOSITORY["full_name"]
+                + "/.github/workflows/other.yml@"
+                + "c" * 40
+            ),
+            "CodeQL referenced workflow SHA mismatch": lambda run: run[
+                "referenced_workflows"
+            ][1].update(
+                path=BASE_REPOSITORY["full_name"]
+                + "/.github/workflows/codeql.yml@"
+                + "d" * 40,
+                sha="d" * 40,
+            ),
         }
         for name, change in fields.items():
             with self.subTest(name=name):

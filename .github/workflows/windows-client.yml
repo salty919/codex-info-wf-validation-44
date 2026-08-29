@@ -26,7 +26,7 @@ jobs:
       contents: read
       pull-requests: read
     outputs:
-      product: ${{ steps.scope.outputs.product }}
+      binary_impact: ${{ steps.scope.outputs.binary_impact }}
       ready: ${{ steps.version.outputs.ready }}
       version: ${{ steps.version.outputs.version }}
     steps:
@@ -59,12 +59,7 @@ jobs:
           }
           git cat-file -e "$BASE_SHA^{commit}"
           classifier="$RUNNER_TEMP/ci-change-scope.py"
-          if ! git cat-file -e "$BASE_SHA:scripts/ci_change_scope.py" 2>/dev/null; then
-            # Finite bootstrap boundary: a base predating the trusted
-            # classifier always takes the full product path.
-            printf 'product=true\n' >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
+          git cat-file -e "$BASE_SHA:scripts/ci_change_scope.py"
           git show "$BASE_SHA:scripts/ci_change_scope.py" > "$classifier"
           scope_root="$RUNNER_TEMP/ci-change-scope"
           mkdir -p "$scope_root"
@@ -80,16 +75,16 @@ jobs:
             --expected-base-sha "$BASE_SHA" \
             --expected-head-sha "$HEAD_SHA")"
           case "$scope" in
-            product) product=true ;;
-            non-product) product=false ;;
+            binary-impact) binary_impact=true ;;
+            no-binary-impact) binary_impact=false ;;
             *) echo 'change-scope classifier returned an invalid result' >&2; exit 1 ;;
           esac
-          printf 'product=%s\n' "$product" >> "$GITHUB_OUTPUT"
+          printf 'binary_impact=%s\n' "$binary_impact" >> "$GITHUB_OUTPUT"
       # The trusted preparer owns `python3 scripts/product_version.py bump --expected "$base_version"`
       # on temporary API data.  This pull_request job only reads PR data and
       # never has a token that can mutate contents or checks.
       - name: Verify the exact next patch version
-        if: steps.scope.outputs.product == 'true'
+        if: steps.scope.outputs.binary_impact == 'true'
         id: version
         shell: bash
         env:
@@ -121,14 +116,14 @@ jobs:
           fi
 
   native-quality:
-    if: github.event_name == 'pull_request' && needs.version-prepared.outputs.product == 'true' && needs.version-prepared.outputs.ready == 'true'
+    if: github.event_name == 'pull_request' && needs.version-prepared.outputs.binary_impact == 'true' && needs.version-prepared.outputs.ready == 'true'
     needs: [version-prepared]
     uses: ./.github/workflows/rust.yml
     permissions:
       contents: read
 
   codeql-analysis:
-    if: github.event_name == 'pull_request' && needs.version-prepared.outputs.product == 'true' && needs.version-prepared.outputs.ready == 'true'
+    if: github.event_name == 'pull_request' && needs.version-prepared.outputs.binary_impact == 'true' && needs.version-prepared.outputs.ready == 'true'
     needs: [version-prepared]
     uses: ./.github/workflows/codeql.yml
     permissions:
@@ -137,7 +132,7 @@ jobs:
 
   windows-quality:
     name: Merge policy
-    if: github.event_name == 'pull_request' && needs.version-prepared.outputs.product == 'true' && needs.version-prepared.outputs.ready == 'true'
+    if: github.event_name == 'pull_request' && needs.version-prepared.outputs.binary_impact == 'true' && needs.version-prepared.outputs.ready == 'true'
     needs: [version-prepared]
     runs-on: ubuntu-latest
     steps:
@@ -184,7 +179,7 @@ jobs:
           if-no-files-found: error
 
   ui-quality:
-    if: github.event_name == 'pull_request' && needs.version-prepared.outputs.product == 'true' && needs.version-prepared.outputs.ready == 'true'
+    if: github.event_name == 'pull_request' && needs.version-prepared.outputs.binary_impact == 'true' && needs.version-prepared.outputs.ready == 'true'
     needs: [version-prepared]
     runs-on: windows-latest
     steps:
@@ -366,12 +361,12 @@ jobs:
           WINDOWS_RESULT: ${{ needs.windows-quality.result }}
           UI_RESULT: ${{ needs.ui-quality.result }}
           VERSION_RESULT: ${{ needs.version-prepared.result }}
-          PRODUCT_CHANGED: ${{ needs.version-prepared.outputs.product }}
+          BINARY_IMPACT: ${{ needs.version-prepared.outputs.binary_impact }}
           VERSION_READY: ${{ needs.version-prepared.outputs.ready }}
         run: |
           set -euo pipefail
           [[ "$VERSION_RESULT" == success ]] || { echo "version-prepared job did not succeed: $VERSION_RESULT" >&2; exit 1; }
-          case "$PRODUCT_CHANGED" in
+          case "$BINARY_IMPACT" in
             true)
               [[ "$VERSION_READY" == true ]] || { echo 'version preparation did not complete on this revision' >&2; exit 1; }
               for result in "$NATIVE_RESULT" "$CODEQL_RESULT" "$WINDOWS_RESULT" "$UI_RESULT"; do
@@ -382,10 +377,10 @@ jobs:
               done
               ;;
             false)
-              [[ -z "$VERSION_READY" ]] || { echo 'non-product change unexpectedly prepared a version' >&2; exit 1; }
+              [[ -z "$VERSION_READY" ]] || { echo 'non-binary-impact change unexpectedly prepared a version' >&2; exit 1; }
               for result in "$NATIVE_RESULT" "$CODEQL_RESULT" "$WINDOWS_RESULT" "$UI_RESULT"; do
                 [[ "$result" == skipped ]] || {
-                  echo "non-product quality job was not skipped: $result" >&2
+                  echo "non-binary-impact quality job was not skipped: $result" >&2
                   exit 1
                 }
               done
@@ -396,40 +391,40 @@ jobs:
               ;;
           esac
       - uses: actions/checkout@v4
-        if: needs.version-prepared.outputs.product == 'true'
+        if: needs.version-prepared.outputs.binary_impact == 'true'
         with:
           fetch-depth: 0
       - name: Download native quality evidence
-        if: needs.version-prepared.outputs.product == 'true'
+        if: needs.version-prepared.outputs.binary_impact == 'true'
         uses: actions/download-artifact@v4
         with:
           name: native-quality
           path: artifacts/native-quality
       - name: Download Windows quality evidence
-        if: needs.version-prepared.outputs.product == 'true'
+        if: needs.version-prepared.outputs.binary_impact == 'true'
         uses: actions/download-artifact@v4
         with:
           name: windows-quality
           path: artifacts/windows-quality
       - name: Download Windows UI E2E evidence
-        if: needs.version-prepared.outputs.product == 'true'
+        if: needs.version-prepared.outputs.binary_impact == 'true'
         uses: actions/download-artifact@v4
         with:
           name: windows-ui-e2e
           path: artifacts/windows-ui-e2e
       - name: Download CI installer artifact
-        if: needs.version-prepared.outputs.product == 'true'
+        if: needs.version-prepared.outputs.binary_impact == 'true'
         uses: actions/download-artifact@v4
         with:
           name: windows-client-installer
           path: artifacts/windows-installer
       - name: Run final acceptance gate before merge
-        if: needs.version-prepared.outputs.product == 'true'
+        if: needs.version-prepared.outputs.binary_impact == 'true'
         env:
           EXPECTED_E2E_SOURCE_SHA: ${{ github.sha }}
         run: bash scripts/final_acceptance_gate.sh artifacts/windows-ui-e2e artifacts/native-quality artifacts/windows-quality
       - name: Assemble accepted release candidate
-        if: needs.version-prepared.outputs.product == 'true'
+        if: needs.version-prepared.outputs.binary_impact == 'true'
         run: |
           set -euo pipefail
           candidate=artifacts/release-candidate
@@ -454,7 +449,7 @@ jobs:
             mv "$manifest" SHA256SUMS
           )
       - name: Upload accepted release candidate
-        if: needs.version-prepared.outputs.product == 'true'
+        if: needs.version-prepared.outputs.binary_impact == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: release-candidate
@@ -512,13 +507,13 @@ jobs:
             --expected-base-sha "$BASE_SHA" \
             --expected-head-sha "$HEAD_SHA")"
           case "$scope" in
-            product) product=true ;;
-            non-product) product=false ;;
+            binary-impact) binary_impact=true ;;
+            no-binary-impact) binary_impact=false ;;
             *) echo 'change-scope classifier returned an invalid result' >&2; exit 1 ;;
           esac
-          printf 'product=%s\n' "$product" >> "$GITHUB_OUTPUT"
+          printf 'binary_impact=%s\n' "$binary_impact" >> "$GITHUB_OUTPUT"
       - name: Resolve accepted PR quality run
-        if: steps.scope.outputs.product == 'true'
+        if: steps.scope.outputs.binary_impact == 'true'
         id: quality-run
         env:
           GH_TOKEN: ${{ github.token }}
@@ -543,7 +538,7 @@ jobs:
           )"
           printf 'run-id=%s\n' "$resolved_run_id" >> "$GITHUB_OUTPUT"
       - name: Download accepted PR release candidate
-        if: steps.scope.outputs.product == 'true'
+        if: steps.scope.outputs.binary_impact == 'true'
         uses: actions/download-artifact@v4
         with:
           name: release-candidate
@@ -552,12 +547,12 @@ jobs:
           repository: ${{ github.repository }}
           path: artifacts/release-candidate
       - name: Verify accepted source and artifact hashes
-        if: steps.scope.outputs.product == 'true'
+        if: steps.scope.outputs.binary_impact == 'true'
         env:
           EXPECTED_MERGE_SHA: ${{ github.event.pull_request.merge_commit_sha }}
         run: bash scripts/release_candidate_gate.sh artifacts/release-candidate "$EXPECTED_MERGE_SHA"
       - name: Create deterministic update manifest
-        if: steps.scope.outputs.product == 'true'
+        if: steps.scope.outputs.binary_impact == 'true'
         id: release-version
         shell: pwsh
         env:
@@ -571,7 +566,7 @@ jobs:
             -OutputPath ./artifacts/release-candidate/CodexInfo.WindowsClient.update.json `
             -Repository $env:REPOSITORY
       - name: Create GitHub Release and upload Windows assets
-        if: steps.scope.outputs.product == 'true'
+        if: steps.scope.outputs.binary_impact == 'true'
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
