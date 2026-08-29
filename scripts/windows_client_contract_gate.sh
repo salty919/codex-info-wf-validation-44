@@ -784,6 +784,8 @@ require_file scripts/workflow_quality_gate.py
 require_file scripts/ci_trust_fixture.py
 require_file scripts/ci_change_scope.py
 require_file scripts/test_ci_change_scope.py
+require_file scripts/test_codeql_workflow.py
+require_file .github/workflows/codeql.yml
 require_file scripts/release_candidate_gate.sh
 require_file scripts/release_candidate_gate_test.sh
 require_file scripts/release_quality_run_resolver.py
@@ -804,6 +806,7 @@ require_file windows-client/CodeCoverage.runsettings
 # workflow/release trust boundaries without repeating a product build, unit
 # test suite, UI run, or acceptance job.
 PYTHONDONTWRITEBYTECODE=1 python3 scripts/test_ci_change_scope.py
+PYTHONDONTWRITEBYTECODE=1 python3 scripts/test_codeql_workflow.py
 PYTHONDONTWRITEBYTECODE=1 python3 scripts/workflow_quality_gate.py --self-test
 PYTHONDONTWRITEBYTECODE=1 python3 scripts/ci_trust_fixture.py --self-test
 PYTHONDONTWRITEBYTECODE=1 python3 scripts/test_release_quality_run_resolver.py

@@ -127,6 +127,14 @@ jobs:
     permissions:
       contents: read
 
+  codeql-analysis:
+    if: github.event_name == 'pull_request' && needs.version-prepared.outputs.product == 'true' && needs.version-prepared.outputs.ready == 'true'
+    needs: [version-prepared]
+    uses: ./.github/workflows/codeql.yml
+    permissions:
+      contents: read
+      security-events: write
+
   windows-quality:
     name: Merge policy
     if: github.event_name == 'pull_request' && needs.version-prepared.outputs.product == 'true' && needs.version-prepared.outputs.ready == 'true'
@@ -348,12 +356,13 @@ jobs:
     # version preparation; this job is still instantiated to report every
     # skipped or failed quality owner through its first outcome check.
     if: always() && github.event_name == 'pull_request'
-    needs: [version-prepared, native-quality, windows-quality, ui-quality]
+    needs: [version-prepared, native-quality, codeql-analysis, windows-quality, ui-quality]
     runs-on: ubuntu-latest
     steps:
       - name: Verify quality job outcomes
         env:
           NATIVE_RESULT: ${{ needs.native-quality.result }}
+          CODEQL_RESULT: ${{ needs.codeql-analysis.result }}
           WINDOWS_RESULT: ${{ needs.windows-quality.result }}
           UI_RESULT: ${{ needs.ui-quality.result }}
           VERSION_RESULT: ${{ needs.version-prepared.result }}
@@ -365,7 +374,7 @@ jobs:
           case "$PRODUCT_CHANGED" in
             true)
               [[ "$VERSION_READY" == true ]] || { echo 'version preparation did not complete on this revision' >&2; exit 1; }
-              for result in "$NATIVE_RESULT" "$WINDOWS_RESULT" "$UI_RESULT"; do
+              for result in "$NATIVE_RESULT" "$CODEQL_RESULT" "$WINDOWS_RESULT" "$UI_RESULT"; do
                 [[ "$result" == success ]] || {
                   echo "quality job did not succeed: $result" >&2
                   exit 1
@@ -374,7 +383,7 @@ jobs:
               ;;
             false)
               [[ -z "$VERSION_READY" ]] || { echo 'non-product change unexpectedly prepared a version' >&2; exit 1; }
-              for result in "$NATIVE_RESULT" "$WINDOWS_RESULT" "$UI_RESULT"; do
+              for result in "$NATIVE_RESULT" "$CODEQL_RESULT" "$WINDOWS_RESULT" "$UI_RESULT"; do
                 [[ "$result" == skipped ]] || {
                   echo "non-product quality job was not skipped: $result" >&2
                   exit 1
