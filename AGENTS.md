@@ -75,6 +75,40 @@ cleanup条件と削除予定:
 - cleanupにはforceなしの`git worktree remove`、統合済みbranchに対する`git branch -d`、許可済みremote一時branchの削除だけを使用する。`rm -rf`、`git branch -D`、`git worktree remove --force`、`git clean`、force pushを禁止する。
 - task開始時と終了時に、時刻、canonical worktree path、branch、完全なbase/HEAD SHA、dirty状態、owned/non-owned scope、許可された操作と期限、check結果、commit、push、PR URL/state、残存worktree/local/remote ref、cleanup結果、復旧手段を、terminalで再現できるコマンドとともにchatで報告する。repositoryへagent台帳やEvidence文書を追加してはならない。
 
+## GitHub Issuesガバナンス
+
+### Issueを作業の正本にする
+
+- 今後の機能追加、不具合対策、品質管理、security、運用、文書、調査は、実装branchまたはworktreeを作る前にGitHub Issueへ登録する。Issueが存在しない状態では読取り調査とIssue案の作成だけを許可し、編集、test、commit、push、PR等のmutationを開始しない。
+- ユーザーがchatで新しい取り組みを依頼した場合、その依頼を、Codexが認証済みのユーザーaccountで対応Issueを作成・分類し、作業履歴を更新するstanding authorizationとする。作成直前にIssue title、分類、scope、既存Issueとの重複結果をchatで明示する。
+- 既存Issueと同じ観測結果または成果を扱う場合は新規Issueを作らず、既存Issueを正本として参照する。重複か独立scopeか、parent、破壊的操作に曖昧さがある場合は作成・更新を停止してユーザーへ確認する。priorityが未決定ならCodexは候補と理由を記録し、priority labelを付けず`status:triage`で登録する。priority指定が複数または矛盾している場合は推測せず確認する。
+- Issue serviceの取得・作成・更新に失敗した場合は、local branchや文書をfallback正本にせず停止する。token、secret、private data、raw logをIssueへ記録してはならない。
+- Issue番号を得た後、一時branchの`<task>`は`issue-<number>-<slug>`、worktreeの`<task>`も同じ値とする。branch、commit、PR、進捗コメントは必ずIssue番号を参照する。
+
+### 分類と状態
+
+- 大分類labelは次の集合からexact 1件とする。`bug`は不具合対策、`enhancement`は機能追加、`quality`は品質管理、`security`はsecurity/trust/data protection、`operations`はbuild/CI/Release/repository運用、`documentation`は文書・governance、`investigation`は調査・意思決定を表す。
+- area labelは`area:native`、`area:windows`、`area:ui`、`area:data`、`area:ci`、`area:release`、`area:docs`、`area:governance`から1件以上を付ける。責務境界を跨ぐ場合だけ複数areaを許可する。
+- priority labelは`priority:P0`、`priority:P1`、`priority:P2`、`priority:P3`からユーザーが決定する。`status:triage`中だけ未設定を許し、`ready`、`in-progress`、`blocked`、`review`ではexact 1件を必須とする。Codexはpriorityを提案できるが、ユーザー確認なしに設定、昇格、降格してはならない。
+- open Issueのstatus labelは`status:triage`、`status:ready`、`status:in-progress`、`status:blocked`、`status:review`のexact 1件とする。scope、acceptance criteria、priorityが未確定なら`triage`、着手可能なら`ready`、許可済み作業中なら`in-progress`、外部依存で進行不能なら`blocked`、全実装と証拠が揃いユーザーclose待ちなら`review`とする。closed stateと重複する`status:done`は作らない。
+- Issue作成時は大分類exact 1件、area 1件以上、`status:triage`を設定し、priorityはユーザー確認済みの場合だけ設定する。Codexは実際の状態遷移に合わせてIssue labelと節目コメントを更新する。状態を進めるために未確認のscope、priority、evidenceを推測してはならない。
+
+### sub-issueと依存関係
+
+- 独立した成果、異なるowner/path、依存順序、別PR、別受入証拠のいずれかを持ち、親Issueを単一のbounded changeでcloseできない場合だけnative sub-issueへ分割する。要求数だけを理由にN倍へ展開しない。
+- Codexは分割前にparent、予定sub-issue、各scope、依存DAG、close条件を提示し、ユーザーの明示許可後にだけsub-issueを作成してnative parent relationを設定する。Markdown checklistや重複本文をhierarchyのauthorityにしてはならない。
+- 実行順を制約する関係はnative Issue dependencyとして登録する。単なる関連はcommentまたはIssue linkに留め、誤ったblocked関係を作らない。
+- 各sub-issueは単独で検証・reviewできるacceptance criteriaを持つ。親Issueは子の実装詳細を複製せず、全sub-issueの状態と親固有の統合criteriaだけを管理する。
+- parent Issueは全sub-issueがユーザーによりcloseされ、dependencyが解消し、親固有criteriaが検証されるまで`status:review`またはopenのまま保持する。
+
+### 履歴、PR、close authority
+
+- CodexはIssueへ、着手、宣言済みbranch/worktree/base SHA、scope決定、重要な設計判断、blocker、検証結果、commit、PR URL、cleanup、closure reportを節目ごとにコメントする。短周期polling、逐次command出力、重複status、raw logを投稿してはならない。
+- PR本文とcommit messageでは`Refs #<number>`を使用する。`Fixes`、`Closes`、`Resolves`等のauto-close keywordを使用してはならず、PR mergeだけでIssueをcloseさせない。
+- closure reportには、Issue番号、要求とacceptance criteriaの対応、最新revisionのcheck evidence、関連PRの状態、open sub-issue 0件、dependency解消、未解決finding、残作業、branch/worktree cleanup、推奨close reason（`completed`または`not planned`）を含める。
+- Issueの最終closeとreopenはユーザー本人だけが行う。Codexは明示依頼を受けてもIssueのcloseまたはreopen APIを実行せず、`status:review`とclosure reportを整えてユーザー判断を待つ。
+- closure report後にrevision、criteria、sub-issue、dependency、PR、findingが変化した場合、以前のreportを無効化し、最新状態で再作成する。Codexはcloseを完了扱いせず、GitHub上のstateをread-backしてユーザーによるcloseを確認する。
+
 ## サブエージェントのコスト・速度ガバナンス
 
 - 目的は総Codex消費量とwall-clock timeを同時に削減することであり、サブエージェント使用自体を成功指標にしてはならない。短期・決定論的・逐次的な作業は主担当がlocal commandで処理し、サブエージェントを使わない。
