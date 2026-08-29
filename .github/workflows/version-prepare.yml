@@ -67,14 +67,14 @@ jobs:
             --expected-base-sha "$BASE_SHA" \
             --expected-head-sha "$HEAD_SHA")"
           case "$scope" in
-            product) product=true ;;
-            non-product) product=false ;;
+            binary-impact) binary_impact=true ;;
+            no-binary-impact) binary_impact=false ;;
             *) echo 'change-scope classifier returned an invalid result' >&2; exit 1 ;;
           esac
-          printf 'product=%s\n' "$product" >> "$GITHUB_OUTPUT"
+          printf 'binary_impact=%s\n' "$binary_impact" >> "$GITHUB_OUTPUT"
 
       - name: Validate and prepare version data
-        if: steps.scope.outputs.product == 'true'
+        if: steps.scope.outputs.binary_impact == 'true'
         id: prepare
         shell: bash
         env:

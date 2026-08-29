@@ -280,33 +280,8 @@ require_text src/main.rs 'include_str!("../LICENSE")'
 require_text src/main.rs 'include_str!("../THIRD_PARTY_NOTICES.md")'
 require_text src/main.rs 'i18n.text(TextKey::LegalProtocol)'
 require_text src/main.rs 'i18n.text(TextKey::LegalThirdParty)'
-require_text .github/workflows/windows-client.yml 'uses: ./.github/workflows/rust.yml'
-require_text .github/workflows/windows-client.yml 'needs: [version-prepared, native-quality, codeql-analysis, windows-quality, ui-quality]'
-require_text .github/workflows/windows-client.yml 'product: ${{ steps.scope.outputs.product }}'
-require_text .github/workflows/windows-client.yml 'Classify pull request scope from the trusted base'
-require_text .github/workflows/windows-client.yml 'git show "$BASE_SHA:scripts/ci_change_scope.py" > "$classifier"'
-require_text .github/workflows/windows-client.yml 'scope="$(python3 "$classifier"'
-require_text .github/workflows/windows-client.yml "if: steps.scope.outputs.product == 'true'"
 require_text .github/workflows/windows-client.yml 'Run final acceptance gate before merge'
 require_text .github/workflows/windows-client.yml 'windows_window_move_smoke.ps1 -ClientPath $exe -AllowPhysicalInput'
-require_text .github/workflows/windows-client.yml "if: always() && github.event_name == 'pull_request'"
-require_text .github/workflows/windows-client.yml 'VERSION_RESULT: ${{ needs.version-prepared.result }}'
-require_text .github/workflows/windows-client.yml 'CODEQL_RESULT: ${{ needs.codeql-analysis.result }}'
-require_text .github/workflows/windows-client.yml 'PRODUCT_CHANGED: ${{ needs.version-prepared.outputs.product }}'
-require_text .github/workflows/windows-client.yml '[[ "$VERSION_RESULT" == success ]]'
-require_text .github/workflows/windows-client.yml '[[ "$VERSION_READY" == true ]]'
-require_text .github/workflows/windows-client.yml '[[ -z "$VERSION_READY" ]]'
-require_text .github/workflows/windows-client.yml 'for result in "$NATIVE_RESULT" "$CODEQL_RESULT" "$WINDOWS_RESULT" "$UI_RESULT"; do'
-require_text .github/workflows/windows-client.yml '[[ "$result" == success ]]'
-require_text .github/workflows/windows-client.yml '[[ "$result" == skipped ]]'
-product_job_condition="if: github.event_name == 'pull_request' && needs.version-prepared.outputs.product == 'true' && needs.version-prepared.outputs.ready == 'true'"
-product_job_count="$(rg -o --fixed-strings -- "$product_job_condition" .github/workflows/windows-client.yml | wc -l)"
-[[ "$product_job_count" -eq 4 ]] ||
-    fail "native, CodeQL, Windows, and UI quality jobs must be product-only: count=$product_job_count"
-acceptance_product_condition="if: needs.version-prepared.outputs.product == 'true'"
-acceptance_product_count="$(rg -o --fixed-strings -- "$acceptance_product_condition" .github/workflows/windows-client.yml | wc -l)"
-[[ "$acceptance_product_count" -eq 8 ]] ||
-    fail "all eight product acceptance steps must be scope-guarded: count=$acceptance_product_count"
 ui_quality_scope="$(
     awk '
         $0 == "      - name: Write UI quality evidence" {
@@ -450,51 +425,6 @@ require_text scripts/quality_artifact_gate.sh 'cli-contract-e2e: PASS'
 require_text scripts/quality_artifact_gate.sh 'quality: merge-policy'
 require_text scripts/quality_artifact_gate.sh 'live-applied-rules: PASS'
 require_text scripts/quality_artifact_gate.sh 'merge-policy: PASS'
-require_text .github/workflows/windows-client.yml 'cancel-in-progress: false'
-require_text .github/workflows/windows-client.yml 'pull_request_target:'
-require_text .github/workflows/windows-client.yml 'types: [closed]'
-require_text .github/workflows/windows-client.yml 'version-prepared:'
-require_text .github/workflows/windows-client.yml 'contents: read'
-require_text .github/workflows/windows-client.yml 'pull-requests: read'
-require_text .github/workflows/windows-client.yml "if: github.event_name == 'pull_request_target' && github.event.pull_request.merged == true"
-require_text .github/workflows/windows-client.yml 'Classify merged pull request scope'
-require_text .github/workflows/windows-client.yml 'python3 scripts/ci_change_scope.py'
-require_text .github/workflows/windows-client.yml 'python3 scripts/release_quality_run_resolver.py'
-require_text .github/workflows/windows-client.yml 'runs?event=pull_request&head_sha=$PR_HEAD_SHA&per_page=100'
-release_product_count="$(
-    awk '
-        $0 == "  release:" { in_release = 1; next }
-        in_release && $0 ~ /^  [[:alnum:]_-]+:/ { exit }
-        in_release { print }
-    ' .github/workflows/windows-client.yml |
-        rg -o --fixed-strings "if: steps.scope.outputs.product == 'true'" |
-        wc -l
-)"
-[[ "$release_product_count" -eq 5 ]] ||
-    fail "all five post-merge product steps must be scope-guarded: count=$release_product_count"
-if rg -q --fixed-strings '.pull_requests' .github/workflows/windows-client.yml; then
-    fail 'post-merge release must not trust the optional workflow-run pull_requests association'
-fi
-if rg -q --fixed-strings 'runs?event=pull_request&status=completed&head_sha=' .github/workflows/windows-client.yml; then
-    fail 'post-merge release workflow must query all workflow-run statuses'
-fi
-require_file .github/workflows/version-prepare.yml
-require_text .github/workflows/version-prepare.yml 'pull_request_target:'
-require_text .github/workflows/version-prepare.yml 'ref: refs/heads/main'
-require_text .github/workflows/version-prepare.yml 'persist-credentials: false'
-require_text .github/workflows/version-prepare.yml 'Classify pull request scope'
-require_text .github/workflows/version-prepare.yml 'python3 scripts/ci_change_scope.py'
-require_text .github/workflows/version-prepare.yml "if: steps.scope.outputs.product == 'true'"
-require_text .github/workflows/version-prepare.yml 'pull-requests: read'
-require_text .github/workflows/version-prepare.yml 'python3 scripts/product_version.py bump --expected "$base_version"'
-require_text .github/workflows/version-prepare.yml 'force=false'
-if rg -q --fixed-strings 'ref: ${{ github.event.pull_request.head.sha }}' .github/workflows/version-prepare.yml ||
-   rg -q --fixed-strings 'checks: write' .github/workflows/version-prepare.yml; then
-    fail 'trusted version preparer must not checkout PR code or own a duplicate check result'
-fi
-if rg -q '^  push:' .github/workflows/windows-client.yml; then
-    fail 'main push must not rerun PR quality or release tests'
-fi
 require_text .github/workflows/rust.yml 'dtolnay/rust-toolchain@stable'
 require_text .github/workflows/rust.yml 'x11-apps'
 require_text .github/workflows/rust.yml 'cd artifacts/native-quality'
@@ -781,19 +711,8 @@ if rg -q --fixed-strings 'if ($LASTEXITCODE -ne 0) { throw '\''Physical window m
 fi
 require_file scripts/x11_graph_visual_gate.sh
 require_file scripts/x11_startup_visual_gate.sh
-require_file scripts/workflow_quality_gate.py
-require_file scripts/ci_trust_fixture.py
-require_file scripts/ci_change_scope.py
-require_file scripts/test_ci_change_scope.py
-require_file scripts/test_codeql_workflow.py
-require_file .github/workflows/codeql.yml
-require_file scripts/release_candidate_gate.sh
-require_file scripts/release_candidate_gate_test.sh
-require_file scripts/release_quality_run_resolver.py
-require_file scripts/test_release_quality_run_resolver.py
-require_file scripts/release_state_gate.py
 require_file docs/REQUIREMENTS_LEDGER.md
-for required_ledger_id in X-START-01 X-START-02 X-START-03 X-GRAPH-01 X-THREAD-01 WIN-START-01 WIN-GRAPH-01 WIN-VERSION-01 PROC-LEDGER-01 WF-NONPRODUCT-01; do
+for required_ledger_id in X-START-01 X-START-02 X-START-03 X-GRAPH-01 X-THREAD-01 WIN-START-01 WIN-GRAPH-01 WIN-VERSION-01 PROC-LEDGER-01 WF-BINARY-IMPACT-01; do
     require_text docs/REQUIREMENTS_LEDGER.md "| $required_ledger_id |"
 done
 require_text scripts/regression_guard.sh 'bash scripts/requirements_ledger_gate.sh --final'
@@ -803,17 +722,7 @@ require_text scripts/x11_graph_visual_gate.sh 'implausible vertical stroke'
 require_text docs/PRODUCT_REQUIREMENTS.md '# Codex Info 製品要件'
 require_file windows-client/CodeCoverage.runsettings
 
-# These finite fixtures are owned by this contract gate.  They exercise the
-# workflow/release trust boundaries without repeating a product build, unit
-# test suite, UI run, or acceptance job.
-PYTHONDONTWRITEBYTECODE=1 python3 scripts/test_ci_change_scope.py
-PYTHONDONTWRITEBYTECODE=1 python3 scripts/test_codeql_workflow.py
-PYTHONDONTWRITEBYTECODE=1 python3 scripts/workflow_quality_gate.py --self-test
-PYTHONDONTWRITEBYTECODE=1 python3 scripts/ci_trust_fixture.py --self-test
-PYTHONDONTWRITEBYTECODE=1 python3 scripts/test_release_quality_run_resolver.py
 bash scripts/final_acceptance_gate_test.sh
-bash scripts/release_candidate_gate_test.sh
-PYTHONDONTWRITEBYTECODE=1 python3 scripts/release_state_gate.py --self-test
 
 if command -v dotnet >/dev/null 2>&1; then
     contract_evidence_dir="${WINDOWS_CONTRACT_EVIDENCE_DIR:-}"

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Classify a main pull request as product or allowlisted non-product work.
+"""Classify whether a main pull request changes a shipped binary input.
 
 The classifier is deliberately pure: workflows obtain pull-request JSON from
 GitHub, while this module validates identity, pagination completeness, rename
@@ -16,8 +16,32 @@ import sys
 from typing import Any, Sequence
 
 
-NON_PRODUCT_EXACT_PATHS = frozenset({"AGENTS.md", "README.md"})
-NON_PRODUCT_PREFIXES = ("docs/", ".github/ISSUE_TEMPLATE/")
+BINARY_IMPACT_EXACT_PATHS = frozenset(
+    {
+        ".cargo/config.toml",
+        "COPYRIGHT",
+        "Cargo.lock",
+        "Cargo.toml",
+        "LICENSE",
+        "LICENSE.ja.md",
+        "THIRD_PARTY_NOTICES.md",
+        "build.rs",
+        "windows-client/CodexInfo.WindowsClient.sln",
+        "windows-client/Directory.Build.props",
+        "windows-client/THIRD_PARTY_NOTICES.md",
+        "windows-client/tools/Build-WindowsInstaller.ps1",
+        "windows-client/tools/Collect-ThirdPartyNotices.ps1",
+    }
+)
+BINARY_IMPACT_PREFIXES = (
+    "LICENSES/",
+    "assets/",
+    "protocol/",
+    "src/",
+    "ui/",
+    "windows-client/installer/",
+    "windows-client/src/",
+)
 KNOWN_FILE_STATUSES = frozenset(
     {"added", "removed", "modified", "renamed", "copied", "changed", "unchanged"}
 )
@@ -122,8 +146,10 @@ def _validate_path(value: Any) -> str:
     return value
 
 
-def _is_non_product_path(path: str) -> bool:
-    return path in NON_PRODUCT_EXACT_PATHS or path.startswith(NON_PRODUCT_PREFIXES)
+def _has_binary_impact(path: str) -> bool:
+    return path in BINARY_IMPACT_EXACT_PATHS or path.startswith(
+        BINARY_IMPACT_PREFIXES
+    )
 
 
 def _changed_paths(files_pages: Any, expected_count: int) -> tuple[str, ...]:
@@ -186,7 +212,11 @@ def classify_payloads(
         expected_head_sha=expected_head_sha,
     )
     paths = _changed_paths(files_pages, changed_files)
-    return "non-product" if all(_is_non_product_path(path) for path in paths) else "product"
+    return (
+        "binary-impact"
+        if any(_has_binary_impact(path) for path in paths)
+        else "no-binary-impact"
+    )
 
 
 def main(argv: Sequence[str] | None = None) -> int:
