@@ -83,6 +83,8 @@
   曖昧として停止する。単一のrequired acceptanceは常に最終head上に生成する。バイナリ影響ありではversion準備、先行jobの成功、検証対象tree、source SHA、
   各artifact証拠の対応を検査し、バイナリ影響なしではversion未変更、全artifact producerが`skipped`、artifact 0件を検査する。
   分類欠落、期待外のjob結果、失敗・未完了・古い証拠では明示的に失敗してmergeを許可しない。
+  reusableなpre-merge品質workflowはread-onlyとし、`contents: write`を持つpost-merge Release workflowを同じ呼出しgraphへ
+  含めない。Release workflowは`closed` eventだけを所有し、pre-mergeのbuild・test・CodeQLを再実行しない。
 - バイナリ影響ありPRだけ、品質確認を開始する前にPR branch上のversion 3ファイルをexact next patchへ自動更新する。その
   version commitを含む最新mainとの合成treeを品質確認し、mergeによって採番を確定する。採番commit自身では
   元のauthority runがlive PR identityを再確認して最終headの品質jobを一度だけ開始する。採番で生じる`synchronize` runはPR単位の

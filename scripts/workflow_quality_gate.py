@@ -13,6 +13,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 VERSION_WORKFLOW = ROOT / ".github" / "workflows" / "version-prepare.yml"
 WINDOWS_WORKFLOW = ROOT / ".github" / "workflows" / "windows-client.yml"
+RELEASE_WORKFLOW = ROOT / ".github" / "workflows" / "release.yml"
 RUST_WORKFLOW = ROOT / ".github" / "workflows" / "rust.yml"
 CODEQL_WORKFLOW = ROOT / ".github" / "workflows" / "codeql.yml"
 
@@ -45,7 +46,9 @@ def _between(source: str, start: str, end: str) -> str:
     return source[start_index:end_index]
 
 
-def validate_sources(version: str, windows: str, rust: str, codeql: str) -> list[str]:
+def validate_sources(
+    version: str, windows: str, release: str, rust: str, codeql: str
+) -> list[str]:
     errors: list[str] = []
 
     version_trigger = _between(version, "on:\n", "permissions: {}\n")
@@ -88,9 +91,12 @@ def validate_sources(version: str, windows: str, rust: str, codeql: str) -> list
         _count(version, f"          name: {artifact}\n", 1, errors)
 
     windows_trigger = _between(windows, "on:\n", "permissions:\n")
-    for marker in ("  workflow_call:\n", "  pull_request_target:\n"):
-        _count(windows_trigger, marker, 1, errors)
-    for forbidden in ("  workflow_dispatch:\n", "  pull_request:\n"):
+    _count(windows_trigger, "  workflow_call:\n", 1, errors)
+    for forbidden in (
+        "  pull_request_target:\n",
+        "  workflow_dispatch:\n",
+        "  pull_request:\n",
+    ):
         _count(windows_trigger, forbidden, 0, errors)
     for input_name in (
         "premerge",
@@ -115,13 +121,33 @@ def validate_sources(version: str, windows: str, rust: str, codeql: str) -> list
         errors,
     )
     _count(windows, "          name: acceptance-verdict\n", 1, errors)
-    _count(windows, "          name: release-candidate\n", 2, errors)
+    _count(windows, "          name: release-candidate\n", 1, errors)
     _count(windows, "codex-info-final-head-v1", 1, errors)
     _count(windows, "event=workflow_dispatch", 0, errors)
-    _count(windows, "commits/$PR_HEAD_SHA/check-runs?check_name=acceptance", 1, errors)
-    _count(windows, '--workflow-run "$workflow_run_json"', 1, errors)
+    _count(windows, "  release:\n", 0, errors)
+    _count(windows, "contents: write\n", 0, errors)
 
-    release = windows[windows.index("  release:\n") :]
+    release_trigger = _between(release, "on:\n", "permissions:\n")
+    for marker in (
+        "  pull_request_target:\n",
+        '    branches: ["main"]\n',
+        "    types: [closed]\n",
+    ):
+        _count(release_trigger, marker, 1, errors)
+    for forbidden in (
+        "  workflow_call:\n",
+        "  workflow_dispatch:\n",
+        "  pull_request:\n",
+    ):
+        _count(release_trigger, forbidden, 0, errors)
+    _count(release, "  release:\n", 1, errors)
+    _count(release, "    if: github.event.pull_request.merged == true\n", 1, errors)
+    _count(release, "      contents: write\n", 1, errors)
+    _count(release, "          ref: refs/heads/main\n", 1, errors)
+    _count(release, "          name: release-candidate\n", 1, errors)
+    _count(release, "commits/$PR_HEAD_SHA/check-runs?check_name=acceptance", 1, errors)
+    _count(release, '--workflow-run "$workflow_run_json"', 1, errors)
+    release_job = release[release.index("  release:\n") :]
     for forbidden in (
         "cargo build",
         "cargo test",
@@ -130,7 +156,7 @@ def validate_sources(version: str, windows: str, rust: str, codeql: str) -> list
         "Run-WindowsClientE2E",
         "final_acceptance_gate.sh",
     ):
-        _count(release, forbidden, 0, errors)
+        _count(release_job, forbidden, 0, errors)
 
     for source, label in ((rust, "rust"), (codeql, "codeql")):
         _count(source, "      source_sha:\n", 1, errors)
@@ -165,7 +191,7 @@ def validate_sources(version: str, windows: str, rust: str, codeql: str) -> list
             1,
             errors,
         )
-    if windows.index("Resolve accepted PR quality run") > windows.index(
+    if release.index("Resolve accepted PR quality run") > release.index(
         "Download accepted PR release candidate"
     ):
         errors.append("release artifact download precedes accepted-run resolution")
@@ -177,6 +203,7 @@ def validate_workflows() -> list[str]:
         return validate_sources(
             VERSION_WORKFLOW.read_text(encoding="utf-8"),
             WINDOWS_WORKFLOW.read_text(encoding="utf-8"),
+            RELEASE_WORKFLOW.read_text(encoding="utf-8"),
             RUST_WORKFLOW.read_text(encoding="utf-8"),
             CODEQL_WORKFLOW.read_text(encoding="utf-8"),
         )
@@ -314,6 +341,7 @@ def _static_self_test() -> int:
     sources = [
         VERSION_WORKFLOW.read_text(encoding="utf-8"),
         WINDOWS_WORKFLOW.read_text(encoding="utf-8"),
+        RELEASE_WORKFLOW.read_text(encoding="utf-8"),
         RUST_WORKFLOW.read_text(encoding="utf-8"),
         CODEQL_WORKFLOW.read_text(encoding="utf-8"),
     ]
@@ -329,8 +357,8 @@ def _static_self_test() -> int:
         (0, "      checks: write\n", "      checks: read\n"),
         (0, "uses: ./.github/workflows/windows-client.yml", "uses: ./other.yml"),
         (1, "  workflow_call:\n", "  workflow_dispatch:\n"),
+        (1, "permissions:\n  contents: read\n", "permissions:\n  contents: write\n"),
         (1, "          ref: ${{ inputs.head_sha }}\n", "          ref: feat/next\n"),
-        (1, "commits/$PR_HEAD_SHA/check-runs?check_name=acceptance", "actions/runs"),
         (
             1,
             '                [[ "$result" == success ]] || {\n',
@@ -342,10 +370,13 @@ def _static_self_test() -> int:
             "scripts/cli_contract_e2e.sh",
         ),
         (1, "Run-WindowsClientE2E.ps1", "Build-WindowsInstaller.ps1"),
-        (2, "          ref: ${{ inputs.source_sha }}\n", "          ref: feat/next\n"),
-        (3, "          sha: ${{ inputs.source_sha || github.sha }}\n", ""),
-        (3, "  schedule:\n", "  workflow_dispatch:\n"),
-        (3, "github/codeql-action/analyze@v4", "github/codeql-action/autobuild@v4"),
+        (2, "    types: [closed]\n", "    types: [opened]\n"),
+        (2, "      contents: write\n", "      contents: read\n"),
+        (2, "commits/$PR_HEAD_SHA/check-runs?check_name=acceptance", "actions/runs"),
+        (3, "          ref: ${{ inputs.source_sha }}\n", "          ref: feat/next\n"),
+        (4, "          sha: ${{ inputs.source_sha || github.sha }}\n", ""),
+        (4, "  schedule:\n", "  workflow_dispatch:\n"),
+        (4, "github/codeql-action/analyze@v4", "github/codeql-action/autobuild@v4"),
     )
     cases = 1
     for index, needle, replacement in mutations:

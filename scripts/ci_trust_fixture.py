@@ -7,6 +7,8 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 WORKFLOW = ROOT / ".github" / "workflows" / "version-prepare.yml"
+QUALITY_WORKFLOW = ROOT / ".github" / "workflows" / "windows-client.yml"
+RELEASE_WORKFLOW = ROOT / ".github" / "workflows" / "release.yml"
 REPORTER = ROOT / "scripts" / "final_head_check_reporter.py"
 
 
@@ -21,7 +23,9 @@ def section(source: str, start: str, end: str | None) -> str:
     return source[start_index : source.index(end, start_index + len(start))]
 
 
-def validate(workflow: str, reporter: str) -> list[str]:
+def validate(
+    workflow: str, quality_workflow: str, release_workflow: str, reporter: str
+) -> list[str]:
     errors: list[str] = []
 
     def exact(source: str, marker: str, expected: int = 1) -> None:
@@ -92,6 +96,15 @@ def validate(workflow: str, reporter: str) -> list[str]:
 
     exact(workflow, "/dispatches", 0)
     exact(workflow, "event=workflow_dispatch", 0)
+    exact(quality_workflow, "  workflow_call:\n")
+    exact(quality_workflow, "  pull_request_target:\n", 0)
+    exact(quality_workflow, "  release:\n", 0)
+    exact(quality_workflow, "contents: write\n", 0)
+    exact(release_workflow, "  pull_request_target:\n")
+    exact(release_workflow, "    types: [closed]\n")
+    exact(release_workflow, "  workflow_call:\n", 0)
+    exact(release_workflow, "  release:\n")
+    exact(release_workflow, "      contents: write\n")
     exact(reporter, "GITHUB_ACTIONS_APP_ID = 15368")
     exact(reporter, 'CHECK_NAMES = ("version-prepared", "acceptance")')
     exact(reporter, "codex-quality-v1:pr=", 2)
@@ -103,8 +116,10 @@ def validate(workflow: str, reporter: str) -> list[str]:
 
 def main() -> int:
     workflow = WORKFLOW.read_text(encoding="utf-8")
+    quality_workflow = QUALITY_WORKFLOW.read_text(encoding="utf-8")
+    release_workflow = RELEASE_WORKFLOW.read_text(encoding="utf-8")
     reporter = REPORTER.read_text(encoding="utf-8")
-    baseline = validate(workflow, reporter)
+    baseline = validate(workflow, quality_workflow, release_workflow, reporter)
     if baseline:
         raise AssertionError(
             "production CI trust contract failed: " + "; ".join(baseline)
@@ -140,6 +155,16 @@ def main() -> int:
             'python3 scripts/product_version.py bump --expected "$base_version"',
             "python3 scripts/product_version.py bump",
         ),
+        (
+            "quality_workflow",
+            "permissions:\n  contents: read\n",
+            "permissions:\n  contents: write\n",
+        ),
+        (
+            "release_workflow",
+            "    types: [closed]\n",
+            "    types: [opened]\n",
+        ),
         ("reporter", "GITHUB_ACTIONS_APP_ID = 15368", "GITHUB_ACTIONS_APP_ID = 1"),
         (
             "reporter",
@@ -150,12 +175,27 @@ def main() -> int:
     cases = 1
     for target, needle, replacement in mutations:
         candidate_workflow = workflow
+        candidate_quality_workflow = quality_workflow
+        candidate_release_workflow = release_workflow
         candidate_reporter = reporter
         if target == "workflow":
             candidate_workflow = candidate_workflow.replace(needle, replacement, 1)
+        elif target == "quality_workflow":
+            candidate_quality_workflow = candidate_quality_workflow.replace(
+                needle, replacement, 1
+            )
+        elif target == "release_workflow":
+            candidate_release_workflow = candidate_release_workflow.replace(
+                needle, replacement, 1
+            )
         else:
             candidate_reporter = candidate_reporter.replace(needle, replacement, 1)
-        if not validate(candidate_workflow, candidate_reporter):
+        if not validate(
+            candidate_workflow,
+            candidate_quality_workflow,
+            candidate_release_workflow,
+            candidate_reporter,
+        ):
             raise AssertionError(f"CI trust mutation was accepted: {needle!r}")
         cases += 1
     print(f"ci-trust-fixture: PASS cases={cases}")
