@@ -142,34 +142,44 @@ def resolve_quality_run_id(event: Any, pull_request: Any, check_runs: Any) -> in
 
     identity = validate_merged_identity(event, pull_request)
     pr_number, head_sha = identity[0], identity[1]
-    exact: list[Any] = []
+    exact: list[tuple[Any, re.Match[str]]] = []
     for run in _flatten_check_runs(check_runs):
         if not isinstance(run, dict):
             raise ResolutionError("invalid check run")
         app = _required(run, "app", "check_run")
-        if (
+        if not (
             run.get("name") == "acceptance"
             and run.get("head_sha") == head_sha
             and _required(app, "id", "check_run.app") == GITHUB_ACTIONS_APP_ID
         ):
-            exact.append(run)
+            continue
+        external_id = run.get("external_id")
+        match = (
+            EXTERNAL_ID_PATTERN.fullmatch(external_id)
+            if isinstance(external_id, str)
+            else None
+        )
+        if match is None:
+            # Native Actions job checks use an opaque UUID external ID and may
+            # share the required context name. They are not release authority.
+            # Anything claiming our reserved namespace must still fail closed.
+            if isinstance(external_id, str) and external_id.startswith(
+                "codex-quality-v1:"
+            ):
+                raise ResolutionError(
+                    "final-head acceptance external_id is malformed"
+                )
+            continue
+        if (int(match.group("pr")), match.group("head")) != (pr_number, head_sha):
+            raise ResolutionError("final-head acceptance belongs to another candidate")
+        exact.append((run, match))
     if len(exact) != 1:
         raise ResolutionError(
-            f"expected exactly one GitHub Actions acceptance check, found {len(exact)}"
+            f"expected exactly one final-head acceptance check, found {len(exact)}"
         )
-    accepted = exact[0]
+    accepted, match = exact[0]
     if accepted.get("status") != "completed" or accepted.get("conclusion") != "success":
         raise ResolutionError("final-head acceptance check is not successful")
-    external_id = accepted.get("external_id")
-    match = (
-        EXTERNAL_ID_PATTERN.fullmatch(external_id)
-        if isinstance(external_id, str)
-        else None
-    )
-    if match is None:
-        raise ResolutionError("final-head acceptance external_id is malformed")
-    if (int(match.group("pr")), match.group("head")) != (pr_number, head_sha):
-        raise ResolutionError("final-head acceptance belongs to another candidate")
     run_id = int(match.group("run"))
     expected_url = f"https://github.com/{identity[6]}/actions/runs/{run_id}"
     if accepted.get("details_url") != expected_url:
