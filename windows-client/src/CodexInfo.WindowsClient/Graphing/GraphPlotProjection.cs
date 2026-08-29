@@ -75,9 +75,32 @@ internal static class GraphPlotProjection
         TimeZoneInfo displayTimeZone,
         CultureInfo culture)
     {
+        return BuildAxes(scene, displayTimeZone, culture, 1, 1);
+    }
+
+    /// <summary>
+    /// Builds axes whose endpoint-label gutter keeps the physical width it
+    /// has at <paramref name="referenceDataAreaWidth"/> while the current
+    /// data area grows or shrinks horizontally.
+    /// </summary>
+    public static GraphAxisProjection BuildAxes(
+        GraphScene scene,
+        TimeZoneInfo displayTimeZone,
+        CultureInfo culture,
+        double currentDataAreaWidth,
+        double referenceDataAreaWidth)
+    {
         ArgumentNullException.ThrowIfNull(scene);
         ArgumentNullException.ThrowIfNull(displayTimeZone);
         ArgumentNullException.ThrowIfNull(culture);
+        if (!double.IsFinite(currentDataAreaWidth) || currentDataAreaWidth <= 0)
+        {
+            throw new ArgumentOutOfRangeException(nameof(currentDataAreaWidth));
+        }
+        if (!double.IsFinite(referenceDataAreaWidth) || referenceDataAreaWidth <= 0)
+        {
+            throw new ArgumentOutOfRangeException(nameof(referenceDataAreaWidth));
+        }
 
         var bottomValues = new double[5];
         var bottomLabels = new string[5];
@@ -99,6 +122,17 @@ internal static class GraphPlotProjection
         var gutterRatio = scene.Metric == GraphMetric.Tokens
             ? TokenLabelGutterRatio
             : DollarLabelGutterRatio;
+        var referenceGutterWidth = referenceDataAreaWidth * gutterRatio / (1 + gutterRatio);
+        var referenceLabelGapWidth = referenceDataAreaWidth * LabelGapRatio / (1 + gutterRatio);
+        var currentPlotWidth = currentDataAreaWidth - referenceGutterWidth;
+        if (currentPlotWidth <= 0)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(currentDataAreaWidth),
+                "The current data area must be wider than the fixed endpoint-label gutter.");
+        }
+        var currentGutterRatio = referenceGutterWidth / currentPlotWidth;
+        var currentLabelGapRatio = referenceLabelGapWidth / currentPlotWidth;
         var modelPadding = scene.ModelMaximum * AxisPaddingRatio;
         var remainingPadding = 100d * AxisPaddingRatio;
 
@@ -109,12 +143,12 @@ internal static class GraphPlotProjection
             modelLabels,
             [0, 25, 50, 75, 100],
             ["0%", "25%", "50%", "75%", "100%"],
-            scene.PeriodEndAt + span * gutterRatio,
+            scene.PeriodEndAt + span * currentGutterRatio,
             -modelPadding,
             scene.ModelMaximum + modelPadding,
             -remainingPadding,
             100d + remainingPadding,
-            scene.PeriodEndAt + span * LabelGapRatio);
+            scene.PeriodEndAt + span * currentLabelGapRatio);
     }
 
     /// <summary>

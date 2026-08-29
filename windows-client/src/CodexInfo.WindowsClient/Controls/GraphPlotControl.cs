@@ -4,6 +4,8 @@
 using System.Globalization;
 using Avalonia;
 using Avalonia.Automation.Peers;
+using Avalonia.Controls;
+using Avalonia.Threading;
 using CodexInfo.WindowsClient.Graphing;
 using CodexInfo.WindowsClient.Localization;
 using ScottPlot.Avalonia;
@@ -41,12 +43,20 @@ public sealed class GraphPlotControl : AvaPlot
     private ScottPlot.Plottables.Text? solLabel;
     private ScottPlot.Plottables.Text? terraLabel;
     private ScottPlot.Plottables.Text? lunaLabel;
+    private double[] remainingConnectorX = [];
+    private double[] solConnectorX = [];
+    private double[] terraConnectorX = [];
+    private double[] lunaConnectorX = [];
+    private double? referenceControlWidth;
+    private readonly Dictionary<GraphMetric, double> referenceDataAreaWidths = [];
+    private int sceneRevision;
 
     public GraphPlotControl()
     {
         UserInputProcessor.Disable();
         HandleMouseWheelEvent = false;
         ClipToBounds = true;
+        SizeChanged += OnControlSizeChanged;
         ApplyScene();
     }
 
@@ -92,6 +102,7 @@ public sealed class GraphPlotControl : AvaPlot
 
     private void ApplyScene()
     {
+        var revision = ++sceneRevision;
         Plot.Clear();
         remainingSeries = null;
         solSeries = null;
@@ -105,6 +116,10 @@ public sealed class GraphPlotControl : AvaPlot
         solLabel = null;
         terraLabel = null;
         lunaLabel = null;
+        remainingConnectorX = [];
+        solConnectorX = [];
+        terraConnectorX = [];
+        lunaConnectorX = [];
         ApplyTheme();
 
         var scene = Scene;
@@ -114,10 +129,7 @@ public sealed class GraphPlotControl : AvaPlot
             return;
         }
 
-        var axes = GraphPlotProjection.BuildAxes(
-            scene,
-            LocalizationService.DisplayTimeZone,
-            CultureInfo.CurrentCulture);
+        var axes = BuildAxesForCurrentWidth(scene);
         foreach (var interval in GraphPlotProjection.BuildVisibleIdleIntervals(scene))
         {
             var band = Plot.Add.Rectangle(
@@ -141,6 +153,34 @@ public sealed class GraphPlotControl : AvaPlot
         AddEndpointLabels(scene, axes);
         ApplyAxes(scene, axes);
         ApplyVisibility();
+        ScheduleReferenceCapture(
+            scene.Metric,
+            revision,
+            (long)Plot.RenderManager.RenderCount,
+            attemptsRemaining: 20);
+    }
+
+    private GraphAxisProjection BuildAxesForCurrentWidth(GraphScene scene)
+    {
+        if (referenceControlWidth is { } controlWidth &&
+            referenceDataAreaWidths.TryGetValue(scene.Metric, out var referenceDataAreaWidth))
+        {
+            var currentDataAreaWidth = referenceDataAreaWidth + Bounds.Width - controlWidth;
+            if (currentDataAreaWidth > 0)
+            {
+                return GraphPlotProjection.BuildAxes(
+                    scene,
+                    LocalizationService.DisplayTimeZone,
+                    CultureInfo.CurrentCulture,
+                    currentDataAreaWidth,
+                    referenceDataAreaWidth);
+            }
+        }
+
+        return GraphPlotProjection.BuildAxes(
+            scene,
+            LocalizationService.DisplayTimeZone,
+            CultureInfo.CurrentCulture);
     }
 
     private ModelSeriesVisual AddModelSeries(
@@ -214,17 +254,7 @@ public sealed class GraphPlotControl : AvaPlot
 
     private void ApplyAxes(GraphScene scene, GraphAxisProjection axes)
     {
-        Plot.Axes.SetLimits(
-            scene.PeriodStartAt,
-            axes.DisplayEndAt,
-            axes.ModelDisplayMinimum,
-            axes.ModelDisplayMaximum,
-            Plot.Axes.Bottom,
-            Plot.Axes.Left);
-        Plot.Axes.SetLimitsY(
-            axes.RemainingDisplayMinimum,
-            axes.RemainingDisplayMaximum,
-            Plot.Axes.Right);
+        ApplyLimits(scene, axes);
         Plot.Axes.Bottom.TickGenerator = new NumericManual(
             axes.BottomValues.ToArray(),
             axes.BottomLabels.ToArray());
@@ -240,6 +270,153 @@ public sealed class GraphPlotControl : AvaPlot
         Plot.Axes.Right.IsVisible = false;
     }
 
+    private void ApplyLimits(GraphScene scene, GraphAxisProjection axes)
+    {
+        Plot.Axes.SetLimits(
+            scene.PeriodStartAt,
+            axes.DisplayEndAt,
+            axes.ModelDisplayMinimum,
+            axes.ModelDisplayMaximum,
+            Plot.Axes.Bottom,
+            Plot.Axes.Left);
+        Plot.Axes.SetLimitsY(
+            axes.RemainingDisplayMinimum,
+            axes.RemainingDisplayMaximum,
+            Plot.Axes.Right);
+    }
+
+    private void OnControlSizeChanged(object? sender, SizeChangedEventArgs change)
+    {
+        var previousControlWidth = change.PreviousSize.Width;
+        var currentControlWidth = change.NewSize.Width;
+        if (referenceControlWidth is null &&
+            double.IsFinite(currentControlWidth) && currentControlWidth > 0)
+        {
+            // The Graph window opens at its specified 940 logical-pixel
+            // reference width. Remember the first arranged control width so
+            // every metric can derive the same reference after its first
+            // completed render, even if it is first selected after a resize.
+            referenceControlWidth = currentControlWidth;
+        }
+        var previousDataAreaWidth = Plot.LastRender.DataRect.Width;
+        if (!double.IsFinite(previousControlWidth) || previousControlWidth <= 0 ||
+            !double.IsFinite(currentControlWidth) || currentControlWidth <= 0 ||
+            !double.IsFinite(previousDataAreaWidth) || previousDataAreaWidth <= 0)
+        {
+            return;
+        }
+
+        var scene = Scene;
+        if (!scene.HasPoints || referenceControlWidth is not { } controlWidth)
+        {
+            return;
+        }
+        if (!referenceDataAreaWidths.TryGetValue(scene.Metric, out var referenceDataAreaWidth))
+        {
+            referenceDataAreaWidth = previousDataAreaWidth +
+                controlWidth - previousControlWidth;
+            referenceDataAreaWidths[scene.Metric] = referenceDataAreaWidth;
+        }
+        ApplyResponsiveLayout(scene);
+    }
+
+    private void ScheduleReferenceCapture(
+        GraphMetric metric,
+        int revision,
+        long priorRenderCount,
+        int attemptsRemaining)
+    {
+        DispatcherTimer.RunOnce(() =>
+        {
+            var currentScene = Scene;
+            if (sceneRevision != revision ||
+                !currentScene.HasPoints ||
+                currentScene.Metric != metric ||
+                referenceDataAreaWidths.ContainsKey(metric))
+            {
+                return;
+            }
+
+            if ((long)Plot.RenderManager.RenderCount <= priorRenderCount)
+            {
+                if (attemptsRemaining > 1)
+                {
+                    ScheduleReferenceCapture(
+                        metric,
+                        revision,
+                        priorRenderCount,
+                        attemptsRemaining - 1);
+                }
+                return;
+            }
+
+            var currentControlWidth = Bounds.Width;
+            var currentDataAreaWidth = Plot.LastRender.DataRect.Width;
+            if (referenceControlWidth is not { } controlWidth ||
+                !double.IsFinite(currentControlWidth) || currentControlWidth <= 0 ||
+                !double.IsFinite(currentDataAreaWidth) || currentDataAreaWidth <= 0)
+            {
+                return;
+            }
+            var referenceDataAreaWidth = currentDataAreaWidth + controlWidth - currentControlWidth;
+            if (!double.IsFinite(referenceDataAreaWidth) || referenceDataAreaWidth <= 0)
+            {
+                return;
+            }
+            referenceDataAreaWidths[metric] = referenceDataAreaWidth;
+
+            // A metric first selected after a resize initially uses the
+            // legacy proportional projection. Correct it only after a render
+            // has completed, without subscribing to or mutating ScottPlot
+            // inside its render callbacks.
+            if (Math.Abs(currentControlWidth - controlWidth) > 0.5)
+            {
+                ApplyResponsiveLayout(currentScene);
+            }
+        }, TimeSpan.FromMilliseconds(25), DispatcherPriority.Background);
+    }
+
+    private void ApplyResponsiveLayout(GraphScene scene)
+    {
+        if (referenceControlWidth is not { } controlWidth ||
+            !referenceDataAreaWidths.TryGetValue(scene.Metric, out var referenceDataAreaWidth))
+        {
+            return;
+        }
+        var currentDataAreaWidth = referenceDataAreaWidth + Bounds.Width - controlWidth;
+        if (!double.IsFinite(currentDataAreaWidth) || currentDataAreaWidth <= 0)
+        {
+            return;
+        }
+        var axes = GraphPlotProjection.BuildAxes(
+            scene,
+            LocalizationService.DisplayTimeZone,
+            CultureInfo.CurrentCulture,
+            currentDataAreaWidth,
+            referenceDataAreaWidth);
+        ApplyLimits(scene, axes);
+        UpdateEndpointLayout(remainingConnectorX, remainingLabel, axes.EndpointLabelAt);
+        UpdateEndpointLayout(solConnectorX, solLabel, axes.EndpointLabelAt);
+        UpdateEndpointLayout(terraConnectorX, terraLabel, axes.EndpointLabelAt);
+        UpdateEndpointLayout(lunaConnectorX, lunaLabel, axes.EndpointLabelAt);
+        Refresh();
+    }
+
+    private static void UpdateEndpointLayout(
+        double[] connectorX,
+        ScottPlot.Plottables.Text? label,
+        double endpointLabelAt)
+    {
+        if (connectorX.Length == 2)
+        {
+            connectorX[1] = endpointLabelAt;
+        }
+        if (label is not null)
+        {
+            label.Location = new ScottPlot.Coordinates(endpointLabelAt, label.Location.Y);
+        }
+    }
+
     private void AddEndpointLabels(GraphScene scene, GraphAxisProjection axes)
     {
         foreach (var endpoint in GraphPlotProjection.BuildEndpointLabels(scene, CultureInfo.CurrentCulture))
@@ -253,8 +430,9 @@ public sealed class GraphPlotControl : AvaPlot
                 GraphSeries.Luna => LunaColor,
                 _ => MutedColor,
             };
+            var connectorX = new double[] { scene.PeriodEndAt, axes.EndpointLabelAt };
             var connector = Plot.Add.Scatter(
-                new double[] { scene.PeriodEndAt, axes.EndpointLabelAt },
+                connectorX,
                 new double[] { endpoint.PointAxisValue, endpoint.AxisValue },
                 color.WithOpacity(0.75));
             connector.Axes.YAxis = axis;
@@ -272,10 +450,14 @@ public sealed class GraphPlotControl : AvaPlot
             label.LabelPadding = 2;
             switch (endpoint.Series)
             {
-                case GraphSeries.Remaining: remainingLabel = label; remainingConnector = connector; break;
-                case GraphSeries.Sol: solLabel = label; solConnector = connector; break;
-                case GraphSeries.Terra: terraLabel = label; terraConnector = connector; break;
-                case GraphSeries.Luna: lunaLabel = label; lunaConnector = connector; break;
+                case GraphSeries.Remaining:
+                    remainingLabel = label; remainingConnector = connector; remainingConnectorX = connectorX; break;
+                case GraphSeries.Sol:
+                    solLabel = label; solConnector = connector; solConnectorX = connectorX; break;
+                case GraphSeries.Terra:
+                    terraLabel = label; terraConnector = connector; terraConnectorX = connectorX; break;
+                case GraphSeries.Luna:
+                    lunaLabel = label; lunaConnector = connector; lunaConnectorX = connectorX; break;
             }
         }
     }

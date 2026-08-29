@@ -159,6 +159,75 @@ public sealed class GraphPlotControlTests
     }
 
     [Fact]
+    public void PlotProjectionKeepsMetricSpecificEndpointGutterFixedAcrossUnboundedWidths()
+    {
+        const double referenceWidth = 800;
+        double[] currentWidths = [320, 800, 1_200, 10_000];
+        var points = new[]
+        {
+            Point(1_000, 100, 0, 0, 0),
+            Point(2_000, 75, 2, 4, 6),
+        };
+
+        foreach (var (metric, legacyGutterRatio) in new[]
+        {
+            (GraphMetric.Dollars, 0.20),
+            (GraphMetric.Tokens, 0.27),
+        })
+        {
+            var scene = GraphScene.Create(points, metric, points[0].Timestamp, points[^1].Timestamp);
+            var expectedGutter = referenceWidth * legacyGutterRatio / (1 + legacyGutterRatio);
+            var expectedLabelGap = referenceWidth * 0.018 / (1 + legacyGutterRatio);
+
+            foreach (var currentWidth in currentWidths)
+            {
+                var projection = GraphPlotProjection.BuildAxes(
+                    scene,
+                    TimeZoneInfo.Utc,
+                    CultureInfo.InvariantCulture,
+                    currentWidth,
+                    referenceWidth);
+                var displaySpan = projection.DisplayEndAt - scene.PeriodStartAt;
+                var plotWidth = currentWidth *
+                    (scene.PeriodEndAt - scene.PeriodStartAt) / displaySpan;
+                var labelGap = currentWidth *
+                    (projection.EndpointLabelAt - scene.PeriodEndAt) / displaySpan;
+
+                Assert.Equal(expectedGutter, currentWidth - plotWidth, precision: 9);
+                Assert.Equal(expectedLabelGap, labelGap, precision: 9);
+            }
+        }
+    }
+
+    [Fact]
+    public void PlotProjectionLegacyOverloadRetainsTheExistingEndpointCoordinates()
+    {
+        foreach (var metric in new[] { GraphMetric.Dollars, GraphMetric.Tokens })
+        {
+            var points = new[]
+            {
+                Point(1_000, 100, 0, 0, 0),
+                Point(2_000, 75, 2, 4, 6),
+            };
+            var scene = GraphScene.Create(points, metric, points[0].Timestamp, points[^1].Timestamp);
+
+            var legacy = GraphPlotProjection.BuildAxes(
+                scene,
+                TimeZoneInfo.Utc,
+                CultureInfo.InvariantCulture);
+            var sameWidth = GraphPlotProjection.BuildAxes(
+                scene,
+                TimeZoneInfo.Utc,
+                CultureInfo.InvariantCulture,
+                800,
+                800);
+
+            Assert.Equal(legacy.DisplayEndAt, sameWidth.DisplayEndAt);
+            Assert.Equal(legacy.EndpointLabelAt, sameWidth.EndpointLabelAt);
+        }
+    }
+
+    [Fact]
     public void PlotProjectionSeparatesFlatAndRisingSegmentsLikeTheNativeGraph()
     {
         var scene = Scene(
