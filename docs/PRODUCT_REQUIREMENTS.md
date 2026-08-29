@@ -61,37 +61,43 @@
 
 ## 6. 配布・顧客向け表明
 
-- Windows製品版とX版は単一のstable `X.Y.Z`を共有する。通常のPRはmajor/minorを変更せず、mergeごとに
+- Windows製品版とX版は単一のstable `X.Y.Z`を共有する。製品変更を含むPRはmajor/minorを変更せず、mergeごとに
   自動採番処理がpatchを十進整数としてちょうど1増やす。patchからminorへ桁上がりさせず、`1.0.9`の次は
   `1.0.10`とする。major/minorは利用者の明示指示を要する別変更でだけ更新し、自動採番処理は変更しない。
   `Cargo.toml`、root packageの`Cargo.lock`、`windows-client/Directory.Build.props`が開始時点で同値でない場合、
   または期待元versionとmainが一致しない場合は、3ファイルを一つも変更せず停止する。
-- PR作成前は単一のローカル入口からnative deterministic test、data protection契約、Windows unit/contract testを
+- `main`向けPRの変更pathが`AGENTS.md`、`README.md`、`docs/**`、`.github/ISSUE_TEMPLATE/**`だけで構成される場合を
+  「非製品のみ」とする。rename/copyは変更前後のpathを両方判定する。これ以外を1件でも含むmixed PR、未知path、
+  workflow・CI script・製品sourceの変更は製品変更として完全な採番・品質・配布経路を通す。PR/API identity不一致、
+  changed-files件数と全page取得結果の不一致、重複・空・malformed data、分類器未対応時は非製品扱いへfallbackせず、
+  mutation前に失敗する。ただしtrusted baseに分類器がまだ存在しない導入時の1境界だけは製品変更として完全経路を通す。
+- 製品変更PRの作成前は単一のローカル入口からnative deterministic test、data protection契約、Windows unit/contract testを
   各1回だけ実行する。必須Rust testは1回の全target実行結果から名前と成功を確認し、個別に再実行しない。
   PRではrelease artifactに必要なnative buildとCLI/recorder実行、mainの実適用merge rule、実Windows installer/UIを
-  各1回だけ確認し、ローカルと同じtest/gateを別job、別workflow、acceptance、Releaseで再実行しない。すべてのmergeが
-  release candidateを作るためpath classifierでartifact producerを省略せず、高コストなdeterministic testをPRへ戻さない。
-  単一のrequired acceptanceは先行jobの成功、検証対象tree、source SHA、各artifact証拠の対応だけを検査し、
-  version準備を含む失敗・未完了・古い証拠では明示的に失敗してmergeを許可しない。merge方式は、検証済みtreeと
-  main上のmerge結果を同一性検証できる方式に限定する。
-- PR品質確認を開始する前に、PR branch上のversion 3ファイルだけをexact next patchへ自動更新する。その
+  各1回だけ確認し、ローカルと同じtest/gateを別job、別workflow、acceptance、Releaseで再実行しない。非製品のみPRは
+  これらの製品build/test/artifact producerをすべてskipし、分類とrequired check集約だけを短時間で実行する。
+  単一のrequired acceptanceは常に生成する。製品変更ではversion準備、先行jobの成功、検証対象tree、source SHA、
+  各artifact証拠の対応を検査し、非製品のみではversion未変更、全artifact producerが`skipped`、artifact 0件を検査する。
+  分類欠落、期待外のjob結果、失敗・未完了・古い証拠では明示的に失敗してmergeを許可しない。
+- 製品変更PRだけ、品質確認を開始する前にPR branch上のversion 3ファイルをexact next patchへ自動更新する。その
   version commitを含む最新mainとの合成treeを品質確認し、mergeによって採番を確定する。採番commit自身では
-  高コスト品質jobを開始せず、新しいheadに対する次のworkflow runで一度だけ確認する。
-  ready_for_review等で同じheadの正当な品質runが複数存在し得るため、merge後はeventとPR APIの
-  全identity（PR番号、head/base repository・ref・SHA、merge SHA）および`merged_at`の一致を確認してから、
-  quality run APIをstatusで絞らず全status・全page取得し、同一identityのexact候補がすべて
-  `created_at <= updated_at <= merged_at`を満たすことを検証する。そのうち`run_number`が最大で一意のcandidateだけを選び、
-  そのcandidateが`completed`/`success`のときだけ受理する。最新candidateの`failure`/`cancelled`/`pending`、
-  tie、候補zero、malformed、merge後（post-merge）run、pagination不完全・異常はartifact取得前にfail-closedとし、
-  older successへfallbackしない。`pull_requests`はauthorityにせず、検証済みtreeとの一致を確認し、
-  quality test/buildを再実行せずmanifest生成とRelease公開を行う。同時mergeと公開は直列化する。
-  PR品質証拠とtreeが一致しない、version以外の差分が混入する、tag/Releaseが別SHAを
-  指す、通信障害、5xx、部分uploadの場合は上書きせずfail-closedで停止する。
-- PR由来のcheckout、script、workflow、artifactを、repository contents・checks・Releaseへのwrite権限を
-  持つjobで実行しない。自動採番はdefault branchのtrusted workflow/toolだけを実行し、PRのversion 3ファイルを
-  dataとして検証した後、same-repository headへexact 1 commitを原子的に追加する。head/baseの競合、fork、
-  不正version、対象外file mutationでは書き込まない。post-merge jobはdefault branchのmainだけをcheckoutし、
-  eventのmerge SHAと一致しない場合はRelease mutationを行わない。
+  高コスト品質jobを開始せず、新しいheadに対する次のworkflow runで一度だけ確認する。非製品のみPRはversion 3ファイルを
+  変更せず、`version-prepared` required jobを分類だけで成功完了させる。
+- 製品変更のmerge後だけ、eventとPR APIの全identity（PR番号、head/base repository・ref・SHA、merge SHA）および
+  `merged_at`の一致を確認する。ready_for_review等で同じheadの正当な品質runが複数存在し得ることを前提に、quality run APIを
+  statusで絞らず全status・全page取得し、同一identityのexact候補がすべて`created_at <= updated_at <= merged_at`を
+  満たすことを検証する。そのうち`run_number`が最大で一意のcandidateだけを選び、`completed`/`success`のときだけ
+  受理する。最新candidateの失敗・未完了、tie、候補zero、malformed、post-merge run、pagination不完全・異常は
+  artifact取得前にfail-closedとし、older successへfallbackしない。`pull_requests`はauthorityにせず、検証済みtreeとの
+  一致を確認し、quality test/buildを再実行せずmanifest生成とRelease公開を行う。同時mergeと公開は直列化する。
+  非製品のみのmerge後jobは分類だけで成功完了し、quality run解決、artifact download、binary build、manifest、tag、
+  GitHub Releaseを一切生成しない。
+- PR由来のcheckout、script、workflow、artifactを、repository contents・checks・Releaseへのwrite権限を持つjobで実行しない。
+  変更分類はPR/file APIの完全なidentityとpaginationをdefault branchまたはPRのtrusted baseにある分類器で判定する。
+  自動採番はdefault branchのtrusted workflow/toolだけを実行し、PRのversion 3ファイルをdataとして検証した後、
+  same-repository headへexact 1 commitを原子的に追加する。head/baseの競合、fork、不正version、対象外file mutationでは
+  書き込まない。post-merge jobはdefault branchのmainだけをcheckoutし、分類不成立またはeventのmerge SHAと不一致の場合は
+  Release mutationを行わない。
 - CodeQLはmerge必須gateとし、critical/high findingをdismissやworkflow無効化で通過させない。外部AI findingsが
   provider側の未対応modelで継続失敗する場合は、そのAI機能だけをrepository単位で無効化できるが、CodeQL、
   code-scanning alerts、required acceptanceは維持する。

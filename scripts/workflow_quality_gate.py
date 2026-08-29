@@ -110,6 +110,17 @@ EXPECTED_LIVE_RULE_KEYS = frozenset(
     {"type", "parameters", "ruleset_source_type", "ruleset_source", "ruleset_id"}
 )
 EXPECTED_LIVE_STATUS_CONTEXTS = frozenset({"acceptance", "version-prepared"})
+PRODUCT_JOB_IF = (
+    "github.event_name == 'pull_request' && "
+    "needs.version-prepared.outputs.product == 'true' && "
+    "needs.version-prepared.outputs.ready == 'true'"
+)
+PRODUCT_STEP_IF = "needs.version-prepared.outputs.product == 'true'"
+RELEASE_PRODUCT_STEP_IF = "steps.scope.outputs.product == 'true'"
+RELEASE_JOB_IF = (
+    "github.event_name == 'pull_request_target' && "
+    "github.event.pull_request.merged == true"
+)
 
 
 class WorkflowError(ValueError):
@@ -129,6 +140,13 @@ class Job:
     properties: Mapping[str, str]
     needs: tuple[str, ...]
     run_blocks: tuple[RunBlock, ...]
+
+
+@dataclass(frozen=True)
+class Step:
+    label: str
+    properties: Mapping[str, str]
+    lines: tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -328,6 +346,55 @@ def _event_child_lines(workflow: Workflow, event: str) -> tuple[str, ...]:
     if value:
         raise WorkflowError(f"trigger {event} must be a block")
     return workflow.lines[start + 1 : end]
+
+
+def _job_steps(workflow: Workflow, job_name: str) -> tuple[Step, ...]:
+    marker = f"  {job_name}:"
+    starts = [index for index, line in enumerate(workflow.lines) if line == marker]
+    if len(starts) != 1:
+        raise WorkflowError(f"job marker is not unique: {job_name}")
+    job_start = starts[0]
+    job_end = next(
+        (
+            index
+            for index in range(job_start + 1, len(workflow.lines))
+            if re.match(r"^  [A-Za-z0-9_.-]+:", workflow.lines[index])
+        ),
+        len(workflow.lines),
+    )
+    steps_markers = [
+        index
+        for index in range(job_start + 1, job_end)
+        if workflow.lines[index] == "    steps:"
+    ]
+    if len(steps_markers) != 1:
+        raise WorkflowError(f"steps mapping is not unique: {job_name}")
+    step_starts = [
+        index
+        for index in range(steps_markers[0] + 1, job_end)
+        if re.match(r"^ {6}-\s", workflow.lines[index])
+    ]
+    result: list[Step] = []
+    for position, start in enumerate(step_starts):
+        end = step_starts[position + 1] if position + 1 < len(step_starts) else job_end
+        first = workflow.lines[start]
+        match = re.match(r"^ {6}-\s+(name|uses):\s*(.+?)\s*$", first)
+        if match is None:
+            raise WorkflowError(f"unsupported step marker in {job_name}: {first}")
+        label = match.group(2) if match.group(1) == "name" else f"uses:{match.group(2)}"
+        properties: dict[str, str] = {match.group(1): match.group(2)}
+        for line in workflow.lines[start + 1 : end]:
+            parsed = _key_value(line, 8)
+            if parsed is None:
+                continue
+            _, key, value = parsed
+            if key in properties:
+                raise WorkflowError(f"duplicate step property {key} in {job_name}:{label}")
+            properties[key] = value
+        result.append(Step(label, properties, workflow.lines[start:end]))
+    if not result:
+        raise WorkflowError(f"steps mapping is empty: {job_name}")
+    return tuple(result)
 
 
 def _mask_quoted(line: str) -> str:
@@ -676,6 +743,125 @@ def _native_artifact_contract(workflow: Workflow) -> list[str]:
     return errors
 
 
+def _version_scope_contract(workflow: Workflow) -> list[str]:
+    errors: list[str] = []
+    steps = _job_steps(workflow, "version-prepared")
+    expected_labels = (
+        "uses:actions/checkout@v4",
+        "Classify pull request scope from the trusted base",
+        "Verify the exact next patch version",
+    )
+    if tuple(step.label for step in steps) != expected_labels:
+        return ["version-prepared step set or order changed"]
+    scope, version = steps[1], steps[2]
+    scope_text = "\n".join(scope.lines)
+    version_text = "\n".join(version.lines)
+    for marker in (
+        'git cat-file -e "$BASE_SHA^{commit}"',
+        'git show "$BASE_SHA:scripts/ci_change_scope.py" > "$classifier"',
+        'python3 "$classifier"',
+        '"repos/$REPOSITORY/pulls/$PR_NUMBER/files?per_page=100"',
+        "--paginate --slurp",
+        "printf 'product=true\\n' >> \"$GITHUB_OUTPUT\"",
+    ):
+        if scope_text.count(marker) != 1:
+            errors.append(f"trusted-base scope marker cardinality changed: {marker}")
+    if "python3 scripts/ci_change_scope.py" in scope_text:
+        errors.append("pull_request scope executes the PR classifier")
+    if scope.properties.get("id") != "scope":
+        errors.append("version-prepared scope step id changed")
+    if version.properties.get("if") != "steps.scope.outputs.product == 'true'":
+        errors.append("version check is not product-only")
+    if 'id: version' not in version_text:
+        errors.append("version step id changed")
+    workflow_text = workflow.text
+    if workflow_text.count("      product: ${{ steps.scope.outputs.product }}") != 1:
+        errors.append("version-prepared product output changed")
+    permissions = (
+        "    permissions:\n"
+        "      contents: read\n"
+        "      pull-requests: read\n"
+        "    outputs:\n"
+    )
+    if workflow_text.count(permissions) != 1:
+        errors.append("version-prepared permissions are not exact")
+    if workflow.jobs["version-prepared"].properties.get("if") != "github.event_name == 'pull_request'":
+        errors.append("version-prepared is not pull_request-only")
+    for owner in ("native-quality", "windows-quality", "ui-quality"):
+        if workflow.jobs.get(owner, Job("", {}, (), ())).properties.get("if") != PRODUCT_JOB_IF:
+            errors.append(f"{owner} is not exact product-only")
+    return errors
+
+
+def _acceptance_scope_contract(workflow: Workflow) -> list[str]:
+    errors: list[str] = []
+    steps = _job_steps(workflow, "acceptance")
+    expected_labels = (
+        "Verify quality job outcomes",
+        "uses:actions/checkout@v4",
+        "Download native quality evidence",
+        "Download Windows quality evidence",
+        "Download Windows UI E2E evidence",
+        "Download CI installer artifact",
+        "Run final acceptance gate before merge",
+        "Assemble accepted release candidate",
+        "Upload accepted release candidate",
+    )
+    if tuple(step.label for step in steps) != expected_labels:
+        return ["acceptance step set or order changed"]
+    if "PRODUCT_CHANGED: ${{ needs.version-prepared.outputs.product }}" not in "\n".join(steps[0].lines):
+        errors.append("acceptance product scope environment is missing")
+    outcome = workflow.jobs["acceptance"].run_blocks[0].body
+    exact_counts = {
+        'case "$PRODUCT_CHANGED" in': 1,
+        '[[ "$VERSION_READY" == true ]]': 1,
+        '[[ -z "$VERSION_READY" ]]': 1,
+        'for result in "$NATIVE_RESULT" "$WINDOWS_RESULT" "$UI_RESULT"; do': 2,
+        '[[ "$result" == success ]]': 1,
+        '[[ "$result" == skipped ]]': 1,
+    }
+    for marker, expected in exact_counts.items():
+        if outcome.count(marker) != expected:
+            errors.append(f"acceptance scope marker count changed: {marker}")
+    for step in steps[1:]:
+        if step.properties.get("if") != PRODUCT_STEP_IF:
+            errors.append(f"acceptance product step is not guarded: {step.label}")
+    return errors
+
+
+def _release_scope_contract(workflow: Workflow) -> list[str]:
+    errors: list[str] = []
+    steps = _job_steps(workflow, "release")
+    expected_labels = (
+        "uses:actions/checkout@v4",
+        "Classify merged pull request scope",
+        "Resolve accepted PR quality run",
+        "Download accepted PR release candidate",
+        "Verify accepted source and artifact hashes",
+        "Create deterministic update manifest",
+        "Create GitHub Release and upload Windows assets",
+    )
+    if tuple(step.label for step in steps) != expected_labels:
+        return ["release step set or order changed"]
+    checkout_text = "\n".join(steps[0].lines)
+    scope_text = "\n".join(steps[1].lines)
+    if "ref: refs/heads/main" not in checkout_text:
+        errors.append("release scope is not evaluated from trusted main")
+    for marker in (
+        "python3 scripts/ci_change_scope.py",
+        '"repos/$REPOSITORY/pulls/$PR_NUMBER/files?per_page=100"',
+        "--paginate --slurp",
+    ):
+        if scope_text.count(marker) != 1:
+            errors.append(f"release scope marker cardinality changed: {marker}")
+    if steps[1].properties.get("id") != "scope":
+        errors.append("release scope step id changed")
+    for step in steps[2:]:
+        if step.properties.get("if") != RELEASE_PRODUCT_STEP_IF:
+            errors.append(f"release mutation step is not product-only: {step.label}")
+    return errors
+
+
 def validate_workflows(windows_path: Path = WINDOWS_WORKFLOW, rust_path: Path = RUST_WORKFLOW) -> list[str]:
     errors: list[str] = []
     try:
@@ -756,10 +942,7 @@ def validate_workflows(windows_path: Path = WINDOWS_WORKFLOW, rust_path: Path = 
                 if required not in acceptance_text:
                     errors.append(f"acceptance first step environment is missing {required}")
         release_if = windows.jobs.get("release", Job("", {}, (), ())).properties.get("if", "")
-        if not (
-            "github.event_name == 'pull_request_target'" in release_if
-            and "github.event.pull_request.merged == true" in release_if
-        ):
+        if release_if != RELEASE_JOB_IF:
             errors.append("release is not closed-and-merged-only")
 
         counts = _owner_counts((windows, rust))
@@ -777,6 +960,9 @@ def validate_workflows(windows_path: Path = WINDOWS_WORKFLOW, rust_path: Path = 
             errors.extend(_quality_commands(windows, ("acceptance", "release")))
         errors.extend(_native_artifact_contract(rust))
         errors.extend(_live_audit_contract(windows))
+        errors.extend(_version_scope_contract(windows))
+        errors.extend(_acceptance_scope_contract(windows))
+        errors.extend(_release_scope_contract(windows))
 
         # A reusable workflow must advertise workflow_call; this avoids
         # accepting a source copy whose job text merely happens to match.
@@ -804,6 +990,7 @@ class MergeRun:
     base_sha: str
     tree_sha: str
     jobs: tuple[MergeJob, ...]
+    product: bool = True
     artifact_ids: tuple[str, ...] = ()
     provenance_markers: tuple[str, ...] = ()
 
@@ -949,18 +1136,8 @@ def evaluate_merge_state(state: MergeState) -> bool:
         return False
     if not all(
         _full_sha(value)
-        for value in (
-            state.current_base,
-            state.current_head,
-            state.current_tree,
-            state.provenance_source,
-            state.provenance_tree,
-        )
+        for value in (state.current_base, state.current_head, state.current_tree)
     ):
-        return False
-    if not _nonempty_identifier(state.provenance_id):
-        return False
-    if state.provenance_source != state.current_head or state.provenance_tree != state.current_tree:
         return False
     # The supplied collection is the current PR mapping, not an unbounded
     # history query. Stale rows must be rejected rather than silently filtered.
@@ -975,12 +1152,30 @@ def evaluate_merge_state(state: MergeState) -> bool:
         or run.head_sha != state.current_head
         or run.base_sha != state.current_base
         or run.tree_sha != state.current_tree
-        or not run.artifact_ids
-        or not all(_nonempty_identifier(identifier) for identifier in run.artifact_ids)
-        or not run.provenance_markers
-        or not all(_nonempty_identifier(marker) for marker in run.provenance_markers)
-        or f"source-sha: {state.current_head}" not in run.provenance_markers
-        or f"tree-sha: {state.current_tree}" not in run.provenance_markers
+        or type(run.product) is not bool
+    ):
+        return False
+    if run.product:
+        if (
+            not _full_sha(state.provenance_source)
+            or not _full_sha(state.provenance_tree)
+            or not _nonempty_identifier(state.provenance_id)
+            or state.provenance_source != state.current_head
+            or state.provenance_tree != state.current_tree
+            or not run.artifact_ids
+            or not all(_nonempty_identifier(identifier) for identifier in run.artifact_ids)
+            or not run.provenance_markers
+            or not all(_nonempty_identifier(marker) for marker in run.provenance_markers)
+            or f"source-sha: {state.current_head}" not in run.provenance_markers
+            or f"tree-sha: {state.current_tree}" not in run.provenance_markers
+        ):
+            return False
+    elif (
+        state.provenance_source != ""
+        or state.provenance_tree != ""
+        or state.provenance_id != ""
+        or run.artifact_ids != ()
+        or run.provenance_markers != ()
     ):
         return False
     contexts = [job.context for job in run.jobs]
@@ -1022,6 +1217,24 @@ def _valid_merge_state() -> MergeState:
         ),
         provenance_id="provenance-101",
         live_applied_rules=_valid_live_applied_rules_fixture(),
+    )
+
+
+def _valid_non_product_merge_state() -> MergeState:
+    state = _valid_merge_state()
+    return replace(
+        state,
+        provenance_source="",
+        provenance_tree="",
+        provenance_id="",
+        runs=(
+            replace(
+                state.runs[0],
+                product=False,
+                artifact_ids=(),
+                provenance_markers=(),
+            ),
+        ),
     )
 
 
@@ -1227,6 +1440,17 @@ def _static_mutations() -> tuple[tuple[str, Callable[[Path, Path], None]], ...]:
         text = windows.read_text(encoding="utf-8")
         windows.write_text(_replace_exact(text, "if: always() && github.event_name == 'pull_request'", "if: github.event_name == 'pull_request'"), encoding="utf-8")
 
+    def release_on_any_close(windows: Path, _rust: Path) -> None:
+        text = windows.read_text(encoding="utf-8")
+        windows.write_text(
+            _replace_exact(
+                text,
+                f"    if: {RELEASE_JOB_IF}\n",
+                "    if: github.event_name == 'pull_request_target'\n",
+            ),
+            encoding="utf-8",
+        )
+
     def missing_version_outcome_guard(windows: Path, _rust: Path) -> None:
         text = windows.read_text(encoding="utf-8")
         needle = '          [[ "$VERSION_RESULT" == success ]] || { echo "version-prepared job did not succeed: $VERSION_RESULT" >&2; exit 1; }\n'
@@ -1234,9 +1458,82 @@ def _static_mutations() -> tuple[tuple[str, Callable[[Path, Path], None]], ...]:
 
     def missing_owner_outcome_guard(windows: Path, _rust: Path) -> None:
         text = windows.read_text(encoding="utf-8")
-        needle = '          for result in "$NATIVE_RESULT" "$WINDOWS_RESULT" "$UI_RESULT"; do\n'
-        replacement = '          for result in "$NATIVE_RESULT" "$WINDOWS_RESULT"; do\n'
+        needle = (
+            '              for result in "$NATIVE_RESULT" "$WINDOWS_RESULT" "$UI_RESULT"; do\n'
+            '                [[ "$result" == success ]] || {\n'
+        )
+        replacement = (
+            '              for result in "$NATIVE_RESULT" "$WINDOWS_RESULT"; do\n'
+            '                [[ "$result" == success ]] || {\n'
+        )
         windows.write_text(_replace_exact(text, needle, replacement), encoding="utf-8")
+
+    def missing_product_job_guard(windows: Path, _rust: Path) -> None:
+        text = windows.read_text(encoding="utf-8")
+        needle = f"  native-quality:\n    if: {PRODUCT_JOB_IF}\n"
+        replacement = (
+            "  native-quality:\n"
+            "    if: github.event_name == 'pull_request' && "
+            "needs.version-prepared.outputs.ready == 'true'\n"
+        )
+        windows.write_text(_replace_exact(text, needle, replacement), encoding="utf-8")
+
+    def version_scope_on_wrong_event(windows: Path, _rust: Path) -> None:
+        text = windows.read_text(encoding="utf-8")
+        needle = "  version-prepared:\n    if: github.event_name == 'pull_request'\n"
+        replacement = "  version-prepared:\n    if: always()\n"
+        windows.write_text(_replace_exact(text, needle, replacement), encoding="utf-8")
+
+    def wrong_non_product_owner_outcome(windows: Path, _rust: Path) -> None:
+        text = windows.read_text(encoding="utf-8")
+        windows.write_text(
+            _replace_exact(
+                text,
+                '                [[ "$result" == skipped ]] || {\n',
+                '                [[ "$result" == success ]] || {\n',
+            ),
+            encoding="utf-8",
+        )
+
+    def missing_acceptance_product_guard(windows: Path, _rust: Path) -> None:
+        text = windows.read_text(encoding="utf-8")
+        needle = (
+            "      - name: Download native quality evidence\n"
+            "        if: needs.version-prepared.outputs.product == 'true'\n"
+        )
+        windows.write_text(
+            _replace_exact(text, needle, "      - name: Download native quality evidence\n"),
+            encoding="utf-8",
+        )
+
+    def missing_release_product_guard(windows: Path, _rust: Path) -> None:
+        text = windows.read_text(encoding="utf-8")
+        needle = (
+            "      - name: Resolve accepted PR quality run\n"
+            "        if: steps.scope.outputs.product == 'true'\n"
+        )
+        windows.write_text(
+            _replace_exact(text, needle, "      - name: Resolve accepted PR quality run\n"),
+            encoding="utf-8",
+        )
+
+    def execute_pull_request_classifier(windows: Path, _rust: Path) -> None:
+        text = windows.read_text(encoding="utf-8")
+        windows.write_text(
+            _replace_exact(
+                text,
+                '          scope="$(python3 "$classifier" \\\n',
+                '          scope="$(python3 scripts/ci_change_scope.py \\\n',
+            ),
+            encoding="utf-8",
+        )
+
+    def missing_product_output(windows: Path, _rust: Path) -> None:
+        text = windows.read_text(encoding="utf-8")
+        windows.write_text(
+            _replace_exact(text, "      product: ${{ steps.scope.outputs.product }}\n", ""),
+            encoding="utf-8",
+        )
 
     def add_path_filter(windows: Path, _rust: Path) -> None:
         text = windows.read_text(encoding="utf-8")
@@ -1351,8 +1648,16 @@ def _static_mutations() -> tuple[tuple[str, Callable[[Path, Path], None]], ...]:
         ("windows-local-apt-setup", local_apt_setup),
         ("windows-local-dotnet-setup", local_dotnet_setup),
         ("acceptance-always-missing", no_acceptance_always),
+        ("release-merged-guard-missing", release_on_any_close),
         ("acceptance-version-outcome-missing", missing_version_outcome_guard),
         ("acceptance-owner-outcome-missing", missing_owner_outcome_guard),
+        ("product-job-guard-missing", missing_product_job_guard),
+        ("version-scope-wrong-event", version_scope_on_wrong_event),
+        ("non-product-owner-outcome-wrong", wrong_non_product_owner_outcome),
+        ("acceptance-product-guard-missing", missing_acceptance_product_guard),
+        ("release-product-guard-missing", missing_release_product_guard),
+        ("pull-request-classifier-executed", execute_pull_request_classifier),
+        ("product-output-missing", missing_product_output),
         ("pull-request-path-filter", add_path_filter),
         ("quality-command-in-acceptance", forbidden_quality_command),
         ("unknown-job", unknown_job),
@@ -1484,6 +1789,7 @@ def _run_static_cases() -> int:
 
 def _run_merge_cases() -> int:
     valid = _valid_merge_state()
+    valid_non_product = _valid_non_product_merge_state()
     old_base = "4444444444444444444444444444444444444444"
     old_head = "5555555555555555555555555555555555555555"
     old_tree = "6666666666666666666666666666666666666666"
@@ -1527,7 +1833,45 @@ def _run_merge_cases() -> int:
         result = evaluate_merge_state(mutate(valid))
         if result is not expected:
             raise AssertionError(f"merge fixture {name} expected {expected}, got {result}")
-    return len(mutations) + _run_live_applied_rules_cases()
+
+    non_product_cases: tuple[tuple[str, MergeState, bool], ...] = (
+        ("valid-non-product", valid_non_product, True),
+        (
+            "non-product-artifact",
+            run_update(valid_non_product, artifact_ids=("unexpected-artifact",)),
+            False,
+        ),
+        (
+            "non-product-provenance-marker",
+            run_update(valid_non_product, provenance_markers=("unexpected",)),
+            False,
+        ),
+        (
+            "non-product-provenance-id",
+            replace(valid_non_product, provenance_id="unexpected"),
+            False,
+        ),
+        (
+            "non-product-artifact-wrong-empty-type",
+            run_update(valid_non_product, artifact_ids=[]),
+            False,
+        ),
+        (
+            "non-product-provenance-wrong-empty-type",
+            replace(valid_non_product, provenance_source=0),
+            False,
+        ),
+        (
+            "malformed-product-flag",
+            run_update(valid_non_product, product="false"),
+            False,
+        ),
+    )
+    for name, state, expected in non_product_cases:
+        result = evaluate_merge_state(state)
+        if result is not expected:
+            raise AssertionError(f"merge fixture {name} expected {expected}, got {result}")
+    return len(mutations) + len(non_product_cases) + _run_live_applied_rules_cases()
 
 
 def self_test() -> tuple[int, int]:

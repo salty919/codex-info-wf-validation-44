@@ -61,22 +61,21 @@ def fail(message: str) -> None:
     raise FixtureError(message)
 
 
-def extract_run_block(source: str) -> str:
-    """Extract and dedent the production step; never duplicate its shell."""
+def _extract_named_run_block(source: str, marker: str) -> str:
+    """Extract and dedent one named production step's literal shell block."""
 
     lines = source.splitlines()
-    marker = "      - name: Validate and prepare version data"
     marker_indexes = [index for index, line in enumerate(lines) if line == marker]
     if len(marker_indexes) != 1:
-        fail("production validation step marker must occur exactly once")
+        fail(f"production step marker must occur exactly once: {marker}")
     marker_index = marker_indexes[0]
     run_indexes = [
         index
-        for index in range(marker_index + 1, min(len(lines), marker_index + 12))
+        for index in range(marker_index + 1, min(len(lines), marker_index + 20))
         if lines[index] == "        run: |"
     ]
     if len(run_indexes) != 1:
-        fail("production validation step must have one literal run block")
+        fail(f"production step must have one literal run block: {marker}")
 
     body: list[str] = []
     for line in lines[run_indexes[0] + 1 :]:
@@ -89,8 +88,16 @@ def extract_run_block(source: str) -> str:
     while body and body[-1] == "":
         body.pop()
     if not body or not body[0].startswith("set -euo pipefail"):
-        fail("validation run block is empty or not shell code")
+        fail(f"production run block is empty or not shell code: {marker}")
     return "\n".join(body) + "\n"
+
+
+def extract_run_block(source: str) -> str:
+    """Extract the version-mutation shell that the runtime fixture executes."""
+
+    return _extract_named_run_block(
+        source, "      - name: Validate and prepare version data"
+    )
 
 
 def _between(source: str, start: str, end: str) -> str:
@@ -403,11 +410,197 @@ def _validate_external_effect_boundary(block: str) -> None:
     _require(block, 'work="$RUNNER_TEMP/version-prepare"', "temporary work root")
 
 
+def _validate_read_only_scope_block(block: str) -> None:
+    """Keep a write-token scope classifier finite and mutation-free."""
+
+    expected_markers = (
+        '[[ "$REPOSITORY" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ &&',
+        '"$BASE_REPOSITORY" == "$REPOSITORY" &&',
+        '"$HEAD_REPOSITORY" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ &&',
+        '"$PR_NUMBER" =~ ^[1-9][0-9]*$ &&',
+        '"$BASE_SHA" =~ ^[0-9a-fA-F]{40}$ &&',
+        '"$HEAD_SHA" =~ ^[0-9a-fA-F]{40}$ ]] || {',
+        'scope_root="$RUNNER_TEMP/ci-change-scope"',
+        'mkdir -p "$scope_root"',
+        'gh api --method GET "repos/$REPOSITORY/pulls/$PR_NUMBER" > "$scope_root/pull-request.json"',
+        'gh api --method GET --paginate --slurp \\\n  "repos/$REPOSITORY/pulls/$PR_NUMBER/files?per_page=100" > "$scope_root/files.json"',
+        'scope="$(python3 scripts/ci_change_scope.py \\\n',
+        '--pull-request "$scope_root/pull-request.json"',
+        '--files "$scope_root/files.json"',
+        '--expected-repository "$REPOSITORY"',
+        '--expected-head-repository "$HEAD_REPOSITORY"',
+        '--expected-number "$PR_NUMBER"',
+        '--expected-base-sha "$BASE_SHA"',
+        '--expected-head-sha "$HEAD_SHA"',
+        'case "$scope" in',
+        'product) product=true ;;',
+        'non-product) product=false ;;',
+        "*) echo 'change-scope classifier returned an invalid result' >&2; exit 1 ;;",
+        'esac',
+        "printf 'product=%s\\n' \"$product\" >> \"$GITHUB_OUTPUT\"",
+    )
+    for marker in expected_markers:
+        if block.count(marker) != 1:
+            fail(f"scope classifier marker must occur exactly once: {marker}")
+    if len(re.findall(r"(?m)^gh api\s", block)) != 2:
+        fail("scope classification must make exactly two GitHub API reads")
+    if block.count("python3") != 1 or block.count("$(") != 1 or "`" in block:
+        fail("scope classification gained an additional Python invocation")
+    if len(re.findall(r"(?m)^mkdir\s", block)) != 1:
+        fail("scope classification mkdir boundary changed")
+    if re.search(r"--method\s+(?!GET(?:\s|$))", block):
+        fail("scope classification GitHub API method is not read-only")
+    if re.search(
+        r"\b(?:POST|PATCH|PUT|DELETE|git|curl|wget|ssh|scp|bash|sh|node|ruby|perl|"
+        r"rm|mv|cp|tee|dd|chmod|chown|ln|eval|source)\b",
+        block,
+    ):
+        fail("scope classification contains an unapproved command or mutation")
+    expected_command_counts = {
+        "set ": 1,
+        "echo ": 2,
+        "exit ": 2,
+        "mkdir ": 1,
+        "gh api ": 2,
+        "python3 ": 1,
+        "printf ": 1,
+    }
+    for command, expected in expected_command_counts.items():
+        if block.count(command) != expected:
+            fail(f"scope classification command count changed: {command}")
+    identity_failure_lines = (
+        "echo 'pull request scope identity is malformed' >&2",
+        "echo 'merged pull request scope identity is malformed' >&2",
+    )
+    if sum(block.count(line) for line in identity_failure_lines) != 1:
+        fail("scope identity failure marker changed")
+    allowed_starts = (
+        "set -euo pipefail",
+        "[[ ",
+        '"$BASE_REPOSITORY" ',
+        '"$HEAD_REPOSITORY" ',
+        '"$PR_NUMBER" ',
+        '"$BASE_SHA" ',
+        '"$HEAD_SHA" ',
+        "echo '",
+        "exit 1",
+        "}",
+        "scope_root=",
+        "mkdir -p ",
+        "gh api --method GET ",
+        '"repos/$REPOSITORY/pulls/',
+        'scope="$(python3 scripts/ci_change_scope.py ',
+        "--pull-request ",
+        "--files ",
+        "--expected-repository ",
+        "--expected-head-repository ",
+        "--expected-number ",
+        "--expected-base-sha ",
+        "--expected-head-sha ",
+        'case "$scope" in',
+        "product) product=true ;;",
+        "non-product) product=false ;;",
+        "*) echo '",
+        "esac",
+        "printf 'product=%s\\n' ",
+    )
+    for line in block.splitlines():
+        stripped = line.strip()
+        if stripped and not stripped.startswith(allowed_starts):
+            fail(f"scope classification line is outside the finite grammar: {stripped}")
+    for redirection in re.finditer(
+        r'(?<!<)(?:>>?|&>)(?:\s*)("[^"]*"|\'[^\']*\'|[^\s;&|]+)', block
+    ):
+        target = redirection.group(1)
+        if target.startswith("&"):
+            continue
+        if target not in {
+            '"$scope_root/pull-request.json"',
+            '"$scope_root/files.json"',
+            '"$GITHUB_OUTPUT"',
+        }:
+            fail(f"scope classification write escaped bounded paths: {target}")
+
+
+def _validate_scope_contract(source: str) -> None:
+    """Require a read-only trusted classifier before the write-capable step."""
+
+    checkout_marker = "      - name: Checkout trusted default branch"
+    scope_marker = "      - name: Classify pull request scope"
+    validation_marker = "      - name: Validate and prepare version data"
+    for marker in (checkout_marker, scope_marker, validation_marker):
+        if source.count(marker) != 1:
+            fail(f"trusted step marker must occur exactly once: {marker}")
+    if not source.index(checkout_marker) < source.index(scope_marker) < source.index(validation_marker):
+        fail("scope classification must run after trusted checkout and before mutation")
+
+    scope = _between(source, scope_marker, validation_marker)
+    block = _extract_named_run_block(source, scope_marker)
+    if re.search(r"(?m)^        (?:if|continue-on-error):", scope):
+        fail("version scope classifier must run and propagate every failure")
+    for needle, label in (
+        ("        id: scope\n", "scope output id"),
+        ("        shell: bash\n", "scope shell"),
+        ("          GH_TOKEN: ${{ github.token }}\n", "step-local GitHub token"),
+        ("          REPOSITORY: ${{ github.repository }}\n", "repository identity"),
+        ("          PR_NUMBER: ${{ github.event.pull_request.number }}\n", "PR identity"),
+        ("          BASE_REPOSITORY: ${{ github.event.pull_request.base.repo.full_name }}\n", "base repository identity"),
+        ("          HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name }}\n", "head repository identity"),
+        ("          BASE_SHA: ${{ github.event.pull_request.base.sha }}\n", "base SHA identity"),
+        ("          HEAD_SHA: ${{ github.event.pull_request.head.sha }}\n", "head SHA identity"),
+    ):
+        if scope.count(needle) != 1:
+            fail(f"scope contract changed: {label}")
+    _validate_read_only_scope_block(block)
+    if source.count("        if: steps.scope.outputs.product == 'true'\n") != 1:
+        fail("version mutation step must be guarded by the product scope output")
+
+
+def validate_release_scope(source: str) -> None:
+    """Require release classification to finish read-only on trusted main."""
+
+    job_marker = "  release:\n"
+    scope_marker = "      - name: Classify merged pull request scope"
+    mutation_marker = "      - name: Resolve accepted PR quality run"
+    if source.count(job_marker) != 1 or source.count(scope_marker) != 1:
+        fail("release scope job or step marker is not unique")
+    if source.count(mutation_marker) != 1:
+        fail("first release mutation step marker is not unique")
+    release = source[source.index(job_marker) :]
+    checkout_marker = "      - uses: actions/checkout@v4"
+    if release.count(checkout_marker) != 1:
+        fail("release must have one trusted checkout")
+    if not release.index(checkout_marker) < release.index(scope_marker) < release.index(mutation_marker):
+        fail("release classification must precede every artifact or release operation")
+    checkout = release[release.index(checkout_marker) : release.index(scope_marker)]
+    if checkout.count("          ref: refs/heads/main\n") != 1:
+        fail("release classifier checkout must resolve trusted main")
+
+    scope = _between(source, scope_marker, mutation_marker)
+    if re.search(r"(?m)^        (?:if|continue-on-error):", scope):
+        fail("release scope classifier must run and propagate every failure")
+    for needle, label in (
+        ("        id: scope\n", "scope output id"),
+        ("        shell: bash\n", "scope shell"),
+        ("          GH_TOKEN: ${{ github.token }}\n", "step-local GitHub token"),
+        ("          REPOSITORY: ${{ github.repository }}\n", "repository identity"),
+        ("          PR_NUMBER: ${{ github.event.pull_request.number }}\n", "PR identity"),
+        ("          BASE_REPOSITORY: ${{ github.event.pull_request.base.repo.full_name }}\n", "base repository identity"),
+        ("          HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name }}\n", "head repository identity"),
+        ("          BASE_SHA: ${{ github.event.pull_request.base.sha }}\n", "base SHA identity"),
+        ("          HEAD_SHA: ${{ github.event.pull_request.head.sha }}\n", "head SHA identity"),
+    ):
+        if scope.count(needle) != 1:
+            fail(f"release scope contract changed: {label}")
+    _validate_read_only_scope_block(_extract_named_run_block(source, scope_marker))
+
+
 def validate_static(source: str) -> None:
     """Validate the finite trust boundary without parsing untrusted YAML."""
 
     block = extract_run_block(source)
     _validate_external_effect_boundary(block)
+    _validate_scope_contract(source)
     trigger = _between(source, "on:\n", "permissions:\n")
     _require(trigger, "  pull_request_target:\n", "pull_request_target trigger")
     _require(trigger, '    branches: ["main"]\n', "main branch trigger")
@@ -422,9 +615,10 @@ def validate_static(source: str) -> None:
     permissions = re.search(
         r"(?ms)^    permissions:\n(?P<body>(?:^      [^\n]*\n?)+)", source
     )
-    if permissions is None or permissions.group("body") != "      contents: write\n":
-        fail("prepare job permissions must be contents: write only")
-    if re.search(r"(?m)^\s+(?:checks|pull-requests|issues|contents):\s+write\s*$", source) is None:
+    expected_permissions = "      contents: write\n      pull-requests: read\n"
+    if permissions is None or permissions.group("body") != expected_permissions:
+        fail("prepare job permissions must be contents write and pull requests read only")
+    if re.search(r"(?m)^\s+contents:\s+write\s*$", source) is None:
         fail("prepare job contents write permission is missing")
     if re.search(r"(?m)^\s+(?:checks|pull-requests|issues):\s+write\s*$", source):
         fail("PR/checks write permissions are not allowed")
@@ -432,7 +626,7 @@ def validate_static(source: str) -> None:
     checkout = _between(
         source,
         "      - name: Checkout trusted default branch",
-        "      - name: Validate and prepare version data",
+        "      - name: Classify pull request scope",
     )
     for needle, label in (
         ("        uses: actions/checkout@v4\n", "trusted checkout action"),
@@ -1323,6 +1517,36 @@ def check_mutations(source: str) -> int:
     )
     mutations = [
         ("trusted-checkout-pr-head", "          ref: refs/heads/main\n", "          ref: ${{ github.event.pull_request.head.sha }}\n"),
+        (
+            "scope-permission-missing",
+            "      pull-requests: read\n",
+            "",
+        ),
+        (
+            "scope-read-became-write",
+            '          gh api --method GET "repos/$REPOSITORY/pulls/$PR_NUMBER" > "$scope_root/pull-request.json"\n',
+            '          gh api --method POST "repos/$REPOSITORY/pulls/$PR_NUMBER" > "$scope_root/pull-request.json"\n',
+        ),
+        (
+            "scope-classifier-from-other-path",
+            '          scope="$(python3 scripts/ci_change_scope.py \\\n',
+            '          scope="$(python3 scripts/product_version.py \\\n',
+        ),
+        (
+            "scope-product-guard-deleted",
+            "        if: steps.scope.outputs.product == 'true'\n",
+            "",
+        ),
+        (
+            "scope-non-product-became-product",
+            "            non-product) product=false ;;\n",
+            "            non-product) product=true ;;\n",
+        ),
+        (
+            "scope-failure-ignored",
+            "        id: scope\n        shell: bash\n",
+            "        id: scope\n        continue-on-error: true\n        shell: bash\n",
+        ),
         ("force-true", "            -F force=false \\\n", "            -F force=true \\\n"),
         ("fork-guard-deleted", fork_guard, ""),
         ("head-race-guard-deleted", race_guard, ""),
@@ -1373,21 +1597,30 @@ def check_mutations(source: str) -> int:
 def check_release_permission_mutations(source: str) -> int:
     """Exercise the finite release-job permission contract."""
 
+    expected = (
+        "    permissions:\n"
+        "      contents: write\n"
+        "      actions: read\n"
+        "      pull-requests: read\n"
+    )
     mutations = (
         (
             "release-pull-requests-missing",
-            "      pull-requests: read\n",
-            "",
+            expected,
+            expected.replace("      pull-requests: read\n", ""),
         ),
         (
             "release-pull-requests-write",
-            "      pull-requests: read\n",
-            "      pull-requests: write\n",
+            expected,
+            expected.replace("pull-requests: read", "pull-requests: write"),
         ),
         (
             "release-permission-excess",
-            "      actions: read\n",
-            "      actions: read\n      packages: read\n",
+            expected,
+            expected.replace(
+                "      actions: read\n",
+                "      actions: read\n      packages: read\n",
+            ),
         ),
     )
     for name, old, new in mutations:
@@ -1400,6 +1633,67 @@ def check_release_permission_mutations(source: str) -> int:
     return len(mutations)
 
 
+def check_release_scope_mutations(source: str) -> int:
+    """Exercise the finite trusted-main release-classifier boundary."""
+
+    scope_marker = "      - name: Classify merged pull request scope"
+    mutation_marker = "      - name: Resolve accepted PR quality run"
+
+    def mutate_scope(old: str, new: str, label: str) -> str:
+        start = source.index(scope_marker)
+        end = source.index(mutation_marker, start)
+        scope = source[start:end]
+        return source[:start] + _replace_once(scope, old, new, label) + source[end:]
+
+    cases = (
+        (
+            "release-scope-read-became-write",
+            '          gh api --method GET "repos/$REPOSITORY/pulls/$PR_NUMBER" > "$scope_root/pull-request.json"\n',
+            '          gh api --method POST "repos/$REPOSITORY/pulls/$PR_NUMBER" > "$scope_root/pull-request.json"\n',
+        ),
+        (
+            "release-scope-classifier-changed",
+            '          scope="$(python3 scripts/ci_change_scope.py \\\n',
+            '          scope="$(python3 scripts/product_version.py \\\n',
+        ),
+        (
+            "release-scope-non-product-became-product",
+            "            non-product) product=false ;;\n",
+            "            non-product) product=true ;;\n",
+        ),
+        (
+            "release-scope-failure-ignored",
+            "        id: scope\n        env:\n",
+            "        id: scope\n        continue-on-error: true\n        env:\n",
+        ),
+    )
+    for name, old, new in cases:
+        mutated = mutate_scope(old, new, name)
+        try:
+            validate_release_scope(mutated)
+        except FixtureError:
+            continue
+        fail(f"release scope mutation escaped static oracle: {name}")
+
+    release_start = source.index("  release:\n")
+    checkout_end = source.index(scope_marker, release_start)
+    checkout = source[release_start:checkout_end]
+    mutated_checkout = _replace_once(
+        checkout,
+        "          ref: refs/heads/main\n",
+        "          ref: ${{ github.event.pull_request.head.sha }}\n",
+        "release-scope-pr-checkout",
+    )
+    mutated = source[:release_start] + mutated_checkout + source[checkout_end:]
+    try:
+        validate_release_scope(mutated)
+    except FixtureError:
+        pass
+    else:
+        fail("release scope PR checkout mutation escaped static oracle")
+    return len(cases) + 1
+
+
 def self_test() -> tuple[int, int]:
     try:
         source = WORKFLOW.read_text(encoding="utf-8")
@@ -1409,7 +1703,9 @@ def self_test() -> tuple[int, int]:
         mutation_cases = check_mutations(source)
         release_source = RELEASE_WORKFLOW.read_text(encoding="utf-8")
         validate_release_permissions(release_source)
+        validate_release_scope(release_source)
         mutation_cases += check_release_permission_mutations(release_source)
+        mutation_cases += check_release_scope_mutations(release_source)
         if runtime_cases <= 0 or mutation_cases <= 0:
             fail("case counts must be positive")
         return runtime_cases, mutation_cases
