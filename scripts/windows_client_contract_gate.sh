@@ -281,7 +281,7 @@ require_text src/main.rs 'include_str!("../THIRD_PARTY_NOTICES.md")'
 require_text src/main.rs 'i18n.text(TextKey::LegalProtocol)'
 require_text src/main.rs 'i18n.text(TextKey::LegalThirdParty)'
 require_text .github/workflows/windows-client.yml 'uses: ./.github/workflows/rust.yml'
-require_text .github/workflows/windows-client.yml 'needs: [version-prepared, native-quality, windows-quality, ui-quality]'
+require_text .github/workflows/windows-client.yml 'needs: [version-prepared, native-quality, codeql-analysis, windows-quality, ui-quality]'
 require_text .github/workflows/windows-client.yml 'product: ${{ steps.scope.outputs.product }}'
 require_text .github/workflows/windows-client.yml 'Classify pull request scope from the trusted base'
 require_text .github/workflows/windows-client.yml 'git show "$BASE_SHA:scripts/ci_change_scope.py" > "$classifier"'
@@ -291,17 +291,18 @@ require_text .github/workflows/windows-client.yml 'Run final acceptance gate bef
 require_text .github/workflows/windows-client.yml 'windows_window_move_smoke.ps1 -ClientPath $exe -AllowPhysicalInput'
 require_text .github/workflows/windows-client.yml "if: always() && github.event_name == 'pull_request'"
 require_text .github/workflows/windows-client.yml 'VERSION_RESULT: ${{ needs.version-prepared.result }}'
+require_text .github/workflows/windows-client.yml 'CODEQL_RESULT: ${{ needs.codeql-analysis.result }}'
 require_text .github/workflows/windows-client.yml 'PRODUCT_CHANGED: ${{ needs.version-prepared.outputs.product }}'
 require_text .github/workflows/windows-client.yml '[[ "$VERSION_RESULT" == success ]]'
 require_text .github/workflows/windows-client.yml '[[ "$VERSION_READY" == true ]]'
 require_text .github/workflows/windows-client.yml '[[ -z "$VERSION_READY" ]]'
-require_text .github/workflows/windows-client.yml 'for result in "$NATIVE_RESULT" "$WINDOWS_RESULT" "$UI_RESULT"; do'
+require_text .github/workflows/windows-client.yml 'for result in "$NATIVE_RESULT" "$CODEQL_RESULT" "$WINDOWS_RESULT" "$UI_RESULT"; do'
 require_text .github/workflows/windows-client.yml '[[ "$result" == success ]]'
 require_text .github/workflows/windows-client.yml '[[ "$result" == skipped ]]'
 product_job_condition="if: github.event_name == 'pull_request' && needs.version-prepared.outputs.product == 'true' && needs.version-prepared.outputs.ready == 'true'"
 product_job_count="$(rg -o --fixed-strings -- "$product_job_condition" .github/workflows/windows-client.yml | wc -l)"
-[[ "$product_job_count" -eq 3 ]] ||
-    fail "native, Windows, and UI quality jobs must be product-only: count=$product_job_count"
+[[ "$product_job_count" -eq 4 ]] ||
+    fail "native, CodeQL, Windows, and UI quality jobs must be product-only: count=$product_job_count"
 acceptance_product_condition="if: needs.version-prepared.outputs.product == 'true'"
 acceptance_product_count="$(rg -o --fixed-strings -- "$acceptance_product_condition" .github/workflows/windows-client.yml | wc -l)"
 [[ "$acceptance_product_count" -eq 8 ]] ||
