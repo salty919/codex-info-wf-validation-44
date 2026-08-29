@@ -21,6 +21,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      pull-requests: read
     steps:
       - name: Checkout trusted default branch
         uses: actions/checkout@v4
@@ -30,7 +31,50 @@ jobs:
           fetch-depth: 1
           persist-credentials: false
 
+      - name: Classify pull request scope
+        id: scope
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          BASE_REPOSITORY: ${{ github.event.pull_request.base.repo.full_name }}
+          HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          [[ "$REPOSITORY" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ &&
+              "$BASE_REPOSITORY" == "$REPOSITORY" &&
+              "$HEAD_REPOSITORY" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ &&
+              "$PR_NUMBER" =~ ^[1-9][0-9]*$ &&
+              "$BASE_SHA" =~ ^[0-9a-fA-F]{40}$ &&
+              "$HEAD_SHA" =~ ^[0-9a-fA-F]{40}$ ]] || {
+            echo 'pull request scope identity is malformed' >&2
+            exit 1
+          }
+          scope_root="$RUNNER_TEMP/ci-change-scope"
+          mkdir -p "$scope_root"
+          gh api --method GET "repos/$REPOSITORY/pulls/$PR_NUMBER" > "$scope_root/pull-request.json"
+          gh api --method GET --paginate --slurp \
+            "repos/$REPOSITORY/pulls/$PR_NUMBER/files?per_page=100" > "$scope_root/files.json"
+          scope="$(python3 scripts/ci_change_scope.py \
+            --pull-request "$scope_root/pull-request.json" \
+            --files "$scope_root/files.json" \
+            --expected-repository "$REPOSITORY" \
+            --expected-head-repository "$HEAD_REPOSITORY" \
+            --expected-number "$PR_NUMBER" \
+            --expected-base-sha "$BASE_SHA" \
+            --expected-head-sha "$HEAD_SHA")"
+          case "$scope" in
+            product) product=true ;;
+            non-product) product=false ;;
+            *) echo 'change-scope classifier returned an invalid result' >&2; exit 1 ;;
+          esac
+          printf 'product=%s\n' "$product" >> "$GITHUB_OUTPUT"
+
       - name: Validate and prepare version data
+        if: steps.scope.outputs.product == 'true'
         id: prepare
         shell: bash
         env:
