@@ -408,7 +408,8 @@ fi
 require_text .github/workflows/windows-client.yml 'bash scripts/final_acceptance_gate.sh artifacts/windows-ui-e2e'
 require_text .github/workflows/windows-client.yml '-SourceSha $env:SOURCE_SHA'
 require_text .github/workflows/windows-client.yml 'ref: ${{ inputs.head_sha }}'
-require_text .github/workflows/windows-client.yml 'commits/$PR_HEAD_SHA/check-runs?check_name=acceptance'
+require_file .github/workflows/release.yml
+require_text .github/workflows/release.yml 'commits/$PR_HEAD_SHA/check-runs?check_name=acceptance'
 require_file scripts/final_head_check_reporter.py
 require_file scripts/test_final_head_check_reporter.py
 require_file scripts/release_quality_run_resolver.py
@@ -458,7 +459,7 @@ pre_pr_contract_calls="$(count_live_shell_invocations scripts/pre_pr_gate.sh 'ba
 pre_pr_data_calls="$(count_live_shell_invocations scripts/pre_pr_gate.sh 'bash scripts/data_protection_gate.sh')"
 [[ "$pre_pr_data_calls" -eq 1 ]] ||
     fail "pre_pr_gate must own exactly one data protection gate invocation: count=$pre_pr_data_calls"
-for workflow in .github/workflows/windows-client.yml .github/workflows/rust.yml; do
+for workflow in .github/workflows/windows-client.yml .github/workflows/release.yml .github/workflows/rust.yml; do
     if rg -q --fixed-strings 'scripts/regression_guard.sh' "$workflow" ||
        rg -q --fixed-strings 'scripts/data_protection_gate.sh' "$workflow" ||
        rg -q --fixed-strings 'scripts/windows_client_contract_gate.sh' "$workflow"; then
@@ -513,18 +514,18 @@ fi
 require_text scripts/regression_guard.sh 'Rust all-target test set contains a zero-test target'
 require_text scripts/regression_guard.sh 'X11 graph visual gate unverified (DISPLAY unavailable)'
 require_text .github/workflows/rust.yml 'xvfb-run --auto-servernum'
-require_text .github/workflows/windows-client.yml 'Get-GitHubResourceStatus'
-require_text .github/workflows/windows-client.yml 'gh api --method POST "repos/$repository/git/refs"'
-require_text .github/workflows/windows-client.yml 'gh api --method POST "repos/$repository/releases"'
-require_text .github/workflows/windows-client.yml 'python3 scripts/release_state_gate.py created --tag $tag'
-require_text .github/workflows/windows-client.yml '$createdReleaseId = [long]$createdRelease.id'
-require_text .github/workflows/windows-client.yml '$draftReleaseEndpoint = "repos/$repository/releases/$createdReleaseId"'
-require_text .github/workflows/windows-client.yml 'python3 scripts/release_state_gate.py draft `'
-require_text .github/workflows/windows-client.yml 'python3 scripts/release_state_gate.py tag --sha $env:EXPECTED_MERGE_SHA'
-require_text .github/workflows/windows-client.yml 'python3 scripts/release_state_gate.py published `'
-require_text .github/workflows/windows-client.yml 'gh release upload $tag $setup $manifest'
-require_text .github/workflows/windows-client.yml 'gh api --method PATCH "repos/$repository/releases/$createdReleaseId"'
-require_text .github/workflows/windows-client.yml '-F draft=false'
+require_text .github/workflows/release.yml 'Get-GitHubResourceStatus'
+require_text .github/workflows/release.yml 'gh api --method POST "repos/$repository/git/refs"'
+require_text .github/workflows/release.yml 'gh api --method POST "repos/$repository/releases"'
+require_text .github/workflows/release.yml 'python3 scripts/release_state_gate.py created --tag $tag'
+require_text .github/workflows/release.yml '$createdReleaseId = [long]$createdRelease.id'
+require_text .github/workflows/release.yml '$draftReleaseEndpoint = "repos/$repository/releases/$createdReleaseId"'
+require_text .github/workflows/release.yml 'python3 scripts/release_state_gate.py draft `'
+require_text .github/workflows/release.yml 'python3 scripts/release_state_gate.py tag --sha $env:EXPECTED_MERGE_SHA'
+require_text .github/workflows/release.yml 'python3 scripts/release_state_gate.py published `'
+require_text .github/workflows/release.yml 'gh release upload $tag $setup $manifest'
+require_text .github/workflows/release.yml 'gh api --method PATCH "repos/$repository/releases/$createdReleaseId"'
+require_text .github/workflows/release.yml '-F draft=false'
 require_file windows-client/src/CodexInfo.WindowsClient/Settings/ClientSettingsSession.cs
 require_text windows-client/src/CodexInfo.WindowsClient/Settings/ClientSettingsSession.cs 'SettingsCorrupt = false'
 require_file windows-client/src/CodexInfo.WindowsClient/Graphing/GraphPlotProjection.cs
