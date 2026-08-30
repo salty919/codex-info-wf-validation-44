@@ -14,10 +14,12 @@ import json
 import os
 import re
 import sys
+import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
-from urllib.error import HTTPError
+from urllib.error import HTTPError, URLError
 from urllib.parse import quote
 from urllib.request import Request, urlopen
 
@@ -31,6 +33,11 @@ EXTERNAL_ID_PATTERN = re.compile(
     r"^codex-quality-v1:pr=(?P<pr>[1-9][0-9]*):"
     r"head=(?P<head>[0-9a-f]{40}):run=(?P<run>[1-9][0-9]*)$"
 )
+READBACK_ATTEMPTS = 10
+READBACK_DELAY_SECONDS = 1.0
+TRANSITION_ATTEMPTS = 30
+TRANSITION_CHECK_NAME = "feat-acceptance"
+TRANSITION_RULE_ERROR = 'Required status check "feat-acceptance" is expected.'
 
 
 class ReporterError(ValueError):
@@ -70,6 +77,24 @@ class RegisterResult:
     acceptance_check_id: int
 
 
+@dataclass(frozen=True)
+class VersionTransition:
+    repository: str
+    pr_number: int
+    base_repository: str
+    base_sha: str
+    head_repository: str
+    head_ref: str
+    old_head_sha: str
+    new_head_sha: str
+    run_id: int
+    run_url: str
+
+    @property
+    def external_id(self) -> str:
+        return f"codex-version-v1:head={self.new_head_sha}:run={self.run_id}"
+
+
 class GitHubApi:
     def __init__(self, token: str, base_url: str = "https://api.github.com") -> None:
         if not token:
@@ -100,9 +125,13 @@ class GitHubApi:
                 return response.status, json.loads(raw) if raw else {}
         except HTTPError as error:
             raw = error.read()
-            detail = raw.decode("utf-8", errors="replace")
+            try:
+                return error.code, json.loads(raw) if raw else {}
+            except json.JSONDecodeError:
+                return error.code, {"message": raw.decode("utf-8", errors="replace")}
+        except URLError as error:
             raise ReporterError(
-                f"GitHub API {method} {path} failed with HTTP {error.code}: {detail}"
+                "GitHub API request failed before a response"
             ) from error
 
 
@@ -130,6 +159,12 @@ def _repository(value: Any, label: str) -> str:
     return value
 
 
+def _head_ref(value: Any, label: str) -> str:
+    if not isinstance(value, str) or not value or "\x00" in value:
+        raise ReporterError(f"invalid {label}")
+    return value
+
+
 def _required(mapping: Any, key: str, label: str) -> Any:
     if not isinstance(mapping, dict) or key not in mapping:
         raise ReporterError(f"missing {label}.{key}")
@@ -144,16 +179,14 @@ def validate_identity(identity: Identity) -> None:
     _positive_integer(identity.run_id, "run ID")
     _sha(identity.base_sha, "base SHA")
     _sha(identity.head_sha, "head SHA")
+    _head_ref(identity.head_ref, "head ref")
     if (
         identity.repository != identity.base_repository
         or identity.repository != identity.head_repository
-        or identity.head_ref != "feat/next"
         or identity.run_url
         != f"https://github.com/{identity.repository}/actions/runs/{identity.run_id}"
     ):
-        raise ReporterError(
-            "identity is outside the trusted feat/next to main boundary"
-        )
+        raise ReporterError("identity is outside the trusted same-repository boundary")
 
 
 def _validate_pull_request(api: Api, identity: Identity, *, require_open: bool) -> None:
@@ -333,17 +366,267 @@ def _assert_unique_mutation(
     *,
     expected_status: str,
     expected_conclusion: str | None,
+    attempts: int = READBACK_ATTEMPTS,
+    sleep: Callable[[float], None] = time.sleep,
 ) -> None:
-    read_back = _check_runs(api, identity, name)
-    if (
-        len(read_back) != 1
-        or _required(read_back[0], "id", "check_run")
-        != _required(mutated, "id", "check_run")
-        or _required(read_back[0], "external_id", "check_run") != identity.external_id
-        or _required(read_back[0], "status", "check_run") != expected_status
-        or _required(read_back[0], "conclusion", "check_run") != expected_conclusion
+    if attempts <= 0:
+        raise ReporterError("read-back attempts must be positive")
+    for attempt in range(attempts):
+        read_back = _check_runs(api, identity, name)
+        if len(read_back) > 1:
+            raise ReporterError(f"{name} check state is not exact after mutation")
+        if len(read_back) == 1 and (
+            _required(read_back[0], "id", "check_run")
+            == _required(mutated, "id", "check_run")
+            and _required(read_back[0], "external_id", "check_run")
+            == identity.external_id
+            and _required(read_back[0], "status", "check_run") == expected_status
+            and _required(read_back[0], "conclusion", "check_run")
+            == expected_conclusion
+        ):
+            return
+        if attempt + 1 < attempts:
+            sleep(READBACK_DELAY_SECONDS)
+    raise ReporterError(f"{name} check state is not exact after mutation")
+
+
+def validate_version_transition(transition: VersionTransition) -> None:
+    for value, label in (
+        (transition.repository, "repository"),
+        (transition.base_repository, "base repository"),
+        (transition.head_repository, "head repository"),
     ):
-        raise ReporterError(f"{name} check state is not exact after mutation")
+        _repository(value, label)
+    for value, label in (
+        (transition.base_sha, "base SHA"),
+        (transition.old_head_sha, "old head SHA"),
+        (transition.new_head_sha, "new head SHA"),
+    ):
+        _sha(value, label)
+    _positive_integer(transition.pr_number, "PR number")
+    _positive_integer(transition.run_id, "run ID")
+    _head_ref(transition.head_ref, "head ref")
+    if (
+        transition.repository != transition.base_repository
+        or transition.repository != transition.head_repository
+        or transition.old_head_sha == transition.new_head_sha
+        or transition.run_url
+        != (
+            f"https://github.com/{transition.repository}/actions/runs/"
+            f"{transition.run_id}"
+        )
+    ):
+        raise ReporterError(
+            "version transition is outside the same-repository boundary"
+        )
+
+
+def _transition_ref_name(transition: VersionTransition) -> str:
+    return quote(f"heads/{transition.head_ref}", safe="/")
+
+
+def _read_transition_ref(api: Api, transition: VersionTransition) -> str:
+    status, response = api.request(
+        "GET",
+        f"/repos/{transition.repository}/git/ref/{_transition_ref_name(transition)}",
+    )
+    if status != 200 or not isinstance(response, dict):
+        raise ReporterError(f"head ref read returned HTTP {status}")
+    ref_object = _required(response, "object", "ref response")
+    return _sha(_required(ref_object, "sha", "ref object"), "head ref SHA")
+
+
+def _update_transition_ref(api: Api, transition: VersionTransition) -> tuple[int, Any]:
+    return api.request(
+        "PATCH",
+        f"/repos/{transition.repository}/git/refs/{_transition_ref_name(transition)}",
+        {"sha": transition.new_head_sha, "force": False},
+    )
+
+
+def _is_expected_transition_rejection(status: int, response: Any) -> bool:
+    return (
+        status == 422
+        and isinstance(response, dict)
+        and isinstance(response.get("message"), str)
+        and TRANSITION_RULE_ERROR in response["message"]
+    )
+
+
+def _transition_check_payload(transition: VersionTransition) -> dict[str, Any]:
+    return {
+        "name": TRANSITION_CHECK_NAME,
+        "head_sha": transition.new_head_sha,
+        "status": "completed",
+        "conclusion": "success",
+        "external_id": transition.external_id,
+        "details_url": transition.run_url,
+        "output": {
+            "title": "Trusted generated version commit",
+            "summary": "The only additional change is the validated version transition.",
+        },
+    }
+
+
+def _transition_check_is_exact(
+    transition: VersionTransition, check: Any, check_id: int
+) -> bool:
+    if not isinstance(check, dict) or not isinstance(check.get("app"), dict):
+        return False
+    return (
+        check.get("id") == check_id
+        and check.get("name") == TRANSITION_CHECK_NAME
+        and check.get("head_sha") == transition.new_head_sha
+        and check.get("external_id") == transition.external_id
+        and check.get("status") == "completed"
+        and check.get("conclusion") == "success"
+        and check["app"].get("id") == GITHUB_ACTIONS_APP_ID
+    )
+
+
+def _create_transition_check(api: Api, transition: VersionTransition) -> int:
+    status, check = api.request(
+        "POST",
+        f"/repos/{transition.repository}/check-runs",
+        _transition_check_payload(transition),
+    )
+    if status != 201 or not isinstance(check, dict):
+        raise ReporterError(f"transition check creation returned HTTP {status}")
+    check_id = _positive_integer(check.get("id"), "transition check ID")
+    if not _transition_check_is_exact(transition, check, check_id):
+        raise ReporterError("transition check creation response is not exact")
+    return check_id
+
+
+def _wait_for_transition_check(
+    api: Api,
+    transition: VersionTransition,
+    check_id: int,
+    *,
+    attempts: int,
+    sleep: Callable[[float], None],
+) -> None:
+    encoded_name = quote(TRANSITION_CHECK_NAME, safe="")
+    path = (
+        f"/repos/{transition.repository}/commits/{transition.new_head_sha}/check-runs"
+        f"?check_name={encoded_name}&filter=all&per_page=100"
+    )
+    for attempt in range(attempts):
+        status, response = api.request("GET", path)
+        if status != 200 or not isinstance(response, dict):
+            raise ReporterError(f"transition check read returned HTTP {status}")
+        checks = response.get("check_runs")
+        total = response.get("total_count")
+        if (
+            not isinstance(checks, list)
+            or type(total) is not int
+            or total != len(checks)
+        ):
+            raise ReporterError("transition check read is incomplete or malformed")
+        if len(checks) > 1:
+            raise ReporterError("multiple transition checks exist")
+        if checks:
+            if not _transition_check_is_exact(transition, checks[0], check_id):
+                raise ReporterError("visible transition check is not the created check")
+            return
+        if attempt + 1 < attempts:
+            sleep(1)
+    raise ReporterError("transition check did not become visible")
+
+
+def _transition_pull_identity(pull_request: Any) -> tuple[Any, ...]:
+    base = _required(pull_request, "base", "pull_request")
+    head = _required(pull_request, "head", "pull_request")
+    return (
+        _required(pull_request, "number", "pull_request"),
+        _required(pull_request, "state", "pull_request"),
+        _required(
+            _required(base, "repo", "pull_request.base"), "full_name", "base.repo"
+        ),
+        _required(base, "ref", "pull_request.base"),
+        _required(base, "sha", "pull_request.base"),
+        _required(
+            _required(head, "repo", "pull_request.head"), "full_name", "head.repo"
+        ),
+        _required(head, "ref", "pull_request.head"),
+        _required(head, "sha", "pull_request.head"),
+    )
+
+
+def _wait_for_transition_pull_request(
+    api: Api,
+    transition: VersionTransition,
+    *,
+    attempts: int,
+    sleep: Callable[[float], None],
+) -> None:
+    expected = (
+        transition.pr_number,
+        "open",
+        transition.base_repository,
+        "main",
+        transition.base_sha,
+        transition.head_repository,
+        transition.head_ref,
+    )
+    for attempt in range(attempts):
+        if _read_transition_ref(api, transition) != transition.new_head_sha:
+            raise ReporterError("head ref moved after the generated update")
+        status, pull_request = api.request(
+            "GET", f"/repos/{transition.repository}/pulls/{transition.pr_number}"
+        )
+        if status != 200:
+            raise ReporterError(f"pull-request read returned HTTP {status}")
+        observed = _transition_pull_identity(pull_request)
+        if observed[:7] != expected:
+            raise ReporterError("live pull-request identity changed during projection")
+        if observed[7] == transition.new_head_sha:
+            return
+        if observed[7] != transition.old_head_sha:
+            raise ReporterError("live pull-request head moved to an unexpected SHA")
+        if attempt + 1 < attempts:
+            sleep(1)
+    raise ReporterError("generated head did not become visible in the pull request")
+
+
+def publish_version_transition(
+    api: Api,
+    transition: VersionTransition,
+    *,
+    attempts: int = TRANSITION_ATTEMPTS,
+    sleep: Callable[[float], None] = time.sleep,
+) -> None:
+    validate_version_transition(transition)
+    if attempts <= 0:
+        raise ReporterError("transition attempts must be positive")
+    current = _read_transition_ref(api, transition)
+    if current not in {transition.old_head_sha, transition.new_head_sha}:
+        raise ReporterError("head ref moved before the generated update")
+    if current == transition.old_head_sha:
+        check_id: int | None = None
+        for attempt in range(attempts):
+            status, response = _update_transition_ref(api, transition)
+            if status == 200:
+                updated = _required(
+                    _required(response, "object", "ref update"),
+                    "sha",
+                    "updated ref object",
+                )
+                if updated != transition.new_head_sha:
+                    raise ReporterError("ref update returned an unexpected SHA")
+                break
+            if not _is_expected_transition_rejection(status, response):
+                raise ReporterError(f"ref update returned unexpected HTTP {status}")
+            if check_id is None:
+                check_id = _create_transition_check(api, transition)
+            _wait_for_transition_check(
+                api, transition, check_id, attempts=attempts, sleep=sleep
+            )
+            if attempt + 1 < attempts:
+                sleep(1)
+        else:
+            raise ReporterError("ref update remained blocked after check visibility")
+    _wait_for_transition_pull_request(api, transition, attempts=attempts, sleep=sleep)
 
 
 def register_checks(api: Api, identity: Identity) -> RegisterResult:
@@ -485,16 +768,39 @@ def _verify_sha256s(directory: Path) -> None:
         raise ReporterError("SHA256SUMS does not cover the exact artifact file set")
 
 
-def _verify_artifacts(
-    identity: Identity,
-    *,
-    binary_impact: str,
-    version: str,
-    verdict_directory: Path,
-    candidate_directory: Path,
-) -> str:
+def verify_verdict(
+    *, pr_number: int, head_sha: str, verdict_directory: Path
+) -> tuple[str, str, str, str]:
+    _positive_integer(pr_number, "PR number")
+    _sha(head_sha, "head SHA")
+    _verify_sha256s(verdict_directory)
+    verdict = _parse_evidence(verdict_directory / "acceptance.txt")
+    if set(verdict) != {
+        "schema",
+        "pr-number",
+        "source-sha",
+        "binary-impact",
+        "windows-impact",
+        "version",
+        "acceptance",
+    }:
+        raise ReporterError("acceptance verdict fields are not exact")
+    if (
+        verdict.get("schema") != "codex-info-final-head-v1"
+        or verdict.get("pr-number") != str(pr_number)
+        or verdict.get("source-sha") != head_sha
+        or verdict.get("acceptance") != "PASS"
+    ):
+        raise ReporterError("acceptance verdict identity does not match the final head")
+    binary_impact = verdict["binary-impact"]
+    windows_impact = verdict["windows-impact"]
+    version = verdict["version"]
     if binary_impact not in {"true", "false"}:
         raise ReporterError("binary impact output is missing or malformed")
+    if windows_impact not in {"true", "false"}:
+        raise ReporterError("Windows impact output is missing or malformed")
+    if windows_impact == "true" and binary_impact != "true":
+        raise ReporterError("Windows impact cannot be true without binary impact")
     if binary_impact == "false" and version:
         raise ReporterError("no-binary acceptance unexpectedly contains a version")
     if (
@@ -502,19 +808,29 @@ def _verify_artifacts(
         and re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", version) is None
     ):
         raise ReporterError("binary acceptance version is missing or malformed")
-    _verify_sha256s(verdict_directory)
-    verdict = _parse_evidence(verdict_directory / "acceptance.txt")
-    expected = {
-        "schema": "codex-info-final-head-v1",
-        "pr-number": str(identity.pr_number),
-        "source-sha": identity.head_sha,
-        "binary-impact": binary_impact,
-        "version": version,
-        "acceptance": "PASS",
-    }
-    if verdict != expected:
-        raise ReporterError("acceptance verdict identity does not match the final head")
-    if binary_impact == "true":
+    evidence_digest = hashlib.sha256(
+        (verdict_directory / "SHA256SUMS").read_bytes()
+    ).hexdigest()
+    return binary_impact, windows_impact, version, evidence_digest
+
+
+def _verify_artifacts(
+    identity: Identity,
+    *,
+    binary_impact: str,
+    windows_impact: str,
+    version: str,
+    verdict_directory: Path,
+    candidate_directory: Path,
+) -> str:
+    observed = verify_verdict(
+        pr_number=identity.pr_number,
+        head_sha=identity.head_sha,
+        verdict_directory=verdict_directory,
+    )
+    if observed[:3] != (binary_impact, windows_impact, version):
+        raise ReporterError("acceptance verdict outputs do not match the final head")
+    if windows_impact == "true":
         _verify_sha256s(candidate_directory)
         candidate = _parse_evidence(candidate_directory / "acceptance.txt")
         if set(candidate) != {
@@ -537,10 +853,8 @@ def _verify_artifacts(
                 raise ReporterError(f"release candidate {key} mismatch")
         _sha(candidate.get("tree-sha"), "release candidate tree SHA")
     elif candidate_directory.exists() and any(candidate_directory.iterdir()):
-        raise ReporterError(
-            "no-binary acceptance unexpectedly contains a release candidate"
-        )
-    return hashlib.sha256((verdict_directory / "SHA256SUMS").read_bytes()).hexdigest()
+        raise ReporterError("non-Windows acceptance unexpectedly contains a release candidate")
+    return observed[3]
 
 
 def finalize_acceptance(
@@ -549,6 +863,7 @@ def finalize_acceptance(
     *,
     quality_result: str,
     binary_impact: str,
+    windows_impact: str,
     version: str,
     verdict_directory: Path,
     candidate_directory: Path,
@@ -585,6 +900,7 @@ def finalize_acceptance(
         evidence_digest = _verify_artifacts(
             identity,
             binary_impact=binary_impact,
+            windows_impact=windows_impact,
             version=version,
             verdict_directory=verdict_directory,
             candidate_directory=candidate_directory,
@@ -592,14 +908,14 @@ def finalize_acceptance(
         _positive_integer(verdict_artifact_id, "acceptance-verdict artifact ID")
         if not DIGEST_PATTERN.fullmatch(verdict_artifact_digest):
             raise ReporterError("acceptance-verdict artifact identity is malformed")
-        if binary_impact == "true":
+        if windows_impact == "true":
             _positive_integer(candidate_artifact_id, "release-candidate artifact ID")
             if not DIGEST_PATTERN.fullmatch(candidate_artifact_digest):
                 raise ReporterError("release-candidate artifact identity is malformed")
-        if binary_impact == "false" and (
+        if windows_impact == "false" and (
             candidate_artifact_id or candidate_artifact_digest
         ):
-            raise ReporterError("no-binary acceptance has release-candidate metadata")
+            raise ReporterError("non-Windows acceptance has release-candidate metadata")
         conclusion = "success"
         detail = (
             f"run={identity.run_id}; verdict-artifact={verdict_artifact_id}; "
@@ -681,6 +997,7 @@ def main(argv: list[str] | None = None) -> int:
     _add_identity_arguments(finalize_parser)
     finalize_parser.add_argument("--quality-result", required=True)
     finalize_parser.add_argument("--binary-impact", required=True)
+    finalize_parser.add_argument("--windows-impact", required=True)
     finalize_parser.add_argument("--version", default="")
     finalize_parser.add_argument("--verdict-directory", type=Path, required=True)
     finalize_parser.add_argument("--candidate-directory", type=Path, required=True)
@@ -688,7 +1005,51 @@ def main(argv: list[str] | None = None) -> int:
     finalize_parser.add_argument("--verdict-artifact-digest", required=True)
     finalize_parser.add_argument("--candidate-artifact-id", default="")
     finalize_parser.add_argument("--candidate-artifact-digest", default="")
+    verify_parser = subparsers.add_parser("verify-verdict")
+    verify_parser.add_argument("--pr-number", required=True)
+    verify_parser.add_argument("--head-sha", required=True)
+    verify_parser.add_argument("--verdict-directory", type=Path, required=True)
+    verify_parser.add_argument("--github-output", type=Path, required=True)
+    transition_parser = subparsers.add_parser("publish-version")
+    transition_parser.add_argument("--repository", required=True)
+    transition_parser.add_argument("--pr-number", required=True)
+    transition_parser.add_argument("--base-repository", required=True)
+    transition_parser.add_argument("--base-sha", required=True)
+    transition_parser.add_argument("--head-repository", required=True)
+    transition_parser.add_argument("--head-ref", required=True)
+    transition_parser.add_argument("--old-head-sha", required=True)
+    transition_parser.add_argument("--new-head-sha", required=True)
+    transition_parser.add_argument("--run-id", required=True)
+    transition_parser.add_argument("--run-url", required=True)
     args = parser.parse_args(argv)
+    if args.command == "verify-verdict":
+        binary_impact, windows_impact, version, _digest = verify_verdict(
+            pr_number=_positive_integer(args.pr_number, "PR number"),
+            head_sha=args.head_sha,
+            verdict_directory=args.verdict_directory,
+        )
+        with args.github_output.open("a", encoding="utf-8") as output:
+            output.write(f"binary_impact={binary_impact}\n")
+            output.write(f"windows_impact={windows_impact}\n")
+            output.write(f"version={version}\n")
+        return 0
+    if args.command == "publish-version":
+        transition = VersionTransition(
+            repository=args.repository,
+            pr_number=_positive_integer(args.pr_number, "PR number"),
+            base_repository=args.base_repository,
+            base_sha=args.base_sha,
+            head_repository=args.head_repository,
+            head_ref=args.head_ref,
+            old_head_sha=args.old_head_sha,
+            new_head_sha=args.new_head_sha,
+            run_id=_positive_integer(args.run_id, "run ID"),
+            run_url=args.run_url,
+        )
+        publish_version_transition(
+            GitHubApi(os.environ.get("GH_TOKEN", "")), transition
+        )
+        return 0
     identity = _identity_from_args(args)
     api = GitHubApi(os.environ.get("GH_TOKEN", ""))
     if args.command == "register":
@@ -705,6 +1066,7 @@ def main(argv: list[str] | None = None) -> int:
             identity,
             quality_result=args.quality_result,
             binary_impact=args.binary_impact,
+            windows_impact=args.windows_impact,
             version=args.version,
             verdict_directory=args.verdict_directory,
             candidate_directory=args.candidate_directory,

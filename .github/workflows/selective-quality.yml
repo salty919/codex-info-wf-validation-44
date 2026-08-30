@@ -118,8 +118,6 @@ jobs:
       selection_json: ${{ inputs.selection_json }}
     permissions:
       contents: read
-      pull-requests: read
-      security-events: write
 
   codeql-quality:
     name: codeql-quality

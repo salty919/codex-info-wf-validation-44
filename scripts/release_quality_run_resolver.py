@@ -48,6 +48,12 @@ def _repository(value: Any, path: str) -> str:
     return value
 
 
+def _ref(value: Any, path: str) -> str:
+    if not isinstance(value, str) or not value or "\x00" in value:
+        raise ResolutionError(f"invalid {path}")
+    return value
+
+
 def _timestamp(value: Any, path: str) -> datetime:
     if not isinstance(value, str) or not value:
         raise ResolutionError(f"invalid {path}")
@@ -70,13 +76,13 @@ def _pull_request_identity(value: Any, path: str) -> tuple[Any, ...]:
     return (
         number,
         _sha(_required(head, "sha", f"{path}.head"), f"{path}.head.sha"),
-        _required(head, "ref", f"{path}.head"),
+        _ref(_required(head, "ref", f"{path}.head"), f"{path}.head.ref"),
         _repository(
             _required(head_repo, "full_name", f"{path}.head.repo"),
             f"{path}.head.repo.full_name",
         ),
         _sha(_required(base, "sha", f"{path}.base"), f"{path}.base.sha"),
-        _required(base, "ref", f"{path}.base"),
+        _ref(_required(base, "ref", f"{path}.base"), f"{path}.base.ref"),
         _repository(
             _required(base_repo, "full_name", f"{path}.base.repo"),
             f"{path}.base.repo.full_name",
@@ -105,11 +111,10 @@ def validate_merged_identity(event: Any, pull_request: Any) -> tuple[Any, ...]:
     )
     if (
         repository != event_identity[6]
-        or event_identity[2] != "feat/next"
         or event_identity[3] != repository
         or event_identity[5] != "main"
     ):
-        raise ResolutionError("merged identity is outside feat/next to main")
+        raise ResolutionError("merged identity is outside same-repository PRs to main")
     return event_identity
 
 

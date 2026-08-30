@@ -16,6 +16,7 @@ HEAD_SHA = "2" * 40
 BASE_SHA = "1" * 40
 MERGE_SHA = "3" * 40
 RUN_ID = 987654
+HEAD_REF = "fix/windows-release"
 
 
 def pull_request() -> dict[str, Any]:
@@ -26,7 +27,7 @@ def pull_request() -> dict[str, Any]:
         "merge_commit_sha": MERGE_SHA,
         "head": {
             "sha": HEAD_SHA,
-            "ref": "feat/next",
+            "ref": HEAD_REF,
             "repo": {"full_name": REPOSITORY},
         },
         "base": {
@@ -122,6 +123,30 @@ class ReleaseQualityRunResolverTests(unittest.TestCase):
         self.assertEqual(
             resolver.resolve_quality_run_id(event(), pull_request(), pages), RUN_ID
         )
+
+    def test_accepts_any_nonempty_same_repository_head_ref(self) -> None:
+        for head_ref in ("feat/next", "fix/windows-only", "release_2026.08"):
+            with self.subTest(head_ref=head_ref):
+                changed_event = event()
+                changed_pr = pull_request()
+                changed_event["pull_request"]["head"]["ref"] = head_ref
+                changed_pr["head"]["ref"] = head_ref
+                self.assertEqual(
+                    resolver.resolve_quality_run_id(
+                        changed_event, changed_pr, check_runs()
+                    ),
+                    RUN_ID,
+                )
+        for head_ref in ("", "bad\x00ref"):
+            with self.subTest(head_ref=head_ref):
+                changed_event = event()
+                changed_pr = pull_request()
+                changed_event["pull_request"]["head"]["ref"] = head_ref
+                changed_pr["head"]["ref"] = head_ref
+                with self.assertRaisesRegex(resolver.ResolutionError, "invalid"):
+                    resolver.resolve_quality_run_id(
+                        changed_event, changed_pr, check_runs()
+                    )
 
     def test_ignores_native_same_name_job_checks_from_premerge_and_closed_runs(
         self,
