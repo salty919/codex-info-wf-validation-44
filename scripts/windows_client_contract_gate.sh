@@ -594,9 +594,11 @@ require_text windows-client/tools/Run-WindowsClientE2E.ps1 'Assert-E2EGraphHasMo
 require_text windows-client/tools/Run-WindowsClientE2E.ps1 'public static extern bool PrintWindow'
 require_text windows-client/tools/Run-WindowsClientE2E.ps1 "\$compilerReferenceRoot = Join-Path \$PSHOME 'ref'"
 require_text windows-client/tools/Run-WindowsClientE2E.ps1 "Get-ChildItem -LiteralPath \$compilerReferenceRoot -Filter '*.dll' -File"
-require_text windows-client/tools/Run-WindowsClientE2E.ps1 '$drawingCommonReference = [System.Drawing.Bitmap].Assembly.Location'
-require_text windows-client/tools/Run-WindowsClientE2E.ps1 "Assert-E2E (Test-Path -LiteralPath \$drawingCommonReference -PathType Leaf) 'System.Drawing.Common reference could not be resolved.'"
-require_text windows-client/tools/Run-WindowsClientE2E.ps1 '$compilerReferences += $drawingCommonReference'
+require_text windows-client/tools/Run-WindowsClientE2E.ps1 '[System.Drawing.Bitmap].Assembly.Location'
+require_text windows-client/tools/Run-WindowsClientE2E.ps1 "[System.Reflection.Assembly]::Load('System.Private.Windows.GdiPlus')"
+require_text windows-client/tools/Run-WindowsClientE2E.ps1 "[System.Reflection.Assembly]::Load('System.Private.Windows.Core')"
+require_text windows-client/tools/Run-WindowsClientE2E.ps1 'Test-Path -LiteralPath $_ -PathType Leaf'
+require_text windows-client/tools/Run-WindowsClientE2E.ps1 '$compilerReferences += $runtimeReferences'
 require_text windows-client/tools/Run-WindowsClientE2E.ps1 'Add-Type -ReferencedAssemblies $compilerReferences -TypeDefinition'
 if rg -q --fixed-strings "GetData('TRUSTED_PLATFORM_ASSEMBLIES')" windows-client/tools/Run-WindowsClientE2E.ps1 ||
     rg -q --fixed-strings 'Add-Type -ReferencedAssemblies System.Drawing -TypeDefinition' windows-client/tools/Run-WindowsClientE2E.ps1; then

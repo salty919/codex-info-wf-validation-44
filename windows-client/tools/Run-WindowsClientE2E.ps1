@@ -114,10 +114,14 @@ Add-Type -AssemblyName System.Drawing
 $compilerReferenceRoot = Join-Path $PSHOME 'ref'
 $compilerReferences = @(Get-ChildItem -LiteralPath $compilerReferenceRoot -Filter '*.dll' -File |
     Select-Object -ExpandProperty FullName)
-$drawingCommonReference = [System.Drawing.Bitmap].Assembly.Location
+$runtimeReferences = @(
+    [System.Drawing.Bitmap].Assembly.Location
+    ([System.Reflection.Assembly]::Load('System.Private.Windows.GdiPlus')).Location
+    ([System.Reflection.Assembly]::Load('System.Private.Windows.Core')).Location
+)
 Assert-E2E ($compilerReferences.Count -gt 0) 'PowerShell compiler references could not be resolved.'
-Assert-E2E (Test-Path -LiteralPath $drawingCommonReference -PathType Leaf) 'System.Drawing.Common reference could not be resolved.'
-$compilerReferences += $drawingCommonReference
+Assert-E2E (@($runtimeReferences | Where-Object { -not (Test-Path -LiteralPath $_ -PathType Leaf) }).Count -eq 0) 'Windows drawing runtime references could not be resolved.'
+$compilerReferences += $runtimeReferences
 
 Add-Type -ReferencedAssemblies $compilerReferences -TypeDefinition @'
 using System;
