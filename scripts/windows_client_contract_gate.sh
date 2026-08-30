@@ -592,6 +592,18 @@ require_text windows-client/tools/Run-WindowsClientE2E.ps1 'Assert-E2EQuotaGauge
 require_text windows-client/tools/Run-WindowsClientE2E.ps1 'Assert-E2EGraphHasModelData'
 require_text windows-client/tools/Run-WindowsClientE2E.ps1 'Assert-E2EGraphHasModelData $plot $graph.Handle $graphPast'
 require_text windows-client/tools/Run-WindowsClientE2E.ps1 'public static extern bool PrintWindow'
+require_text windows-client/tools/Run-WindowsClientE2E.ps1 "\$compilerReferenceRoot = Join-Path \$PSHOME 'ref'"
+require_text windows-client/tools/Run-WindowsClientE2E.ps1 "Get-ChildItem -LiteralPath \$compilerReferenceRoot -Filter '*.dll' -File"
+require_text windows-client/tools/Run-WindowsClientE2E.ps1 '[System.Drawing.Bitmap].Assembly.Location'
+require_text windows-client/tools/Run-WindowsClientE2E.ps1 "[System.Reflection.Assembly]::Load('System.Private.Windows.GdiPlus')"
+require_text windows-client/tools/Run-WindowsClientE2E.ps1 "[System.Reflection.Assembly]::Load('System.Private.Windows.Core')"
+require_text windows-client/tools/Run-WindowsClientE2E.ps1 'Test-Path -LiteralPath $_ -PathType Leaf'
+require_text windows-client/tools/Run-WindowsClientE2E.ps1 '$compilerReferences += $runtimeReferences'
+require_text windows-client/tools/Run-WindowsClientE2E.ps1 'Add-Type -ReferencedAssemblies $compilerReferences -TypeDefinition'
+if rg -q --fixed-strings "GetData('TRUSTED_PLATFORM_ASSEMBLIES')" windows-client/tools/Run-WindowsClientE2E.ps1 ||
+    rg -q --fixed-strings 'Add-Type -ReferencedAssemblies System.Drawing -TypeDefinition' windows-client/tools/Run-WindowsClientE2E.ps1; then
+    fail 'Windows E2E embedded C# must use compiler references plus the System.Drawing.Common owner assembly'
+fi
 require_function_text windows-client/tools/Run-WindowsClientE2E.ps1 Capture-E2EWindow 'PrintWindow'
 require_function_text windows-client/tools/Run-WindowsClientE2E.ps1 Capture-E2EWindow 'PW_RENDERFULLCONTENT'
 require_function_text windows-client/tools/Run-WindowsClientE2E.ps1 Capture-E2EWindow 'changedPixels'
