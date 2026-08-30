@@ -333,11 +333,20 @@ def validate_sources(
     _count(release, "  release:\n", 1, errors)
     _count(release, "    if: github.event.pull_request.merged == true\n", 1, errors)
     _count(release, "      contents: write\n", 1, errors)
-    _count(release, "          ref: refs/heads/main\n", 1, errors)
+    _count(
+        release,
+        "          ref: ${{ github.event.pull_request.merge_commit_sha }}\n",
+        1,
+        errors,
+    )
     _count(release, "          name: acceptance-verdict\n", 1, errors)
     _count(release, "          name: release-candidate\n", 1, errors)
     _count(release, "commits/$PR_HEAD_SHA/check-runs?check_name=acceptance", 1, errors)
+    _count(release, 'git/commits/$PR_HEAD_SHA" > "$head_commit_json"', 1, errors)
     _count(release, '--workflow-run "$workflow_run_json"', 1, errors)
+    _count(release, '--head-commit "$head_commit_json"', 1, errors)
+    _count(release, "accepted run changed during verification", 0, errors)
+    _count(release, "printf 'run-id=%s\\n' \"$verified_run_id\"", 1, errors)
     _count(release, "final_head_check_reporter.py verify-verdict", 1, errors)
     _count(release, "steps.verdict.outputs.windows_impact == 'true'", 4, errors)
     _count(release, "scripts/ci_change_scope.py", 0, errors)
