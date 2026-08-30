@@ -215,6 +215,17 @@ def validate_sources(
         1,
         errors,
     )
+    version_prepare = _between(
+        version,
+        "      - name: Validate and prepare version data\n",
+        "      - name: Select the exact quality head\n",
+    )
+    _count(
+        version_prepare,
+        "          PR_NUMBER: ${{ github.event.pull_request.number }}\n",
+        1,
+        errors,
+    )
     _count(version, '[[ "$before_identity" == "$after_identity" ]]', 1, errors)
     _count(version, "      actions: write\n", 0, errors)
     _count(version, "      contents: write\n", 1, errors)
