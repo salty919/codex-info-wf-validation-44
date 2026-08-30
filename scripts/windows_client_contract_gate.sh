@@ -595,6 +595,7 @@ require_text windows-client/tools/Run-WindowsClientE2E.ps1 'public static extern
 require_text windows-client/tools/Run-WindowsClientE2E.ps1 '[System.Drawing.Bitmap].Assembly.Location'
 require_text windows-client/tools/Run-WindowsClientE2E.ps1 '[System.Drawing.Color].Assembly.Location'
 require_text windows-client/tools/Run-WindowsClientE2E.ps1 "[System.Reflection.Assembly]::Load('System.Private.Windows.GdiPlus')"
+require_text windows-client/tools/Run-WindowsClientE2E.ps1 "[System.Reflection.Assembly]::Load('System.Private.Windows.Core')"
 require_text windows-client/tools/Run-WindowsClientE2E.ps1 'Where-Object { -not [string]::IsNullOrWhiteSpace($_) }'
 require_text windows-client/tools/Run-WindowsClientE2E.ps1 'Select-Object -Unique'
 require_text windows-client/tools/Run-WindowsClientE2E.ps1 "Assert-E2E (\$drawingReferences.Count -gt 0) 'System.Drawing runtime assemblies could not be resolved.'"

@@ -113,11 +113,14 @@ Add-Type -AssemblyName System.Drawing
 
 $gdiPlusAssembly = [System.Reflection.Assembly]::Load('System.Private.Windows.GdiPlus')
 Assert-E2E ($null -ne $gdiPlusAssembly -and -not [string]::IsNullOrWhiteSpace($gdiPlusAssembly.Location)) 'System.Private.Windows.GdiPlus runtime assembly could not be resolved.'
+$windowsCoreAssembly = [System.Reflection.Assembly]::Load('System.Private.Windows.Core')
+Assert-E2E ($null -ne $windowsCoreAssembly -and -not [string]::IsNullOrWhiteSpace($windowsCoreAssembly.Location)) 'System.Private.Windows.Core runtime assembly could not be resolved.'
 
 $drawingReferences = @(
     [System.Drawing.Bitmap].Assembly.Location
     [System.Drawing.Color].Assembly.Location
     $gdiPlusAssembly.Location
+    $windowsCoreAssembly.Location
 ) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -Unique
 Assert-E2E ($drawingReferences.Count -gt 0) 'System.Drawing runtime assemblies could not be resolved.'
 

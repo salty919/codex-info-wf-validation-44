@@ -41,7 +41,8 @@ mapfile -t scoped_paths < <(grep -oE '`[^`]+`' "$ledger" | tr -d '`' | sort -u)
 mapfile -t changed_paths < <({
     git diff --name-only
     git diff --cached --name-only
-    git ls-files --others --exclude-standard
+    git ls-files --others --exclude-standard |
+        awk '$0 !~ /(^|\/)__pycache__\/[^/]+\.pyc$/'
 } | sort -u)
 for changed_path in "${changed_paths[@]}"; do
     [[ -n "$changed_path" ]] || continue
