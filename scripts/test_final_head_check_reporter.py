@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import copy
+from dataclasses import replace
 import hashlib
 import tempfile
 import unittest
@@ -16,6 +17,7 @@ REPOSITORY = "salty919/codex_info_v2"
 BASE_SHA = "1" * 40
 HEAD_SHA = "2" * 40
 RUN_ID = 24680
+HEAD_REF = "user/main-change"
 
 
 def identity() -> reporter.Identity:
@@ -26,7 +28,7 @@ def identity() -> reporter.Identity:
         head_repository=REPOSITORY,
         base_sha=BASE_SHA,
         head_sha=HEAD_SHA,
-        head_ref="feat/next",
+        head_ref=HEAD_REF,
         run_id=RUN_ID,
         run_url=f"https://github.com/{REPOSITORY}/actions/runs/{RUN_ID}",
     )
@@ -43,7 +45,7 @@ def pull_request(*, head_sha: str = HEAD_SHA) -> dict[str, Any]:
         },
         "head": {
             "repo": {"full_name": REPOSITORY},
-            "ref": "feat/next",
+            "ref": HEAD_REF,
             "sha": head_sha,
         },
     }
@@ -244,6 +246,20 @@ class FinalHeadCheckReporterTests(unittest.TestCase):
         ):
             reporter.register_checks(api, identity())
 
+    def test_same_repository_main_pr_accepts_arbitrary_nonempty_head_refs(self) -> None:
+        for head_ref in ("feat/next", "fix/windows-only", "release_2026.08"):
+            with self.subTest(head_ref=head_ref):
+                value = replace(identity(), head_ref=head_ref)
+                api = FakeApi()
+                api.pull_request["head"]["ref"] = head_ref
+                result = reporter.register_checks(api, value)
+                self.assertTrue(result.quality_required)
+        for head_ref in ("", "bad\x00ref"):
+            with self.subTest(head_ref=head_ref), self.assertRaises(
+                reporter.ReporterError
+            ):
+                reporter.validate_identity(replace(identity(), head_ref=head_ref))
+
     def test_finalize_accepts_bound_artifacts_and_completes_acceptance(self) -> None:
         api = FakeApi()
         api.checks["version-prepared"] = [
@@ -261,6 +277,7 @@ class FinalHeadCheckReporterTests(unittest.TestCase):
                     "pr-number": "42",
                     "source-sha": HEAD_SHA,
                     "binary-impact": "true",
+                    "windows-impact": "true",
                     "version": "1.2.3",
                     "acceptance": "PASS",
                 },
@@ -281,6 +298,7 @@ class FinalHeadCheckReporterTests(unittest.TestCase):
                 identity(),
                 quality_result="success",
                 binary_impact="true",
+                windows_impact="true",
                 version="1.2.3",
                 verdict_directory=verdict,
                 candidate_directory=candidate,
@@ -291,6 +309,107 @@ class FinalHeadCheckReporterTests(unittest.TestCase):
             )
 
         self.assertEqual(api.checks["acceptance"][0]["conclusion"], "success")
+
+    def test_artifact_contract_covers_all_valid_impact_combinations(self) -> None:
+        cases = (
+            ("false", "false", "", False, True),
+            ("true", "false", "1.2.3", False, True),
+            ("true", "true", "1.2.3", True, True),
+            ("false", "true", "", False, False),
+        )
+        for binary_impact, windows_impact, version, with_candidate, valid in cases:
+            with self.subTest(
+                binary_impact=binary_impact, windows_impact=windows_impact
+            ), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                verdict = root / "verdict"
+                candidate = root / "candidate"
+                write_evidence(
+                    verdict,
+                    {
+                        "schema": "codex-info-final-head-v1",
+                        "pr-number": "42",
+                        "source-sha": HEAD_SHA,
+                        "binary-impact": binary_impact,
+                        "windows-impact": windows_impact,
+                        "version": version,
+                        "acceptance": "PASS",
+                    },
+                )
+                if with_candidate:
+                    write_evidence(
+                        candidate,
+                        {
+                            "schema": "codex-info-quality-v1",
+                            "pr-number": "42",
+                            "source-sha": HEAD_SHA,
+                            "tree-sha": "3" * 40,
+                            "version": version,
+                            "acceptance": "PASS",
+                        },
+                    )
+                if valid:
+                    digest = reporter._verify_artifacts(
+                        identity(),
+                        binary_impact=binary_impact,
+                        windows_impact=windows_impact,
+                        version=version,
+                        verdict_directory=verdict,
+                        candidate_directory=candidate,
+                    )
+                    self.assertRegex(digest, r"^[0-9a-f]{64}$")
+                else:
+                    with self.assertRaises(reporter.ReporterError):
+                        reporter._verify_artifacts(
+                            identity(),
+                            binary_impact=binary_impact,
+                            windows_impact=windows_impact,
+                            version=version,
+                            verdict_directory=verdict,
+                            candidate_directory=candidate,
+                        )
+
+    def test_verify_verdict_cli_writes_release_decision_outputs(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            verdict = root / "verdict"
+            output = root / "github-output"
+            write_evidence(
+                verdict,
+                {
+                    "schema": "codex-info-final-head-v1",
+                    "pr-number": "42",
+                    "source-sha": HEAD_SHA,
+                    "binary-impact": "true",
+                    "windows-impact": "false",
+                    "version": "1.2.3",
+                    "acceptance": "PASS",
+                },
+            )
+            self.assertEqual(
+                reporter.main(
+                    [
+                        "verify-verdict",
+                        "--pr-number",
+                        "42",
+                        "--head-sha",
+                        HEAD_SHA,
+                        "--verdict-directory",
+                        str(verdict),
+                        "--github-output",
+                        str(output),
+                    ]
+                ),
+                0,
+            )
+            self.assertEqual(
+                output.read_text(encoding="utf-8").splitlines(),
+                [
+                    "binary_impact=true",
+                    "windows_impact=false",
+                    "version=1.2.3",
+                ],
+            )
 
     def test_finalize_records_failure_for_malformed_artifact_digest(self) -> None:
         api = FakeApi()
@@ -309,6 +428,7 @@ class FinalHeadCheckReporterTests(unittest.TestCase):
                     "pr-number": "42",
                     "source-sha": HEAD_SHA,
                     "binary-impact": "false",
+                    "windows-impact": "false",
                     "version": "",
                     "acceptance": "PASS",
                 },
@@ -319,6 +439,7 @@ class FinalHeadCheckReporterTests(unittest.TestCase):
                     identity(),
                     quality_result="success",
                     binary_impact="false",
+                    windows_impact="false",
                     version="",
                     verdict_directory=verdict,
                     candidate_directory=candidate,
@@ -350,6 +471,7 @@ class FinalHeadCheckReporterTests(unittest.TestCase):
                     identity(),
                     quality_result="failure",
                     binary_impact="true",
+                    windows_impact="true",
                     version="1.2.3",
                     verdict_directory=root / "verdict",
                     candidate_directory=root / "candidate",

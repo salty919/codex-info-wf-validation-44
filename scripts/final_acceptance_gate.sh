@@ -2,10 +2,9 @@
 set -euo pipefail
 
 # This is the single PR acceptance boundary.  It is intentionally
-# fail-closed, but evidence-only: the native release/CLI/recorder owners, the
-# merge-policy audit, and the UI job own execution and upload immutable result
-# bundles; this script only joins and verifies those bundles.  No environment
-# variable can replace the evidence.
+# fail-closed, but evidence-only: the selected Windows owner executes and
+# uploads its immutable UI bundle; this script verifies that bundle. Other
+# selected owners are accepted by the shared selected-quality gate.
 ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 
@@ -17,12 +16,6 @@ hold() {
 evidence_dir="${1:-${WINDOWS_E2E_EVIDENCE_DIR:-}}"
 [[ -n "$evidence_dir" ]] || hold "Windows UI E2E evidence directory is required"
 [[ -d "$evidence_dir" ]] || hold "Windows UI E2E evidence directory is missing: $evidence_dir"
-native_evidence_dir="${2:-${NATIVE_QUALITY_EVIDENCE_DIR:-}}"
-windows_evidence_dir="${3:-${WINDOWS_QUALITY_EVIDENCE_DIR:-}}"
-[[ -n "$native_evidence_dir" ]] || hold "native quality evidence directory is required"
-[[ -n "$windows_evidence_dir" ]] || hold "Windows quality evidence directory is required"
-[[ -d "$native_evidence_dir" ]] || hold "native quality evidence directory is missing: $native_evidence_dir"
-[[ -d "$windows_evidence_dir" ]] || hold "Windows quality evidence directory is missing: $windows_evidence_dir"
 
 log_file="$evidence_dir/windows-client-e2e.log"
 [[ -f "$log_file" ]] || hold "Windows UI E2E log is missing"
@@ -41,11 +34,6 @@ current_tree="$(git rev-parse 'HEAD^{tree}' 2>/dev/null || true)"
     hold "checked out source SHA does not match expected source SHA: current=$current_sha expected=$expected_sha"
 [[ "$current_tree" == "$expected_tree" ]] ||
     hold "checked out source tree does not match expected tree: current=$current_tree expected=$expected_tree"
-
-bash scripts/quality_artifact_gate.sh \
-    "$native_evidence_dir" "$windows_evidence_dir" "$evidence_dir" \
-    "$expected_sha" "$expected_tree" \
-    || hold "quality artifact verification failed"
 
 grep -Fq -- "source-sha: $expected_sha" "$log_file" \
     || hold "Windows UI E2E evidence was not produced from expected source SHA: $expected_sha"
@@ -114,4 +102,4 @@ for capture_name in "${required_captures[@]}"; do
     [[ "$actual_hash" == "$logged_hash" ]] || hold "Windows UI screenshot hash does not match its E2E log: $capture_name.png"
 done
 
-echo "final-acceptance-gate: PASS (source-matched native, Windows, and UI evidence; physical window-move smoke; and source-matched screenshots)"
+echo "final-acceptance-gate: PASS (source-matched Windows UI evidence, physical window-move smoke, and source-matched screenshots)"

@@ -24,15 +24,11 @@ clean_tree="$work/clean-tree"
 fixture_repo="$work/fixture-repo"
 evidence_root="$work/evidence"
 tool_dir="$work/tools"
-native_dir="$evidence_root/native-quality"
-windows_dir="$evidence_root/windows-quality"
 ui_dir="$evidence_root/windows-ui-e2e"
 mkdir -p \
     "$clean_tree" \
     "$fixture_repo/scripts" \
     "$tool_dir" \
-    "$native_dir" \
-    "$windows_dir" \
     "$ui_dir"
 
 # The gate deliberately rejects a dirty source tree.  Use an archive of HEAD
@@ -41,15 +37,11 @@ git archive HEAD | tar -xf - -C "$clean_tree"
 git_dir="$(git rev-parse --absolute-git-dir)"
 [[ -z "$(GIT_DIR="$git_dir" GIT_WORK_TREE="$clean_tree" git status --porcelain=v1 --untracked-files=all)" ]] ||
     fail "clean HEAD fixture is unexpectedly dirty"
-cp scripts/final_acceptance_gate.sh scripts/quality_artifact_gate.sh "$fixture_repo/scripts/"
+cp scripts/final_acceptance_gate.sh "$fixture_repo/scripts/"
 
 source_sha="$(git rev-parse HEAD)"
 tree_sha="$(git rev-parse 'HEAD^{tree}')"
 
-printf 'schema: codex-info-quality-v1\nquality: native\nsource-sha: %s\ntree-sha: %s\nrelease-build: PASS\ncli-contract-e2e: PASS\nrecorder-daemon: PASS\nnative-quality: PASS\n' \
-    "$source_sha" "$tree_sha" > "$native_dir/native-quality.txt"
-printf 'schema: codex-info-quality-v1\nquality: merge-policy\nsource-sha: %s\ntree-sha: %s\nlive-applied-rules: PASS\nmerge-policy: PASS\n' \
-    "$source_sha" "$tree_sha" > "$windows_dir/windows-quality.txt"
 printf 'schema: codex-info-quality-v1\nquality: ui\nsource-sha: %s\ntree-sha: %s\nwindows-ui-e2e: PASS\nwindow-move-smoke: PASS\nui-quality: PASS\n' \
     "$source_sha" "$tree_sha" > "$ui_dir/ui-quality.txt"
 printf 'source-sha: %s\nwindow-move-smoke: PASS\n' "$source_sha" > "$ui_dir/window-move-smoke.log"
@@ -107,8 +99,6 @@ make_manifest() {
     ) || fail "could not hash fixture bundle: $directory"
     mv "$manifest" "$directory/SHA256SUMS"
 }
-make_manifest "$native_dir"
-make_manifest "$windows_dir"
 make_manifest "$ui_dir"
 
 # Only the commands used by the evidence gate are available at runtime.
@@ -148,7 +138,7 @@ gate_output="$(
     EXPECTED_E2E_SOURCE_SHA="$source_sha" \
     EXPECTED_SOURCE_TREE_SHA="$tree_sha" \
         "$tool_dir/bash" "$fixture_repo/scripts/final_acceptance_gate.sh" \
-        "$ui_dir" "$native_dir" "$windows_dir" 2>&1
+        "$ui_dir" 2>&1
 )" || {
     printf '%s\n' "$gate_output" >&2
     fail "final acceptance gate failed without rg in PATH"

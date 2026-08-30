@@ -39,13 +39,12 @@ def validate(codeql: str, windows: str, selective: str) -> list[str]:
     exact(codeql, "github/codeql-action/analyze@v4")
     exact(codeql, "github/codeql-action/autobuild@", 0)
 
-    exact(windows, "    uses: ./.github/workflows/codeql.yml\n")
-    exact(windows, "      head_ref: ${{ inputs.head_ref }}\n")
+    exact(windows, "    uses: ./.github/workflows/codeql.yml\n", 0)
     exact(selective, "  codeql-quality:\n")
     exact(selective, "    if: inputs.codeql_languages_json != '[]'\n")
     exact(selective, "    uses: ./.github/workflows/codeql.yml\n")
     exact(selective, "      languages_json: ${{ inputs.codeql_languages_json }}\n")
-    exact(selective, "      security-events: write\n", 2)
+    exact(selective, "      security-events: write\n")
     exact(selective, "      - codeql-quality\n")
     return errors
 
@@ -65,7 +64,11 @@ def main() -> int:
         (0, "          build-mode: none\n", "          build-mode: autobuild\n"),
         (0, "          sha: ${{ inputs.source_sha || github.sha }}\n", ""),
         (0, "  security-events: write\n", ""),
-        (1, "      head_ref: ${{ inputs.head_ref }}\n", ""),
+        (
+            1,
+            "  ui-quality:\n",
+            "  duplicate-codeql:\n    uses: ./.github/workflows/codeql.yml\n\n  ui-quality:\n",
+        ),
         (2, "    if: inputs.codeql_languages_json != '[]'\n", ""),
         (2, "      languages_json: ${{ inputs.codeql_languages_json }}\n", ""),
         (2, "      - codeql-quality\n", ""),

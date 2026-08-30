@@ -37,7 +37,10 @@ def validate(
             errors.append(f"count {marker!r}: expected {expected}, found {actual}")
 
     prepare = section(workflow, "  prepare:\n", "  register-final-head-checks:\n")
-    register = section(workflow, "  register-final-head-checks:\n", "  quality:\n")
+    register = section(
+        workflow, "  register-final-head-checks:\n", "  selected-quality:\n"
+    )
+    selected = section(workflow, "  selected-quality:\n", "  quality:\n")
     quality = section(workflow, "  quality:\n", "  finalize-final-head-checks:\n")
     finalize = section(workflow, "  finalize-final-head-checks:\n", None)
 
@@ -56,16 +59,14 @@ def validate(
     exact(prepare, "          ref: refs/heads/main\n")
     exact(prepare, "          persist-credentials: false\n")
     exact(prepare, '"repos/$REPOSITORY/check-runs"')
+    exact(prepare, 'Required status check \"feat-acceptance\" is expected.')
     exact(prepare, '{name:"feat-acceptance",head_sha:$head_sha,status:"completed",')
-    exact(prepare, '"$(jq -r \'.app.id\' <<<"$check_info")" == 15368')
+    exact(prepare, '"$HEAD_REPOSITORY" == "$REPOSITORY"', 2)
+    exact(prepare, '--expected-head-ref "$HEAD_REF"')
+    exact(prepare, '            --format json)"\n')
     exact(prepare, '"repos/$REPOSITORY/git/refs/heads/$HEAD_REF"\n')
     exact(prepare, "            -F force=false \\\n")
-    if prepare.index('"repos/$REPOSITORY/check-runs"') > prepare.index(
-        '"$update_ref_endpoint"'
-    ):
-        errors.append("generated version check is created after the protected ref update")
     for marker in (
-        '[[ "$HEAD_REPOSITORY" != "$REPOSITORY" ]]',
         '[[ "$observed_head" == "$HEAD_SHA" ]]',
         "\"repos/$REPOSITORY/git/commits/$HEAD_SHA\" --jq '.tree.sha'",
         "{message:$message,tree:$tree,parents:[$parent]}",
@@ -87,12 +88,22 @@ def validate(
     exact(register, "actions/checkout@v4", 1)
     exact(register, "      contents: write\n", 0)
 
+    exact(selected, "uses: ./.github/workflows/selective-quality.yml")
+    exact(selected, "      selection_json: ${{ needs.prepare.outputs.selection_json }}\n")
+    exact(
+        selected,
+        "      codeql_languages_json: ${{ needs.prepare.outputs.codeql_languages_json }}\n",
+    )
+    exact(selected, "      security-events: write\n")
+    exact(selected, "      checks: write\n", 0)
+
     exact(quality, "uses: ./.github/workflows/windows-client.yml")
     exact(quality, "      premerge: true\n")
     exact(quality, "      head_sha: ${{ needs.prepare.outputs.final_head_sha }}\n")
+    exact(quality, "      selection_json: ${{ needs.prepare.outputs.selection_json }}\n")
     exact(quality, "      contents: read\n")
-    exact(quality, "      pull-requests: read\n")
-    exact(quality, "      security-events: write\n")
+    exact(quality, "      pull-requests: read\n", 0)
+    exact(quality, "      security-events: write\n", 0)
     exact(quality, "      checks: write\n", 0)
 
     exact(finalize, "      actions: read\n")
@@ -110,17 +121,27 @@ def validate(
     exact(quality_workflow, "  pull_request_target:\n", 0)
     exact(quality_workflow, "  release:\n", 0)
     exact(quality_workflow, "contents: write\n", 0)
+    exact(quality_workflow, "  native-quality:\n", 0)
+    exact(quality_workflow, "  codeql-analysis:\n", 0)
+    exact(quality_workflow, "Audit live applied merge rules", 0)
+    exact(quality_workflow, "      selective_mode: true\n", 0)
+    exact(quality_workflow, "    if: inputs.premerge == true && inputs.selective_mode == true", 1)
     exact(release_workflow, "  pull_request_target:\n")
     exact(release_workflow, "    types: [closed]\n")
     exact(release_workflow, "  workflow_call:\n", 0)
     exact(release_workflow, "  release:\n")
     exact(release_workflow, "      contents: write\n")
+    exact(release_workflow, "name: acceptance-verdict\n")
+    exact(release_workflow, "final_head_check_reporter.py verify-verdict")
+    exact(release_workflow, "steps.verdict.outputs.windows_impact == 'true'", 4)
+    exact(release_workflow, "scripts/ci_change_scope.py", 0)
     exact(reporter, "GITHUB_ACTIONS_APP_ID = 15368")
     exact(reporter, 'CHECK_NAMES = ("version-prepared", "acceptance")')
     exact(reporter, "codex-quality-v1:pr=", 2)
     exact(reporter, "multiple GitHub Actions {name} checks exist on the final head")
     exact(reporter, "another active run owns a final-head required check")
     exact(reporter, "live pull-request identity does not match the final head")
+    exact(reporter, 'identity.head_ref != "feat/next"', 0)
     return errors
 
 
@@ -233,13 +254,13 @@ def main() -> int:
             "            -F force=false \\\n",
             "            -F force=true \\\n",
         ),
-        (
-            "workflow",
-            '{name:"feat-acceptance",head_sha:$head_sha,status:"completed",',
-            '{name:"acceptance",head_sha:$head_sha,status:"completed",',
-        ),
         ("workflow", "      checks: write\n", "      checks: read\n"),
         ("workflow", "scripts/final_head_check_reporter.py register", "true"),
+        (
+            "workflow",
+            "uses: ./.github/workflows/selective-quality.yml",
+            "uses: ./other-selective.yml",
+        ),
         (
             "workflow",
             "uses: ./.github/workflows/windows-client.yml",
@@ -270,6 +291,11 @@ def main() -> int:
             "release_workflow",
             "    types: [closed]\n",
             "    types: [opened]\n",
+        ),
+        (
+            "release_workflow",
+            "steps.verdict.outputs.windows_impact == 'true'",
+            "always()",
         ),
         ("reporter", "GITHUB_ACTIONS_APP_ID = 15368", "GITHUB_ACTIONS_APP_ID = 1"),
         (

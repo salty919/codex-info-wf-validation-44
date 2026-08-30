@@ -130,6 +130,12 @@ def _repository(value: Any, label: str) -> str:
     return value
 
 
+def _head_ref(value: Any, label: str) -> str:
+    if not isinstance(value, str) or not value or "\x00" in value:
+        raise ReporterError(f"invalid {label}")
+    return value
+
+
 def _required(mapping: Any, key: str, label: str) -> Any:
     if not isinstance(mapping, dict) or key not in mapping:
         raise ReporterError(f"missing {label}.{key}")
@@ -144,16 +150,14 @@ def validate_identity(identity: Identity) -> None:
     _positive_integer(identity.run_id, "run ID")
     _sha(identity.base_sha, "base SHA")
     _sha(identity.head_sha, "head SHA")
+    _head_ref(identity.head_ref, "head ref")
     if (
         identity.repository != identity.base_repository
         or identity.repository != identity.head_repository
-        or identity.head_ref != "feat/next"
         or identity.run_url
         != f"https://github.com/{identity.repository}/actions/runs/{identity.run_id}"
     ):
-        raise ReporterError(
-            "identity is outside the trusted feat/next to main boundary"
-        )
+        raise ReporterError("identity is outside the trusted same-repository boundary")
 
 
 def _validate_pull_request(api: Api, identity: Identity, *, require_open: bool) -> None:
@@ -485,16 +489,39 @@ def _verify_sha256s(directory: Path) -> None:
         raise ReporterError("SHA256SUMS does not cover the exact artifact file set")
 
 
-def _verify_artifacts(
-    identity: Identity,
-    *,
-    binary_impact: str,
-    version: str,
-    verdict_directory: Path,
-    candidate_directory: Path,
-) -> str:
+def verify_verdict(
+    *, pr_number: int, head_sha: str, verdict_directory: Path
+) -> tuple[str, str, str, str]:
+    _positive_integer(pr_number, "PR number")
+    _sha(head_sha, "head SHA")
+    _verify_sha256s(verdict_directory)
+    verdict = _parse_evidence(verdict_directory / "acceptance.txt")
+    if set(verdict) != {
+        "schema",
+        "pr-number",
+        "source-sha",
+        "binary-impact",
+        "windows-impact",
+        "version",
+        "acceptance",
+    }:
+        raise ReporterError("acceptance verdict fields are not exact")
+    if (
+        verdict.get("schema") != "codex-info-final-head-v1"
+        or verdict.get("pr-number") != str(pr_number)
+        or verdict.get("source-sha") != head_sha
+        or verdict.get("acceptance") != "PASS"
+    ):
+        raise ReporterError("acceptance verdict identity does not match the final head")
+    binary_impact = verdict["binary-impact"]
+    windows_impact = verdict["windows-impact"]
+    version = verdict["version"]
     if binary_impact not in {"true", "false"}:
         raise ReporterError("binary impact output is missing or malformed")
+    if windows_impact not in {"true", "false"}:
+        raise ReporterError("Windows impact output is missing or malformed")
+    if windows_impact == "true" and binary_impact != "true":
+        raise ReporterError("Windows impact cannot be true without binary impact")
     if binary_impact == "false" and version:
         raise ReporterError("no-binary acceptance unexpectedly contains a version")
     if (
@@ -502,19 +529,29 @@ def _verify_artifacts(
         and re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", version) is None
     ):
         raise ReporterError("binary acceptance version is missing or malformed")
-    _verify_sha256s(verdict_directory)
-    verdict = _parse_evidence(verdict_directory / "acceptance.txt")
-    expected = {
-        "schema": "codex-info-final-head-v1",
-        "pr-number": str(identity.pr_number),
-        "source-sha": identity.head_sha,
-        "binary-impact": binary_impact,
-        "version": version,
-        "acceptance": "PASS",
-    }
-    if verdict != expected:
-        raise ReporterError("acceptance verdict identity does not match the final head")
-    if binary_impact == "true":
+    evidence_digest = hashlib.sha256(
+        (verdict_directory / "SHA256SUMS").read_bytes()
+    ).hexdigest()
+    return binary_impact, windows_impact, version, evidence_digest
+
+
+def _verify_artifacts(
+    identity: Identity,
+    *,
+    binary_impact: str,
+    windows_impact: str,
+    version: str,
+    verdict_directory: Path,
+    candidate_directory: Path,
+) -> str:
+    observed = verify_verdict(
+        pr_number=identity.pr_number,
+        head_sha=identity.head_sha,
+        verdict_directory=verdict_directory,
+    )
+    if observed[:3] != (binary_impact, windows_impact, version):
+        raise ReporterError("acceptance verdict outputs do not match the final head")
+    if windows_impact == "true":
         _verify_sha256s(candidate_directory)
         candidate = _parse_evidence(candidate_directory / "acceptance.txt")
         if set(candidate) != {
@@ -537,10 +574,8 @@ def _verify_artifacts(
                 raise ReporterError(f"release candidate {key} mismatch")
         _sha(candidate.get("tree-sha"), "release candidate tree SHA")
     elif candidate_directory.exists() and any(candidate_directory.iterdir()):
-        raise ReporterError(
-            "no-binary acceptance unexpectedly contains a release candidate"
-        )
-    return hashlib.sha256((verdict_directory / "SHA256SUMS").read_bytes()).hexdigest()
+        raise ReporterError("non-Windows acceptance unexpectedly contains a release candidate")
+    return observed[3]
 
 
 def finalize_acceptance(
@@ -549,6 +584,7 @@ def finalize_acceptance(
     *,
     quality_result: str,
     binary_impact: str,
+    windows_impact: str,
     version: str,
     verdict_directory: Path,
     candidate_directory: Path,
@@ -585,6 +621,7 @@ def finalize_acceptance(
         evidence_digest = _verify_artifacts(
             identity,
             binary_impact=binary_impact,
+            windows_impact=windows_impact,
             version=version,
             verdict_directory=verdict_directory,
             candidate_directory=candidate_directory,
@@ -592,14 +629,14 @@ def finalize_acceptance(
         _positive_integer(verdict_artifact_id, "acceptance-verdict artifact ID")
         if not DIGEST_PATTERN.fullmatch(verdict_artifact_digest):
             raise ReporterError("acceptance-verdict artifact identity is malformed")
-        if binary_impact == "true":
+        if windows_impact == "true":
             _positive_integer(candidate_artifact_id, "release-candidate artifact ID")
             if not DIGEST_PATTERN.fullmatch(candidate_artifact_digest):
                 raise ReporterError("release-candidate artifact identity is malformed")
-        if binary_impact == "false" and (
+        if windows_impact == "false" and (
             candidate_artifact_id or candidate_artifact_digest
         ):
-            raise ReporterError("no-binary acceptance has release-candidate metadata")
+            raise ReporterError("non-Windows acceptance has release-candidate metadata")
         conclusion = "success"
         detail = (
             f"run={identity.run_id}; verdict-artifact={verdict_artifact_id}; "
@@ -681,6 +718,7 @@ def main(argv: list[str] | None = None) -> int:
     _add_identity_arguments(finalize_parser)
     finalize_parser.add_argument("--quality-result", required=True)
     finalize_parser.add_argument("--binary-impact", required=True)
+    finalize_parser.add_argument("--windows-impact", required=True)
     finalize_parser.add_argument("--version", default="")
     finalize_parser.add_argument("--verdict-directory", type=Path, required=True)
     finalize_parser.add_argument("--candidate-directory", type=Path, required=True)
@@ -688,7 +726,23 @@ def main(argv: list[str] | None = None) -> int:
     finalize_parser.add_argument("--verdict-artifact-digest", required=True)
     finalize_parser.add_argument("--candidate-artifact-id", default="")
     finalize_parser.add_argument("--candidate-artifact-digest", default="")
+    verify_parser = subparsers.add_parser("verify-verdict")
+    verify_parser.add_argument("--pr-number", required=True)
+    verify_parser.add_argument("--head-sha", required=True)
+    verify_parser.add_argument("--verdict-directory", type=Path, required=True)
+    verify_parser.add_argument("--github-output", type=Path, required=True)
     args = parser.parse_args(argv)
+    if args.command == "verify-verdict":
+        binary_impact, windows_impact, version, _digest = verify_verdict(
+            pr_number=_positive_integer(args.pr_number, "PR number"),
+            head_sha=args.head_sha,
+            verdict_directory=args.verdict_directory,
+        )
+        with args.github_output.open("a", encoding="utf-8") as output:
+            output.write(f"binary_impact={binary_impact}\n")
+            output.write(f"windows_impact={windows_impact}\n")
+            output.write(f"version={version}\n")
+        return 0
     identity = _identity_from_args(args)
     api = GitHubApi(os.environ.get("GH_TOKEN", ""))
     if args.command == "register":
@@ -705,6 +759,7 @@ def main(argv: list[str] | None = None) -> int:
             identity,
             quality_result=args.quality_result,
             binary_impact=args.binary_impact,
+            windows_impact=args.windows_impact,
             version=args.version,
             verdict_directory=args.verdict_directory,
             candidate_directory=args.candidate_directory,
