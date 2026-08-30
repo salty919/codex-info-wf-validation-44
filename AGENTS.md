@@ -5,9 +5,10 @@
 - 監査版ごとのEvidence、文書SHA一覧、サブエージェント作業台帳をrepositoryへ追加しない。再現可能なtestと必要最小限の仕様を残す。
 - 要件漏れを理由にN倍、N二乗、N階乗、全直積へ展開しない。同じ観測結果は既存要件へ統合し、因果関係のある有限caseだけを追加する。
 - ユーザーが述べていない要件、状態、分岐、品質目標を追加しない。実装上の入力errorや例外を製品要件の選択肢へ昇格させず、追加する各条項をユーザーの明示要求へ直接対応付けられない場合は削除する。
+- 各mutationの直前と、編集、test、委譲、commit、push、PR作成へ段階が移る時に、その操作を明示要求、Issueの受入条件、owned scopeへ直接対応付ける。対応付けできない、またはscopeが広がった場合は即停止する。この判定結果は実装前、検証前、完了報告前に短くchatへ報告する。
 - 実施申請に事実誤認、要求の取違い、scope誤りが判明した場合、その申請への許可だけを失効させ、要求自体は継続する。誤りと訂正差分を示して申請をやり直し、ユーザーが申請内容の誤りを発見することを安全境界にしない。
-- 各taskの初期要求と直接関係しない事項は、同じtask、branch、PRへ追加せず、調査、編集、test、委譲、commit、push、PR作成へ着手しない。許される準備は、その事項を別のGitHub Issueへ登録し、実施してよいかユーザーへ確認することだけとする。
-- 前項の確認は、何が問題で何を行うかをユーザーが理解できる短い言葉で説明し、ユーザー本人の明示許可を得る。専門用語が必要な場合は平易な説明を併記し、専門用語だけの説明、説明不足、過去の許可を実施許可として扱わない。
+- 各taskの初期要求と直接関係しない事項は、同じtask、branch、PRへ追加せず、別のGitHub Issueへ登録するだけとし、追加調査、編集、test、委譲、commit、push、PR作成へ着手しない。逸脱した場合は実行中のサブエージェントも止め、取り繕う追加修正やcleanupを行わず、現在の差分を報告する。
+- 発見Issueのうちユーザーへ確認するのは`priority:P0`と`priority:P1`だけとし、それらも専門用語だけに偏らず、何が問題で何を行うかをユーザーが理解できる短い言葉で説明し、そのIssueへの明示許可を得るまで着手しない。`priority:P2`、`priority:P3`、`priority:info`はIssueへの記録だけとする。
 - 文書ごとのSHAを完了ブロッカーにしない。製品artifactを一意に識別するhashは記録できるが、内容評価の代用にしない。
 - 外部authority値を推測しない。publisher、certificate、対応OS、保証値が未指定なら、公開・対応表明・mutationを行わないfail-closed動作を要件化する。
 - lockfileと既存package managerを守る。検索は`rg`を優先する。
@@ -94,7 +95,7 @@ cleanup条件と削除予定:
 
 - 今後の機能追加、不具合対策、品質管理、security、運用、文書、調査は、実装branchまたはworktreeを作る前にGitHub Issueへ登録する。Issueが存在しない状態では読取り調査とIssue案の作成だけを許可し、編集、test、commit、push、PR等のmutationを開始しない。
 - ユーザーがchatで新しい取り組みを依頼した場合、その依頼を、Codexが認証済みのユーザーaccountで対応Issueを作成・分類し、作業履歴を更新するstanding authorizationとする。作成直前にIssue title、分類、scope、既存Issueとの重複結果をchatで明示する。
-- 既存Issueと同じ観測結果または成果を扱う場合は新規Issueを作らず、既存Issueを正本として参照する。重複か独立scopeか、parent、破壊的操作に曖昧さがある場合は作成・更新を停止してユーザーへ確認する。priorityが未決定ならCodexは候補と理由を記録し、priority labelを付けず`status:triage`で登録する。priority指定が複数または矛盾している場合は推測せず確認する。
+- 既存Issueと同じ観測結果または成果を扱う場合は新規Issueを作らず、既存Issueを正本として参照する。重複か独立scopeか、parent、破壊的操作に曖昧さがある場合は作成・更新を停止してユーザーへ確認する。発見Issue以外でpriorityが未決定ならCodexは候補と理由を記録し、priority labelを付けず`status:triage`で登録する。Codexが作業中に発見して登録するIssueには観測した影響に対応するpriorityを必ず付け、ユーザー指定が複数または矛盾している場合は推測せず確認する。
 - Issue serviceの取得・作成・更新に失敗した場合は、local branchや文書をfallback正本にせず停止する。token、secret、private data、raw logをIssueへ記録してはならない。
 - Issue番号を得た後、一時branchの`<task>`は`issue-<number>-<slug>`、worktreeの`<task>`も同じ値とする。branch、commit、PR、進捗コメントは必ずIssue番号を参照する。
 
@@ -102,9 +103,9 @@ cleanup条件と削除予定:
 
 - 大分類labelは次の集合からexact 1件とする。`bug`は不具合対策、`enhancement`は機能追加、`quality`は品質管理、`security`はsecurity/trust/data protection、`operations`はbuild/CI/Release/repository運用、`documentation`は文書・governance、`investigation`は調査・意思決定を表す。
 - area labelは`area:native`、`area:windows`、`area:ui`、`area:data`、`area:ci`、`area:release`、`area:docs`、`area:governance`から1件以上を付ける。責務境界を跨ぐ場合だけ複数areaを許可する。
-- priority labelは`priority:P0`、`priority:P1`、`priority:P2`、`priority:P3`からユーザーが決定する。`status:triage`中だけ未設定を許し、`ready`、`in-progress`、`blocked`、`review`ではexact 1件を必須とする。Codexはpriorityを提案できるが、ユーザー確認なしに設定、昇格、降格してはならない。
+- priority labelは`priority:P0`（緊急）、`priority:P1`（高）、`priority:P2`（中）、`priority:P3`（低）、`priority:info`（情報）とする。Codexが作る発見Issueでは観測した影響に基づくexact 1件を設定する。それ以外はユーザーが決定し、`status:triage`中だけ未設定を許し、`ready`、`in-progress`、`blocked`、`review`ではexact 1件を必須とする。
 - open Issueのstatus labelは`status:triage`、`status:ready`、`status:in-progress`、`status:blocked`、`status:review`のexact 1件とする。scope、acceptance criteria、priorityが未確定なら`triage`、着手可能なら`ready`、許可済み作業中なら`in-progress`、外部依存で進行不能なら`blocked`、全実装と証拠が揃いユーザーclose待ちなら`review`とする。closed stateと重複する`status:done`は作らない。
-- Issue作成時は大分類exact 1件、area 1件以上、`status:triage`を設定し、priorityはユーザー確認済みの場合だけ設定する。Codexは実際の状態遷移に合わせてIssue labelと節目コメントを更新する。状態を進めるために未確認のscope、priority、evidenceを推測してはならない。
+- Issue作成時は大分類exact 1件、area 1件以上、`status:triage`を設定する。priorityはCodexが作る発見Issue、またはユーザー確認済みの場合だけ設定する。Codexは実際の状態遷移に合わせてIssue labelと節目コメントを更新する。状態を進めるために未確認のscopeやevidenceを推測してはならない。
 
 ### sub-issueと依存関係
 
