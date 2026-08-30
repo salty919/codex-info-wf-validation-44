@@ -111,9 +111,13 @@ Add-Type -AssemblyName UIAutomationClient
 Add-Type -AssemblyName UIAutomationTypes
 Add-Type -AssemblyName System.Drawing
 
+$gdiPlusAssembly = [System.Reflection.Assembly]::Load('System.Private.Windows.GdiPlus')
+Assert-E2E ($null -ne $gdiPlusAssembly -and -not [string]::IsNullOrWhiteSpace($gdiPlusAssembly.Location)) 'System.Private.Windows.GdiPlus runtime assembly could not be resolved.'
+
 $drawingReferences = @(
     [System.Drawing.Bitmap].Assembly.Location
     [System.Drawing.Color].Assembly.Location
+    $gdiPlusAssembly.Location
 ) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -Unique
 Assert-E2E ($drawingReferences.Count -gt 0) 'System.Drawing runtime assemblies could not be resolved.'
 
