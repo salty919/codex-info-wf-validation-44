@@ -118,6 +118,7 @@ cleanup条件と削除予定:
 ### 履歴、PR、close authority
 
 - CodexはIssueへ、着手、宣言済みbranch/worktree/base SHA、scope決定、重要な設計判断、blocker、検証結果、commit、PR URL、cleanup、closure reportを節目ごとにコメントする。短周期polling、逐次command出力、重複status、raw logを投稿してはならない。
+- Actionsの基盤・制御失敗（選択された製品test自体の正当な失敗を除く）は、同じ観測結果なら作業中Issue、独立した結果なら別Issueへ、run、revision、症状、原因、過剰だった確認または処理、再発防止を記録する。同じrevision・前提条件のまま再実行せず、結果を変える修正または外部状態の変化をread-backしてから1回だけ再試行する。未解決または再発が24時間を超えた場合は通常進行として扱わず、blockerと経過をユーザーへ報告する。
 - PR本文とcommit messageでは`Refs #<number>`を使用する。`Fixes`、`Closes`、`Resolves`等のauto-close keywordを使用してはならず、PR mergeだけでIssueをcloseさせない。
 - closure reportには、Issue番号、要求とacceptance criteriaの対応、最新revisionのcheck evidence、関連PRの状態、open sub-issue 0件、dependency解消、未解決finding、残作業、branch/worktree cleanup、推奨close reason（`completed`または`not planned`）を含める。
 - Issueの最終closeとreopenはユーザー本人だけが行う。Codexは明示依頼を受けてもIssueのcloseまたはreopen APIを実行せず、`status:review`とclosure reportを整えてユーザー判断を待つ。

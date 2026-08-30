@@ -86,6 +86,9 @@
   acceptanceへ追加しない。分類欠落、期待外のjob結果、失敗・未完了・古い証拠では明示的に失敗してmergeを許可しない。
   reusableなpre-merge品質workflowはread-onlyとし、`contents: write`を持つpost-merge Release workflowを同じ呼出しgraphへ
   含めない。
+- `pull_request_target`はPR headではなくtrusted base上のworkflowを実行するため、workflow revisionの更新は旧mainから新mainへ
+  到達できる有限な移行経路を持たなければならない。`feat/next`向けPRの成功をmain向けDAGの証拠へ読み替えない。移行用互換処理は
+  観測済みの旧main状態から新revisionを導入する1回だけに限定し、新main導入後に削除する。通常のowner選択・製品評価へ移行確認を追加しない。
 - バイナリ影響ありPRだけ、品質確認を開始する前にPR branch上のversion 3ファイルをexact next patchへ自動更新する。
   H0で確定したowner/CodeQL選択をH1へそのまま渡し、自動生成した3ファイルを再分類してownerを増やさない。
   H1のversion commitを含むtreeを選択ownerが確認し、mergeによって採番を確定する。採番で生じる`synchronize` runはPR単位の

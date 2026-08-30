@@ -40,6 +40,8 @@
 
 13. Codex code reviewは変更が確定したPR最新headへ`@codex review`を1回だけ投稿して起動する。新commit後は旧headのreviewを根拠にせず、non-outdatedかつ未解決のP0/P1がある間はready/releaseをHOLDする。Codex用の独自API key workflowやrequired statusを追加せず、CodeQL、required acceptance、必要な承認の代替にしない。
 
+14. `pull_request_target` workflowを変更する場合は、旧mainが実際に実行する経路、新main導入後の経路、check/ref/PR反映遅延を有限なlocal fixtureで先に確認し、同じrevision・外部前提のまま実PRを再実行しない。`feat/next`向け成功だけでmain向けworkflowをPASSにせず、移行互換は新main導入後に削除する。この移行fixtureを通常のowner品質DAGへ追加しない。
+
 ## 回帰発生時
 
 回帰を検出した時点で、前回のPASS証拠を現行成果物の証拠として再利用しない。影響する観測結果だけを再検証し、無関係な検査や文書hash更新を連鎖させない。過去DB・履歴を削除して見かけ上直すことは禁止する。

@@ -4,7 +4,9 @@
 from __future__ import annotations
 
 import argparse
+import json
 import re
+import sys
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 
@@ -17,6 +19,12 @@ CODEQL_WORKFLOW = ROOT / ".github" / "workflows" / "codeql.yml"
 FEAT_WORKFLOW = ROOT / ".github" / "workflows" / "feat-integration.yml"
 SELECTIVE_WORKFLOW = ROOT / ".github" / "workflows" / "selective-quality.yml"
 LINUX_UI_WORKFLOW = ROOT / ".github" / "workflows" / "linux-ui-quality.yml"
+
+# Transition-only compatibility for the old main workflow. Remove this mode
+# after main contains the new version-prepare workflow that no longer calls it.
+BOOTSTRAP_RULESET_ID = 21746295
+BOOTSTRAP_RULESET_SOURCE = "salty919/codex_info_v2"
+
 
 class WorkflowError(ValueError):
     """Raised when a workflow contract is absent or ambiguous."""
@@ -185,20 +193,37 @@ def validate_sources(
     _count(version, "scripts/ci_change_scope.py", 1, errors)
     _count(version, "scripts/final_head_check_reporter.py register", 1, errors)
     _count(version, "scripts/final_head_check_reporter.py finalize", 1, errors)
+    _count(version, "scripts/final_head_check_reporter.py publish-version", 1, errors)
     _count(version, "      checks: write\n", 3, errors)
-    _count(version, '"repos/$REPOSITORY/check-runs"', 1, errors)
+    _count(version, '"repos/$REPOSITORY/check-runs"', 0, errors)
     _count(
         version,
-        'Required status check \"feat-acceptance\" is expected.',
-        1,
+        'Required status check "feat-acceptance" is expected.',
+        0,
         errors,
     )
     _count(
         version,
         '{name:"feat-acceptance",head_sha:$head_sha,status:"completed",',
+        0,
+        errors,
+    )
+    _count(
+        version, "          ref: ${{ github.event.pull_request.base.sha }}\n", 3, errors
+    )
+    _count(
+        version,
+        '"repos/$REPOSITORY/pulls/$PR_NUMBER" > "$scope_root/before.json"\n',
         1,
         errors,
     )
+    _count(
+        version,
+        '"repos/$REPOSITORY/pulls/$PR_NUMBER" > "$scope_root/after.json"\n',
+        1,
+        errors,
+    )
+    _count(version, '[[ "$before_identity" == "$after_identity" ]]', 1, errors)
     _count(version, "      actions: write\n", 0, errors)
     _count(version, "      contents: write\n", 1, errors)
     _count(version, "      premerge: true\n", 1, errors)
@@ -386,6 +411,47 @@ def _replace_job_fragment(
     return source.replace(job, mutated_job, 1)
 
 
+def validate_bootstrap_applied_rules_json(raw: str) -> bool:
+    def unique_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+        result: dict[str, object] = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError("duplicate JSON key")
+            result[key] = value
+        return result
+
+    def reject_float(_value: str) -> object:
+        raise ValueError("floating-point JSON number")
+
+    try:
+        payload = json.loads(
+            raw, object_pairs_hook=unique_object, parse_float=reject_float
+        )
+    except (json.JSONDecodeError, TypeError, UnicodeError, ValueError):
+        return False
+    return type(payload) is list and payload == _bootstrap_rule_fixture()
+
+
+def _bootstrap_rule_fixture() -> list[dict[str, object]]:
+    return [
+        {
+            "type": "code_scanning",
+            "parameters": {
+                "code_scanning_tools": [
+                    {
+                        "tool": "CodeQL",
+                        "security_alerts_threshold": "high_or_higher",
+                        "alerts_threshold": "errors",
+                    }
+                ]
+            },
+            "ruleset_source_type": "Repository",
+            "ruleset_source": BOOTSTRAP_RULESET_SOURCE,
+            "ruleset_id": BOOTSTRAP_RULESET_ID,
+        }
+    ]
+
+
 def _static_self_test() -> int:
     sources = [
         VERSION_WORKFLOW.read_text(encoding="utf-8"),
@@ -411,10 +477,11 @@ def _static_self_test() -> int:
             "uses: ./.github/workflows/selective-quality.yml",
             "uses: ./other-selective.yml",
         ),
+        (0, "scripts/final_head_check_reporter.py publish-version", "true"),
         (
             0,
-            '{name:"feat-acceptance",head_sha:$head_sha,status:"completed",',
-            '{name:"acceptance",head_sha:$head_sha,status:"completed",',
+            "          ref: ${{ github.event.pull_request.base.sha }}\n",
+            "          ref: refs/heads/main\n",
         ),
         (0, "      checks: write\n", "      checks: read\n"),
         (0, "uses: ./.github/workflows/windows-client.yml", "uses: ./other.yml"),
@@ -481,8 +548,16 @@ def _static_self_test() -> int:
 
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--self-test", action="store_true", required=True)
-    parser.parse_args(argv)
+    modes = parser.add_mutually_exclusive_group(required=True)
+    modes.add_argument("--self-test", action="store_true")
+    modes.add_argument("--validate-live-applied-rules", action="store_true")
+    arguments = parser.parse_args(argv)
+    if arguments.validate_live_applied_rules:
+        if not validate_bootstrap_applied_rules_json(sys.stdin.read()):
+            print("workflow-quality-gate: FAIL live-applied-rules", file=sys.stderr)
+            return 1
+        print("workflow-quality-gate: PASS live-applied-rules")
+        return 0
     static_cases = _static_self_test()
     print(f"workflow-quality-gate: PASS static_cases={static_cases}")
     return 0
