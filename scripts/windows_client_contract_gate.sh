@@ -325,91 +325,34 @@ manifest_write_line="$(rg -n -m2 --fixed-strings '[System.IO.File]::WriteAllText
     fail 'UI quality marker and manifest writer ordering markers are incomplete'
 (( quality_lines_line < quality_write_line && quality_write_line < hash_lines_line && hash_lines_line < manifest_write_line )) ||
     fail 'UI quality lines must be written before SHA256SUMS is calculated and written'
-workflow_contract_scope="$(
-    awk '
-        $0 == "  windows-quality:" {
-            in_windows_quality = 1
-            next
-        }
-        in_windows_quality && $0 ~ /^  [[:alnum:]_-]+:/ {
-            exit
-        }
-        in_windows_quality &&
-            $0 == "      - uses: actions/checkout@v4" {
-            checkout_count++
-            checkout_line = NR
-        }
-        in_windows_quality &&
-            $0 == "      - name: Audit live applied merge rules" {
-            audit_count++
-            audit_line = NR
-        }
-        in_windows_quality &&
-            $0 == "      - name: Write Windows quality evidence" {
-            write_count++
-            write_line = NR
-        }
-        in_windows_quality &&
-            $0 == "      - name: Upload Windows quality evidence" {
-            upload_count++
-            upload_line = NR
-        }
-        in_windows_quality && index($0, "apt-get") {
-            apt_count++
-        }
-        in_windows_quality && index($0, "actions/setup-dotnet@") {
-            dotnet_setup_count++
-        }
-        in_windows_quality && index($0, "scripts/windows_client_contract_gate.sh") {
-            contract_call_count++
-        }
-        in_windows_quality && index($0, "WINDOWS_CONTRACT_EVIDENCE_DIR") {
-            evidence_env_count++
-        }
-        END {
-            printf "%d %d %d %d %d %d %d %d %d %d %d %d\n",
-                checkout_count + 0,
-                audit_count + 0,
-                write_count + 0,
-                upload_count + 0,
-                checkout_line + 0,
-                audit_line + 0,
-                write_line + 0,
-                upload_line + 0,
-                apt_count + 0,
-                dotnet_setup_count + 0,
-                contract_call_count + 0,
-                evidence_env_count + 0
-        }
-    ' .github/workflows/windows-client.yml
-)"
-read -r checkout_count audit_count write_count upload_count \
-    checkout_line audit_line write_line upload_line apt_count dotnet_setup_count \
-    contract_call_count evidence_env_count <<<"$workflow_contract_scope"
-[[ "$checkout_count" -eq 1 && "$audit_count" -eq 1 &&
-    "$write_count" -eq 1 && "$upload_count" -eq 1 ]] ||
-    fail "Windows PR quality job must have one checkout, live audit, provenance, and upload step"
-[[ "$checkout_line" -lt "$audit_line" && "$audit_line" -lt "$write_line" &&
-    "$write_line" -lt "$upload_line" ]] ||
-    fail "Windows live audit and provenance steps are out of order"
-[[ "$apt_count" -eq 0 && "$dotnet_setup_count" -eq 0 &&
-    "$contract_call_count" -eq 0 && "$evidence_env_count" -eq 0 ]] ||
-    fail "Windows PR quality job must not run local contract setup, tests, or evidence export"
-require_text .github/workflows/windows-client.yml 'source-sha: $source_sha'
-require_text .github/workflows/windows-client.yml 'tree-sha: $tree_sha'
-require_text .github/workflows/windows-client.yml 'quality: merge-policy'
-require_text .github/workflows/windows-client.yml 'live-applied-rules: PASS'
-require_text .github/workflows/windows-client.yml 'merge-policy: PASS'
-if rg -q --fixed-strings 'windows-contract: PASS' .github/workflows/windows-client.yml ||
-   rg -q --fixed-strings 'windows-tests: PASS' .github/workflows/windows-client.yml ||
-   rg -q --fixed-strings 'windows-quality: PASS' .github/workflows/windows-client.yml; then
-    fail 'Windows merge-policy evidence retains obsolete test or Windows-quality markers'
-fi
-require_text .github/workflows/windows-client.yml 'bash scripts/final_acceptance_gate.sh artifacts/windows-ui-e2e'
+require_text .github/workflows/windows-client.yml "inputs.selective_mode == true && contains(fromJSON(inputs.selection_json).owners, 'WINDOWS')"
+require_text .github/workflows/windows-client.yml 'windows-impact: $WINDOWS_IMPACT'
+for forbidden_workflow_marker in \
+    '  native-quality:' \
+    '  codeql-analysis:' \
+    '  windows-quality:' \
+    'Audit live applied merge rules' \
+    'validate-live-applied-rules' \
+    'uses: ./.github/workflows/rust.yml' \
+    'uses: ./.github/workflows/codeql.yml'; do
+    if rg -q --fixed-strings -- "$forbidden_workflow_marker" .github/workflows/windows-client.yml; then
+        fail "Windows reusable workflow retains an unrelated quality owner: $forbidden_workflow_marker"
+    fi
+done
+require_text .github/workflows/version-prepare.yml 'uses: ./.github/workflows/selective-quality.yml'
+require_text .github/workflows/version-prepare.yml 'selection_json: ${{ needs.prepare.outputs.selection_json }}'
+require_text .github/workflows/selective-quality.yml 'uses: ./.github/workflows/windows-client.yml'
+require_text .github/workflows/selective-quality.yml 'selective_mode: true'
+require_text .github/workflows/windows-client.yml 'bash scripts/final_acceptance_gate.sh "$WINDOWS_UI_EVIDENCE"'
+require_text .github/workflows/windows-client.yml 'WINDOWS_UI_EVIDENCE: ${{ runner.temp }}/windows-ui-e2e'
+require_text .github/workflows/windows-client.yml 'CANDIDATE: ${{ runner.temp }}/release-candidate'
 require_text .github/workflows/windows-client.yml '-SourceSha $env:SOURCE_SHA'
 require_text .github/workflows/windows-client.yml 'ref: ${{ inputs.head_sha }}'
 require_file .github/workflows/release.yml
 require_text .github/workflows/release.yml 'commits/$PR_HEAD_SHA/check-runs?check_name=acceptance'
+require_text .github/workflows/release.yml 'name: acceptance-verdict'
+require_text .github/workflows/release.yml 'final_head_check_reporter.py verify-verdict'
+require_text .github/workflows/release.yml "steps.verdict.outputs.windows_impact == 'true'"
 require_file scripts/final_head_check_reporter.py
 require_file scripts/test_final_head_check_reporter.py
 require_file scripts/release_quality_run_resolver.py
@@ -427,11 +370,6 @@ require_text scripts/final_acceptance_gate.sh 'grep -F --'
 require_file scripts/final_acceptance_gate_test.sh
 require_text scripts/final_acceptance_gate_test.sh 'final-acceptance-gate-test: PASS cases=$cases'
 require_text scripts/final_acceptance_gate_test.sh 'isolated acceptance PATH unexpectedly contains rg'
-require_text scripts/quality_artifact_gate.sh 'release-build: PASS'
-require_text scripts/quality_artifact_gate.sh 'cli-contract-e2e: PASS'
-require_text scripts/quality_artifact_gate.sh 'quality: merge-policy'
-require_text scripts/quality_artifact_gate.sh 'live-applied-rules: PASS'
-require_text scripts/quality_artifact_gate.sh 'merge-policy: PASS'
 require_text .github/workflows/rust.yml 'dtolnay/rust-toolchain@stable'
 require_text .github/workflows/rust.yml 'x11-apps'
 require_text .github/workflows/rust.yml 'cd artifacts/native-quality'
@@ -447,7 +385,7 @@ done
 if rg -q --fixed-strings -- 'sha256sum artifacts/native-quality/native-quality.txt' .github/workflows/rust.yml; then
     fail 'native quality manifest must use bundle-relative paths'
 fi
-final_gate_line="$(rg -n 'bash scripts/final_acceptance_gate.sh artifacts/windows-ui-e2e' .github/workflows/windows-client.yml | cut -d: -f1 | head -n 1)"
+final_gate_line="$(rg -n 'bash scripts/final_acceptance_gate.sh \"\$WINDOWS_UI_EVIDENCE\"' .github/workflows/windows-client.yml | cut -d: -f1 | head -n 1)"
 [[ -n "$final_gate_line" ]] || fail 'final acceptance gate invocation is missing'
 require_file scripts/pre_pr_gate.sh
 pre_pr_regression_calls="$(count_live_shell_invocations scripts/pre_pr_gate.sh 'bash scripts/regression_guard.sh')"

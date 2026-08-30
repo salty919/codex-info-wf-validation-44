@@ -71,45 +71,46 @@
   workflow・CI検査・test・文書・repository ruleだけの変更はバイナリ影響なしとする。分類はこの二つだけとし、rename/copyは
   変更前後pathを両方判定する。PR/file APIのidentity、changed-files件数、全page、重複・schema検証に失敗した処理は
   分類結果を返さず、versionまたはRelease mutationを開始しない。
-- バイナリ影響ありPRの作成前は単一のローカル入口からnative deterministic test、data protection契約、Windows unit/contract testを
-  各1回だけ実行する。必須Rust testは1回の全target実行結果から名前と成功を確認し、個別に再実行しない。
-  PRではrelease artifactに必要なnative buildとCLI/recorder実行、mainの実適用merge rule、実Windows installer/UIを
-  各1回だけ確認し、ローカルと同じtest/gateを別job、別workflow、acceptance、Releaseで再実行しない。バイナリ影響なしPRは
-  これらの製品build/test/artifact producerをすべてskipし、分類とrequired check集約だけを短時間で実行する。
-  `main`のtrusted `pull_request_target`を唯一のpre-merge authorityとし、別workflowの`workflow_dispatch`へ品質判定を
-  転送しない。同じDAGが、version準備後のimmutableな最終head SHAへGitHub Actions App（integration id `15368`）として
-  `version-prepared`と`acceptance`のexact 2 required check-runを作成または更新する。check-runは
-  `repository / PR番号 / 最終head SHA / authority run id`へ結び、同じ名前・App・headの0件は作成、1件は再利用、2件以上は
-  曖昧として停止する。単一のrequired acceptanceは常に最終head上に生成する。バイナリ影響ありではversion準備、先行jobの成功、検証対象tree、source SHA、
-  各artifact証拠の対応を検査し、バイナリ影響なしではversion未変更、全artifact producerが`skipped`、artifact 0件を検査する。
-  分類欠落、期待外のjob結果、失敗・未完了・古い証拠では明示的に失敗してmergeを許可しない。
+- `main`向けPRはsame-repositoryであればhead branch名を制限しない。trusted `pull_request_target`が、version追加前の
+  利用者差分（H0）の全pathをDOCS・GOVERNANCE・LINUX_BACKEND・LINUX_UI・WINDOWSの有限ownerへ一度だけ分類する。
+  選択ownerだけをimmutableな最終head（H1）で各1回実行し、非選択ownerは実行しない。CodeQLも同じ選択から
+  actions・python・rust・csharpの必要言語だけを一度実行する。選択ownerのmissing/failure/cancel/skip、非選択ownerの実行、
+  CodeQL言語の余分・欠落はすべて失敗とする。Windowsだけの変更はWINDOWSとcsharpだけ、governanceだけの変更は
+  GOVERNANCEとactions/pythonだけを実行する。branch名、branchの作成元、`feat/next`との包含関係は品質選択へ使用しない。
+- `main`のtrusted `pull_request_target`を唯一のpre-merge authorityとし、別workflowの`workflow_dispatch`へ品質判定を
+  転送しない。同じDAGがH1へGitHub Actions App（integration id `15368`）として`version-prepared`と`acceptance`の
+  exact 2 required check-runを作成または更新する。check-runは`repository / PR番号 / H1 / authority run id`へ結び、
+  同じ名前・App・headの0件は作成、1件は再利用、2件以上は曖昧として停止する。acceptanceは選択結果と実job結果を集約し、
+  WINDOWS選択時だけ同じrunのinstaller/UI証拠を検証してrelease candidateを作る。Linuxだけのバイナリ変更ではWindows評価・
+  Windows candidateを生成しない。live repository ruleの再監査、選択済み製品testの再実行、branch名のallowlistを
+  acceptanceへ追加しない。分類欠落、期待外のjob結果、失敗・未完了・古い証拠では明示的に失敗してmergeを許可しない。
   reusableなpre-merge品質workflowはread-onlyとし、`contents: write`を持つpost-merge Release workflowを同じ呼出しgraphへ
-  含めない。Release workflowは`closed` eventだけを所有し、pre-mergeのbuild・test・CodeQLを再実行しない。
-- バイナリ影響ありPRだけ、品質確認を開始する前にPR branch上のversion 3ファイルをexact next patchへ自動更新する。その
-  version commitを含む最新mainとの合成treeを品質確認し、mergeによって採番を確定する。採番commit自身では
-  元のauthority runがlive PR identityを再確認して最終headの品質jobを一度だけ開始する。採番で生じる`synchronize` runはPR単位の
-  concurrencyで直列化し、同じ最終headの成功済み`acceptance`を再利用して品質ownerを重複実行しない。失敗・cancel後の再試行は
-  同じcheck-runを更新し、別のrequired contextや別dispatchを増やさない。バイナリ影響なしPRはversion 3ファイルを
-  変更せず、最終headの`version-prepared` required check-runを分類だけで成功完了させる。
-- バイナリ影響ありのmerge後だけ、eventとPR APIの全identity（PR番号、head/base repository・ref・SHA、merge SHA）および
+  含めない。
+- バイナリ影響ありPRだけ、品質確認を開始する前にPR branch上のversion 3ファイルをexact next patchへ自動更新する。
+  H0で確定したowner/CodeQL選択をH1へそのまま渡し、自動生成した3ファイルを再分類してownerを増やさない。
+  H1のversion commitを含むtreeを選択ownerが確認し、mergeによって採番を確定する。採番で生じる`synchronize` runはPR単位の
+  concurrencyで直列化し、同じH1の成功済み`acceptance`を再利用してownerを重複実行しない。バイナリ影響なしPRはversion 3ファイルを
+  変更せず、最終headの`version-prepared` required check-runを成功完了させる。
+- merge後はeventとPR APIの全identity（PR番号、head/base repository・ref・SHA、merge SHA）および
   `merged_at`の一致を確認する。最終headのGitHub Actions Appによるexact 1件の成功`acceptance` check-runから、外部IDに
   結び付けられたPR番号・head SHA・authority run idを解決する。そのrunがtrusted
   `.github/workflows/version-prepare.yml`の`pull_request_target`で、main/base SHA上にあり、`completed`/`success`かつ
   `created_at <= updated_at <= merged_at`である場合だけartifactを取得する。check-runまたはrunの候補zero・重複、
   identity・App・URL・時刻・paginationの不一致、malformed、post-merge runはartifact取得前にfail-closedとし、別の
   older successへfallbackしない。`pull_requests`はworkflow runのauthorityにせず、検証済みtreeとの
-  一致を確認し、quality test/buildを再実行せずmanifest生成とRelease公開を行う。同時mergeと公開は直列化する。
-  バイナリ影響なしのmerge後jobは分類だけで成功完了し、quality run解決、artifact download、binary build、manifest、tag、
-  GitHub Releaseを一切生成しない。
+  一致を確認し、受理済み`acceptance-verdict`からH0のWINDOWS選択を読む。WINDOWS選択時だけ候補を取得し、quality test/buildを
+  再実行せずmanifest生成とRelease公開を行う。同時mergeと公開は直列化する。WINDOWS非選択時はverdict確認後にcandidate、
+  binary build、manifest、tag、GitHub Releaseを生成しない。
 - PR由来のcheckout、script、workflow、artifactを、repository contents・checks・Releaseへのwrite権限を持つjobで実行しない。
   変更分類はPR/file APIの完全なidentityとpaginationをdefault branchまたはPRのtrusted baseにある分類器で判定する。
   自動採番はdefault branchのtrusted workflow/toolだけを実行し、PRのversion 3ファイルをdataとして検証した後、
   same-repository headへexact 1 commitを原子的に追加する。head/baseの競合、fork、不正version、対象外file mutationでは
-  書き込まない。post-merge jobはdefault branchのmainだけをcheckoutし、分類不成立またはeventのmerge SHAと不一致の場合は
+  書き込まない。post-merge jobはdefault branchのmainだけをcheckoutし、accepted verdict不成立またはeventのmerge SHAと不一致の場合は
   Release mutationを行わない。
-- バイナリ影響ありPRではCodeQLをmerge必須gateとし、critical/high findingをdismissやworkflow無効化で通過させない。
-  バイナリ影響なしPRとmerge後pushではCodeQL AnalyzeとAutobuildを実行せず、active code-scanning rulesetの設定は維持する。外部AI findingsが
-  provider側の未対応modelで継続失敗する場合は、そのAI機能だけをrepository単位で無効化できるが、バイナリ影響ありPRのCodeQL、
+- 選択ownerからCodeQL言語が導出されるPRではその言語だけをmerge必須gateとし、critical/high findingをdismissやworkflow無効化で
+  通過させない。CodeQL言語が選択されないPRとmerge後pushではCodeQL AnalyzeとAutobuildを実行せず、active code-scanning rulesetの
+  設定はworkflow内で再監査しない。外部AI findingsが
+  provider側の未対応modelで継続失敗する場合は、そのAI機能だけをrepository単位で無効化できるが、選択済みCodeQL、
   code-scanning alerts、required acceptanceは維持する。
 - Codex code reviewはPRの変更が確定した最新headに対して`@codex review`を1回だけ起動する補助レビューとする。
   古いheadの結果や未解決かつnon-outdatedのP0/P1をready判定へ流用せず、独自API key workflowを追加しない。

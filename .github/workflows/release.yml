@@ -31,49 +31,7 @@ jobs:
         with:
           fetch-depth: 0
           ref: refs/heads/main
-      - name: Classify merged pull request scope
-        id: scope
-        env:
-          GH_TOKEN: ${{ github.token }}
-          REPOSITORY: ${{ github.repository }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
-          BASE_REPOSITORY: ${{ github.event.pull_request.base.repo.full_name }}
-          HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name }}
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          [[ "$REPOSITORY" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ &&
-              "$BASE_REPOSITORY" == "$REPOSITORY" &&
-              "$HEAD_REPOSITORY" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ &&
-              "$PR_NUMBER" =~ ^[1-9][0-9]*$ &&
-              "$BASE_SHA" =~ ^[0-9a-fA-F]{40}$ &&
-              "$HEAD_SHA" =~ ^[0-9a-fA-F]{40}$ ]] || {
-            echo 'merged pull request scope identity is malformed' >&2
-            exit 1
-          }
-          scope_root="$RUNNER_TEMP/ci-change-scope"
-          mkdir -p "$scope_root"
-          gh api --method GET "repos/$REPOSITORY/pulls/$PR_NUMBER" > "$scope_root/pull-request.json"
-          gh api --method GET --paginate --slurp \
-            "repos/$REPOSITORY/pulls/$PR_NUMBER/files?per_page=100" > "$scope_root/files.json"
-          scope="$(python3 scripts/ci_change_scope.py \
-            --pull-request "$scope_root/pull-request.json" \
-            --files "$scope_root/files.json" \
-            --expected-repository "$REPOSITORY" \
-            --expected-head-repository "$HEAD_REPOSITORY" \
-            --expected-number "$PR_NUMBER" \
-            --expected-base-sha "$BASE_SHA" \
-            --expected-head-sha "$HEAD_SHA")"
-          case "$scope" in
-            binary-impact) binary_impact=true ;;
-            no-binary-impact) binary_impact=false ;;
-            *) echo 'change-scope classifier returned an invalid result' >&2; exit 1 ;;
-          esac
-          printf 'binary_impact=%s\n' "$binary_impact" >> "$GITHUB_OUTPUT"
       - name: Resolve accepted PR quality run
-        if: steps.scope.outputs.binary_impact == 'true'
         id: quality-run
         env:
           GH_TOKEN: ${{ github.token }}
@@ -111,8 +69,28 @@ jobs:
             exit 1
           }
           printf 'run-id=%s\n' "$resolved_run_id" >> "$GITHUB_OUTPUT"
+      - name: Download accepted final-head verdict
+        uses: actions/download-artifact@v4
+        with:
+          name: acceptance-verdict
+          run-id: ${{ steps.quality-run.outputs.run-id }}
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          path: artifacts/acceptance-verdict
+      - name: Verify original PR selection verdict
+        id: verdict
+        env:
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+          python3 scripts/final_head_check_reporter.py verify-verdict \
+            --pr-number "$PR_NUMBER" \
+            --head-sha "$PR_HEAD_SHA" \
+            --verdict-directory artifacts/acceptance-verdict \
+            --github-output "$GITHUB_OUTPUT"
       - name: Download accepted PR release candidate
-        if: steps.scope.outputs.binary_impact == 'true'
+        if: steps.verdict.outputs.windows_impact == 'true'
         uses: actions/download-artifact@v4
         with:
           name: release-candidate
@@ -121,7 +99,7 @@ jobs:
           repository: ${{ github.repository }}
           path: artifacts/release-candidate
       - name: Verify accepted source and artifact hashes
-        if: steps.scope.outputs.binary_impact == 'true'
+        if: steps.verdict.outputs.windows_impact == 'true'
         env:
           EXPECTED_MERGE_SHA: ${{ github.event.pull_request.merge_commit_sha }}
           EXPECTED_PR_NUMBER: ${{ github.event.pull_request.number }}
@@ -137,7 +115,7 @@ jobs:
           }
           bash scripts/release_candidate_gate.sh artifacts/release-candidate "$EXPECTED_MERGE_SHA"
       - name: Create deterministic update manifest
-        if: steps.scope.outputs.binary_impact == 'true'
+        if: steps.verdict.outputs.windows_impact == 'true'
         id: release-version
         shell: pwsh
         env:
@@ -151,7 +129,7 @@ jobs:
             -OutputPath ./artifacts/release-candidate/CodexInfo.WindowsClient.update.json `
             -Repository $env:REPOSITORY
       - name: Create GitHub Release and upload Windows assets
-        if: steps.scope.outputs.binary_impact == 'true'
+        if: steps.verdict.outputs.windows_impact == 'true'
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}

@@ -1,14 +1,11 @@
 #!/usr/bin/env python3
-"""Finite fail-closed contracts for the final-head Windows quality graph."""
+"""Finite static contracts for the selective main-PR quality graph."""
 
 from __future__ import annotations
 
 import argparse
-import copy
-import json
 import re
-import sys
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -20,16 +17,6 @@ CODEQL_WORKFLOW = ROOT / ".github" / "workflows" / "codeql.yml"
 FEAT_WORKFLOW = ROOT / ".github" / "workflows" / "feat-integration.yml"
 SELECTIVE_WORKFLOW = ROOT / ".github" / "workflows" / "selective-quality.yml"
 LINUX_UI_WORKFLOW = ROOT / ".github" / "workflows" / "linux-ui-quality.yml"
-
-EXPECTED_RULESET_ID = 21746295
-EXPECTED_RULE_SOURCE = "salty919/codex_info_v2"
-EXPECTED_CONTEXTS = frozenset({"acceptance", "version-prepared"})
-BINARY_IMPACT_JOB_IF = (
-    "inputs.selective_mode == false && inputs.premerge == true && "
-    "needs.version-prepared.outputs.binary_impact == 'true' && "
-    "needs.version-prepared.outputs.ready == 'true'"
-)
-
 
 class WorkflowError(ValueError):
     """Raised when a workflow contract is absent or ambiguous."""
@@ -89,22 +76,12 @@ PERMISSION_EDGE_SPECS: tuple[
         0,
         "quality",
         "windows-client.yml",
-        {
-            "contents": "read",
-            "pull-requests": "read",
-            "security-events": "write",
-        },
-    ),
-    (
-        1,
-        "native-quality",
-        "rust.yml",
         {"contents": "read"},
     ),
     (
-        1,
-        "codeql-analysis",
-        "codeql.yml",
+        0,
+        "selected-quality",
+        "selective-quality.yml",
         {"contents": "read", "security-events": "write"},
     ),
     (
@@ -133,11 +110,7 @@ PERMISSION_EDGE_SPECS: tuple[
         6,
         "windows-quality",
         "windows-client.yml",
-        {
-            "contents": "read",
-            "pull-requests": "read",
-            "security-events": "write",
-        },
+        {"contents": "read"},
     ),
     (
         6,
@@ -181,6 +154,13 @@ def validate_sources(
     errors: list[str] = []
     sources = (version, windows, release, rust, codeql, feat, selective, linux_ui)
     _validate_permission_edges(sources, errors)
+    for source, label in (
+        (version, "main version workflow"),
+        (windows, "Windows reusable workflow"),
+        (release, "release workflow"),
+    ):
+        if "feat/next" in source:
+            errors.append(f"{label} contains a forbidden PR head branch allowlist")
 
     version_trigger = _between(version, "on:\n", "permissions: {}\n")
     for marker in (
@@ -194,16 +174,25 @@ def validate_sources(
     for job in (
         "  prepare:\n",
         "  register-final-head-checks:\n",
+        "  selected-quality:\n",
         "  quality:\n",
         "  finalize-final-head-checks:\n",
     ):
         _count(version, job, 1, errors)
     _count(version, "  dispatch-quality:\n", 0, errors)
+    _count(version, "uses: ./.github/workflows/selective-quality.yml", 1, errors)
     _count(version, "uses: ./.github/workflows/windows-client.yml", 1, errors)
+    _count(version, "scripts/ci_change_scope.py", 1, errors)
     _count(version, "scripts/final_head_check_reporter.py register", 1, errors)
     _count(version, "scripts/final_head_check_reporter.py finalize", 1, errors)
     _count(version, "      checks: write\n", 3, errors)
     _count(version, '"repos/$REPOSITORY/check-runs"', 1, errors)
+    _count(
+        version,
+        'Required status check \"feat-acceptance\" is expected.',
+        1,
+        errors,
+    )
     _count(
         version,
         '{name:"feat-acceptance",head_sha:$head_sha,status:"completed",',
@@ -213,6 +202,12 @@ def validate_sources(
     _count(version, "      actions: write\n", 0, errors)
     _count(version, "      contents: write\n", 1, errors)
     _count(version, "      premerge: true\n", 1, errors)
+    _count(
+        version,
+        "      selection_json: ${{ needs.prepare.outputs.selection_json }}\n",
+        2,
+        errors,
+    )
     _count(
         version,
         "      head_sha: ${{ needs.prepare.outputs.final_head_sha }}\n",
@@ -227,6 +222,12 @@ def validate_sources(
     )
     for artifact in ("acceptance-verdict", "release-candidate"):
         _count(version, f"          name: {artifact}\n", 1, errors)
+    if not (
+        version.index("      - name: Classify pull request scope\n")
+        < version.index("      - name: Validate and prepare version data\n")
+        < version.index("  selected-quality:\n")
+    ):
+        errors.append("H0 classification must precede version preparation and H1 quality")
 
     windows_trigger = _between(windows, "on:\n", "permissions:\n")
     _count(windows_trigger, "  workflow_call:\n", 1, errors)
@@ -248,7 +249,6 @@ def validate_sources(
         "selection_json",
     ):
         _count(windows_trigger, f"      {input_name}:\n", 1, errors)
-    _count(windows, f"    if: {BINARY_IMPACT_JOB_IF}\n", 3, errors)
     _count(
         windows,
         "    if: inputs.premerge == true && inputs.selective_mode == false\n",
@@ -263,22 +263,28 @@ def validate_sources(
     )
     _count(
         windows,
-        "    if: always() && inputs.premerge == true && ((inputs.selective_mode == false && needs.version-prepared.outputs.binary_impact == 'true' && needs.version-prepared.outputs.ready == 'true') || (inputs.selective_mode == true && contains(fromJSON(inputs.selection_json).owners, 'WINDOWS')))\n",
+        "    if: inputs.premerge == true && inputs.selective_mode == true && contains(fromJSON(inputs.selection_json).owners, 'WINDOWS')\n",
         1,
         errors,
     )
-    _count(windows, "          ref: ${{ inputs.head_sha }}\n", 4, errors)
-    _count(windows, "      source_sha: ${{ inputs.head_sha }}\n", 2, errors)
-    _count(windows, "      head_ref: ${{ inputs.head_ref }}\n", 1, errors)
+    _count(windows, "          ref: ${{ inputs.head_sha }}\n", 3, errors)
+    _count(windows, "      source_sha: ${{ inputs.head_sha }}\n", 0, errors)
     _count(
         windows,
-        "needs: [version-prepared, native-quality, codeql-analysis, windows-quality, ui-quality]",
+        "    needs: [version-prepared]\n",
         1,
         errors,
     )
     _count(windows, "          name: acceptance-verdict\n", 1, errors)
     _count(windows, "          name: release-candidate\n", 1, errors)
     _count(windows, "codex-info-final-head-v1", 1, errors)
+    _count(windows, "          windows-impact: $WINDOWS_IMPACT\n", 1, errors)
+    for forbidden_job in ("native-quality", "codeql-analysis", "windows-quality"):
+        _count(windows, f"  {forbidden_job}:\n", 0, errors)
+    _count(windows, "Audit live applied merge rules", 0, errors)
+    _count(windows, "validate-live-applied-rules", 0, errors)
+    _count(windows, "scripts/ci_change_scope.py", 0, errors)
+    _count(selective, "scripts/ci_change_scope.py", 0, errors)
     _count(windows, "event=workflow_dispatch", 0, errors)
     _count(windows, "  release:\n", 0, errors)
     _count(windows, "contents: write\n", 0, errors)
@@ -300,9 +306,13 @@ def validate_sources(
     _count(release, "    if: github.event.pull_request.merged == true\n", 1, errors)
     _count(release, "      contents: write\n", 1, errors)
     _count(release, "          ref: refs/heads/main\n", 1, errors)
+    _count(release, "          name: acceptance-verdict\n", 1, errors)
     _count(release, "          name: release-candidate\n", 1, errors)
     _count(release, "commits/$PR_HEAD_SHA/check-runs?check_name=acceptance", 1, errors)
     _count(release, '--workflow-run "$workflow_run_json"', 1, errors)
+    _count(release, "final_head_check_reporter.py verify-verdict", 1, errors)
+    _count(release, "steps.verdict.outputs.windows_impact == 'true'", 4, errors)
+    _count(release, "scripts/ci_change_scope.py", 0, errors)
     release_job = release[release.index("  release:\n") :]
     for forbidden in (
         "cargo build",
@@ -340,13 +350,6 @@ def validate_sources(
     quality_sources = windows + rust
     for owner, expected in owner_counts.items():
         _count(quality_sources, owner, expected, errors)
-    for outcome in ("success", "skipped"):
-        _count(
-            windows,
-            f'                [[ "$result" == {outcome} ]] || {{\n',
-            1,
-            errors,
-        )
     if release.index("Resolve accepted PR quality run") > release.index(
         "Download accepted PR release candidate"
     ):
@@ -368,132 +371,6 @@ def validate_workflows() -> list[str]:
         )
     except (OSError, UnicodeError, WorkflowError, ValueError) as error:
         return [str(error)]
-
-
-def _mapping(value: object) -> Mapping[str, object] | None:
-    return value if isinstance(value, Mapping) else None
-
-
-def _valid_rule_metadata(rule: Mapping[str, object]) -> bool:
-    return (
-        set(rule)
-        == {"type", "parameters", "ruleset_source_type", "ruleset_source", "ruleset_id"}
-        and type(rule.get("ruleset_id")) is int
-        and rule.get("ruleset_id") == EXPECTED_RULESET_ID
-        and rule.get("ruleset_source_type") == "Repository"
-        and rule.get("ruleset_source") == EXPECTED_RULE_SOURCE
-    )
-
-
-def _valid_applied_rules(payload: object) -> bool:
-    if type(payload) is not list or len(payload) != 2:
-        return False
-    rules = [_mapping(item) for item in payload]
-    if any(rule is None for rule in rules):
-        return False
-    typed_rules = {rule.get("type"): rule for rule in rules if rule is not None}
-    if set(typed_rules) != {"required_status_checks", "code_scanning"}:
-        return False
-    status = typed_rules["required_status_checks"]
-    code_scanning = typed_rules["code_scanning"]
-    if not _valid_rule_metadata(status) or not _valid_rule_metadata(code_scanning):
-        return False
-    parameters = _mapping(status.get("parameters"))
-    if parameters is None or set(parameters) != {
-        "required_status_checks",
-        "strict_required_status_checks_policy",
-        "do_not_enforce_on_create",
-    }:
-        return False
-    checks = parameters.get("required_status_checks")
-    if (
-        parameters.get("strict_required_status_checks_policy") is not True
-        or parameters.get("do_not_enforce_on_create") is not False
-        or type(checks) is not list
-        or len(checks) != 2
-    ):
-        return False
-    normalized = []
-    for check in checks:
-        entry = _mapping(check)
-        if entry is None or set(entry) != {"context", "integration_id"}:
-            return False
-        if (
-            type(entry.get("context")) is not str
-            or entry.get("integration_id") != 15368
-        ):
-            return False
-        normalized.append(entry["context"])
-    if len(set(normalized)) != 2 or set(normalized) != EXPECTED_CONTEXTS:
-        return False
-    code_parameters = _mapping(code_scanning.get("parameters"))
-    if code_parameters is None or set(code_parameters) != {"code_scanning_tools"}:
-        return False
-    tools = code_parameters.get("code_scanning_tools")
-    if type(tools) is not list or len(tools) != 1:
-        return False
-    codeql = _mapping(tools[0])
-    return (
-        codeql is not None
-        and set(codeql) == {"tool", "alerts_threshold", "security_alerts_threshold"}
-        and codeql.get("tool") == "CodeQL"
-        and codeql.get("alerts_threshold") == "errors"
-        and codeql.get("security_alerts_threshold") == "high_or_higher"
-    )
-
-
-def validate_live_applied_rules_json(raw: str) -> bool:
-    def unique_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
-        result: dict[str, object] = {}
-        for key, value in pairs:
-            if key in result:
-                raise ValueError("duplicate JSON key")
-            result[key] = value
-        return result
-
-    try:
-        payload = json.loads(raw, object_pairs_hook=unique_object)
-    except (json.JSONDecodeError, TypeError, UnicodeError, ValueError):
-        return False
-    return _valid_applied_rules(payload)
-
-
-def _valid_rules_fixture() -> list[dict[str, object]]:
-    metadata = {
-        "ruleset_source_type": "Repository",
-        "ruleset_source": EXPECTED_RULE_SOURCE,
-        "ruleset_id": EXPECTED_RULESET_ID,
-    }
-    return [
-        {
-            "type": "required_status_checks",
-            "parameters": {
-                "required_status_checks": [
-                    {"context": "acceptance", "integration_id": 15368},
-                    {"context": "version-prepared", "integration_id": 15368},
-                ],
-                "strict_required_status_checks_policy": True,
-                "do_not_enforce_on_create": False,
-            },
-            **metadata,
-        },
-        {
-            "type": "code_scanning",
-            "parameters": {
-                "code_scanning_tools": [
-                    {
-                        "tool": "CodeQL",
-                        "alerts_threshold": "errors",
-                        "security_alerts_threshold": "high_or_higher",
-                    }
-                ]
-            },
-            **metadata,
-        },
-    ]
-
-
-Mutation = Callable[[list[str]], None]
 
 
 def _replace_job_fragment(
@@ -531,6 +408,11 @@ def _static_self_test() -> int:
         (0, "scripts/final_head_check_reporter.py register", "true"),
         (
             0,
+            "uses: ./.github/workflows/selective-quality.yml",
+            "uses: ./other-selective.yml",
+        ),
+        (
+            0,
             '{name:"feat-acceptance",head_sha:$head_sha,status:"completed",',
             '{name:"acceptance",head_sha:$head_sha,status:"completed",',
         ),
@@ -541,8 +423,8 @@ def _static_self_test() -> int:
         (1, "          ref: ${{ inputs.head_sha }}\n", "          ref: feat/next\n"),
         (
             1,
-            '                [[ "$result" == success ]] || {\n',
-            '                [[ "$result" == skipped ]] || {\n',
+            "    if: inputs.premerge == true && inputs.selective_mode == true",
+            "    if: always() && inputs.selective_mode == true",
         ),
         (
             1,
@@ -553,6 +435,7 @@ def _static_self_test() -> int:
         (2, "    types: [closed]\n", "    types: [opened]\n"),
         (2, "      contents: write\n", "      contents: read\n"),
         (2, "commits/$PR_HEAD_SHA/check-runs?check_name=acceptance", "actions/runs"),
+        (2, "steps.verdict.outputs.windows_impact == 'true'", "always()"),
         (3, "          ref: ${{ inputs.source_sha }}\n", "          ref: feat/next\n"),
         (4, "          sha: ${{ inputs.source_sha || github.sha }}\n", ""),
         (4, "  schedule:\n", "  workflow_dispatch:\n"),
@@ -596,54 +479,12 @@ def _static_self_test() -> int:
     return cases
 
 
-def _rules_self_test() -> int:
-    valid = _valid_rules_fixture()
-    cases: list[object] = [valid]
-    for mutation in (
-        lambda value: value.pop(),
-        lambda value: value[0].update(ruleset_id=1),
-        lambda value: value[0]["parameters"].update(
-            strict_required_status_checks_policy=False
-        ),
-        lambda value: value[0]["parameters"]["required_status_checks"][0].update(
-            integration_id=1
-        ),
-        lambda value: value[1]["parameters"]["code_scanning_tools"][0].update(
-            alerts_threshold="none"
-        ),
-    ):
-        candidate = copy.deepcopy(valid)
-        mutation(candidate)
-        cases.append(candidate)
-    if not validate_live_applied_rules_json(json.dumps(cases[0])):
-        raise AssertionError("valid rules fixture was rejected")
-    for candidate in cases[1:]:
-        if validate_live_applied_rules_json(json.dumps(candidate)):
-            raise AssertionError("invalid rules fixture was accepted")
-    for malformed in ("", "{}", "null", '{"a":1,"a":2}'):
-        if validate_live_applied_rules_json(malformed):
-            raise AssertionError("malformed rules JSON was accepted")
-    return len(cases) + 4
-
-
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    modes = parser.add_mutually_exclusive_group(required=True)
-    modes.add_argument("--self-test", action="store_true")
-    modes.add_argument("--validate-live-applied-rules", action="store_true")
-    args = parser.parse_args(argv)
-    if args.validate_live_applied_rules:
-        if not validate_live_applied_rules_json(sys.stdin.read()):
-            print("workflow-quality-gate: FAIL live-applied-rules", file=sys.stderr)
-            return 1
-        print("workflow-quality-gate: PASS live-applied-rules")
-        return 0
+    parser.add_argument("--self-test", action="store_true", required=True)
+    parser.parse_args(argv)
     static_cases = _static_self_test()
-    rules_cases = _rules_self_test()
-    print(
-        f"workflow-quality-gate: PASS static_cases={static_cases} "
-        f"rules_cases={rules_cases}"
-    )
+    print(f"workflow-quality-gate: PASS static_cases={static_cases}")
     return 0
 
 
