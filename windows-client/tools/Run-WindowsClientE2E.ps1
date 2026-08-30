@@ -111,20 +111,13 @@ Add-Type -AssemblyName UIAutomationClient
 Add-Type -AssemblyName UIAutomationTypes
 Add-Type -AssemblyName System.Drawing
 
-$gdiPlusAssembly = [System.Reflection.Assembly]::Load('System.Private.Windows.GdiPlus')
-Assert-E2E ($null -ne $gdiPlusAssembly -and -not [string]::IsNullOrWhiteSpace($gdiPlusAssembly.Location)) 'System.Private.Windows.GdiPlus runtime assembly could not be resolved.'
-$windowsCoreAssembly = [System.Reflection.Assembly]::Load('System.Private.Windows.Core')
-Assert-E2E ($null -ne $windowsCoreAssembly -and -not [string]::IsNullOrWhiteSpace($windowsCoreAssembly.Location)) 'System.Private.Windows.Core runtime assembly could not be resolved.'
+$trustedPlatformAssemblies = [string][System.AppContext]::GetData('TRUSTED_PLATFORM_ASSEMBLIES')
+$compilerReferences = @($trustedPlatformAssemblies -split [IO.Path]::PathSeparator) |
+    Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -Unique
+Assert-E2E ($compilerReferences.Count -gt 0) 'Trusted platform assemblies could not be resolved.'
+Assert-E2E ($compilerReferences -contains [System.Drawing.Bitmap].Assembly.Location -and $compilerReferences -contains [System.Drawing.Color].Assembly.Location) 'System.Drawing runtime assemblies are missing from the trusted platform set.'
 
-$drawingReferences = @(
-    [System.Drawing.Bitmap].Assembly.Location
-    [System.Drawing.Color].Assembly.Location
-    $gdiPlusAssembly.Location
-    $windowsCoreAssembly.Location
-) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -Unique
-Assert-E2E ($drawingReferences.Count -gt 0) 'System.Drawing runtime assemblies could not be resolved.'
-
-Add-Type -ReferencedAssemblies $drawingReferences -TypeDefinition @'
+Add-Type -ReferencedAssemblies $compilerReferences -TypeDefinition @'
 using System;
 using System.Drawing;
 using System.Collections.Generic;

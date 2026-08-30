@@ -592,14 +592,13 @@ require_text windows-client/tools/Run-WindowsClientE2E.ps1 'Assert-E2EQuotaGauge
 require_text windows-client/tools/Run-WindowsClientE2E.ps1 'Assert-E2EGraphHasModelData'
 require_text windows-client/tools/Run-WindowsClientE2E.ps1 'Assert-E2EGraphHasModelData $plot $graph.Handle $graphPast'
 require_text windows-client/tools/Run-WindowsClientE2E.ps1 'public static extern bool PrintWindow'
+require_text windows-client/tools/Run-WindowsClientE2E.ps1 "GetData('TRUSTED_PLATFORM_ASSEMBLIES')"
 require_text windows-client/tools/Run-WindowsClientE2E.ps1 '[System.Drawing.Bitmap].Assembly.Location'
 require_text windows-client/tools/Run-WindowsClientE2E.ps1 '[System.Drawing.Color].Assembly.Location'
-require_text windows-client/tools/Run-WindowsClientE2E.ps1 "[System.Reflection.Assembly]::Load('System.Private.Windows.GdiPlus')"
-require_text windows-client/tools/Run-WindowsClientE2E.ps1 "[System.Reflection.Assembly]::Load('System.Private.Windows.Core')"
 require_text windows-client/tools/Run-WindowsClientE2E.ps1 'Where-Object { -not [string]::IsNullOrWhiteSpace($_) }'
 require_text windows-client/tools/Run-WindowsClientE2E.ps1 'Select-Object -Unique'
-require_text windows-client/tools/Run-WindowsClientE2E.ps1 "Assert-E2E (\$drawingReferences.Count -gt 0) 'System.Drawing runtime assemblies could not be resolved.'"
-require_text windows-client/tools/Run-WindowsClientE2E.ps1 'Add-Type -ReferencedAssemblies $drawingReferences -TypeDefinition'
+require_text windows-client/tools/Run-WindowsClientE2E.ps1 "Assert-E2E (\$compilerReferences.Count -gt 0) 'Trusted platform assemblies could not be resolved.'"
+require_text windows-client/tools/Run-WindowsClientE2E.ps1 'Add-Type -ReferencedAssemblies $compilerReferences -TypeDefinition'
 if rg -q --fixed-strings 'Add-Type -ReferencedAssemblies System.Drawing -TypeDefinition' windows-client/tools/Run-WindowsClientE2E.ps1; then
     fail 'Windows E2E embedded C# must use the runtime assemblies that own Bitmap and Color'
 fi
