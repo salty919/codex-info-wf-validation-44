@@ -21,3 +21,4 @@ public static class ProductInfo
         }
     }
 }
+// Remote validation marker: exercises the Windows quality owner without changing behavior.
