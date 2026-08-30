@@ -13,7 +13,7 @@ elif [[ $# -gt 0 ]]; then
     fail "unknown option: $1"
 fi
 [[ -f "$ledger" ]] || fail "missing $ledger"
-rg -q --fixed-strings '| ID | 要求（観測可能な契約） | 境界・失敗動作 | 実装範囲 | 独立オラクル | 状態 |' "$ledger" || fail 'ledger header is missing'
+grep -Fq '| ID | 要求（観測可能な契約） | 境界・失敗動作 | 実装範囲 | 独立オラクル | 状態 |' "$ledger" || fail 'ledger header is missing'
 
 mapfile -t rows < <(awk -F'|' '/^\| [A-Z0-9]+-[A-Z0-9-]+ \|/ { gsub(/[[:space:]]/, "", $2); print $2 }' "$ledger")
 [[ "${#rows[@]}" -gt 0 ]] || fail 'ledger contains no requirement rows'
@@ -37,11 +37,12 @@ done < <(awk '/^\| [A-Z0-9]+-[A-Z0-9-]+ \|/ { print }' "$ledger")
 # Every changed path must be named by at least one ledger scope. This covers
 # worktree, index, and untracked files so an unregistered implementation cannot
 # sneak into a PR merely because the requirement table itself still parses.
-mapfile -t scoped_paths < <(rg -o '`[^`]+`' "$ledger" | tr -d '`' | sort -u)
+mapfile -t scoped_paths < <(grep -oE '`[^`]+`' "$ledger" | tr -d '`' | sort -u)
 mapfile -t changed_paths < <({
     git diff --name-only
     git diff --cached --name-only
-    git ls-files --others --exclude-standard
+    git ls-files --others --exclude-standard |
+        awk '$0 !~ /(^|\/)__pycache__\/[^/]+\.pyc$/'
 } | sort -u)
 for changed_path in "${changed_paths[@]}"; do
     [[ -n "$changed_path" ]] || continue
