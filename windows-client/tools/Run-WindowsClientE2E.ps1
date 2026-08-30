@@ -159,8 +159,8 @@ public sealed class CodexInfoGraphPixelMeasurement {
     public int PlotSpan { get; set; }
     public int GutterWidth { get; set; }
     public int[] GridCenters { get; set; }
-    public int[] SeriesTop { get; set; }
-    public int[] SeriesBottom { get; set; }
+    public int[] SeriesGutterTop { get; set; }
+    public int[] SeriesGutterBottom { get; set; }
     public int[] SeriesPixelCount { get; set; }
     public int[] SeriesGutterPixelCount { get; set; }
     public int[] SeriesRightmost { get; set; }
@@ -266,8 +266,8 @@ public static class CodexInfoGraphPixelScanner {
                     throw new InvalidOperationException("The inferred period-end grid has no vertical grid/series evidence.");
                 }
             }
-            var top = new[] { int.MaxValue, int.MaxValue, int.MaxValue, int.MaxValue };
-            var bottom = new[] { int.MinValue, int.MinValue, int.MinValue, int.MinValue };
+            var gutterTop = new[] { int.MaxValue, int.MaxValue, int.MaxValue, int.MaxValue };
+            var gutterBottom = new[] { int.MinValue, int.MinValue, int.MinValue, int.MinValue };
             var count = new int[4];
             var gutterCount = new int[4];
             var rightmost = new[] { int.MinValue, int.MinValue, int.MinValue, int.MinValue };
@@ -277,10 +277,12 @@ public static class CodexInfoGraphPixelScanner {
                     for (int series = 0; series < SeriesColors.Length; series++) {
                         if (!Matches(pixel, SeriesColors[series], 24)) continue;
                         count[series]++;
-                        top[series] = Math.Min(top[series], localY);
-                        bottom[series] = Math.Max(bottom[series], localY);
                         rightmost[series] = Math.Max(rightmost[series], localX);
-                        if (localX > periodEnd) gutterCount[series]++;
+                        if (localX > periodEnd) {
+                            gutterCount[series]++;
+                            gutterTop[series] = Math.Min(gutterTop[series], localY);
+                            gutterBottom[series] = Math.Max(gutterBottom[series], localY);
+                        }
                     }
                 }
             }
@@ -291,8 +293,8 @@ public static class CodexInfoGraphPixelScanner {
                 PlotSpan = periodEnd - periodStart,
                 GutterWidth = plotWidth - 1 - periodEnd,
                 GridCenters = centers.ToArray(),
-                SeriesTop = top,
-                SeriesBottom = bottom,
+                SeriesGutterTop = gutterTop,
+                SeriesGutterBottom = gutterBottom,
                 SeriesPixelCount = count,
                 SeriesGutterPixelCount = gutterCount,
                 SeriesRightmost = rightmost,
@@ -2905,13 +2907,13 @@ try {
         foreach ($sameHeightState in @('700x640', '1000x640')) {
             for ($seriesIndex = 0; $seriesIndex -lt 4; $seriesIndex++) {
                 Assert-E2E ([Math]::Abs(
-                    $measurements[$sameHeightState].Pixels.SeriesTop[$seriesIndex] -
-                    $target.Pixels.SeriesTop[$seriesIndex]) -le 2) `
-                    "$metricLabel series $seriesIndex top changed at $sameHeightState."
+                    $measurements[$sameHeightState].Pixels.SeriesGutterTop[$seriesIndex] -
+                    $target.Pixels.SeriesGutterTop[$seriesIndex]) -le 2) `
+                    "$metricLabel series $seriesIndex endpoint top changed at $sameHeightState."
                 Assert-E2E ([Math]::Abs(
-                    $measurements[$sameHeightState].Pixels.SeriesBottom[$seriesIndex] -
-                    $target.Pixels.SeriesBottom[$seriesIndex]) -le 2) `
-                    "$metricLabel series $seriesIndex bottom changed at $sameHeightState."
+                    $measurements[$sameHeightState].Pixels.SeriesGutterBottom[$seriesIndex] -
+                    $target.Pixels.SeriesGutterBottom[$seriesIndex]) -le 2) `
+                    "$metricLabel series $seriesIndex endpoint bottom changed at $sameHeightState."
             }
         }
         $restored = $measurements['restore-940x640']
