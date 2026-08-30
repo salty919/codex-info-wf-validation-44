@@ -20,7 +20,7 @@ import unittest
 from dataclasses import dataclass, replace
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[2]
 WORKFLOW = ROOT / ".github" / "workflows" / "version-prepare.yml"
 SCRIPT_DIR = ROOT / "scripts"
 REPOSITORY = "salty919/codex_info_v2"
@@ -563,6 +563,125 @@ class VersionPrepareWorkflowLocalTests(unittest.TestCase):
                     "test_version_prepare_workflow.py",
                     workflow.read_text(encoding="utf-8"),
                 )
+
+    def test_trusted_classifier_accepts_the_exact_prospective_diff(self) -> None:
+        trusted_revision = os.environ.get("LOCAL_TRUSTED_MAIN", "origin/main")
+        base_revision = os.environ.get("LOCAL_PR_BASE", "origin/feat/next")
+        trusted_source = subprocess.run(
+            [
+                "git",
+                "show",
+                f"{trusted_revision}:scripts/ci_change_scope.py",
+            ],
+            cwd=ROOT,
+            text=True,
+            capture_output=True,
+            check=True,
+        ).stdout
+        base_sha = subprocess.run(
+            ["git", "rev-parse", f"{base_revision}^{{commit}}"],
+            cwd=ROOT,
+            text=True,
+            capture_output=True,
+            check=True,
+        ).stdout.strip()
+        head_sha = subprocess.run(
+            ["git", "rev-parse", "HEAD^{commit}"],
+            cwd=ROOT,
+            text=True,
+            capture_output=True,
+            check=True,
+        ).stdout.strip()
+        changed_paths = subprocess.run(
+            ["git", "diff", "--name-only", f"{base_sha}...{head_sha}"],
+            cwd=ROOT,
+            text=True,
+            capture_output=True,
+            check=True,
+        ).stdout.splitlines()
+        self.assertGreater(len(changed_paths), 0)
+
+        with tempfile.TemporaryDirectory(prefix="trusted-classifier-") as raw_root:
+            fixture_root = Path(raw_root)
+            classifier = fixture_root / "ci_change_scope.py"
+            classifier.write_text(trusted_source, encoding="utf-8")
+
+            def classify(paths: list[str]) -> subprocess.CompletedProcess[str]:
+                pull_request = fixture_root / "pull-request.json"
+                files = fixture_root / "files.json"
+                pull_request.write_text(
+                    json.dumps(
+                        {
+                            "number": int(PR_NUMBER),
+                            "state": "open",
+                            "changed_files": len(paths),
+                            "base": {
+                                "repo": {"full_name": REPOSITORY},
+                                "ref": "feat/next",
+                                "sha": base_sha,
+                            },
+                            "head": {
+                                "repo": {"full_name": REPOSITORY},
+                                "ref": HEAD_REF,
+                                "sha": head_sha,
+                            },
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                files.write_text(
+                    json.dumps(
+                        [
+                            [
+                                {"filename": path, "status": "modified"}
+                                for path in paths
+                            ]
+                        ]
+                    ),
+                    encoding="utf-8",
+                )
+                return subprocess.run(
+                    [
+                        sys.executable,
+                        str(classifier),
+                        "--pull-request",
+                        str(pull_request),
+                        "--files",
+                        str(files),
+                        "--expected-repository",
+                        REPOSITORY,
+                        "--expected-head-repository",
+                        REPOSITORY,
+                        "--expected-head-ref",
+                        HEAD_REF,
+                        "--expected-number",
+                        PR_NUMBER,
+                        "--expected-base-ref",
+                        "feat/next",
+                        "--expected-base-sha",
+                        base_sha,
+                        "--expected-head-sha",
+                        head_sha,
+                        "--expected-state",
+                        "open",
+                        "--format",
+                        "json",
+                    ],
+                    cwd=ROOT,
+                    text=True,
+                    capture_output=True,
+                    check=False,
+                )
+
+            old_layout = classify(["scripts/test_version_prepare_workflow.py"])
+            self.assertNotEqual(old_layout.returncode, 0)
+            self.assertIn("has no CI owner", old_layout.stderr)
+            fixed_layout = classify(
+                [".github/tests/test_version_prepare_workflow.py"]
+            )
+            assert_success(self, fixed_layout)
+            exact_diff = classify(changed_paths)
+            assert_success(self, exact_diff)
 
     def test_nonbinary_path_uses_event_head_and_finishes(self) -> None:
         scenario = self.scenario()

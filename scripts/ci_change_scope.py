@@ -49,7 +49,6 @@ GOVERNANCE_EXACT = frozenset(
         "scripts/test_product_version.py",
         "scripts/test_release_quality_run_resolver.py",
         "scripts/test_selected_quality_gate.py",
-        "scripts/test_version_prepare_workflow.py",
         "scripts/windows_client_contract_gate.sh",
         "scripts/workflow_quality_gate.py",
     }
