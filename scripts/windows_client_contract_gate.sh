@@ -592,15 +592,15 @@ require_text windows-client/tools/Run-WindowsClientE2E.ps1 'Assert-E2EQuotaGauge
 require_text windows-client/tools/Run-WindowsClientE2E.ps1 'Assert-E2EGraphHasModelData'
 require_text windows-client/tools/Run-WindowsClientE2E.ps1 'Assert-E2EGraphHasModelData $plot $graph.Handle $graphPast'
 require_text windows-client/tools/Run-WindowsClientE2E.ps1 'public static extern bool PrintWindow'
-require_text windows-client/tools/Run-WindowsClientE2E.ps1 "GetData('TRUSTED_PLATFORM_ASSEMBLIES')"
-require_text windows-client/tools/Run-WindowsClientE2E.ps1 '[System.Drawing.Bitmap].Assembly.Location'
-require_text windows-client/tools/Run-WindowsClientE2E.ps1 '[System.Drawing.Color].Assembly.Location'
-require_text windows-client/tools/Run-WindowsClientE2E.ps1 'Where-Object { -not [string]::IsNullOrWhiteSpace($_) }'
-require_text windows-client/tools/Run-WindowsClientE2E.ps1 'Select-Object -Unique'
-require_text windows-client/tools/Run-WindowsClientE2E.ps1 "Assert-E2E (\$compilerReferences.Count -gt 0) 'Trusted platform assemblies could not be resolved.'"
+require_text windows-client/tools/Run-WindowsClientE2E.ps1 "\$compilerReferenceRoot = Join-Path \$PSHOME 'ref'"
+require_text windows-client/tools/Run-WindowsClientE2E.ps1 "Get-ChildItem -LiteralPath \$compilerReferenceRoot -Filter '*.dll' -File"
+require_text windows-client/tools/Run-WindowsClientE2E.ps1 '$drawingCommonReference = [System.Drawing.Bitmap].Assembly.Location'
+require_text windows-client/tools/Run-WindowsClientE2E.ps1 "Assert-E2E (Test-Path -LiteralPath \$drawingCommonReference -PathType Leaf) 'System.Drawing.Common reference could not be resolved.'"
+require_text windows-client/tools/Run-WindowsClientE2E.ps1 '$compilerReferences += $drawingCommonReference'
 require_text windows-client/tools/Run-WindowsClientE2E.ps1 'Add-Type -ReferencedAssemblies $compilerReferences -TypeDefinition'
-if rg -q --fixed-strings 'Add-Type -ReferencedAssemblies System.Drawing -TypeDefinition' windows-client/tools/Run-WindowsClientE2E.ps1; then
-    fail 'Windows E2E embedded C# must use the runtime assemblies that own Bitmap and Color'
+if rg -q --fixed-strings "GetData('TRUSTED_PLATFORM_ASSEMBLIES')" windows-client/tools/Run-WindowsClientE2E.ps1 ||
+    rg -q --fixed-strings 'Add-Type -ReferencedAssemblies System.Drawing -TypeDefinition' windows-client/tools/Run-WindowsClientE2E.ps1; then
+    fail 'Windows E2E embedded C# must use compiler references plus the System.Drawing.Common owner assembly'
 fi
 require_function_text windows-client/tools/Run-WindowsClientE2E.ps1 Capture-E2EWindow 'PrintWindow'
 require_function_text windows-client/tools/Run-WindowsClientE2E.ps1 Capture-E2EWindow 'PW_RENDERFULLCONTENT'
